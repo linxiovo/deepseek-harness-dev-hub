@@ -48,4 +48,4 @@ Blocked by: 01
 - 发布包 `@deepseek-ai/dsh-llm@0.2.1-alpha.2`：`lib/types/types.d.ts` 的 `TokenUsage`、`StreamChunk`、`LlmModelContext`。
 - 发布包 `@deepseek-ai/dsh-session@0.2.1-alpha.2`：`lib/types/types.d.ts` 的 `SessionHeader`、`SessionEventMap`，及 `lib/types/index.d.ts` 的事件和自有事件接口。
 - 发布包 `@deepseek-ai/dsh-compaction@0.2.1-alpha.2`：`lib/types/types.d.ts` 的 `compaction/summary` 与 `compaction/prune`。
-- 本地原型：`References/Projects/dsh-superagent-prototype/src/app/retry-health.ts`、`src/app/api.ts`、`src/app/sessions.ts`。
+- 本地原型：`meta/References/Projects/dsh-superagent-prototype/src/app/retry-health.ts`、`src/app/api.ts`、`src/app/sessions.ts`。

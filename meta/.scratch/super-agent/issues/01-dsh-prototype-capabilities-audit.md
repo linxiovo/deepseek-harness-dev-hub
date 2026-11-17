@@ -6,7 +6,7 @@ Blocked by: None
 
 ## Question
 
-深入审查 `References/Projects/dsh-superagent-prototype` 源码（`src/core/`、`src/app/`、`src/executor/dsh.ts`、`prompts/`、`skills/`、`src/client/`），查明以下事实以支撑后续架构决策：
+深入审查 `meta/References/Projects/dsh-superagent-prototype` 源码（`src/core/`、`src/app/`、`src/executor/dsh.ts`、`prompts/`、`skills/`、`src/client/`），查明以下事实以支撑后续架构决策：
 1. 当前 `Main Session (orchestrator)` 与 `Executor Session (worker)` 各自暴露了哪些内置工具（Tools），两者之间通过什么数据结构通信（派单、状态汇报、追问、暂停/重试）？
 2. 当前 `Ticket`、`Thread`、`Assignment` 的状态存储（`store.ts` / `kv.ts`）是如何组织的？若要引入带 `Blocked-by` 依赖边的 `Plan DAG` 以及多票顺序合入主干（Worktree → Main branch），现有模型缺少哪些字段与钩子？
 3. 主会话（`orchestrator`）目前的上下文增长是如何管理的？D-SH 宿主 API 是否原生支持会话压缩（compact）、清理重置（clear）或新开继承会话？
@@ -14,7 +14,7 @@ Blocked by: None
 
 ## Answer
 
-> 审查对象：`References/Projects/dsh-superagent-prototype`（实际目录名 `dsh-superagent-prototype`）。D-SH 宿主能力以 `package.json` 锁定的 `@deepseek-ai/dsh-*@0.2.1-alpha.2` 类型声明为准；原型自己的调用点均标到文件与符号。
+> 审查对象：`meta/References/Projects/dsh-superagent-prototype`（实际目录名 `dsh-superagent-prototype`）。D-SH 宿主能力以 `package.json` 锁定的 `@deepseek-ai/dsh-*@0.2.1-alpha.2` 类型声明为准；原型自己的调用点均标到文件与符号。
 
 ### 0. 结论速览
 

@@ -6,7 +6,7 @@ Status: resolved
 
 ## Notes
 
-- **Domain**: 全自动 AI 软件研发与长线维护系统（基于 DeepSeek Harness 插件体系，演进自 `References/Projects/dsh-superagent-prototype`）。术语见根目录 [`GLOSSARY.md`](../../GLOSSARY.md)，当前架构约束见 [`docs/architecture.md`](../../docs/architecture.md)。
+- **Domain**: 全自动 AI 软件研发与长线维护系统（基于 DeepSeek Harness 插件体系，演进自 `meta/References/Projects/dsh-superagent-prototype`）。术语见 [`meta/GLOSSARY.md`](../../GLOSSARY.md)，当前架构约束见 [`meta/docs/architecture.md`](../../docs/architecture.md)。
 - **Skills every session should consult**: `wayfinder`, `grilling`, `domain-modeling`。
 - **Standing preferences**:
   1. 人类参与入口处的需求对齐（`grill-with-docs` / `wayfinder`），交棒后在授权范围内自主推进至正式关票，再转入 Stage 2 常驻监听。资源额度耗尽时暂停受影响工作并报告真实状态，不用无限消耗换取表面完成。

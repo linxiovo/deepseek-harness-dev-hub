@@ -28,14 +28,22 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 
 ### Development checks
 
-From the repository root, use pnpm 11.7.0 with a supported Node.js version. [Plugin CI](../../.github/workflows/plugin-ci.yml) runs on Ubuntu for pushes and pull requests targeting `main`, with read-only repository access. To run the same full check locally on Linux (or in WSL):
+From the repository root, use pnpm 11.7.0 with a supported Node.js version. [Plugin CI](../../.github/workflows/plugin-ci.yml) runs on Ubuntu (`check`) and native Windows (`windows`) for pushes and pull requests targeting `main`, with read-only repository access. The Linux job waits for Windows to pass. To run the full check locally on Linux (or in WSL):
 
 ```sh
 pnpm -C plugin install --frozen-lockfile
 pnpm -C plugin check
 ```
 
-`check` runs typechecking, the test suite and the build. Some tests require POSIX utilities and fail on native Windows. There, install dependencies as above and use `pnpm -C plugin typecheck` for the Windows-safe check; use WSL or Linux for the full suite. After the local hook installer is merged into `main`, run `pnpm -C plugin run hooks:install` in your own checkout to opt into the Windows-safe pre-commit checks. The local hook is not a substitute for the Linux CI job.
+`check` runs typechecking, the full test suite and the build. Some tests require POSIX utilities and fail on native Windows. The Windows job runs typechecking, the handoff tests and the build; use the same commands locally in PowerShell after installing dependencies as above:
+
+```sh
+pnpm -C plugin typecheck
+pnpm -C plugin exec vitest run tests/handoff.spec.ts
+pnpm -C plugin build
+```
+
+Use WSL or Linux for the full suite. After the local hook installer is merged into `main`, run `pnpm -C plugin run hooks:install` in your own checkout to opt into local pre-commit checks. GitHub branch-protection rules and the GitHub Source's `requiredChecks` must be configured separately to require `windows` at merge time or for ticket evidence; the job dependency alone does not restrict merging.
 
 ## Accounts
 

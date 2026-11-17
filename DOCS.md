@@ -6,4 +6,4 @@
 
 | 模块名称 | 职责摘要 | 相对路径 |
 | --- | --- | --- |
-| plugin / dsh-superagent | 面向单一 GitHub 仓库的 Cordis bundle，处理请求、授权、执行与回复 | [plugin/README.md](plugin/README.md) |
+| `plugin/` | 独立 Cordis bundle：源码、配置、提示词、Skill、测试与编号文档的模块内导航 | [plugin/DOCS.md](plugin/DOCS.md) |

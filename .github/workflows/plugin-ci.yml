@@ -13,11 +13,16 @@ jobs:
   check:
     name: check
     needs: windows
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: plugin
     steps:
+      - name: Require Windows success
+        working-directory: ${{ github.workspace }}
+        if: ${{ always() && needs.windows.result != 'success' }}
+        run: exit 1
       - name: Checkout
         uses: actions/checkout@v7
         with:

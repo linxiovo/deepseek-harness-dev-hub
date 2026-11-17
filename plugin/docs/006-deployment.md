@@ -28,7 +28,7 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 
 ### Development checks
 
-From the repository root, use pnpm 11.7.0 with a supported Node.js version. [Plugin CI](../../.github/workflows/plugin-ci.yml) runs on Ubuntu (`check`) and native Windows (`windows`) for pushes and pull requests targeting `main`, with read-only repository access. The Linux job waits for Windows to pass. To run the full check locally on Linux (or in WSL):
+From the repository root, use pnpm 11.7.0 with a supported Node.js version. [Plugin CI](../../.github/workflows/plugin-ci.yml) runs on Ubuntu (`check`) and native Windows (`windows`) for pushes and pull requests targeting `main`, with read-only repository access. Linux `check` waits for Windows and explicitly fails if Windows fails; it is not skipped (GitHub treats skipped required jobs as successful). To run the full check locally on Linux (or in WSL):
 
 ```sh
 pnpm -C plugin install --frozen-lockfile

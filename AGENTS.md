@@ -1,3 +1,14 @@
+## 目录与代码位置
+
+- `meta/References/`（含 `meta/References/Projects/dsh-superagent-prototype` 与 `meta/References/Skills/mattpocock`）为只读参考子模块，禁止在其中直接修改或提交代码。
+- 基于原型演进的实际可交付代码、配置（`cordis.patch.yml`）、提示词、Skill 与测试一律落地于 `plugin/` 目录，作为独立 Cordis bundle 演进并纳入根目录 `DOCS.md` 文档树。
+- 架构规范、术语表与需求规格见 `meta/docs/architecture.md`、`meta/GLOSSARY.md` 与 `meta/.scratch/super-agent-implementation/spec.md`。
+
+## 工具与消息边界
+
+- Hub Agent（`dsh-superagent-router`）保留只读代码/图片检视（`read`、`read_image`、`glob`、`grep`、`skill`）及受控协调工具，由 preset 与 `tools.restrict` 硬性禁用 `bash`/`pwsh`、`job_*` 与 `write`/`edit`，不得依赖提示词软约束。
+- Worker Session 仅通过中枢路由对外答复，不得借确认回执或通道命令直连人类；票据结束后 Worker 及其子会话不得继续修改仓库。
+
 ## Git 提交
 
 所有提交必须使用中文标题，包括普通提交、合并提交和回滚提交；正文说明也使用中文。提交类型、作用域、代码标识符和必要的专有名词可保留英文。

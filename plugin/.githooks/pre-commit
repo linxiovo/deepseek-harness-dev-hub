@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+pnpm -C plugin typecheck
+pnpm -C plugin exec vitest run tests/docs.spec.ts tests/tickets.spec.ts tests/handoff.spec.ts

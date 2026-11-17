@@ -26,6 +26,17 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 - A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
 - For Feishu: `lark-cli` (tested with 1.0.90) and a Feishu or Lark app with a bot
 
+### Development checks
+
+From the repository root, use pnpm 11.7.0 with a supported Node.js version. [Plugin CI](../../.github/workflows/plugin-ci.yml) runs on Ubuntu for pushes and pull requests targeting `main`, with read-only repository access. To run the same full check locally on Linux (or in WSL):
+
+```sh
+pnpm -C plugin install --frozen-lockfile
+pnpm -C plugin check
+```
+
+`check` runs typechecking, the test suite and the build. Some tests require POSIX utilities and fail on native Windows. There, install dependencies as above and use `pnpm -C plugin typecheck` for the Windows-safe check; use WSL or Linux for the full suite. After the local hook installer is merged into `main`, run `pnpm -C plugin run hooks:install` in your own checkout to opt into the Windows-safe pre-commit checks. The local hook is not a substitute for the Linux CI job.
+
 ## Accounts
 
 ### Agent GitHub account

@@ -1,0 +1,18 @@
+# Keep text normalized and shell entry points executable across Windows and Linux.
+* text=auto eol=lf
+
+# Binary assets are never subject to line-ending conversion.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.zip binary
+*.sqlite binary
+
+# These scripts and Git hooks must retain Unix line endings on checkout.
+plugin/scripts/* text eol=lf
+plugin/.githooks/* text eol=lf

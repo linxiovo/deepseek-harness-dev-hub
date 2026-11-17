@@ -33,7 +33,14 @@ Read the numbered documents in order; each builds only on the ones before it.
 
 ## Development
 
-`pnpm check` runs the typecheck, the tests and the build.
+From the repository root, use Node.js 22.19+ (22.x) or 24+, and pnpm 11.7.0. On Linux, run the same full check as [Plugin CI](../.github/workflows/plugin-ci.yml):
+
+```sh
+pnpm -C plugin install --frozen-lockfile
+pnpm -C plugin check
+```
+
+`check` typechecks, runs the tests and builds. The full suite includes POSIX-dependent tests; on native Windows, run `pnpm -C plugin typecheck` and use WSL or Linux for `pnpm -C plugin check`. After the local hook installer is merged into `main`, opt in with `pnpm -C plugin run hooks:install`; the pre-commit hook runs only the Windows-safe subset, not the full POSIX suite. See [deployment checks](docs/006-deployment.md#development-checks).
 
 ## License
 

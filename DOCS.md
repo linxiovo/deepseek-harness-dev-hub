@@ -6,5 +6,4 @@
 
 | 模块名称 | 职责摘要 | 相对路径 |
 | --- | --- | --- |
-
-_当前仓库尚未新增实际代码，后续新增代码模块时按行补入此表。_
+| plugin / dsh-superagent | 面向单一 GitHub 仓库的 Cordis bundle，处理请求、授权、执行与回复 | [plugin/README.md](plugin/README.md) |

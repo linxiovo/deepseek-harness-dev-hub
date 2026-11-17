@@ -1,0 +1,15 @@
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 依赖与构建产物
+node_modules/
+dist/
+coverage/
+*.log
+
+# 本地环境配置
+.env
+.env.*
+!.env.example

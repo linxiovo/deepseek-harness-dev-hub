@@ -13,7 +13,7 @@ A team can edit three team sections, add skills, and override every built-in sys
 | Delivery requirements | Evidence in pull requests, the auto-merge condition with its line threshold, and the commit author; without one, the Executor commits as the agent account's no-reply address |
 | Team skills | Knowledge the agents load when they need it, such as an `identities` skill that says which Feishu user is which GitHub account |
 
-The built-in text covers the roles, tool usage, host mechanics, authorization rules, and the GitHub and Feishu skills. It refers to the team sections by their headings instead of repeating them.
+The built-in text covers the roles, tool usage, host mechanics, authorization rules, Source skills and the planner's unattended to-spec skill. It refers to the team sections by their headings instead of repeating them.
 
 ### Built-in parts and templates
 
@@ -21,10 +21,11 @@ Overrides use these keys:
 
 | Parts | Keys |
 | --- | --- |
-| Shared instructions and roles | `runtime/shared`, `runtime/orchestrator`, `runtime/worker` |
+| Shared instructions and roles | `runtime/shared`, `runtime/orchestrator`, `runtime/worker`, `runtime/planner` |
 | Working instructions | `runtime/subscriptions`, `runtime/replies`, `runtime/dispatch`, `runtime/work`, `runtime/admission` |
 | Handoff instructions | `runtime/handoff/orchestrator`, `runtime/handoff/worker` |
 | Source skills | `skill/feishu`, `skill/github` |
+| Planner skill | `skill/to-spec` |
 | Generated sections | `runtime/environment`, `runtime/policy`, `runtime/policy/none` |
 
 The generated sections are editable templates. They must retain these placeholders:
@@ -61,6 +62,10 @@ The environment section gives the main Session deployment-wide values and each E
 Executors also read DeepSeek Harness's coding prompt and the repository's `AGENTS.md`; the main Session does not. An inferred Ticket adds a final note limiting its Executor to the matched rules. Assignments and incoming messages arrive inline as Trigger cards, with resource pointers only for truncated content.
 
 Executors work unattended. Their tools exclude those that ask a person, present UI to them or change the profile, such as `ask_user_question`, `present` and `plugin_manager`.
+
+Planner Sessions receive only `runtime/planner` and `skill/to-spec`, with neither Ticket policy nor Source/team skills. Their confirmed handoff arrives inline; specification research and writing belong to the planner, while the Hub may inspect context read-only and does not modify repository files.
+
+The planner's task and resume turns and the Hub's handoff relays are packaged templates, not override parts: `Planning` sends `prompts/planner-task.md` with the confirmed brief and `prompts/planner-resume.md` with the recorded answer, and `Handoffs` fills `prompts/handoff-relay.md` for a product question or a published specification. `Sessions` loads `prompts/planner-inactive.md` and `prompts/planner-denied.md` once at module load, as the guard's refusals for a handoff that is no longer `planning` and for a tool outside a planner Session's allowance. The main Session's tools load `prompts/handoff-errors.md` once, strictly checking its six keys, for their Hub handoff refusals.
 
 From strongest to weakest:
 

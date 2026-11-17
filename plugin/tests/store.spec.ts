@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import ts from 'typescript'
 import { Store, SCHEMA_VERSION } from '../src/app/store.ts'
 import { MemoryRepositories, key, type Assignment, type Decision, type Repositories, type Thread, type Ticket } from '../src/core/index.ts'
 import { threadFacts } from '../src/app/views/records.ts'
@@ -137,10 +138,36 @@ it('spells every kv key in KV alone, so each record is named by its entry there'
   const keys = entries.map(entry => typeof entry === 'string' ? entry : entry.prefix).filter(name => /[-:]/.test(name))
   const modules = readdirSync(src, { recursive: true, encoding: 'utf8' })
     .filter(path => /\.tsx?$/.test(path) && !['kv.ts', join('app', 'migration.ts')].includes(path))
-  const spelled = modules.flatMap(path => {
-    const text = readFileSync(join(src, path), 'utf8')
-    return keys.filter(name => text.includes(`'${name}`) || text.includes(`\`${name}`)).map(name => `${path}: ${name}`)
-  })
+  const literalPrefix = (value: ts.Expression): string | undefined => {
+    if (ts.isStringLiteralLike(value)) return value.text
+    if (ts.isTemplateExpression(value)) return value.head.text
+    if (ts.isBinaryExpression(value) && value.operatorToken.kind === ts.SyntaxKind.PlusToken) return literalPrefix(value.left)
+    if (ts.isParenthesizedExpression(value) || ts.isAsExpression(value)) return literalPrefix(value.expression)
+    return undefined
+  }
+  const literalStoreKeys = (text: string, path: string): string[] => {
+    const found: string[] = []
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+        const { expression: receiver, name } = node.expression
+        const onStore = ts.isIdentifier(receiver) ? receiver.text === 'store' :
+          ts.isPropertyAccessExpression(receiver) && receiver.name.text === 'store'
+        if (onStore && ['get', 'set', 'keys', 'delete'].includes(name.text)) {
+          const first = node.arguments[0]
+          const raw = first && literalPrefix(first)
+          if (raw && keys.some(key => raw.startsWith(key))) found.push(raw)
+        }
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true))
+    return found
+  }
+  expect(literalStoreKeys('const requestId = `handoff:${id}:spec`;', 'sample.ts')).toEqual([])
+  expect(literalStoreKeys('store.set("handoff:42", {}); this.store.keys(`handoff:${id}`);', 'sample.ts'))
+    .toEqual(['handoff:42', 'handoff:'])
+  const spelled = modules.flatMap(path => literalStoreKeys(readFileSync(join(src, path), 'utf8'), path)
+    .map(name => `${path}: ${name}`))
   expect(spelled).toEqual([])
 })
 

@@ -32,6 +32,7 @@ type RegisteredTool = { name: string; execute: (args: unknown, execution: { sign
 type FakeAgent = {
   id: string; status: string; inbox: { nextTurn: UserMessage[]; nextStep: UserMessage[] }
   cancel: Mock; inject: Mock<(message: UserMessage) => void>; steer: Mock<(message: UserMessage) => void>; followup: Mock<(message: UserMessage) => void>
+  directUserMessage: (text: string) => void
 }
 /** A text message, as DSH's job tools and subagents send their notices. */
 const notice = (id: string, text: string) => ({ id, role: 'user', content: [{ type: 'text', text }], source: { kind: 'tool-jobs', form: 'notice' } }) as unknown as UserMessage
@@ -132,7 +133,7 @@ export function subagentRuntime(agents: Map<string, FakeAgent>) {
 }
 
 /** @param seed - writes to the database before the Runtime opens it, such as records an earlier version stored. */
-export async function startRuntime(seed?: (store: Store) => void) {
+export async function startRuntime(seed?: (store: Store) => void, options: { withFeishu?: boolean } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'orchestrator-host-'))
   const AGENT = join(directory, 'agent-gh'), BOT = join(directory, 'lark-bot')
   const repository = { default_branch: 'master', permissions: { push: true } }
@@ -161,6 +162,8 @@ export async function startRuntime(seed?: (store: Store) => void) {
     return { done, collected: { stdout: reader(answers[argv.join(' ')] ?? ''), stderr: reader('') } }
   }) }
   const agents = new Map<string, FakeAgent>()
+  const sessionHistory = new Map<string, { seq: number; type: string; data: UserMessage }[]>()
+  let directMessageSequence = 0
   /** Each Session's next step, which takes the messages that wait for one. */
   const steps = new Map<string, () => void>(), claims = new Map<string, () => void>()
   const tools = new Map<string, Map<string, RegisteredTool>>()
@@ -194,7 +197,11 @@ export async function startRuntime(seed?: (store: Store) => void) {
         for (const message of [...inbox.nextStep.filter(item => !taken.has(item.id)), ...queued]) {
           taken.add(message.id)
           ctx.emit('agent/inbox/claimed', { agent, message, turn } as never)
-          if (!cut) ctx.emit('session/event', session as never, { type: 'user/message', data: message } as never)
+          if (!cut) {
+            const event = { seq: sessionEvents.length, type: 'user/message', data: message }
+            sessionEvents.push(event)
+            ctx.emit('session/event', session as never, event as never)
+          }
         }
       }
       steps.set(sessionId, () => { take(false) })
@@ -210,7 +217,9 @@ export async function startRuntime(seed?: (store: Store) => void) {
         turn++
         take(true)
       })
-      const session = { id: sessionId, snapshotEvents: () => [], requestHeader: () => undefined, append: vi.fn() }
+      const sessionEvents = sessionHistory.get(sessionId) ?? []
+      sessionHistory.set(sessionId, sessionEvents)
+      const session = { id: sessionId, snapshotEvents: () => sessionEvents, requestHeader: () => undefined, append: vi.fn() }
       let status = 'idle'
       const idle: (() => void)[] = []
       // A cancel drops the inbox unless kept, and the turn it stops ends a moment later, which DSH says.
@@ -224,7 +233,14 @@ export async function startRuntime(seed?: (store: Store) => void) {
           ctx.emit('agent/status', { agent, status: 'idle' } as never)
         })
       })
+      const directUserMessage = (text: string) => {
+        const message = { id: `direct-user-${++directMessageSequence}`, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } } as unknown as UserMessage
+        const event = { seq: sessionEvents.length, type: 'user/message', data: message }
+        sessionEvents.push(event)
+        ctx.emit('session/event', session as never, event as never)
+      }
       agents.set(sessionId, { id: sessionId, ctx: agentCtx, inbox, followup: deliver('queue'), steer: deliver('steer'), inject: vi.fn(), session, cancel,
+        directUserMessage,
         get status() { return status }, set status(next: string) { status = next; if (next === 'idle') for (const wake of idle.splice(0)) wake() },
         // Once its turn ended, as DSH's does.
         whenIdle: () => status === 'idle' ? Promise.resolve() : new Promise<void>(resolve => { idle.push(resolve) }) } as never)
@@ -233,30 +249,49 @@ export async function startRuntime(seed?: (store: Store) => void) {
     prompt: vi.fn(() => { throw new Error('Plugin delivery must not use user RPC') }),
     inspect: vi.fn(async () => ({ events: [] })),
   }
-  const reader = { read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} }
-  const persistence = { flush: vi.fn(async () => {}), open: vi.fn(async () => reader) }
+  const persistence = { flush: vi.fn(async () => {}), open: vi.fn(async (sessionId: string) => ({
+    read: async (offset = 0, count = 512) => ({ events: (sessionHistory.get(sessionId) ?? []).slice(offset, offset + count) }),
+    [Symbol.asyncDispose]: async () => {},
+  })) }
   const webServer = { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }
   const jobs = jobRegistry(id => agents.get(id))
   const subagents = subagentRuntime(agents)
   const services = { agents, llm: { resolveCallConfig: vi.fn(async (value: unknown) => value) }, sessionController: controller,
     sessionPersistence: persistence, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }) }, permissionPresets: { set: () => {} }, subprocess, webServer,
     jobs: jobs.service, subagents: subagents.service }
-  const ctx = new Context()
+  let ctx = new Context()
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   for (const cli of [AGENT, BOT]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
   const seeded = new Store(join(directory, 'orchestrator.sqlite'))
-  const sources = { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT } }, feishu: { enabled: true, config: { cli: BOT } } }
+  const sources = { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT } },
+    ...(options.withFeishu === false ? {} : { feishu: { enabled: true, config: { cli: BOT } } }) }
   seeded.saveSettings(SettingsSchema.parse({ ...seeded.settings(), sources }))
   seed?.(seeded)
   seeded.close()
-  const runtime = new Runtime(ctx, testMachine({ stateDir: directory }), vi.fn())
+  let runtime = new Runtime(ctx, testMachine({ stateDir: directory }), vi.fn())
   await runtime.ready
-  runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
+  if (options.withFeishu !== false) runtime.sources.register(feishuKind)
+  runtime.sources.register(githubKind)
   const settings = runtime.store.settings()
   runtime.store.saveSettings({ ...settings, eval: { ...settings.eval, mode: 'auto' },
-    policy: { ...settings.policy, sources: { feishu: { allowed: [{ id: MEMBER, name: 'Alice' }], syncChat: CHAT }, github: { allowed: [{ id: 'alice' }] } } },
-    sources: { ...sources, feishu: { enabled: true, config: { cli: BOT, chats: [{ chatId: CHAT, listen: 'all' }], directMessages: true } } } })
+    policy: { ...settings.policy, sources: { github: { allowed: [{ id: 'alice' }] },
+      ...(options.withFeishu === false ? {} : { feishu: { allowed: [{ id: MEMBER, name: 'Alice' }], syncChat: CHAT } }) } },
+    sources: { ...sources,
+      ...(options.withFeishu === false ? {} : { feishu: { enabled: true, config: { cli: BOT, chats: [{ chatId: CHAT, listen: 'all' }], directMessages: true } } }) } })
   deliveries.mockClear()
+
+  async function restart() {
+    await runtime.stop()
+    agents.clear()
+    tools.clear()
+    ctx = new Context()
+    for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
+    runtime = new Runtime(ctx, testMachine({ stateDir: directory }), vi.fn())
+    await runtime.ready
+    if (options.withFeishu !== false) runtime.sources.register(feishuKind)
+    runtime.sources.register(githubKind)
+    return runtime
+  }
 
   /** Parsed JSON payloads delivered to `sessionId`. */
   const relays = (sessionId: string) => deliveries.mock.calls.map(([call]) => call).filter(call => call.sessionId === sessionId)
@@ -267,6 +302,13 @@ export async function startRuntime(seed?: (store: Store) => void) {
     if (!tool) throw new Error(`Tool ${name} is not registered for ${sessionId}`)
     return await tool.execute(args, { signal: new AbortController().signal }) as Record<string, unknown>
   }
+  const sendUserMessage = (sessionId: string, text: string) => {
+    const agent = agents.get(sessionId)
+    if (!agent) throw new Error(`Session ${sessionId} does not exist`)
+    agent.directUserMessage(text)
+  }
+  const idlePlanning = () => runtime.effects.idle('planning')
+  const idleRelay = () => runtime.effects.idle('relay')
   /** Route one decision with the main Session's orchestrator_route, answering its result; a refused one throws its reason. */
   async function route(item: Record<string, unknown>): Promise<Record<string, unknown>> {
     const { results } = await runTool(runtime.masterId, 'orchestrator_route', { decisions: [item] }) as { results: Record<string, unknown>[] }
@@ -293,7 +335,7 @@ export async function startRuntime(seed?: (store: Store) => void) {
   const step = (sessionId: string) => { steps.get(sessionId)!() }
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
-  return { runtime, ctx, directory, agents, tools, deliveries, relays, candidates, runTool, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
+  return { get runtime() { return runtime }, get ctx() { return ctx }, restart, idlePlanning, idleRelay, directory, agents, tools, deliveries, relays, candidates, runTool, sendUserMessage, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
     jobs, subagents, step, claim }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>

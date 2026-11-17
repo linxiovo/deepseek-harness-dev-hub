@@ -27,3 +27,4 @@
 | 006 部署 | 安装、账户、机器配置、启停、设置、升级与排障 | [docs/006-deployment.md](docs/006-deployment.md) |
 | 007 架构 | 类与胶水层、依赖规则、源码与测试索引、持久化及模型接口 | [docs/007-architecture.md](docs/007-architecture.md) |
 | 008 扩展手册 | 新增 Source 的逐步实现示例 | [docs/008-cookbook.md](docs/008-cookbook.md) |
+| 009 交棒 | Harness 交棒确认、只读规划会话、单一问题与规格发布 | [docs/009-handoff.md](docs/009-handoff.md) |

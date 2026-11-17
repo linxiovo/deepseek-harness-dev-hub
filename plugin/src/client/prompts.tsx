@@ -137,6 +137,9 @@ function TeamEditor({ config, view, selected, onSelect, onEdit }: {
       onChange={event => onEdit(withSection(config, selected, event.target.value))} />
   </div>
 }
+/** The part's read-by hint, by the role that alone reads it. */
+const READ_BY = { orchestrator: 'promptReadBy.orchestrator', worker: 'promptReadBy.worker',
+  planner: 'promptReadBy.planner' } as const
 /**
  * A built-in part: its text, the team's override or the built-in one, with a reset; a template says which placeholders it
  * keeps; an override whose built-in text changed since shows the change and offers to keep the team's text or take the new one.
@@ -151,7 +154,7 @@ function BuiltInEditor({ config, view, part, onEdit }: {
   const base = config.overrides?.[part.key]?.base
   const previous = view.defaultChanged.find(item => item.part === part.key && item.base === base)?.previous
   const readBy = part.key.startsWith('skill/') ? 'promptReadBy.skill' : part.roles.length > 1 ? 'promptReadBy.both'
-    : `promptReadBy.${part.roles[0]!}` as const
+    : READ_BY[part.roles[0]!]
   return <div className="dt-prompt-main">
     <div className="dt-subhead"><h3 className="dt-section-title">{sectionLabel(t, view, name)}</h3>
       <span className="dt-actions"><Button variant="outline" size="sm" icon={<Icon name="refresh" />} disabled={!config.overrides?.[part.key]}

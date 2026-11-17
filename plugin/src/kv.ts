@@ -2,6 +2,7 @@
  * Typed key-value store keys and key families grouped by the single component that owns and writes each family.
  * Readers and writers refer to a record by its entry here so each key is spelled once with its value type.
  */
+import type { Handoff, ProjectRef, Spec } from './core/handoff.ts'
 import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { SettingsSave } from './policy.ts'
@@ -55,4 +56,11 @@ export const KV = {
   feishu: { chats: record<Record<string, boolean>>('feishu-chats'), history: family<string, [chat: string]>('feishu-history:'),
     topics: family<Record<string, string>, [chat: string]>('feishu-history-threads:'),
     seen: family<string[], [thread: string]>('thread-seen:'), initialized: family<boolean, [thread: string]>('thread-initialized:') },
+  /** Handoffs: current record by project; immutable full records and specs; direct confirmation receipts. */
+  handoffs: { current: family<string, [projectId: string]>('handoff-current:'),
+    record: family<Handoff, [id: string]>('handoff:'),
+    project: family<ProjectRef, [id: string]>('handoff-project:'),
+    spec: family<Spec, [handoffId: string]>('handoff-spec:'),
+    confirmationReceipt: family<{ handoffId: string }, [sessionId: string, messageId: string]>(
+      'handoff-confirmation:', (sessionId, messageId) => JSON.stringify([sessionId, messageId])) },
 }

@@ -6,17 +6,53 @@ import { UserError, followupOwners, key, reasonText, type Decision, type Decisio
   from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
+import type { Handoffs } from '../handoffs.ts'
 import { ticketCard } from '../cards.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
 import type { Sessions } from '../sessions.ts'
 import type { Settings } from '../settings.ts'
+import { promptFile } from '../skill-files.ts'
 import type { Store } from '../store.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 
 const RoutingNoteSchema = z.string().trim()
   .refine(text => wordCount(text) <= NOTE_WORDS, `Routing note must not exceed ${NOTE_WORDS} words (Chinese uses word segmentation). Shorten it; do not split it across deliveries.`)
   .describe(`Optional routing background or explicit human constraint, at most ${NOTE_WORDS} words. Never add implementation instructions or replace the original source.`)
+/** A handoff is a single product intent the user confirmed, not a bundle of unrelated goals. */
+const HandoffConfirmationSchema = z.object({
+  project: z.object({ repository: z.string().trim().min(1), workspace: z.string().trim().min(1) }).strict(),
+  goal: z.string().trim().min(1),
+  constraints: z.array(z.string().trim().min(1)),
+  acceptanceScope: z.array(z.string().trim().min(1)).min(1),
+  authorization: z.object({ scope: z.string().trim().min(1), release: z.enum(['authorized', 'not-authorized']) }).strict(),
+  confirmation: z.string().min(1).refine(text => !!text.trim(), 'Confirmation cannot be blank')
+    .describe('Verbatim latest direct Hub user confirmation; never relay.'),
+}).strict()
+const ApprovalSchema = z.object({
+  confirmed: z.literal(true),
+  brief: HandoffConfirmationSchema.omit({ confirmation: true }),
+}).strict()
+const handoffErrors = z.object({
+  latestConfirmation: z.string().min(1),
+  latestAnswer: z.string().min(1),
+  confirmationSession: z.string().min(1),
+  answerSession: z.string().min(1),
+  invalidConfirmation: z.string().min(1),
+  mismatchedBrief: z.string().min(1),
+}).strict().parse(JSON.parse(promptFile('handoff-errors')))
+/** Only the latest direct Hub user event may authorize a confirmation or answer. */
+function latestDirectUserMessageId(agent: Agent, text: string, kind: 'confirmation' | 'answer'): string {
+  const events = agent.session.snapshotEvents()
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index]
+    if (!event || event.type !== 'user/message' || event.data.source.kind !== 'user') continue
+    const message = event.data.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
+    if (message === text) return String(event.seq)
+    break
+  }
+  throw new Error(kind === 'confirmation' ? handoffErrors.latestConfirmation : handoffErrors.latestAnswer)
+}
 export interface MainToolsHost {
   readonly context: Context
   readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
@@ -26,6 +62,7 @@ export interface MainToolsHost {
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
+  readonly handoffs: Pick<Handoffs, 'confirm' | 'answer' | 'get' | 'spec'>
   /** Schedules a pass to carry out work queued by an Engine command (such as an Eval or ticket resume). */
   requestPass(): void
   sendReplies(): Promise<void>
@@ -153,10 +190,52 @@ function routeTool(host: MainToolsHost): Tool {
 }
 /** Builds the main Session's tools; `agent` scopes prompt preview resources to that Session. */
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
-  const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
+  const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings, handoffs: host.handoffs }
   return [
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
+    tool({
+      name: 'orchestrator_handoff_confirm',
+      description: 'Direct Hub approval only: persist one project goal, acceptance scope, and authorization; planner writes the spec.',
+      schema: HandoffConfirmationSchema,
+      execute: async ({ confirmation, ...brief }) => {
+        if (agent.id !== host.resources.masterId) throw new Error(handoffErrors.confirmationSession)
+        const messageId = latestDirectUserMessageId(agent, confirmation, 'confirmation')
+        let parsed: unknown
+        try { parsed = JSON.parse(confirmation) } catch {
+          throw new Error(handoffErrors.invalidConfirmation)
+        }
+        const approval = ApprovalSchema.safeParse(parsed)
+        if (!approval.success) throw new Error(handoffErrors.invalidConfirmation)
+        const approvedBrief = approval.data.brief
+        if (brief.project.repository !== approvedBrief.project.repository || brief.project.workspace !== approvedBrief.project.workspace
+          || brief.goal !== approvedBrief.goal
+          || brief.constraints.length !== approvedBrief.constraints.length
+          || brief.constraints.some((value, index) => value !== approvedBrief.constraints[index])
+          || brief.acceptanceScope.length !== approvedBrief.acceptanceScope.length
+          || brief.acceptanceScope.some((value, index) => value !== approvedBrief.acceptanceScope[index])
+          || brief.authorization.scope !== approvedBrief.authorization.scope
+          || brief.authorization.release !== approvedBrief.authorization.release) {
+          throw new Error(handoffErrors.mismatchedBrief)
+        }
+        const { handoff, reused } = host.handoffs.confirm({ ...approvedBrief,
+          confirmedBy: { sessionId: agent.id, messageId, text: confirmation } })
+        return { id: handoff.id, reused, handoff, spec: handoff.spec ?? null,
+          read: { handoff: `handoff/${handoff.id}`, spec: `spec/${handoff.id}` } }
+      },
+    }),
+    tool({
+      name: 'orchestrator_handoff_answer',
+      description: 'Hub only: relay the direct user answer to this handoff’s planner question; never infer it.',
+      schema: z.object({ handoffId: z.string().trim().min(1), questionId: z.string().trim().min(1),
+        answer: z.string().min(1).refine(text => !!text.trim(), 'Answer cannot be blank') }).strict(),
+      execute: async ({ handoffId, questionId, answer }) => {
+        if (agent.id !== host.resources.masterId) throw new Error(handoffErrors.answerSession)
+        latestDirectUserMessageId(agent, answer, 'answer')
+        const handoff = host.handoffs.answer(handoffId, questionId, answer)
+        return { handoffId, handoff, read: `handoff/${handoffId}`, spec: `spec/${handoffId}` }
+      },
+    }),
     routeTool(host),
     tool({
       name: 'orchestrator_ticket_retry',

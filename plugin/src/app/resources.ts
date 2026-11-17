@@ -13,6 +13,7 @@ import { transcriptEntry } from './context.ts'
 import { builtInParts, defaultPrompts } from './prompts.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Commands } from '../infra/commands.ts'
+import type { Handoffs } from './handoffs.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
 import type { Sessions } from './sessions.ts'
 import type { Settings } from './settings.ts'
@@ -28,6 +29,8 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'thread/<key>', holds: 'one thread: its label and link, its tickets and latest decisions, and its triggers, newest first', executor: true },
   { name: 'decisions', holds: 'decisions, newest first' },
   { name: 'decision/<id>', holds: 'one decision with its audit' },
+  { name: 'handoff/<id>', holds: 'the persisted, explicitly confirmed project and product intent, including planner questions and answers' },
+  { name: 'spec/<id>', holds: 'the published specification for this handoff, with observable acceptance and test interfaces; pending until publication' },
   { name: 'ticket/<id>', holds: 'a ticket\'s card, the trigger, decision and threads it is tied to, its latest assignments with the start of each '
     + 'report, and its inputs, newest first', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
@@ -72,6 +75,7 @@ export interface ResourceHost {
 export interface MainResourceHost extends ResourceHost {
   readonly sessions: Pick<Sessions, 'status' | 'modelRetry'>
   readonly settings: Pick<Settings, 'view' | 'block'>
+  readonly handoffs: Pick<Handoffs, 'get' | 'spec'>
 }
 interface Read {
   host: ResourceHost; resource: string; rest: string; offset: number; limit?: number
@@ -152,6 +156,16 @@ const ROUTES: readonly Route[] = [
     const decision = main(read).store.decisions.get(read.rest)
     if (!decision) throw new Error('Unknown decision')
     return decisionDetails(decision)
+  }],
+  ['handoff/', read => {
+    const handoff = main(read).handoffs.get(read.rest)
+    if (!handoff || !read.rest || read.rest.includes('/')) throw new Error('Unknown handoff')
+    return handoff
+  }],
+  ['spec/', read => {
+    const host = main(read), handoff = host.handoffs.get(read.rest)
+    if (!handoff || !read.rest || read.rest.includes('/')) throw new Error('Unknown handoff')
+    return host.handoffs.spec(read.rest) ?? { handoffId: read.rest, status: 'pending' }
   }],
   ['settings', read => main(read).settings.view()],
   ['settings/', read => text(read, JSON.stringify(main(read).settings.block(read.rest)))],

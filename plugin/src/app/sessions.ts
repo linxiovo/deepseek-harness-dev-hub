@@ -1,4 +1,4 @@
-/** Lifecycle, prompt/tool/skill decoration, message delivery, and budget retry tracking for orchestrator and worker DSH sessions. */
+/** Lifecycle, prompt/tool/skill decoration, message delivery, and budget retry tracking for orchestrator, planner and worker DSH sessions. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
@@ -14,8 +14,8 @@ import type { Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
 import { RetryHealth } from './retry-health.ts'
 import { initializeRoleModel } from './role-models.ts'
-import { bundledSkills } from './skill-files.ts'
-import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
+import { bundledSkills, promptFile } from './skill-files.ts'
+import { SKILL_PREFIX, type PromptVersion, type Prompts, type Role as PromptRole } from './prompts.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
@@ -34,18 +34,22 @@ export interface SessionsHost {
   closing(): boolean
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
   environment(ticket: Ticket): Variable[]
-  /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
-  tools(agent: Agent, ticket?: Ticket): Tool[]
+  /** Whether the persisted handoff is in its active planning state; all other statuses deny planner tools. */
+  plannerActive(handoffId: string): boolean
+  /** Tools for the main Session, a worker ticket, or an explicit planner role; the planner receives only its own tools. */
+  tools(agent: Agent, ticket?: Ticket, role?: 'planner'): Tool[]
 }
 
 /**
  * What Sessions registered for an agent it decorated: the releases of its prompt section, tools and skill scope, the scope
  * its skills are registered in, and the skills of one prompt revision; for a worker's subagent, only its tool limits.
  */
-interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; subagent?: true }
+interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; role?: PromptRole; subagent?: true }
 
-/** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
-export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router'
+/** The agent presets Executor, planner and main Sessions are created with, which the bundle's patch defines. */
+export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router', PLANNER_PRESET = 'dsh-superagent-planner'
+const plannerHandoffId = (sessionId: string): string | undefined =>
+  sessionId.startsWith('planner-') && sessionId.length > 'planner-'.length ? sessionId.slice('planner-'.length) : undefined
 declare module '@deepseek-ai/cordis' {
   interface Events {
     /** DSH's agent preset registry selected `agentPreset` for a Session. */
@@ -60,6 +64,11 @@ declare module '@deepseek-ai/cordis' {
  */
 const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
   'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
+/** Only read-only DSH capabilities and explicit specification tools are usable by a planner. */
+const PLANNER_TOOLS: readonly string[] = ['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch', 'skill']
+const SHARED_HOST_TOOLS: readonly string[] = ['orchestrator_read']
+const PLANNER_HOST_TOOLS: readonly string[] = ['orchestrator_spec_question', 'orchestrator_spec_publish']
+const PLANNER_INACTIVE = promptFile('planner-inactive'), PLANNER_DENIED = promptFile('planner-denied')
 /** What the main Session is told when it would wait: what it waits for comes to it, and a waiting step holds back the next. */
 const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job\'s end with its output arrive by themselves as messages; '
   + 'end the turn instead of waiting for them.'
@@ -124,7 +133,8 @@ export class Sessions {
     ctx.inject(['agentPresets'], child => {
       child.on('agent-preset/selected', (sessionId, preset) => {
         const ticketId = ticketOfSession(sessionId), agent = ctx.agents.get(sessionId as SessionId)
-        const ours = sessionId === this.host.masterId ? ROUTER_PRESET : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
+        const ours = sessionId === this.host.masterId ? ROUTER_PRESET : plannerHandoffId(sessionId) ? PLANNER_PRESET
+          : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
         if (!ours || preset === ours || !agent) return
         const presets = child.get('agentPresets') as { select(agent: Agent, preset: string): Promise<string> }
         presets.select(agent, ours).catch(() => {})
@@ -134,15 +144,19 @@ export class Sessions {
       if (status === 'idle' && !this.host.closing()) { this.retryHealth.clear(agent.id); this.updateModelHealth() }
     })
   }
-  /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
-  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
+  /** Resolves or creates a role session in `cwd`, sets its preset and model, decorates it, and renames it to `title`. */
+  async ensure(id: string, cwd: string, title: string, role: PromptRole): Promise<Agent> {
+    const plannerId = role === 'planner' ? plannerHandoffId(id) : undefined
+    if (role === 'planner' && (!plannerId || !this.host.plannerActive(plannerId))) {
+      throw new Error('A planner Session needs an active, persisted planning handoff and planner-<handoffId> session ID')
+    }
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
       const workspace = await ctx.workspaceRegistry.create(cwd)
       // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml).
       await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id,
-        agentPreset: role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
+        agentPreset: role === 'planner' ? PLANNER_PRESET : role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
       result = await ctx.sessionController.resolveAgent(id as SessionId)
     }
     if ('error' in result) throw result.error
@@ -233,9 +247,11 @@ export class Sessions {
     if (this.bindings.has(agent)) return
     const host = this.host
     const master = agent.id === host.masterId
-    const ticket = master ? undefined : this.ticketOf(agent)
-    if (!master && !ticket) { this.limitSubagent(agent); return }
-    const binding: SessionBinding = { disposers: [] }
+    const plannerId = master ? undefined : plannerHandoffId(agent.id)
+    const ticket = master || plannerId ? undefined : this.ticketOf(agent)
+    if (!master && !plannerId && !ticket) { this.limitSubagent(agent); return }
+    const role: PromptRole = master ? 'orchestrator' : plannerId ? 'planner' : 'worker'
+    const binding: SessionBinding = { disposers: [], role }
     this.bindings.set(agent, binding)
     this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
     if (agent.status === 'idle') this.retryHealth.clear(agent.id)
@@ -244,9 +260,9 @@ export class Sessions {
     binding.disposers.push(agent.ctx.systemPrompt.section({ name: 'dsh-superagent-policy', order: 9999, interpolate: false, text: context => {
       const version = this.promptFor(agent, context.signal !== undefined)
       const current = ticket && host.store.tickets.get(ticket.id)
-      const composed = host.prompts.compose(version.config, master ? 'orchestrator' : 'worker', current ? host.environment(current) : undefined)
+      const composed = host.prompts.compose(version.config, role, current ? host.environment(current) : undefined)
       return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${current ? mandateInstructions(current.mandate) : ''}`
-    }, ...(master ? { complete: true } : {}) }))
+    }, ...(master || plannerId ? { complete: true } : {}) }))
     // A recreated skill scope (e.g. after the skills service restarts) starts empty, so reset `binding.skills` before rebinding.
     const skillScope = agent.ctx.inject(['skills'], scope => {
       binding.scope = scope
@@ -258,10 +274,16 @@ export class Sessions {
     // Bail out if the agent was disposed while awaiting the skill scope.
     if (this.bindings.get(agent) !== binding) return
     const register = this.registerTool(agent, binding)
-    for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
+    for (const tool of host.tools(agent, ticket, plannerId ? 'planner' : undefined)) {
+      if (plannerId ? !SHARED_HOST_TOOLS.includes(tool.name) && !PLANNER_HOST_TOOLS.includes(tool.name)
+        : PLANNER_HOST_TOOLS.includes(tool.name)) continue
+      register(tool.name, tool.description, tool.schema, tool.execute)
+    }
     if (master) {
       binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
         agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
+    } else if (plannerId) {
+      binding.disposers.push(...this.plannerOnly(agent, plannerId))
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
       binding.disposers.push(...this.workOnly(agent, ticket!.id))
@@ -279,6 +301,15 @@ export class Sessions {
         : projections?.stateOf?.(agent.session, 'agentPreset')
       return (selected ?? agent.session.header.agentPreset) === ROUTER_PRESET
     } catch { return false }
+  }
+  /** Restrict every planner turn to read-only tools and its own handoff tools, including restored Sessions. */
+  private plannerOnly(agent: Agent, handoffId: string): (() => void)[] {
+    const allow = PLANNER_TOOLS.filter(name => agent.ctx.tools.get(name, scopeParentOf(agent)))
+    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(({ name }) => {
+      if (!this.host.plannerActive(handoffId)) return PLANNER_INACTIVE
+      return PLANNER_TOOLS.includes(name) || SHARED_HOST_TOOLS.includes(name) || PLANNER_HOST_TOOLS.includes(name) ? undefined
+        : PLANNER_DENIED
+    })]
   }
   /**
    * An Executor Session's tools: only the profile's work tools, which DSH requires to be known, and none once its ticket
@@ -316,8 +347,8 @@ export class Sessions {
     if (!scope || previous?.revision === version.revision) return
     previous?.dispose()
     const disposers: (() => void)[] = []
-    for (const [name, content] of this.host.prompts.skills(version.config)) {
-      const bundled = name === 'feishu' || name === 'github' ? bundledSkills[name] : undefined
+    for (const [name, content] of this.host.prompts.skills(version.config, binding.role)) {
+      const bundled = name === 'feishu' || name === 'github' || name === 'to-spec' ? bundledSkills[name] : undefined
       const body = version.config.skills[name] ?? ''
       const description = bundled?.description ?? (body.replace(/\s+/g, ' ').slice(0, 120) || 'Custom dsh-superagent operational skill.')
       disposers.push(scope.skills.register({ name: `${SKILL_PREFIX}${name}`, description, content, source: 'runtime',

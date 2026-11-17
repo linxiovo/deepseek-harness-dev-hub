@@ -40,7 +40,7 @@ pnpm -C plugin install --frozen-lockfile
 pnpm -C plugin check
 ```
 
-`check` typechecks, runs the tests and builds. The full suite includes POSIX-dependent tests; on native Windows, run `pnpm -C plugin typecheck` and use WSL or Linux for `pnpm -C plugin check`. After the local hook installer is merged into `main`, opt in with `pnpm -C plugin run hooks:install`; the pre-commit hook runs only the Windows-safe subset, not the full POSIX suite. See [deployment checks](docs/006-deployment.md#development-checks).
+`check` typechecks, runs the full tests and builds, but waits for the native Windows job to pass first. Windows CI typechecks, runs the handoff tests and builds; the other tests rely on POSIX utilities, so use Linux or WSL for the full suite. After the local hook installer is merged into `main`, opt in with `pnpm -C plugin run hooks:install`; the pre-commit hook is not a substitute for CI. See [deployment checks](docs/006-deployment.md#development-checks).
 
 ## License
 

@@ -10,7 +10,7 @@ Status: resolved
 - **Skills every session should consult**: `wayfinder`, `grilling`, `domain-modeling`。
 - **Standing preferences**:
   1. 人类参与入口处的需求对齐（`grill-with-docs` / `wayfinder`），交棒后在授权范围内自主推进至正式关票，再转入 Stage 2 常驻监听。资源额度耗尽时暂停受影响工作并报告真实状态，不用无限消耗换取表面完成。
-  2. Hub Agent 不配备代码读写/Bash 执行工具，仅通过会话调度、状态检视与事件路由掌控全局；技术冲突与测试/审查失败一律由 Hub Agent 自主仲裁。
+  2. Hub Agent 不配备 Bash 或代码写入/修改工具，仅保留只读代码/图片检索与会话调度、状态检视、事件路由工具掌控全局；技术冲突与测试/审查失败一律由 Hub Agent 自主仲裁。
   3. 核心工作流、AI 文档树协议与测试分层设计保持编程语言无关；代码与 CI 首期默认打通 GitHub + GitHub Actions，预留 Jenkins 等扩展槽位。
   4. 本项目覆盖 Skills 中的历史归档惯例：所有文档只保留当前有效内容，失效内容原地替换或删除；不保存讨论过程、历史沿革、废弃方案或历史决策归档。地图的 `Current decisions` 只索引当前有效结论，决策票只保存当前问题或当前结论。文档树协议见[AI 文档树协议](./issues/02-ai-doc-tree-protocol.md)。
 

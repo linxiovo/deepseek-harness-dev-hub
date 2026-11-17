@@ -285,7 +285,7 @@ ID 由 `key()`（`src/core/ids.ts`）确定性生成：`ticket:<evalId>`、`assi
 
 #### 3.3 对 Hub Agent 的直接含义
 
-- 如果新插件要求 Hub Agent **硬性**无 Bash/read，不能只靠 `prompts/orchestrator.md`；必须改 `Sessions.decorate` 的 `tools.restrict` allow 列表（去掉 `bash`/`read`/`read_image`）和 `ROUTER_PRESET`（去掉 shell/tool-fs），否则主会话仍能调用。
+- 如果新插件要求 Hub Agent **硬性**移除 Bash 与写入权限（仅保留 `read`/`read_image`/`glob`/`grep` 只读检视），不能只靠 `prompts/orchestrator.md`；必须改 `Sessions.decorate` 的 `tools.restrict` allow 列表（去掉 `bash`/`job_*`，按需补入 `glob`/`grep`）和 `ROUTER_PRESET`（去掉 `shell`/`tool-jobs`，保留 `tool-fs` 的 `write: false, edit: false` 并按需挂载 `@deepseek-ai/dsh-tool-fs-search`），否则主会话仍能调用 Bash。
 - 需要长期常驻时，最稳的是“**SQLite/Plan 状态是事实源，主会话历史只是缓存**”：定期用 `ctx.compaction.compactNow`/`compactIfNeeded`，或在阶段边界用 `sessionController.fork`/`create` 新主会话并把 `KV.runtime.masterId` 指向新 id（后者原型未实现，需要重启 Runtime 才生效）。
 - D-SH 没有“清空当前 Session 历史”的公开 API；不要把 `Agent.inbox.clear()` 误当成 clear。若产品要求“新开继承会话”，应显式用 `fork`，并把 `masterId` 迁移逻辑写进 Runtime 启动路径。
 
@@ -365,7 +365,7 @@ ID 由 `key()`（`src/core/ids.ts`）确定性生成：`ticket:<evalId>`、`assi
 
 - **可复用底座**：`Engine` 的事务单写、`Effects` 的持久化重试、`Sessions`/`AgentDelivery` 的 Session 装饰与幂等投递、`Store` 的 JSON 聚合 + generated column、以及面板的 stage/tab 骨架，都适合直接演进，不需要重写调度内核。
 - **必须新增而非 prompt 约定**：Plan DAG 的依赖边、节点状态、按依赖 gate 的 launch、顺序 merge queue，都需要领域字段 + Engine/Effect 钩子；现有 `Decision.ticketId` 单值、`Evals.accept` 单票、`Tickets.create` 整批订阅是三个必须先解决的模型约束。
-- **Hub 上下文**：宿主已给 `compact`/`fork`，但没有“清空当前 Session”；常驻 Hub 应把 Plan/票状态放 SQLite，主会话只做摘要与路由，阶段边界用 compact 或 fork；若产品要求 Hub 无 Bash/read，必须改 `Sessions.decorate` 的 allow 列表和 `ROUTER_PRESET`，不能只改 prompt。
+- **Hub 上下文**：宿主已给 `compact`/`fork`，但没有“清空当前 Session”；常驻 Hub 应把 Plan/票状态放 SQLite，主会话只做摘要与路由，阶段边界用 compact 或 fork；若要硬性收紧 Hub 工具边界（去掉 `bash`/`job_*`，只留只读检视与协调），必须改 `Sessions.decorate` 的 allow 列表和 `ROUTER_PRESET`，不能只改 prompt。
 - **面板**：Plan DAG 与 Doc Tree 各加一个顶层 Tab 最干净；DAG 需要新 `GET plan`（或先给 `ticketSummary` 加 `depends_on` 复用 `GET tickets`）；Doc Tree 需要新 `GET docs` 路由，且当前 deployment 只有远端 `owner/name`，没有稳定本地 docs root，必须先决定文档树数据源（GitHub API 还是新增 `docsRoot` 设置）。
 
 ---

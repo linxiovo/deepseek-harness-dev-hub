@@ -5,7 +5,7 @@
 
 ## 设计要求
 
-- 复用原型的主/执行会话分层、持久化状态与 DSH 原生槽位，不重写或替换 DSH 原生「工作区」组件。无 Bash 的中枢、多项目隔离、独立 Worktree 执行契约、前后端分离 Plan DAG、分角色模型路由与合入协调是本项目需要落实的目标，不是原型已经提供的保证。原型能力见[底座能力与扩展点摸底](../.scratch/super-agent/issues/01-dsh-prototype-capabilities-audit.md)。
+- 复用原型的主/执行会话分层、持久化状态与 DSH 原生槽位，不重写或替换 DSH 原生「工作区」组件。无 Bash 与写入权限的中枢（仅保留只读代码/图片检视与协调工具）、多项目隔离、独立 Worktree 执行契约、前后端分离 Plan DAG、分角色模型路由与合入协调是本项目需要落实的目标，不是原型已经提供的保证。原型能力见[底座能力与扩展点摸底](../.scratch/super-agent/issues/01-dsh-prototype-capabilities-audit.md)。
 - 原版 Matt Pocock 技能集中包含人工确认卡点的技能（如 `to-spec`、`to-tickets`）必须改造为无人值守自决版本，其中 `to-tickets` 遵循「前后端分离、后端写清接口文档、前端依赖后端契约」的拆票规则；同时支持加载团队/用户自定义 Skills 并按版本锁定。
 
 ## 从交棒到持续维护

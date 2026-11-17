@@ -4,10 +4,23 @@
 - 基于原型演进的实际可交付代码、配置（`cordis.patch.yml`）、提示词、Skill 与测试一律落地于 `plugin/` 目录，作为独立 Cordis bundle 演进并纳入根目录 `DOCS.md` 文档树。
 - 架构规范、术语表与需求规格见 `meta/docs/architecture.md`、`meta/GLOSSARY.md` 与 `meta/.scratch/super-agent-implementation/spec.md`。
 
+## 提示词管理
+
+- **统一存放于 `plugin/prompts/`**：所有写给 Agent（含 Hub、Worker、Planner、评估/审查/复盘及各类子会话）的提示词、角色指令、工作流说明、模板片段（含 `{placeholder}` 占位符模板）及运行期引导、纠偏与恢复文案，统一存放在 `plugin/prompts/` 目录（独立 Skill 定义按 DSH 规范存放在 `plugin/skills/<skill-name>/SKILL.md`）。
+- **统一加载、拒绝硬编码**：通过 `plugin/src/app/skill-files.ts` 等统一加载层从 `plugin/prompts/` 读取文本，代码中仅保留文件引用、结构化上下文组装与占位符插值逻辑；禁止在源码（`.ts`/`.tsx`/`.js`）或配置脚本中以字符串常量、模板字面量或拼接文案硬编码提示词。
+- **同步配套与渐进迁移**：新增或拆分提示词文件时，同步核对加载注册入口、`plugin/package.json` 的 `files` 打包清单及受影响文档（如 `plugin/docs/004-prompts.md`）；若改动触及历史遗留的内联提示文本，应一并迁入 `plugin/prompts/`，避免继续新增内联文案。
+
 ## 工具与消息边界
 
 - Hub Agent（`dsh-superagent-router`）保留只读代码/图片检视（`read`、`read_image`、`glob`、`grep`、`skill`）及受控协调工具，由 preset 与 `tools.restrict` 硬性禁用 `bash`/`pwsh`、`job_*` 与 `write`/`edit`，不得依赖提示词软约束。
 - Worker Session 仅通过中枢路由对外答复，不得借确认回执或通道命令直连人类；票据结束后 Worker 及其子会话不得继续修改仓库。
+
+## 编码与全局设计
+
+- **先全局设计、拒绝局部最优**：编码前先梳理完整状态机、数据流、调用链、跨端/跨模块契约及后续演进场景（如多项目隔离、多来源扩展、前后端分离、角色路由与配置版本演进），采用可扩展的统一抽象与清晰边界；拒绝只应付当前单点用例的临时特判、复制逻辑或兼容垫片（shim）。
+- **全量迁移与单一事实**：调整共享数据结构、接口契约、配置形状或状态流转时，同步迁移所有上下游调用方、测试与文档，并清理过时分支与死代码，保持单一事实来源（Single Source of Truth）。
+- **充分考虑边界与异常情况**：主动覆盖并验证非 Happy Path 场景，包括：空值与超长截断、并发竞态与重入、事件/回执重复或乱序、部分失败与超时重试、进程重启或会话轮换后的状态恢复（先持久化意图再执行外部动作，恢复时先对账真实外部状态）、跨平台差异（Windows / POSIX 路径、换行符与 Shell）以及权限与资源额度边界。
+- **如实暴露问题、拒绝掩盖**：前置缺失、能力受限或执行异常时，按契约明确报错或挂起等待处理；拒绝静默吞错、填零或编造默认值及掩盖缺陷的假回退（fake fallback），并为关键边界、并发与恢复路径提供对应验证。
 
 ## Git 提交
 

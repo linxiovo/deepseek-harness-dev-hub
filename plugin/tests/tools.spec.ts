@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { TICKET_STATES } from '../src/app/cards.ts'
 import { builtInBase, builtInParts, defaultPrompts } from '../src/app/prompts.ts'
-import { UserError } from '../src/core/index.ts'
+import { key, UserError } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
 import { RESOURCES } from '../src/app/resources.ts'
 import { CliError, Commands } from '../src/infra/commands.ts'
@@ -253,6 +253,39 @@ it('returns where a reply stands: sent, or dropped when its conversation can no 
   expect(await reply('修好了。')).toEqual({ status: 'sent' })
   vi.mocked(Commands.prototype.lark).mockRejectedValue(new CliError('the message was withdrawn', 230011))
   expect(await reply('修好了，请看 PR。')).toEqual({ status: 'dropped' })
+})
+
+it('records a worker take-up without an acknowledgement and still relays its report to the Hub', async () => {
+  const { ticket, trigger, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const followup = feishu('2', '还有这个', { mentions: [], root_id: 'om_1' })
+  h.runtime.receive(followup); await h.runtime.idle()
+  // The accept acknowledgement already went out; the follow-up is the worker's to take up internally.
+  vi.mocked(Commands.prototype.lark).mockClear()
+  expect(await h.runTool(sessionId, 'orchestrator_ack', { trigger_id: followup.id }))
+    .toEqual({ trigger_id: followup.id, taken_up: true, reused: false })
+  expect(h.runtime.store.receipts.get(key('ack', followup.id))).toBeUndefined()
+  expect(h.runtime.store.replyStatus(key('ack', followup.id))).toBeUndefined()
+  expect(h.runtime.store.triggers.disposition(followup.id)!.acked).toEqual([ticket.id])
+  // The Hub's accept acknowledgement keeps its receipt and is not refreshed by the worker's take-up.
+  expect(h.runtime.store.replyStatus(key('ack', trigger.id))).toBe('sent')
+  expect(Commands.prototype.lark).not.toHaveBeenCalled()
+  // A second take-up records nothing new and sends nothing.
+  expect(await h.runTool(sessionId, 'orchestrator_ack', { trigger_id: followup.id }))
+    .toEqual({ trigger_id: followup.id, taken_up: true, reused: true })
+  expect(h.runtime.store.triggers.disposition(followup.id)!.acked).toEqual([ticket.id])
+  expect(h.runtime.store.receipts.get(key('ack', followup.id))).toBeUndefined()
+  // A person's message on a thread this ticket does not follow is not its work to take up.
+  const stranger = feishu('3', '这个问题无关', { mentions: [], root_id: undefined })
+  h.runtime.receive(stranger); await h.runtime.idle()
+  await expect(h.runTool(sessionId, 'orchestrator_ack', { trigger_id: stranger.id })).rejects.toThrow('does not belong')
+  expect(h.runtime.store.receipts.get(key('ack', stranger.id))).toBeUndefined()
+  // Its report still reaches the Hub, while nothing reaches the person from the worker's tools.
+  h.deliveries.mockClear()
+  await h.runTool(sessionId, 'orchestrator_report', { state: 'blocked', summary: 'Needs a decision.' })
+  await h.runtime.idle()
+  expect(h.relays(h.runtime.masterId)).toEqual([expect.objectContaining({ kind: 'worker_report', state: 'blocked',
+    ticket: expect.objectContaining({ ticket_id: ticket.id }) })])
+  expect(h.runtime.store.receipts.get(key('ack', followup.id))).toBeUndefined()
 })
 
 it('checks an acknowledgement against the IM word limit, not a character count', async () => {

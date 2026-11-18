@@ -1,6 +1,6 @@
 /** Concurrent runtime behavior across overlapping triggers, deliveries, and worker launches. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { latestAssignment, waitsForPerson, type Ticket, type Trigger } from '../src/core/index.ts'
+import { key, latestAssignment, waitsForPerson, type Ticket, type Trigger } from '../src/core/index.ts'
 import { Later } from '../src/app/effects.ts'
 import { reportRelay } from '../src/app/notices.ts'
 import { WorkerSlots, inputMessage, mandateInstructions, ticketExecution, transient, triggerMessage } from '../src/executor/dsh.ts'
@@ -411,18 +411,21 @@ describe('a worker whose work runs in the background', () => {
     const page = await h.api('GET', `tickets/${one.ticket.id}`)
     expect((page.body as { assignments: Record<string, unknown>[] }).assignments[0]).not.toHaveProperty('turnEndedAt')
   })
-  it('keeps a ticket open at a merge while its worker does in the background a message it acknowledged', async () => {
+  it('keeps a ticket open at a merge while its worker does in the background a message it took up', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
     const ticket = () => h.runtime.store.tickets.get(one.ticket.id)!
     h.runtime.engine.bindThread(one.ticket.id, { source: 'github', id: '7' }, true)
     await h.runTool(one.sessionId, 'orchestrator_report', { state: 'ready', summary: 'PR ready' }); await h.runtime.idle()
     idle(one.sessionId); await h.runtime.idle()
-    // A person asks for more; the worker acknowledges it, starts the work in the background and its turn ends.
+    // A person asks for more; the worker takes it up internally, starts the work in the background and its turn ends.
     await new Promise(resolve => setTimeout(resolve, 5))
     const more = feishu('2', '再加个测试', { mentions: [], root_id: 'om_1' })
     h.runtime.receive(more); await h.runtime.idle()
     await vi.waitFor(() => expect(ticket().undelivered).toEqual([]))
-    await h.runTool(one.sessionId, 'orchestrator_ack', { trigger_id: more.id, text: '收到' })
+    expect(await h.runTool(one.sessionId, 'orchestrator_ack', { trigger_id: more.id }))
+      .toEqual({ trigger_id: more.id, taken_up: true, reused: false })
+    expect(h.runtime.store.triggers.disposition(more.id)!.acked).toEqual([one.ticket.id])
+    expect(h.runtime.store.receipts.get(key('ack', more.id))).toBeUndefined()
     h.jobs.run(one.sessionId)
     idle(one.sessionId); await h.runtime.idle()
     h.runtime.engine.threadClosed({ source: 'github', id: '7' }, 'merged', new Date().toISOString())

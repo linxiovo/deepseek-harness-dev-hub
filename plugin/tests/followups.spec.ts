@@ -2,6 +2,7 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { CHAT, feishu, startRuntime, type Host } from './fixtures/host.ts'
 import { repliedTo } from '../src/app/links.ts'
+import { key } from '../src/core/index.ts'
 import { inputMessage } from '../src/executor/dsh.ts'
 
 let h: Host | undefined
@@ -274,9 +275,16 @@ it('keeps a listed member\'s request on a ticket\'s thread to that ticket, so it
     note: expect.stringContaining('orchestrator_route kind stop') })])
   await expect(h.route({ kind: 'accept', trigger_id: request.id, title: '概览页按钮',
     worktree_name: 'overview-button', acknowledgement: '收到。' })).rejects.toThrow(/its worker decides whether it belongs there/)
-  // The worker takes it as within its ticket and says so.
-  expect(await h.runTool(sessionId, 'orchestrator_ack', { trigger_id: request.id, text: '收到：概览页的保存按钮也一起改。' }))
-    .toMatchObject({ trigger_id: request.id })
+  // The worker takes it up as within its ticket, internally: the trigger records who took it up and nothing goes to a person.
+  expect(await h.runTool(sessionId, 'orchestrator_ack', { trigger_id: request.id }))
+    .toEqual({ trigger_id: request.id, taken_up: true, reused: false })
+  expect(h.runtime.store.triggers.disposition(request.id)).toMatchObject({ acked: [ticket.id] })
+  expect(h.runtime.store.receipts.get(key('ack', request.id))).toBeUndefined()
+  // A repeated take-up reuses the record, and still sends nothing.
+  expect(await h.runTool(sessionId, 'orchestrator_ack', { trigger_id: request.id }))
+    .toEqual({ trigger_id: request.id, taken_up: true, reused: true })
+  expect(h.runtime.store.triggers.disposition(request.id)!.acked).toEqual([ticket.id])
+  expect(h.runtime.store.receipts.get(key('ack', request.id))).toBeUndefined()
   expect(h.runtime.store.tickets.list().map(item => item.id)).toEqual([ticket.id])
   expect(h.candidates()).toEqual([])
 })

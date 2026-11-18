@@ -164,6 +164,8 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   const agents = new Map<string, FakeAgent>()
   const sessionHistory = new Map<string, { seq: number; type: string; data: UserMessage }[]>()
   let directMessageSequence = 0
+  // DSH's agents service lists the Sessions still loaded; Sessions install reads it after a service restart.
+  Object.assign(agents, { list: () => [...agents.values()] })
   /** Each Session's next step, which takes the messages that wait for one. */
   const steps = new Map<string, () => void>(), claims = new Map<string, () => void>()
   const tools = new Map<string, Map<string, RegisteredTool>>()

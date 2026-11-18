@@ -532,7 +532,7 @@ describe('follow-up owners', () => {
     h.engine.report(ticketId, { state: 'progress', summary: 'working' })
     // The worker acknowledges one of two messages, and its final report was on its way before it took up the other.
     h.tick(1); h.engine.receive(trigger('2')); h.engine.receive(trigger('3')); h.settle()
-    h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '2', text: 'On it' })
+    h.engine.takeUp(ticketId, '2')
     h.engine.report(ticketId, { state: 'dropped', summary: 'nothing to do' })
     expect(h.repo.threads.get('chat:t1')!.pending).toEqual(['3'])
     // The ticket no longer counts as having reached it, so its candidate names no ticket that gave no reason.
@@ -547,7 +547,7 @@ describe('follow-up owners', () => {
       h.engine.report(ticketId, { state: 'ready', summary: 'PR ready' })
       // A person asks for one more change, which the worker takes up or has not yet, and the pull request merges meanwhile.
       h.tick(1); h.engine.receive(trigger('2')); h.settle()
-      if (taken) h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '2', text: 'On it' })
+      if (taken) h.engine.takeUp(ticketId, '2')
       h.engine.threadClosed({ source: 'gh', id: 'pr-9' }, 'merged', '2026-09-23T00:00:01Z')
       // One it has not taken up leaves the merge to end the ticket, and goes to Eval.
       expect([h.repo.tickets.get(ticketId)!.ended?.outcome, h.repo.threads.get('chat:t1')!.pending]).toEqual(taken ? [undefined, []]
@@ -1008,21 +1008,6 @@ describe('automatic input', () => {
   })
 })
 describe('replies', () => {
-  it('acknowledges a person\'s message that reached an open ticket once, and refuses others', () => {
-    const h = harness()
-    const ticketId = accepted(h).ticketId!
-    // The acknowledgement of the accept stays; a later request for one reuses it.
-    expect(h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '1', text: 'On it' })).toEqual({ id: key('ack', '1'), status: 'pending', reused: true })
-    expect(h.outbox.map(message => message.text)).toEqual(['ok'])
-    h.engine.receive(trigger('2', { actor: guest }))
-    expect(h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '2', text: 'Looking' })).toEqual({ id: key('ack', '2'), status: 'pending', reused: false })
-    h.engine.receive(trigger('3', { human: false }))
-    expect(() => h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '3', text: 'x' })).toThrow(new UserError('ackNotPerson'))
-    h.engine.receive(trigger('6', { threads: [{ source: 'chat', id: 'elsewhere' }] }))
-    expect(() => h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '6', text: 'x' })).toThrow(new UserError('notReached'))
-    h.engine.stopTicket(ticketId)
-    expect(() => h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '2', text: 'x' })).toThrow(new UserError('ackEnded'))
-  })
   it('sends an answer only after the worker reported it, a result only for a ready ticket, and attention only for its current question', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
@@ -1047,6 +1032,47 @@ describe('replies', () => {
     h.engine.report(ticketId, { state: 'ready', summary: 'Done' })
     expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Done' })).toMatchObject({ status: 'pending' })
     expect(h.outbox.at(-1)!.channel).toEqual(trigger('1').channel)
+  })
+})
+describe('worker take-up', () => {
+  it('records a worker take-up of a person\'s follow-up without queueing a message, and repeats it without another', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    // The accept acknowledgement is the Hub's; the worker's take-up of a follow-up sends nothing to the person.
+    const queued = [...h.outbox]
+    h.tick(1); h.engine.receive(trigger('2')); h.settle()
+    expect(h.engine.takeUp(ticketId, '2')).toEqual({ ticketId, triggerId: '2', reused: false })
+    expect(h.repo.triggers.disposition('2')).toMatchObject({ fanout: [ticketId], acked: [ticketId] })
+    expect(h.outbox).toEqual(queued)
+    // A second take-up records nothing and sends nothing; the message stays taken up once.
+    expect(h.engine.takeUp(ticketId, '2')).toEqual({ ticketId, triggerId: '2', reused: true })
+    expect(h.repo.triggers.disposition('2')!.acked).toEqual([ticketId])
+    expect(h.outbox).toEqual(queued)
+  })
+  it('refuses a take-up from another ticket or a context-only thread, of a bot\'s message, and after the ticket ended', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const queued = [...h.outbox]
+    // A message on a thread the ticket does not follow.
+    h.engine.receive(trigger('5', { threads: [{ source: 'chat', id: 'elsewhere' }] }))
+    expect(() => h.engine.takeUp(ticketId, '5')).toThrow(new UserError('notReached'))
+    // A thread the ticket follows only for context: its worker may read it but not take it up as this ticket's work.
+    h.engine.followForContext(ticketId, { source: 'chat', id: 'side' })
+    h.tick(1); h.engine.receive(trigger('6', { threads: [{ source: 'chat', id: 'side' }] }))
+    expect(h.repo.triggers.disposition('6')).toMatchObject({ fanout: [ticketId], context: [ticketId] })
+    expect(() => h.engine.takeUp(ticketId, '6')).toThrow(new UserError('notReached'))
+    // A bot's message that reached the ticket is no human request to take up.
+    h.tick(1); h.engine.receive(trigger('3', { human: false })); h.settle()
+    expect(() => h.engine.takeUp(ticketId, '3')).toThrow(new UserError('ackNotPerson'))
+    // A message the Engine does not know.
+    expect(() => h.engine.takeUp(ticketId, 'ghost')).toThrow(new UserError('unknownTrigger'))
+    // A ticket that ended takes up nothing, also the request it started from.
+    h.engine.stopTicket(ticketId, 'not needed')
+    expect(() => h.engine.takeUp(ticketId, '1')).toThrow(new UserError('ackEnded'))
+    // None of the refusals recorded or queued anything.
+    expect([h.repo.triggers.disposition('5')!.acked, h.repo.triggers.disposition('6')!.acked,
+      h.repo.triggers.disposition('3')!.acked, h.repo.triggers.disposition('1')!.acked]).toEqual([undefined, undefined, undefined, undefined])
+    expect(h.outbox).toEqual(queued)
   })
 })
 describe('ticket commands', () => {
@@ -1351,7 +1377,7 @@ describe('final review: Threads followed for context', () => {
     const ticketId = accepted(h).ticketId!
     h.engine.followForContext(ticketId, { source: 'chat', id: 'side' })
     h.tick(1); h.engine.receive(trigger('5', { threads: [{ source: 'chat', id: 'side' }], channel: { source: 'chat', thread: 'side', address: { message: '5' } } }))
-    expect(() => h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '5', text: 'On it' })).toThrow(new UserError('notReached'))
+    expect(() => h.engine.takeUp(ticketId, '5')).toThrow(new UserError('notReached'))
     expect(() => h.engine.report(ticketId, { state: 'progress', summary: 'A question', question: 'Which page?', askedBy: '5' })).toThrow(new UserError('notAsker'))
   })
 })
@@ -1403,7 +1429,7 @@ describe('follow-up review: turn ends', () => {
     h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-9' }, true)
     h.engine.report(ticketId, { state: 'ready', summary: 'PR ready' })
     h.tick(1); h.engine.receive(trigger('2')); h.settle()
-    h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '2', text: 'On it' })
+    h.engine.takeUp(ticketId, '2')
     // It answers another question in a progress report while it works on the message.
     h.tick(1); h.engine.report(ticketId, { state: 'progress', summary: 'Answered the other question' })
     merge(h)
@@ -1415,7 +1441,7 @@ describe('follow-up review: turn ends', () => {
     h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-9' }, true)
     h.engine.report(ticketId, { state: 'ready', summary: 'PR ready' })
     h.tick(1); h.engine.receive(trigger('2')); h.settle()
-    h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '2', text: 'On it' })
+    h.engine.takeUp(ticketId, '2')
     merge(h)
     h.engine.report(ticketId, { state: 'dropped', summary: 'Nothing more to do' })
     expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ outcome: 'merged' })

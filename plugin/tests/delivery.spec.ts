@@ -19,6 +19,8 @@ function fixture(history: UserMessage[] = []) {
   const flush = vi.fn(async () => {})
   const open = vi.fn(async () => ({ read, [Symbol.asyncDispose]: close }))
   const agents = new Map([[agent.id, agent]])
+  // DSH's agents service lists the Sessions still loaded.
+  Object.assign(agents, { list: () => [...agents.values()] })
   ctx.reflect.provide('agents', agents)
   ctx.reflect.provide('sessionPersistence', { open, flush })
   const delivery = new AgentDelivery(ctx)

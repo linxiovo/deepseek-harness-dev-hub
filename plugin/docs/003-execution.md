@@ -26,7 +26,7 @@ Each Ticket gets an Executor Session named `worker-<ticket id>` and a directory 
 
 Executor Sessions run commands without approval as the operator's OS user. Their `dsh-superagent-worker` preset contains the tools needed for work and moves foreground shell commands to background jobs after 5 seconds. This lets a worker receive new messages at the next step instead of waiting for a long command to finish.
 
-The main Session uses `dsh-superagent-router`, with the same 5-second shell and job-wait limits and a smaller tool set for routing. Sessions retain the preset selected at creation. Worker subagents use DeepSeek Harness's `standard` preset.
+The main Session uses `dsh-superagent-router`, a read-only preset with inspection and coordination tools and no shell, background jobs or file writes; `010-session-boundaries.md` states that contract. Sessions retain the preset selected at creation. Worker subagents use DeepSeek Harness's `standard` preset.
 
 ### Background work and worker slots
 
@@ -44,7 +44,7 @@ When an Assignment ends, its shell jobs are killed without waking the Session. I
 
 Stopping or restarting the plugin inside the DeepSeek Harness process uses the same shutdown path. Inputs not yet taken into Session history are retained. Shutdown waits up to 10 seconds for each worker's background work; a process restart ends that work outright. An Assignment interrupted while busy restarts with a recovery note.
 
-Worker subagents, including nested ones, use DeepSeek Harness's `standard` preset with the worker's permissions. They retain only the worker's allowed work tools, and lose those tools when the Ticket ends. Under `standard`, a shell command moves to the background after 60 seconds. A subagent's jobs are killed when it ends.
+Worker subagents at every depth use DeepSeek Harness's `standard` preset with the worker's permissions. They retain only the worker's allowed work tools, and lose them once the Ticket ends, whichever level created them. Under `standard`, a shell command moves to the background after 60 seconds. A subagent's jobs are killed when it ends.
 
 ### Preparing a Ticket directory
 
@@ -99,9 +99,9 @@ A Ticket follows the pull request it started from once its Executor reports it. 
 
 The Ticket is done when none of the pull requests it opened remain open. If it opened none, all pull requests it follows must be closed. It then ends with the outcome of the last relevant close and keeps its Subscriptions, allowing a later human comment to resume it.
 
-A close does not end the Ticket while resumed, retried or recovered work is unfinished. It also waits if the Executor acknowledged or answered a follow-up it owns but has not since made a non-progress Report or ended a turn after reading that message. A later `ready` Report ends the Ticket once the same pull-request completion rule is satisfied.
+A close does not end the Ticket while resumed, retried or recovered work is unfinished. It also waits if the Executor took up a follow-up it owns (by recording it internally) or answered it but has not since made a non-progress Report or ended a turn after reading that message. A later `ready` Report ends the Ticket once the same pull-request completion rule is satisfied.
 
-Chat Channels receive one final notice about the pull-request outcome. GitHub already displays the outcome on the pull request itself. Removing a Ticket's Subscription to a pull request also stops it following that pull request.
+Chat Channels receive one final notice, queued by the host, about the pull-request outcome. GitHub already displays the outcome on the pull request itself. Removing a Ticket's Subscription to a pull request also stops it following that pull request.
 
 "Awaiting review" therefore means a `ready` Report with a pull request.
 
@@ -109,7 +109,7 @@ Chat Channels receive one final notice about the pull-request outcome. GitHub al
 
 The Executor decides human follow-ups on its Ticket's own Threads. It handles in-scope requests and hands back requests beyond its scope or for another Ticket. Once no Executor owns the message, it becomes a candidate for the main Session. The main Session may otherwise act on the follow-up only to stop work at the person's request.
 
-An Input counts as read after the Session takes it into a step and subsequently reports or ends a turn. When a Ticket ends, unread messages that were not acknowledged, answered or handed back return to Eval, as described in [002 Authorization](002-authorization.md). Read messages left without action, such as thanks, do not.
+An Input counts as read after the Session takes it into a step and subsequently reports or ends a turn. When a Ticket ends, unread messages that its Worker did not take up or answer and did not hand back return to Eval, as described in [002 Authorization](002-authorization.md). Read messages left without action, such as thanks, do not.
 
 Threads followed only for context still deliver messages, but do not give the Ticket ownership of human follow-ups or resume ended Tickets. Those messages can be assessed independently.
 
@@ -174,9 +174,9 @@ The Feishu event consumer reports every failure, and polling of subscribed topic
 A malformed item in a GitHub list or a Feishu page is skipped, and the Source's state counts it.
 ### Channel failure
 
-Outgoing messages are stored and sent as stored work, retried with backoff from 5 seconds, doubling up to 300.
+Outgoing messages are stored and sent as stored work, retried with backoff from 5 seconds, doubling up to 300. The main Session sends an answer, a result or an attention message; the host itself queues the acknowledgement an accept carries and any pull-request end or Source notice. All are outgoing messages; neither a Worker's take-up nor its report queues one directly.
 
-A Ticket's messages to one conversation go out in the order they were queued, so its acknowledgement comes before its later answer or result: a message waits while an earlier one of the same Ticket to the same conversation has not gone out, until that one has failed three times in a row and shows as a problem.
+A Ticket's messages to one conversation go out in the order they were queued, so the acknowledgement an accept carries comes before the Ticket's later answer or result: a message waits while an earlier one of the same Ticket to the same conversation has not gone out, until that one has failed three times in a row and shows as a problem.
 
 Messages of other Tickets, and messages of no Ticket, do not wait for it.
 
@@ -188,7 +188,7 @@ The Sources answer that for a deleted Issue or a locked conversation on GitHub, 
 
 A reply to a review comment that no longer exists goes to the pull request's conversation instead.
 
-A dropped message keeps its record, with when and why it was dropped and the Ticket it was for, so it is never queued again; a dropped acknowledgement reads as dropped, not sent.
+A dropped message keeps its record, with when and why it was dropped and the Ticket it was for, so it is never queued again; a dropped acknowledgement of an accepted Ticket, which only the host queues, reads as dropped, not sent.
 ### Pause processing
 
 Stops dispatch, new Evals, Eval timeouts, Input delivery and replies; a launch already under way waits until processing resumes.

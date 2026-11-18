@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { Engine, MemoryRepositories, key, type Assessor, type Executor, type Thread, type Ticket, type Trigger } from '../src/core/index.ts'
+import { Engine, key, type Assessor, type Executor, type Thread, type Ticket, type Trigger } from '../src/core/index.ts'
 import { backfillChat, consumerRetry, feishuKind, feishuTriggerId, feishuRef, feishuTime, feishuTrigger, historyEvent }
   from '../src/sources/feishu.ts'
 import { KV } from '../src/kv.ts'
@@ -1043,7 +1043,7 @@ describe('feishu event consumer', () => {
    * A bot CLI whose `event consume` behaves as `mode` says: `never` gets ready, `warn` warns once ready, `ready` stays up,
    * and `flaky` exits after its first ready. It records each run and the PID of the latest.
    */
-  function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late'): string {
+  function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late' | 'late-ready'): string {
     const path = join(dir, 'lark-bot')
     writeFileSync(path, `#!/bin/sh
   [ "$1" = event ] || { echo '{"ok":true,"data":{}}'; exit 0; }
@@ -1055,6 +1055,7 @@ describe('feishu event consumer', () => {
     flaky) echo '[event] ready' >&2; [ "$n" -gt 1 ] && exec sleep 60; exit 1 ;;
     events) echo '[event] ready' >&2; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
     late) echo '[event] ready' >&2; sleep 1; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
+    late-ready) cat '${dir}/events'; while [ ! -f '${dir}/release-ready' ]; do sleep 0.01; done; echo '[event] ready' >&2; touch '${dir}/ready-emitted'; exec sleep 60 ;;
   esac
   `, { mode: 0o755 })
     return path
@@ -1089,14 +1090,22 @@ describe('feishu event consumer', () => {
   it('takes in the event lines it reads, records each chat as direct or not, and reports a malformed line without stopping', async () => {
     writeFileSync(join(dir, 'events'), [event('om_1', 'oc_group', 'group'), event('om_2', 'oc_dm', 'p2p'), 'not json',
       event('om_3', 'oc_group', 'group')].join('\n') + '\n')
-    const { ctx, store } = consumerSource(cli('events'))
+    const { ctx, health, store } = consumerSource(cli('late-ready'))
     const report = vi.spyOn(ctx, 'report')
     running = runFeishu(ctx, controller.signal)
-    await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_3'))).toBeDefined(), until)
-    expect(['om_1', 'om_2'].map(id => store.triggers.get(feishuTriggerId(id))?.meta.direct)).toEqual([false, true])
-    expect(store.get(KV.feishu.chats)).toEqual({ oc_group: false, oc_dm: true })
-    expect(report).toHaveBeenCalledWith('feishu', expect.objectContaining({ state: 'error', detail: expect.stringContaining('JSON') }))
-    controller.abort(); await running; store.close()
+    try {
+      await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_3'))).toBeDefined(), until)
+      expect(['om_1', 'om_2'].map(id => store.triggers.get(feishuTriggerId(id))?.meta.direct)).toEqual([false, true])
+      expect(store.get(KV.feishu.chats)).toEqual({ oc_group: false, oc_dm: true })
+      expect(report).toHaveBeenCalledWith('feishu', expect.objectContaining({ state: 'error', detail: expect.stringContaining('JSON') }))
+      expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
+      // Independent stdout/stderr pipes can deliver readiness after malformed event data.
+      writeFileSync(join(dir, 'release-ready'), 'ready')
+      await vi.waitFor(() => expect(existsSync(join(dir, 'ready-emitted'))).toBe(true), until)
+    } finally {
+      controller.abort(); await running; store.close()
+    }
+    expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
   }, 20_000)
   it('drops the events it reads once the Source is off', async () => {
     writeFileSync(join(dir, 'events'), event('om_9', 'oc_group', 'group') + '\n')

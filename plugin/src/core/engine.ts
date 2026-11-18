@@ -1,20 +1,20 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
 import { isoTime, liveTicket } from './model.ts'
-import type { ChannelRef, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
 import { Evals, type Outcome } from './evals.ts'
 import { Intake, type ReceiveResult } from './intake.ts'
-import { Replies, type Reply, type ReplyRequest } from './replies.ts'
+import { Replies, type Reply, type ReplyRequest, type TakeUp } from './replies.ts'
 import { Tickets } from './tickets.ts'
 
 export type { EngineOptions } from './part.ts'
 export type { WorkerReport } from './assignments.ts'
 export type { Outcome } from './evals.ts'
 export type { ReceiveResult } from './intake.ts'
-export type { Reply, ReplyRequest } from './replies.ts'
+export type { Reply, ReplyRequest, TakeUp } from './replies.ts'
 
 /**
  * Single transactional entry point for mutating Triggers, Threads, Decisions, Tickets, and Assignments.
@@ -126,9 +126,9 @@ export class Engine {
    */
   requestStatus(ticketId: string): boolean { return this.repo.atomic(() => this.tickets.requestStatus(ticketId)) }
   /**
-   * Queue a message for the Channel its purpose names: an acknowledgement or an answer goes where the person's message was
-   * written, attention where the message that raised the question was, else, like a result, to the conversation the ticket
-   * started in. A message queued before is not queued again (see `Replies.reply`).
+   * Queue a message for the Channel its purpose names: an answer goes where the person's message was written, attention
+   * where the message that raised the question was, else, like a result, to the conversation the ticket started in. A message
+   * queued before is not queued again (see `Replies.reply`).
    * @throws UserError when the ticket or trigger is unknown or the purpose's rule refuses it, such as a result of a ticket that
    * is not ready, completed, merged, or dropped.
    */
@@ -228,6 +228,14 @@ export class Engine {
     return this.repo.atomic(() => this.evals.handback(ticketId, triggerId, reason))
   }
   /**
+   * A worker's internal take-up of a person's message it handles within its ticket: the Trigger's disposition records it,
+   * and no message is sent, queued, or refreshed for the person (the Hub owns external replies). Repeated take-up records
+   * nothing; `reused` is true when this ticket had recorded it already.
+   * @throws UserError when the ticket or trigger is unknown, the ticket ended, or the trigger is not a person's message that
+   * reached the ticket on a thread it may write to.
+   */
+  takeUp(ticketId: string, triggerId: string): TakeUp { return this.repo.atomic(() => this.replies.takeUpInternally(ticketId, triggerId)) }
+  /**
    * Record a report on an open ticket's current Assignment. Its question for a person (`attention`) is asked, kept, or
    * cleared (`null` or a `ready` report), and a replaced attention question whose reply has not been sent yet is withdrawn
    * from the outbox. A `blocked` or `failed` report holds back automated inputs until a human message arrives. A `dropped`
@@ -267,4 +275,4 @@ export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reeva
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
 export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
-  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'>
+  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'takeUp'>

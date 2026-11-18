@@ -1,17 +1,19 @@
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { Context } from '@deepseek-ai/cordis'
-import { bindScopeParent } from '@deepseek-ai/dsh-scope'
+import { createScope } from '@deepseek-ai/dsh-scope'
+import { ToolRuntime, type ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { Runtime } from '../src/app/runtime.ts'
+import { ROUTER_PRESET, WORKER_PRESET } from '../src/app/sessions.ts'
 import { jobRegistry } from './fixtures/host.ts'
 import { evalsHealth } from '../src/app/views/overview.ts'
 import { mandateInstructions } from '../src/executor/dsh.ts'
-import { masterPrompt } from '../src/app/context.ts'
 import { reference, testMachine } from './fixtures/deployment.ts'
 import type { Machine } from '../src/deployment.ts'
 import { SCHEMA_VERSION, Store } from '../src/app/store.ts'
@@ -40,13 +42,10 @@ const viewsOf = (value: Runtime) => ({ store: value.store, sources: value.source
 const overviewOf = (value: Runtime) => overview(viewsOf(value), value.health, policyVersion(value.store.settings()), executorLoad(value.store, value.executor.activeCount()), value.setupProblem ?? value.feishuProblem)
 let directory: string
 let controller: { create: ReturnType<typeof vi.fn>; selectModel: ReturnType<typeof vi.fn>; resolveAgent: ReturnType<typeof vi.fn>; rename: ReturnType<typeof vi.fn>; prompt: ReturnType<typeof vi.fn>; inspect: ReturnType<typeof vi.fn> }
-type RegisteredTool = { name: string; output: { render: (args: unknown, result: unknown) => unknown }; execute: (args: unknown, execution: { signal: AbortSignal }) => Promise<unknown> }
-let tools: Map<string, Map<string, RegisteredTool>>
+type RegisteredTool = { name: string; description: string; parameters: Record<string, unknown>; output: { render: (args: unknown, result: unknown) => unknown }; execute: (args: unknown, execution: { signal: AbortSignal }) => Promise<unknown> }
+type ContainerResult = { isError: boolean; content: { type: string; text?: string }[]; value?: unknown; error?: { message: string } }
 type Section = { name: string; text: (context: { signal?: AbortSignal }) => string; interpolate?: boolean }
 let sections: Map<string, Section>
-type Guard = (execution?: { name: string; arguments: unknown }) => string | undefined
-let guards: Map<string, Guard>
-let restricts: Map<string, unknown[]>
 type HttpHandler = (req: unknown, res: unknown) => Promise<void>
 let http: HttpHandler
 async function api(method: string, path: string): Promise<{ status: number; body: unknown }> {
@@ -55,15 +54,55 @@ async function api(method: string, path: string): Promise<{ status: number; body
   await http(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
   return { status, body: JSON.parse(text) }
 }
-let agents: Map<string, { id: string; status: string; inbox: { nextTurn: UserMessage[]; nextStep: UserMessage[] }; cancel: ReturnType<typeof vi.fn>; inject: ReturnType<typeof vi.fn> }>
+let agents: Map<string, { id: string; status: string; ctx: { tools: { register(definition: ToolDefinition): () => void; get(name: string, scope?: object): unknown; execute(input: object): Promise<ContainerResult> } }; inbox: { nextTurn: UserMessage[]; nextStep: UserMessage[] }; cancel: ReturnType<typeof vi.fn>; inject: ReturnType<typeof vi.fn> }>
+/** The tool definition a Session resolves by name, from the real Harness registry: its own or one inherited from its preset. */
+const registered = (sessionId: string, name: string): RegisteredTool | undefined => {
+  const agent = agents.get(sessionId)
+  if (!agent) return undefined
+  return (agent.ctx.tools.get(name, agent) as unknown as RegisteredTool | undefined)
+}
 const runTool = async (sessionId: string, name: string, args: unknown) => {
-  const tool = tools.get(sessionId)?.get(name)
+  const tool = registered(sessionId, name)
   if (!tool) throw new Error(`Tool ${name} is not registered for ${sessionId}`)
   const output = await tool.execute(args, { signal: new AbortController().signal })
   expect(JSON.parse(JSON.stringify(output))).toStrictEqual(output)
   await runtime.idle()
   return output as Record<string, unknown>
 }
+let calls = 0
+/** The tools every fixture preset inherits, as the profile's work tools, and the plugins and MCP servers that meant to be blocked. */
+const INHERITED_TOOLS = ['bash', 'pwsh', 'read', 'write', 'edit', 'apply_patch', 'read_image', 'skill', 'job_output', 'job_list', 'job_kill',
+  'glob', 'grep', 'web_search', 'web_fetch', 'todo_write', 'ask_user_question', 'plugin_manager', 'schedule_create', 'create_goal',
+  'session_create', 'session_send_message', 'feishu_doc_edit', 'mcp__context7__resolve-library-id', 'mcp__context7__query-docs',
+  'mcp__feishu__send_message']
+/** A real Harness tool registered in a preset scope: inspection reads a real file, writes change a real file, others answer. */
+const presetTool = (name: string): ToolDefinition => ({
+  name,
+  description: `preset ${name}`,
+  parameters: { type: 'object', additionalProperties: true },
+  output: { schema: { type: 'object', additionalProperties: true },
+    render: (_args, value) => [{ type: 'text' as const, text: JSON.stringify(value) }] },
+  execute: async input => {
+    const args = input as Record<string, unknown>
+    if (name === 'read' || name === 'read_image') {
+      return typeof args.path === 'string' ? { path: args.path, text: readFileSync(args.path, 'utf8') } : { called: name }
+    }
+    if (name === 'write' || name === 'edit' || name === 'apply_patch') {
+      const path = String(args.path), content = String(args.content)
+      writeFileSync(path, content)
+      return { path, written: true }
+    }
+    return { called: name }
+  },
+})
+/** Dispatch one call through the real registry, which resolves visibility and guards at call time and runs the tool body. */
+const dispatch = async (sessionId: string, name: string, args: unknown = {}): Promise<ContainerResult> => {
+  const agent = agents.get(sessionId) as unknown as { ctx: { tools: { execute(input: object): Promise<ContainerResult> } } }
+  const result = await agent.ctx.tools.execute({ callId: `call-${++calls}`, name, arguments: args, agent, signal: new AbortController().signal })
+  await runtime.idle()
+  return result
+}
+const resultText = (result: ContainerResult): string => result.content.map(block => block.type === 'text' ? block.text ?? '' : '').join('\n')
 function subscribe(ticketId: string, ref: { source: string; id: string }): void {
   const key = threadKey(ref)
   const thread = runtime.store.threads.get(key) ?? { key, ref, createdAt: '', subscriptions: [], correlated: [], pending: [], meta: {} }
@@ -77,6 +116,9 @@ async function receive(trigger: Trigger, target = runtime) {
 let services: Record<string, unknown>
 /** DSH's job registry the Runtime's Executor reads its workers' shell jobs from. */
 let jobs: ReturnType<typeof jobRegistry>
+/** A test-owned real writer is stopped before removing its temporary working directory, even if a barrier rejects. */
+let trackedWriter: ChildProcessWithoutNullStreams | undefined
+let trackedWriterExit: Promise<void> | undefined
 /** What worker commands of the startup checks print, by argv; an Error makes the command fail with its message. */
 let answers: Record<string, string | Error>
 /** Stand-in CLIs on disk, since setup finds executables before it runs them: the agent's, the merge account's and the Feishu bot's. */
@@ -154,34 +196,27 @@ beforeEach(async () => {
   }
   const ctx = new Context()
   agents = new Map()
-  tools = new Map()
+  // DSH's agents service lists the Sessions still loaded; Sessions install reads it after a service restart.
+  Object.assign(agents, { list: () => [...agents.values()] })
   sections = new Map()
-  guards = new Map()
-  restricts = new Map()
+  calls = 0
   deliveries = vi.fn()
+  const presets = new Map<string, object>()
   controller = {
     create: vi.fn(async ({ sessionId, agentPreset }) => {
       if (agents.has(sessionId)) return
-      const agentCtx = new Context()
-      const preset = {}
-      const inherited = ['bash', 'read', 'read_image', 'skill', 'job_output', 'job_list', 'job_kill', 'grep', 'web_search',
-        'ask_user_question', 'plugin_manager', 'schedule_create', 'create_goal', 'session_create', 'session_send_message', 'feishu_doc_edit']
-      const sessionTools = new Map<string, RegisteredTool>()
-      tools.set(sessionId, sessionTools)
-      agentCtx.reflect.provide('tools', { register: (tool: RegisteredTool) => { sessionTools.set(tool.name,
-        tool); return () => sessionTools.delete(tool.name) },
-        // Preset tools are inherited; subagent is registered on the agent itself and cannot be named by restrict.
-        get: (name: string, scope?: object) => {
-          const own = scope === agents.get(sessionId)
-          return (scope === preset || own) && inherited.includes(name) || own && name === 'subagent' ? { name } : undefined
-        },
-        restrict: vi.fn((rule: { allow: string[] }) => {
-          if (rule.allow.some(name => !inherited.includes(name))) throw new Error('Restriction names a non-inherited tool')
-          restricts.set(sessionId, [...restricts.get(sessionId) ?? [], rule]); return () => {}
-        }),
-        guard: vi.fn((check: Guard) => { guards.set(sessionId, check); return () => {} }) })
-      agentCtx.reflect.provide('skills', { register: () => () => {} })
-      agentCtx.reflect.provide('systemPrompt', { section: (spec: Section) => { sections.set(sessionId, spec); return () => {} } })
+      const preset = agentPreset === ROUTER_PRESET ? presets.get(ROUTER_PRESET)!
+        : agentPreset === WORKER_PRESET ? presets.get(WORKER_PRESET)! : presets.get('standard')!
+      const modelEvents: { type: string; data: unknown }[] = []
+      const agent = { id: sessionId, status: 'idle', inject: vi.fn(),
+        session: { id: sessionId, header: { agentPreset }, snapshotEvents: () => modelEvents, requestHeader: () => undefined,
+          append: vi.fn((type: string, data: unknown) => { modelEvents.push({ type, data }) }) },
+        cancel: vi.fn(), whenIdle: async () => {} } as unknown as { ctx: Context } & Record<string, unknown>
+      const scoped = createScope(ctx, agent, { parent: preset }).ctx
+      const agentCtx = scoped.isolate('systemPrompt')
+      agent.ctx = agentCtx
+      agentCtx.reflect.provide('systemPrompt', { section: (spec: Section) => { sections.set(sessionId, spec); return () => {} },
+        tools: () => () => {}, getSectionOrder: () => 0 })
       const inbox = { nextTurn: [] as UserMessage[], nextStep: [] as UserMessage[],
         // A pending message taken out, as DSH's inbox does by its id.
         remove: (id: string) => [inbox.nextTurn, inbox.nextStep].some(list => {
@@ -189,22 +224,32 @@ beforeEach(async () => {
           if (at >= 0) list.splice(at, 1)
           return at >= 0
         }) }
-      const modelEvents: { type: string; data: unknown }[] = []
       const deliver = (mode: 'queue' | 'steer') => vi.fn((message: UserMessage) => {
         inbox[mode === 'queue' ? 'nextTurn' : 'nextStep'].push(message)
         deliveries({ sessionId, mode, id: message.id, text: message.content.map(block => block.type === 'text' ? block.text : '').join('') })
         agents.get(sessionId)!.status = 'running'
       })
-      agents.set(sessionId, { id: sessionId, ctx: agentCtx, inbox, followup: deliver('queue'), steer: deliver('steer'), status: 'idle', inject: vi.fn(), session: { id: sessionId, header: { agentPreset }, snapshotEvents: () => modelEvents, requestHeader: () => undefined, append: vi.fn((type: string, data: unknown) => { modelEvents.push({ type, data }) }) }, cancel: vi.fn(), whenIdle: async () => {} } as never)
-      bindScopeParent(agents.get(sessionId)!, preset)
+      agent.inbox = inbox; agent.followup = deliver('queue'); agent.steer = deliver('steer')
+      agents.set(sessionId, agent as never)
     }),
     selectModel: vi.fn(async () => {}), resolveAgent: vi.fn(async id => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }), rename: vi.fn(async () => {}),
     prompt: vi.fn(() => { throw new Error('Plugin delivery must not use user RPC') }),
     inspect: vi.fn(async () => ({ events: [] })),
   }
   jobs = jobRegistry()
-  services = { agents, llm: { resolveCallConfig: vi.fn(async value => value) }, sessionController: controller, sessionPersistence: { flush: vi.fn(async () => {}), open: vi.fn(async () => ({ read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} })) }, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }) }, permissionPresets: { set: () => {} }, subprocess, webServer: { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }, jobs: jobs.service }
+  services = { agents, llm: { resolveCallConfig: vi.fn(async value => value) }, sessionController: controller, sessionPersistence: { flush: vi.fn(async () => {}), open: vi.fn(async () => ({ read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} })) }, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }) }, permissionPresets: { set: () => {} }, skills: { register: () => () => {} }, subprocess, webServer: { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }, jobs: jobs.service }
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
+  const systemPrompt = { tools: () => () => {}, section: () => () => {}, getSectionOrder: () => 0 }
+  ctx.reflect.provide('systemPrompt', systemPrompt)
+  const toolRuntime = new ToolRuntime(ctx)
+  services.systemPrompt = systemPrompt
+  services.tools = toolRuntime
+  for (const id of [ROUTER_PRESET, WORKER_PRESET, 'standard']) {
+    const key = { id }
+    const scope = createScope(ctx, key)
+    for (const name of INHERITED_TOOLS) scope.ctx.tools.register(presetTool(name))
+    presets.set(id, key)
+  }
   for (const cli of [AGENT(), OTHER(), BOT()]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
   const store = new Store(join(directory, 'orchestrator.sqlite')); seed(store); store.close()
   runtime = new Runtime(ctx, testMachine({ stateDir: directory }), restarts)
@@ -214,7 +259,18 @@ beforeEach(async () => {
   runtime.store.saveSettings({ ...runtime.store.settings(), policy: { ...runtime.store.settings().policy, sources: { feishu: { allowed: [{ id: MEMBER, name: 'Alice' }], syncChat: CHAT }, github: { allowed: [{ id: 'alice' }] } } }, eval: { ...runtime.store.settings().eval, mode: 'auto' }, sources: { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT() } }, feishu: { enabled: true, config: { cli: BOT(), chats: [{ chatId: CHAT, listen: 'all' }], directMessages: true } } } })
   deliveries.mockClear()
 })
-afterEach(async () => { expect(controller.prompt).not.toHaveBeenCalled(); await runtime?.stop(); vi.restoreAllMocks(); rmSync(directory, { recursive: true, force: true }) })
+afterEach(async () => {
+  if (trackedWriter) {
+    if (trackedWriter.exitCode === null && trackedWriter.signalCode === null) trackedWriter.kill()
+    await trackedWriterExit
+    trackedWriter = undefined
+    trackedWriterExit = undefined
+  }
+  expect(controller.prompt).not.toHaveBeenCalled()
+  await runtime?.stop()
+  vi.restoreAllMocks()
+  rmSync(directory, { recursive: true, force: true })
+})
 
 it('relays an explicit member mention as a candidate and creates the ticket, acknowledgement, subscription and worker on accept', async () => {
   const { trigger, ticket, sessionId } = await acceptedTicket()
@@ -442,15 +498,21 @@ it('attaches an event to an existing open task through orchestrator_route', asyn
   expect(relays(sessionId)[0]).toMatchObject({ trigger_id: other.id, text: '@bot 顺手把这里也改了', routing_note: '同一个页面' })
 })
 
-it('acknowledges a follow-up from the worker once and rejects events outside the task', async () => {
+it('takes up a follow-up from the worker once without a human reply, and rejects events outside the task', async () => {
   const { sessionId, ticket } = await acceptedTicket()
   const followup = feishu('10', '还有这个', { mentions: [], root_id: 'om_1' })
   await receive(followup)
-  expect(await runTool(sessionId, 'orchestrator_ack', { trigger_id: followup.id, text: '收到，也处理这个。' })).toMatchObject({ acknowledgement: 'sent', reused: false })
-  expect(await runTool(sessionId, 'orchestrator_ack', { trigger_id: followup.id, text: '不同措辞' })).toMatchObject({ reused: true })
+  vi.mocked(Commands.prototype.lark).mockClear()
+  expect(await runTool(sessionId, 'orchestrator_ack', { trigger_id: followup.id }))
+    .toEqual({ trigger_id: followup.id, taken_up: true, reused: false })
+  expect(await runTool(sessionId, 'orchestrator_ack', { trigger_id: followup.id }))
+    .toEqual({ trigger_id: followup.id, taken_up: true, reused: true })
+  // Taking it up is internal: it posts nothing to the person and stores no acknowledgement reply.
+  expect(Commands.prototype.lark).not.toHaveBeenCalled()
+  expect(runtime.store.replyStatus(key('ack', followup.id))).toBeUndefined()
   const stranger = feishu('11', '无关', { mentions: [], root_id: undefined })
   await receive(stranger)
-  await expect(runTool(sessionId, 'orchestrator_ack', { trigger_id: stranger.id, text: 'x' })).rejects.toThrow('does not belong')
+  await expect(runTool(sessionId, 'orchestrator_ack', { trigger_id: stranger.id })).rejects.toThrow('does not belong')
   expect(runtime.store.tickets.get(ticket.id)!.inputs.map(input => input.kind)).toEqual(['trigger'])
 })
 
@@ -598,7 +660,7 @@ it('reports a Source that was switched on as starting until its next pass report
 })
 
 it('records each settings save with its policy change and the open tickets told about it', async () => {
-  const { ticket } = await acceptedTicket()
+  await acceptedTicket()
   const settings = runtime.store.settings()
   await runtime.settings.save('executor', { ...settings.executor, maxWorkers: 5 }, runtime.store.blockRevision('executor'), 'panel')
   // What a Source receives is its own configuration, not the Policy; who may originate work there is the Policy's.
@@ -674,7 +736,9 @@ it('retries only a failed, blocked or undelivered ticket with a new assignment, 
   await runTool(`worker-${ticket.id}`, 'orchestrator_report', { state: 'failed', summary: 'LlmError: offline' })
   expect(waitsForPerson(runtime.store.tickets.get(ticket.id)!)).toBe(true)
   // A person may continue a failed worker in its Session; only an ended Ticket locks its tools.
-  expect(guards.get(`worker-${ticket.id}`)!()).toBeUndefined()
+  const reviewed = join(directory, 'failed-worker-write.txt')
+  await dispatch(`worker-${ticket.id}`, 'write', { path: reviewed, content: 'still works' })
+  expect(readFileSync(reviewed, 'utf8')).toBe('still works')
   const retried = await runtime.engine.retryTicket(ticket.id)
   await runtime.idle()
   expect(waitsForPerson(runtime.store.tickets.get(ticket.id)!)).toBe(false)
@@ -853,7 +917,7 @@ it('reports each setup problem where the operator fixes it, and checks the agent
   const check = subprocess.spawn.mock.calls.map(([spec]) => spec.argv).find(argv => argv.includes(AGENT()))!
   expect(check[0]).toBe('env')
   expect(check[1]!.startsWith('PATH=')).toBe(true)
-  expect(check[1]!.slice('PATH='.length).split(':')).not.toContain(join(directory, 'worker-bin'))
+  expect(check[1]!.slice('PATH='.length).split(delimiter)).not.toContain(join(directory, 'worker-bin'))
   const valid = { ...answers }
   // git older than 2.32 ignores GIT_CONFIG_GLOBAL and reads the operator's configuration.
   answers = { ...valid, [HELPERS]: 'file:/home/me/.gitconfig\0!gh auth git-credential\0' }
@@ -967,27 +1031,32 @@ it('runs setup again while the Feishu bot check failed, and restores the process
   await broken.ready
   expect(broken.setupProblem).toMatchObject({ place: 'deployment', code: 'gitTooOld' })
   expect(process.env.GIT_CONFIG_GLOBAL).toBeUndefined()
-  expect(process.env.PATH?.split(':')).not.toContain(join(directory, 'worker-bin'))
+  expect(process.env.PATH?.split(delimiter)).not.toContain(join(directory, 'worker-bin'))
 })
+
+const workerShimFiles = (process.platform === 'win32'
+  ? ['gh', 'gh.cmd', 'lark-cli', 'lark-cli.cmd', 'send-guard.mjs']
+  : ['gh', 'lark-cli', 'send-guard.mjs']).sort()
+const blockedGhShimFiles = process.platform === 'win32' ? ['personal-gh', 'personal-gh.cmd'] : ['personal-gh']
 
 it('writes worker shims and the agent environment from the configuration only, and restores the environment on stop', async () => {
   const bin = join(directory, 'worker-bin')
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
-  expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain(`exec '${BOT()}'`)
+  expect(readdirSync(bin).sort()).toEqual(workerShimFiles)
   runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, blockedCommands: ['personal-gh'] } })
   const next = await restart({}, { feishu: null })
   await next.ready
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  expect(readdirSync(bin).sort()).toEqual([...workerShimFiles, ...blockedGhShimFiles].sort())
   expect(readFileSync(join(bin, 'personal-gh'), 'utf8')).toContain('personal-gh is blocked in this installation; use gh, which acts as agent-bot.')
   expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain('lark-cli is unavailable: this installation has no Feishu bot.')
-  expect(readFileSync(join(bin, 'gh'), 'utf8')).toContain(`exec '${AGENT()}'`)
-  expect(readFileSync(workerGitConfig(directory), 'utf8')).toContain(`[credential "https://github.com"]\n\thelper = "${credentialHelper(AGENT())}"`)
+  // The helper is a git config double-quoted value: its backslashes are escaped, so a Windows path stays one value.
+  const helper = credentialHelper(AGENT()).replace(/[\\"]/g, char => `\\${char}`)
+  expect(readFileSync(workerGitConfig(directory), 'utf8')).toContain(`[credential "https://github.com"]\n\thelper = "${helper}"`)
   expect(process.env).toMatchObject({ GIT_CONFIG_GLOBAL: workerGitConfig(directory), GIT_CONFIG_NOSYSTEM: '1' })
   expect(process.env.GIT_AUTHOR_NAME).toBeUndefined()
-  expect(process.env.PATH?.split(':')[0]).toBe(bin)
+  expect(process.env.PATH?.split(delimiter)[0]).toBe(bin)
   await next.stop()
   expect(process.env.GIT_CONFIG_GLOBAL).toBeUndefined()
-  expect(process.env.PATH?.split(':')).not.toContain(bin)
+  expect(process.env.PATH?.split(delimiter)).not.toContain(bin)
 })
 
 it('waits for setup when the shim directory holds a file dsh-superagent did not write, and leaves the file alone', async () => {
@@ -1004,9 +1073,9 @@ it('rewrites the blocked-command shims when the Executor settings change them, w
   const bin = join(directory, 'worker-bin')
   const save = (blockedCommands: string[]) => runtime.settings.save('executor', { ...runtime.store.settings().executor, blockedCommands }, runtime.store.blockRevision('executor'), 'panel')
   expect(await save(['personal-gh'])).toMatchObject({ saved: true, restarting: false })
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  expect(readdirSync(bin).sort()).toEqual([...workerShimFiles, ...blockedGhShimFiles].sort())
   await save([])
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
+  expect(readdirSync(bin).sort()).toEqual(workerShimFiles)
   // The commands workers need cannot be blocked.
   await expect(save(['gh'])).rejects.toThrow()
   expect(restarts).not.toHaveBeenCalled()
@@ -1286,16 +1355,53 @@ it('drops a message only when its conversation is gone or not listened to, newes
   expect(dropped).toMatchObject([{ id: 'ignored-reply', dropped: { reason: 'channelIgnored' } }, { id: 'gone-reply', dropped: { reason: 'channelGone' } }])
 })
 
-it('reports a dropped acknowledgement as dropped, with its Ticket on the Source status and in the last day\'s flow', async () => {
-  const { sessionId, ticket } = await acceptedTicket()
-  const followup = feishu('10', '还有这个', { mentions: [], root_id: 'om_1' })
-  await receive(followup)
+it('keeps a Host accept acknowledgement the Channel dropped, while a Worker take-up and a report to the Hub resend nothing', async () => {
+  const trigger = feishu('50', '@bot 修一下这个回归', { root_id: undefined })
+  await receive(trigger)
+  // The Feishu Channel answers that the message or conversation is gone, so the accept's automatic acknowledgement is dropped.
   vi.mocked(Commands.prototype.lark).mockRejectedValue(new CliError('the message was withdrawn', 230011))
-  expect(await runTool(sessionId, 'orchestrator_ack', { trigger_id: followup.id, text: '收到，也处理这个。' })).toMatchObject({ acknowledgement: 'dropped' })
-  expect(await runTool(runtime.masterId, 'orchestrator_read', { resource: `trigger/${followup.id}` })).toMatchObject({ acknowledgement: 'dropped' })
-  const dropped = ((await api('GET', 'sources')).body as unknown as { dropped: unknown[] }[]).flatMap(source => source.dropped)
-  expect(dropped).toMatchObject([{ id: key('ack', followup.id), ticket: { id: ticket.id, title: ticket.title } }])
+  const result = await route({ kind: 'accept', trigger_id: trigger.id, title: '丢弃的确认', worktree_name: worktreeName, acknowledgement: '收到，修复回归。' })
+  // orchestrator_route returns the accepted ticket's id.
+  const accepted = result.ticket as { ticket_id: string }
+  const ticket = runtime.store.tickets.get(accepted.ticket_id)!
+  const sessionId = `worker-${ticket.id}`
+  const ackId = key('ack', trigger.id)
+  expect(runtime.store.receipts.get(ackId)).toMatchObject({ status: 'dropped', kind: 'acknowledgement', ticketId: ticket.id,
+    dropped: expect.objectContaining({ reason: 'channelGone' }) })
+  expect(runtime.store.receipts.waiting()).toEqual([])
+  // The dropped receipt stays dropped: another send pass retries nothing and sends no reply.
+  const replies = () => vi.mocked(Commands.prototype.lark).mock.calls.filter(([args]) => args[1] === '+messages-reply').length
+  const sent = replies()
+  await runtime.sendReplies()
+  expect(replies()).toBe(sent)
+  expect(runtime.store.replyStatus(ackId)).toBe('dropped')
+
+  // The Worker takes the request up internally; its take-up neither refreshes nor resends the dropped acknowledgement.
+  expect(await runTool(sessionId, 'orchestrator_ack', { trigger_id: trigger.id })).toMatchObject({ trigger_id: trigger.id, taken_up: true })
+  expect(await runTool(sessionId, 'orchestrator_read', { resource: `trigger/${trigger.id}` })).toMatchObject({ acknowledgement: 'dropped' })
+  expect(runtime.store.replyStatus(ackId)).toBe('dropped')
+  expect(runtime.store.receipts.waiting()).toEqual([])
+  expect(runtime.effects.pending('reply')).toBe(false)
+  expect(replies()).toBe(sent)
+
+  // Its report is internal and still reaches the Hub inbox, while the person receives nothing new.
+  const hub = agents.get(runtime.masterId)!
+  expect(await runTool(sessionId, 'orchestrator_report', { state: 'blocked', summary: 'needs a decision after the dropped acknowledgement' }))
+    .toMatchObject({ reported: true })
+  const payloads = [...hub.inbox.nextTurn, ...hub.inbox.nextStep]
+    .flatMap(message => message.content.flatMap(block => block.type === 'text' ? [block.text] : []))
+  const reportText = payloads.find(text => text.includes('"kind":"worker_report"') && text.includes(ticket.id))
+  expect(reportText).toBeDefined()
+  expect(JSON.parse(reportText!)).toMatchObject({ kind: 'worker_report', state: 'blocked', summary: 'needs a decision after the dropped acknowledgement',
+    ticket: expect.objectContaining({ ticket_id: ticket.id }) })
+  expect(runtime.store.replyStatus(ackId)).toBe('dropped')
+  expect(replies()).toBe(sent)
+  // The Source status and the day's flow keep the dropped acknowledgement, with its Ticket.
   expect(overviewOf(runtime).flow.dropped).toBe(1)
+  // The Source status keeps the last day's dropped receipts, each with its Ticket.
+  const sourceStatus = (await api('GET', 'sources')).body as unknown as { dropped: { id: string; ticket?: { id: string; title: string } }[] }[]
+  const dropped = sourceStatus.flatMap(source => source.dropped)
+  expect(dropped).toMatchObject([{ id: ackId, ticket: { id: ticket.id, title: ticket.title } }])
 })
 
 it('refuses a settings save with an unknown model or a Source kind that is not installed, an oversized prompt, an unknown revision and a malformed path with 4xx', async () => {
@@ -1355,14 +1461,15 @@ it('tells the main Session of each requeue of the same Trigger', async () => {
   expect(requeued()).toBe(2)
 })
 
-it('keeps replies and acknowledgements to an IM conversation within the IM limit', async () => {
+it('keeps replies to an IM conversation within the IM limit, and takes up a follow-up without reply text', async () => {
   const { ticket, trigger, sessionId } = await acceptedTicket()
   const long = Array.from({ length: IM_WORDS + 1 }, () => 'word').join(' ')
   await runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'reviewed' })
   await expect(runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'result', text: long })).rejects.toThrow(`maximum is ${IM_WORDS}`)
   const follow = feishu('3', '还有一个问题', { mentions: [], root_id: trigger.meta.messageId as string, sender_id: MEMBER })
   await receive(follow)
-  await expect(runTool(sessionId, 'orchestrator_ack', { trigger_id: follow.id, text: long })).rejects.toThrow(`at most ${IM_WORDS} words`)
+  expect(await runTool(sessionId, 'orchestrator_ack', { trigger_id: follow.id })).toMatchObject({ trigger_id: follow.id, taken_up: true })
+  await expect(runTool(sessionId, 'orchestrator_ack', { trigger_id: follow.id, text: long })).rejects.toThrow()
 })
 
 it('refuses a second process on the same state directory before it opens the database, so it migrates nothing', () => {
@@ -1491,79 +1598,467 @@ it('fails a ticket at once on a worker error that is not passing, and relays it'
   expect(relays(runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_report', ticket: { ticket_id: ticket.id }, state: 'failed' })
 })
 
-it('refuses the main Session a bash command that runs sleep and a long job wait, as reports arrive by themselves, and no worker', async () => {
-  const bash = (command: string) => ({ name: 'bash', arguments: { command, description: 'x' } })
-  const main = guards.get(runtime.masterId)!
-  for (const command of ['sleep 60; echo done', 'cd x && sleep 5', 'gh pr checks 7 || sleep 30', 'echo a\nsleep 90', 'while true; do sleep 30; done',
-    '(sleep 5)', '/bin/sleep 240', 'while sleep 30; do gh pr checks 7; done', 'if sleep 5; then gh pr view 7; fi', '{ sleep 60; }', '! sleep 5',
-    'nohup sleep 60', 'exec sleep 60', 'time sleep 60', 'until sleep 1; do :; done', 'command sleep 5', 'env sleep 5'])
-    expect(main(bash(command)), command).toMatch(/^Reports, follow_up notices, new candidates and a background job's end/)
-  // A command that names sleep as data, not at a command position, runs.
-  for (const command of ['gh api repos/acme/widgets/pulls', 'echo "sleep"', 'grep sleep file', 'sleeper --help', 'command -v sleep'])
-    expect(main(bash(command)), command).toBeUndefined()
-  // A command that asks to hold the step longer than 30 seconds, however it waits, under any preset.
-  const timed = (command: string, args: { timeoutMs?: number; run_in_background?: boolean } = {}) =>
-    ({ name: 'bash', arguments: { command, description: 'x', ...args } })
-  expect(main(timed('gh api repos/acme/widgets/pulls', { timeoutMs: 120_000 }))).toMatch(/^Reports/)
-  expect(main(timed("python3 -c 'import time;time.sleep(240)'", { timeoutMs: 600_000 }))).toMatch(/^Reports/)
-  expect(main(timed('gh api repos/acme/widgets/pulls', { timeoutMs: 20_000 }))).toBeUndefined()
-  // Under the router preset, the shell moves a command without a timeout to a background job after 5 seconds, and a job
-  // wait without one ends after 5 seconds too; a longer job wait waits for nothing that arrives that way.
-  expect(main(timed('gh pr checks 7 --watch'))).toBeUndefined()
-  expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true } })).toBeUndefined()
-  expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true, timeout_ms: 30_000 } })).toMatch(/^Reports/)
-  expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true, timeout_ms: 5_000 } })).toBeUndefined()
-  expect(main({ name: 'job_output', arguments: { job_id: 'j' } })).toBeUndefined()
-  // A main Session created before runs under standard, whose shell waits 60 seconds by default and whose job waits last 30:
-  // a command without a timeout runs in the background or names one, and a job wait names one.
-  ;(agents.get(runtime.masterId) as unknown as { session: { header: { agentPreset: string } } }).session.header = { agentPreset: 'standard' }
-  expect(main(timed('gh pr checks 7 --watch'))).toMatch(/^This shell waits up to 60 seconds by default: pass timeoutMs of at most 30000/)
-  expect(main(timed('gh pr checks 7 --watch', { run_in_background: true }))).toBeUndefined()
-  expect(main(timed('gh api repos/acme/widgets/pulls', { timeoutMs: 20_000 }))).toBeUndefined()
-  expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true } })).toMatch(/^Reports/)
-  expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true, timeout_ms: 5_000 } })).toBeUndefined()
-  // A worker waits for its own work as it needs.
-  const { sessionId } = await acceptedTicket()
-  expect(guards.get(sessionId)!(bash('sleep 60'))).toBeUndefined()
-  // The main Session's role says so.
-  expect(masterPrompt).toContain('Worker reports, follow_up notices, new candidates and a background job\'s end, with its output, arrive by themselves as messages')
-})
-
-it('reads the main Session\'s preset from a registry with or without presetForSession, and takes standard\'s caps when it cannot', async () => {
-  const watch = { name: 'bash', arguments: { command: 'gh pr checks 7 --watch', description: 'x' } }
-  const route = { name: 'orchestrator_route', arguments: { decisions: [] } }
-  const guard = async (registry: Record<string, unknown>, projections?: Record<string, unknown>) => {
-    services.agentPresets = registry
-    if (projections) services.sessionProjections = projections; else delete services.sessionProjections
-    await (await restart()).ready
-    return guards.get(runtime.masterId)!
-  }
-  // A released DSH's registry has no presetForSession: the projection says standard, so standard's caps apply, and the
-  // other tools run.
-  let main = await guard({ select: vi.fn() }, { stateOf: vi.fn((_session: unknown, key: string) => key === 'agentPreset' ? 'standard' : undefined) })
-  expect(main(route)).toBeUndefined()
-  expect(main(watch)).toMatch(/^This shell waits up to 60 seconds by default/)
-  // Without the projection either, the preset it was created with counts: the router preset.
-  main = await guard({ select: vi.fn() })
-  expect([main(route), main(watch)]).toEqual([undefined, undefined])
-  // The registry says standard though the Session was created with the router preset: standard's caps apply.
-  main = await guard({ select: vi.fn(), presetForSession: () => 'standard' })
-  expect(main(watch)).toMatch(/^This shell waits up to 60 seconds by default/)
-  // A registry that fails is read as standard, the safer caps, and the guard does not throw.
-  main = await guard({ select: vi.fn(), presetForSession: () => { throw new Error('no projection') } })
-  expect(main(route)).toBeUndefined()
-  expect(main(watch)).toMatch(/^This shell waits up to 60 seconds by default/)
-})
-
-it('refuses an ended ticket\'s worker its tools, and restricts the main Session to the tools it may use', async () => {
+it('keeps Hub inspection, assessment and coordination while refusing shell, jobs and writes at tool invocation', async () => {
   const { ticket, sessionId } = await acceptedTicket()
-  expect(guards.get(sessionId)!()).toBeUndefined()
+  const repo = join(directory, 'repo.txt')
+  writeFileSync(repo, 'hello hub')
+  // The Hub's read-only preset tools are registered in the real Harness registry and run their bodies.
+  expect(await dispatch(runtime.masterId, 'read', { path: repo }))
+    .toMatchObject({ isError: false, value: { path: repo, text: 'hello hub' } })
+  for (const name of ['read_image', 'glob', 'grep', 'skill']) expect((await dispatch(runtime.masterId, name)).isError, name).toBe(false)
+  // The profile still registers shell, job and write tools for its other Sessions, but the Hub resolves none of them, and a
+  // dispatch that names one is refused before its body can touch the file.
+  const denied = join(directory, 'hub-write.txt')
+  for (const name of ['bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'write', 'edit', 'apply_patch']) {
+    expect(registered(runtime.masterId, name), name).toBeUndefined()
+    const result = await dispatch(runtime.masterId, name, { path: denied, content: 'x', command: 'echo x' })
+    expect(result.isError, name).toBe(true)
+    expect(resultText(result), name).toMatch(/unknown tool/i)
+  }
+  expect(() => readFileSync(denied)).toThrow()
+  // The Hub's own tools are scoped registrations, so inspection, read-only assessment and a worker's summary still work.
+  expect(await runTool(runtime.masterId, 'orchestrator_read', { resource: `ticket/${ticket.id}` }))
+    .toMatchObject({ ticket_id: ticket.id, state: expect.any(String) })
+  const pending = feishu('77', '这个文案好奇怪，改成“浏览网页”吧', { mentions: [] })
+  await receive(pending)
+  vi.mocked(Commands.prototype.lark).mockResolvedValue({ items: [{ message_id: 'om_77', chat_id: CHAT }] })
+  expect(await runTool(runtime.masterId, 'orchestrator_eval', { trigger_id: pending.id })).toMatchObject({ trigger_id: pending.id })
+  // A worker's report reaches the Hub as a summary relay.
+  await runTool(sessionId, 'orchestrator_report', { state: 'failed', summary: 'hub boundary' })
+  expect(relays(runtime.masterId)).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'worker_report',
+    ticket: expect.objectContaining({ ticket_id: ticket.id }), state: 'failed', summary: 'hub boundary' })]))
+  // An existing Executor Session takes a new assignment after a failure; the ticket keeps the same worker Session.
+  expect(await runTool(runtime.masterId, 'orchestrator_ticket_retry', { ticket_id: ticket.id }))
+    .toMatchObject({ reason: 'Started a new assignment', ticket: { ticket_id: ticket.id } })
+  expect(controller.create.mock.calls.filter(([options]) => (options as { sessionId: string }).sessionId === sessionId)).toHaveLength(1)
+  expect(runtime.store.tickets.get(ticket.id)!.assignments.map(item => item.state)).toEqual(['ended', 'running'])
+})
+
+it('reapplies Hub restrictions and coordination to live Sessions after a service restart', async () => {
+  const trigger = feishu('60', '@bot 检查重启权限')
+  await receive(trigger)
+  const probe = join(directory, 'permission-gap.txt')
+  writeFileSync(probe, 'untouched')
+  // Restart the service while its existing Hub Agent is still loaded.
+  const next = await restart()
+  await next.ready
+  // Inherited writes remain unavailable after the live Hub is re-decorated.
+  const denied = await dispatch(next.masterId, 'write', { path: probe, content: 'after the restart' })
+  expect([denied.isError, readFileSync(probe, 'utf8')]).toEqual([true, 'untouched'])
+  await vi.waitFor(() => expect(registered(next.masterId, 'orchestrator_route')).toBeDefined())
+  expect(await dispatch(next.masterId, 'read', { path: probe })).toMatchObject({ isError: false, value: { path: probe, text: 'untouched' } })
+  expect(await runTool(next.masterId, 'orchestrator_route', { decisions: [{ kind: 'ignore', trigger_id: trigger.id, reason: 'permission probe only' }] }))
+    .toMatchObject({ results: [{ trigger_id: trigger.id, kind: 'ignore', decision: 'ignore' }] })
+})
+
+it('lets a worker and any-depth subagents write during its ticket, and refuses all of them once it ends', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  const created = (runtime as unknown as { ctx: Context }).ctx
+  const create = controller.create as (options: { sessionId: string }) => Promise<void>
+  const addChild = async (id: string, parent: string) => {
+    await create({ sessionId: id })
+    const agent = agents.get(id)! as unknown as { session: { header: { parentSession?: string } } }
+    agent.session.header = { parentSession: parent }
+    await created.parallel('agent/created', { agent } as never)
+  }
+  let deepest = sessionId
+  for (let depth = 1; depth <= 10; depth++) {
+    const id = `deep-${depth}`
+    await addChild(id, deepest)
+    deepest = id
+  }
+  const workerFile = join(directory, 'worker.txt'), deepFile = join(directory, 'deep.txt')
+  expect(await dispatch(sessionId, 'write', { path: workerFile, content: 'worker' })).toMatchObject({ isError: false })
+  expect(await dispatch(deepest, 'write', { path: deepFile, content: 'deep' })).toMatchObject({ isError: false })
+  expect(readFileSync(workerFile, 'utf8')).toBe('worker')
+  expect(readFileSync(deepFile, 'utf8')).toBe('deep')
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'boundary report' })
+
   runtime.engine.stopTicket(ticket.id)
-  expect(guards.get(sessionId)!()).toBe('Ticket ended; new work needs a new authorized ticket')
-  expect(restricts.get(runtime.masterId)).toEqual([{ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }])
-  // A worker keeps only the profile's work tools: none that ask a person, change the profile, schedule or start work outside
-  // the worker slots, reach other Sessions or edit documents, whenever they were registered.
-  expect(restricts.get(sessionId)).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
+  // A child created after the ticket ended is guarded at creation as well.
+  await addChild('late-child', deepest)
+  const lateFile = join(directory, 'late.txt')
+  for (const [session, file] of [[sessionId, workerFile], [deepest, deepFile], ['late-child', lateFile]] as const) {
+    const denied = await dispatch(session, 'write', { path: file, content: 'overwrite' })
+    expect(denied.isError, session).toBe(true)
+    expect(resultText(denied), session).toContain('Ticket ended; new work needs a new authorized ticket')
+  }
+  expect(readFileSync(workerFile, 'utf8')).toBe('worker')
+  expect(readFileSync(deepFile, 'utf8')).toBe('deep')
+  expect(() => readFileSync(lateFile)).toThrow()
+  // The management side still reads the ended ticket and the worker's last report.
+  expect(await runTool(runtime.masterId, 'orchestrator_read', { resource: `ticket/${ticket.id}` }))
+    .toMatchObject({ ticket_id: ticket.id, ended: expect.anything() })
+  expect(await runTool(runtime.masterId, 'orchestrator_read', { resource: `ticket/${ticket.id}/result` }))
+    .toMatchObject({ text: 'boundary report' })
+})
+
+it('takes one Worker from a real file edit through a real Node test to a Hub-only report, then refuses its write after that report ends the ticket', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  // Verify the inherited preset tool passes workOnly before installing the process adapter.
+  expect(await dispatch(sessionId, 'bash', { command: 'echo preset-permission-probe', description: 'Check the inherited shell permission' }))
+    .toMatchObject({ isError: false })
+  const workspace = ticket.execution!.directory
+  // The fixture's preset bash only records that it was called. This test-level adapter is the real shell for this Worker's
+  // call: it spawns the command in the ticket directory, while the mounted runtime still resolves visibility and the live
+  // Ticket's guard before any body runs.
+  const shellEnv = {
+    ...Object.fromEntries(Object.entries(process.env).filter(([name, value]) =>
+      !['NODE_OPTIONS', 'FORCE_COLOR'].includes(name) && value !== undefined)),
+    NO_COLOR: '1',
+  }
+  const runShell = (command: string) => {
+    const { promise, resolve } = Promise.withResolvers<{ exitCode: number; stdout: string; stderr: string }>()
+    const child = spawn(command, { cwd: workspace, env: shellEnv, shell: true })
+    let stdout = '', stderr = ''
+    child.stdout.on('data', chunk => { stdout += String(chunk) })
+    child.stderr.on('data', chunk => { stderr += String(chunk) })
+    child.on('error', error => resolve({ exitCode: -1, stdout, stderr: `${stderr}${String(error)}` }))
+    child.on('close', code => resolve({ exitCode: code ?? -1, stdout, stderr }))
+    return promise
+  }
+  agents.get(sessionId)!.ctx.tools.register({
+    name: 'bash',
+    description: 'Run a command in the ticket workspace.',
+    parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'], additionalProperties: false },
+    output: { schema: { type: 'object', properties: { exitCode: { type: 'integer' }, stdout: { type: 'string' }, stderr: { type: 'string' } },
+      required: ['exitCode', 'stdout', 'stderr'], additionalProperties: false },
+      render: (_args, value) => [{ type: 'text' as const, text: JSON.stringify(value) }] },
+    execute: input => {
+      if (!input || typeof input !== 'object' || !('command' in input) || typeof input.command !== 'string') throw new Error('bash needs a command')
+      return runShell(input.command)
+    },
+  })
+
+  const modulePath = join(workspace, 'slug.cjs'), testPath = join(workspace, 'slug.test.cjs')
+  const moduleSource = `'use strict'
+const slugify = value => value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+module.exports = { slugify }
+`
+  const testSource = `'use strict'
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const { slugify } = require('./slug.cjs')
+test('slugify("  Worker Boundary!  ") returns "worker-boundary"', () => {
+  assert.equal(slugify('  Worker Boundary!  '), 'worker-boundary')
+})
+`
+  // Both edits are ordinary mounted Worker tool calls, admitted only while the Ticket is live.
+  expect(await dispatch(sessionId, 'write', { path: modulePath, content: moduleSource }))
+    .toMatchObject({ isError: false, value: { path: modulePath, written: true } })
+  expect(await dispatch(sessionId, 'write', { path: testPath, content: testSource }))
+    .toMatchObject({ isError: false, value: { path: testPath, written: true } })
+  expect(readFileSync(modulePath, 'utf8')).toBe(moduleSource)
+  expect(readFileSync(testPath, 'utf8')).toBe(testSource)
+  // The command is a real OS process: it loads the module just written and checks its observable result.
+  const ran = await dispatch(sessionId, 'bash', { command: `"${process.execPath}" --test --test-reporter=tap "${testPath}"` })
+  expect(ran.isError).toBe(false)
+  // The bash tool registered above returns this shape, and a successful dispatch carries it as `value`.
+  const output = ran.value as { exitCode: number; stdout: string; stderr: string }
+  expect(output.exitCode, output.stderr).toBe(0)
+  expect(output.stdout).toContain('# pass 1')
+  expect(output.stdout).toContain('# fail 0')
+  expect(output.stdout).toContain('returns "worker-boundary"')
+
+  // The report is one internal relay to the Hub, and the Ticket ends without any human-facing send.
+  vi.mocked(Commands.prototype.lark).mockClear()
+  expect(runtime.store.receipts.waiting()).toEqual([])
+  const hub = agents.get(runtime.masterId)!
+  const reported = await dispatch(sessionId, 'orchestrator_report', { state: 'ready', summary: 'slug module passes node --test' })
+  expect(reported.isError).toBe(false)
+  expect(reported.value).toEqual({ reported: true, notification: 'orchestrator' })
+  const payloads = [...hub.inbox.nextTurn, ...hub.inbox.nextStep]
+    .flatMap(message => message.content.flatMap(block => block.type === 'text' ? [block.text] : []))
+  const reportText = payloads.find(text => text.includes('"kind":"worker_report"') && text.includes(ticket.id))
+  expect(reportText).toBeDefined()
+  expect(JSON.parse(reportText!)).toMatchObject({ kind: 'worker_report', state: 'ready', summary: 'slug module passes node --test',
+    ticket: expect.objectContaining({ ticket_id: ticket.id }) })
+  expect(runtime.store.tickets.get(ticket.id)).toMatchObject({ ended: expect.objectContaining({ by: 'executor', outcome: 'completed' }) })
+  expect(Commands.prototype.lark).not.toHaveBeenCalled()
+  expect(runtime.store.receipts.waiting()).toEqual([])
+
+  // The same Session is still mounted, but every work tool is now guarded on the ended Ticket: the write body never runs.
+  const denied = await dispatch(sessionId, 'write', { path: modulePath, content: 'tampered by an ended ticket' })
+  expect(denied.isError).toBe(true)
+  expect(resultText(denied)).toContain('Ticket ended; new work needs a new authorized ticket')
+  expect(readFileSync(modulePath, 'utf8')).toBe(moduleSource)
+})
+
+it('withholds a reloaded worker child\'s work tools while its stored ancestry is being inspected', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  const inspectionStarted = Promise.withResolvers<void>()
+  const finishInspection = Promise.withResolvers<void>()
+  let delayInspection = false
+  controller.inspect.mockImplementation(async (id: string) => {
+    if (id !== 'stored-parent') return { events: [] }
+    if (delayInspection) { inspectionStarted.resolve(); await finishInspection.promise }
+    return { meta: { parentSession: sessionId }, events: [] }
+  })
+  await (controller.create as (options: { sessionId: string }) => Promise<void>)({ sessionId: 'rehydrated-child' })
+  const child = agents.get('rehydrated-child')! as unknown as { session: { header: { parentSession?: string } } }
+  child.session.header = { parentSession: 'stored-parent' }
+  const mountedRuntime = runtime as unknown as { ctx: Context }
+  await mountedRuntime.ctx.parallel('agent/created', { agent: child } as never)
+  const file = join(directory, 'rehydrated.txt')
+  expect(await dispatch('rehydrated-child', 'write', { path: file, content: 'authorized' })).toMatchObject({ isError: false })
+  expect(readFileSync(file, 'utf8')).toBe('authorized')
+
+  delayInspection = true
+  const next = await restart()
+  try {
+    await inspectionStarted.promise
+    const premature = await dispatch('rehydrated-child', 'write', { path: file, content: 'before ancestry resolved' })
+    expect(premature.isError).toBe(true)
+    expect(readFileSync(file, 'utf8')).toBe('authorized')
+  } finally { finishInspection.resolve() }
+  await next.ready
+  await vi.waitFor(async () => {
+    expect((await dispatch('rehydrated-child', 'write', { path: file, content: 'resumed' })).isError).toBe(false)
+  })
+  expect(readFileSync(file, 'utf8')).toBe('resumed')
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'ancestry restored' })
+  next.engine.stopTicket(ticket.id)
+  expect(resultText(await dispatch('rehydrated-child', 'write', { path: file, content: 'after ticket ended' }))).toContain('Ticket ended')
+  expect(readFileSync(file, 'utf8')).toBe('resumed')
+  expect(await runTool(next.masterId, 'orchestrator_read', { resource: `ticket/${ticket.id}/result` }))
+    .toMatchObject({ text: 'ancestry restored' })
+})
+
+it('keeps a reloaded child fail-closed after ancestry inspection fails while leaving unrelated Sessions alone', async () => {
+  const { sessionId } = await acceptedTicket()
+  let failInspection = false
+  const inspectionFailed = Promise.withResolvers<void>()
+  controller.inspect.mockImplementation(async (id: string) => {
+    if (id !== 'stored-ancestor') return { events: [] }
+    if (failInspection) { inspectionFailed.resolve(); throw new Error('session storage unavailable') }
+    return { meta: { parentSession: sessionId }, events: [] }
+  })
+  const mountedRuntime = runtime as unknown as { ctx: Context }
+  const create = controller.create as (options: { sessionId: string }) => Promise<void>
+  for (const [id, parent] of [['worker-descendant', 'stored-ancestor'], ['unrelated-descendant', 'unrelated-ancestor']] as const) {
+    await create({ sessionId: id })
+    const child = agents.get(id)! as unknown as { session: { header: { parentSession?: string } } }
+    child.session.header = { parentSession: parent }
+    await mountedRuntime.ctx.parallel('agent/created', { agent: child } as never)
+  }
+  const file = join(directory, 'inspection-failure.txt')
+  expect(await dispatch('worker-descendant', 'write', { path: file, content: 'authorized' })).toMatchObject({ isError: false })
+  failInspection = true
+  const next = await restart()
+  await inspectionFailed.promise
+  await next.ready
+  // The installed live-Agent callback is intentionally fire-and-forget; an event-loop turn lets its rejection settle.
+  const settled = Promise.withResolvers<void>()
+  setImmediate(settled.resolve)
+  await settled.promise
+  const denied = await dispatch('worker-descendant', 'write', { path: file, content: 'unauthorized' })
+  expect(denied.isError).toBe(true)
+  expect(readFileSync(file, 'utf8')).toBe('authorized')
+  const unrelated = join(directory, 'unrelated-session.txt')
+  expect(await dispatch('unrelated-descendant', 'write', { path: unrelated, content: 'independent' }))
+    .toMatchObject({ isError: false })
+  expect(readFileSync(unrelated, 'utf8')).toBe('independent')
+})
+
+it('finds the owning worker through a reloaded child whose intermediate parent is no longer loaded', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  controller.inspect.mockImplementation(async (id: string) => id === 'lost-parent'
+    ? { meta: { parentSession: sessionId }, events: [] }
+    : { events: [] })
+  await (controller.create as (options: { sessionId: string }) => Promise<void>)({ sessionId: 'reloaded-child' })
+  const child = agents.get('reloaded-child')! as unknown as { session: { header: { parentSession?: string } } }
+  child.session.header = { parentSession: 'lost-parent' }
+  await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: child } as never)
+  const file = join(directory, 'reloaded.txt')
+  expect(await dispatch('reloaded-child', 'write', { path: file, content: 'before' })).toMatchObject({ isError: false })
+  runtime.engine.stopTicket(ticket.id)
+  expect(resultText(await dispatch('reloaded-child', 'write', { path: file, content: 'after' }))).toContain('Ticket ended')
+  expect(readFileSync(file, 'utf8')).toBe('before')
+})
+
+it('cancels an in-flight recovered grandchild after ticket close when its stored parent is unloaded', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  const grandchild = 'reloaded-grandchild', missingParent = 'stored-middle'
+  controller.inspect.mockImplementation(async (id: string) => id === missingParent
+    ? { meta: { parentSession: sessionId }, events: [] }
+    : { events: [] })
+  await (controller.create as (options: { sessionId: string }) => Promise<void>)({ sessionId: grandchild })
+  const child = agents.get(grandchild)! as unknown as { session: { header: { parentSession?: string } } }
+  child.session.header = { parentSession: missingParent }
+  const mountedRuntime = runtime as unknown as { ctx: Context }
+  await mountedRuntime.ctx.parallel('agent/created', { agent: child } as never)
+  const file = join(directory, 'recovered-turn.txt')
+  expect(await dispatch(grandchild, 'write', { path: file, content: 'before' })).toMatchObject({ isError: false })
+
+  const catalogRead = Promise.withResolvers<void>()
+  mountedRuntime.ctx.reflect.provide('subagents', {
+    listChildren: async (parent: string) => {
+      if (parent === sessionId) return [{ id: missingParent, mode: 'continuable' }]
+      if (parent === missingParent) { catalogRead.resolve(); return [{ id: grandchild, mode: 'continuable' }] }
+      return []
+    },
+    waitForChildren: async () => false,
+    drainChildren: async () => {},
+  })
+  const agent = agents.get(grandchild)!
+  const turn = new AbortController()
+  agent.cancel.mockImplementation(() => { turn.abort(); agent.status = 'idle' })
+  const started = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+  agent.ctx.tools.register({ name: 'edit', description: 'Finish the work already begun by the recovered Session.',
+    parameters: { type: 'object', additionalProperties: false },
+    output: { schema: { type: 'object', properties: { written: { type: 'boolean' } }, required: ['written'], additionalProperties: false },
+      render: (_args, value) => [{ type: 'text' as const, text: JSON.stringify(value) }] },
+    execute: async (_input, execution) => {
+      agent.status = 'running'
+      started.resolve()
+      await release.promise
+      if (!execution.signal.aborted) writeFileSync(file, 'after')
+      return { written: !execution.signal.aborted }
+    },
+  })
+  const inFlight = agent.ctx.tools.execute({ callId: 'recovered-inflight-edit', name: 'edit', arguments: {}, agent, signal: turn.signal })
+  try {
+    await Promise.race([started.promise, inFlight.then(() => { throw new Error('Recovered Session tool never started') })])
+    runtime.engine.stopTicket(ticket.id)
+    await catalogRead.promise
+    // The public SDK child catalog was read; let the stop transaction complete before releasing the in-flight edit.
+    const settled = Promise.withResolvers<void>()
+    setImmediate(settled.resolve)
+    await settled.promise
+    release.resolve()
+    await inFlight.catch(() => {})
+    expect(readFileSync(file, 'utf8')).toBe('before')
+    expect(agent.status).toBe('idle')
+  } finally { release.resolve(); await inFlight.catch(() => {}) }
+})
+
+it('stops a deep child\'s tracked shell process before it can finish writing after ticket close', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  const mountedRuntime = runtime as unknown as { ctx: Context }
+  const sdk = mountedRuntime.ctx
+  const create = controller.create as (options: { sessionId: string }) => Promise<void>
+  const parent = 'nested-parent', deepest = 'nested-writer'
+  for (const [id, owner] of [[parent, sessionId], [deepest, parent]] as const) {
+    await create({ sessionId: id })
+    const agent = agents.get(id)! as unknown as { session: { header: { parentSession?: string } } }
+    agent.session.header = { parentSession: owner }
+    await sdk.parallel('agent/created', { agent } as never)
+  }
+  // The SDK's direct-child release disposes the selected child's descendants too; the job registry remains session-owned.
+  const children = new Map([[sessionId, [parent]], [parent, [deepest]]])
+  const drained = Promise.withResolvers<void>()
+  const subagents = {
+    listChildren: async (owner: string) => (children.get(owner) ?? []).map(id => ({ id })),
+    waitForChildren: async () => false,
+    drainChildren: async (_owner: unknown, ids: readonly string[]) => {
+      for (const id of ids) {
+        agents.delete(id)
+        for (const descendant of children.get(id) ?? []) agents.delete(descendant)
+      }
+      drained.resolve()
+    },
+  }
+  services.subagents = subagents
+  sdk.reflect.provide('subagents', subagents)
+  // Deadlines make a missing SDK or subprocess signal fail at the exact barrier, not as an uncollected test timeout.
+  const barrier = async <T>(name: string, work: Promise<T>): Promise<T> => {
+    const timeout = Promise.withResolvers<never>()
+    const timer = setTimeout(() => timeout.reject(new Error(`Timed out waiting for ${name}`)), 3_000)
+    try { return await Promise.race([work, timeout.promise]) }
+    finally { clearTimeout(timer) }
+  }
+
+  const workspace = ticket.execution!.directory
+  const file = join(workspace, 'deep-writer.txt')
+  const ready = Promise.withResolvers<void>(), wrote = Promise.withResolvers<void>(), armed = Promise.withResolvers<void>()
+  const released = Promise.withResolvers<void>(), exited = Promise.withResolvers<void>()
+  let writer: ChildProcessWithoutNullStreams | undefined
+  let jobId: string | undefined
+  const source = `
+    const fs = require('node:fs')
+    const nl = String.fromCharCode(10)
+    const file = process.argv[1]
+    let pending = ''
+    process.stdin.setEncoding('utf8')
+    process.stdout.write('READY' + nl)
+    process.stdin.on('data', chunk => {
+      pending += chunk
+      while (pending.includes(nl)) {
+        const end = pending.indexOf(nl)
+        const command = pending.slice(0, end)
+        pending = pending.slice(end + 1)
+        if (command === 'WRITE') { fs.writeFileSync(file, 'before'); process.stdout.write('WROTE' + nl) }
+        if (command === 'ARM') process.stdout.write('ARMED' + nl)
+        if (command === 'RELEASE') { fs.writeFileSync(file, 'after'); process.stdout.write('RELEASED' + nl) }
+      }
+    })`
+  agents.get(deepest)!.ctx.tools.register({
+    name: 'bash', description: 'Run a tracked writer in the worker workspace.',
+    parameters: { type: 'object', additionalProperties: false },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'], additionalProperties: false },
+      render: (_args, value) => [{ type: 'text' as const, text: JSON.stringify(value) }] },
+    execute: async () => {
+      jobId = jobs.run(deepest, 'deep repository writer')
+      writer = spawn(process.execPath, ['-e', source, file], { cwd: workspace, env: {
+        ...Object.fromEntries(Object.entries(process.env).filter(([name, value]) =>
+          !['NODE_OPTIONS', 'FORCE_COLOR'].includes(name) && value !== undefined)), NO_COLOR: '1',
+      } })
+      trackedWriter = writer
+      trackedWriterExit = exited.promise
+      let output = ''
+      writer.stdout.on('data', chunk => {
+        output += String(chunk)
+        if (output.includes('READY\n')) ready.resolve()
+        if (output.includes('WROTE\n')) wrote.resolve()
+        if (output.includes('ARMED\n')) armed.resolve()
+        if (output.includes('RELEASED\n')) released.resolve()
+      })
+      writer.once('close', (_code, signal) => { jobs.end(jobId!, signal ? 'killed' : 'completed'); exited.resolve() })
+      writer.once('error', error => { ready.reject(error); wrote.reject(error); armed.reject(error) })
+      return { id: jobId }
+    },
+  })
+  jobs.service.kill.mockImplementation(id => {
+    if (id !== jobId || !writer || !writer.kill()) throw new Error('Cannot stop the tracked writer')
+    return 'requested'
+  })
+  try {
+    const started = await barrier('nested bash dispatch', dispatch(deepest, 'bash'))
+    expect(started).toMatchObject({ isError: false, value: { id: jobId } })
+    await barrier('writer READY', ready.promise)
+    expect(writer!.exitCode).toBeNull()
+    expect(jobs.service.list(deepest)).toEqual([expect.objectContaining({ id: jobId, owner: deepest, status: 'running' })])
+    writer!.stdin.write('WRITE\n')
+    await barrier('writer WRITE acknowledgement', wrote.promise)
+    expect(readFileSync(file, 'utf8')).toBe('before')
+    writer!.stdin.write('ARM\n')
+    await barrier('writer ARM acknowledgement', armed.promise)
+    // The still-live subprocess has an in-flight write waiting for RELEASE; ending the ticket must kill its owning job.
+    runtime.engine.stopTicket(ticket.id)
+    await barrier('subagent teardown', drained.promise)
+    if (writer!.exitCode === null && writer!.signalCode === null && !writer!.killed) {
+      writer!.stdin.write('RELEASE\n')
+      await barrier('writer RELEASE or exit', Promise.race([released.promise, exited.promise]))
+    }
+    expect(readFileSync(file, 'utf8')).toBe('before')
+    await barrier('writer exit', exited.promise)
+    expect(jobs.service.list(deepest)).toEqual([expect.objectContaining({ id: jobId, status: 'killed' })])
+    expect(resultText(await dispatch(sessionId, 'write', { path: file, content: 'after ticket close' }))).toContain('Ticket ended')
+    expect(await runTool(runtime.masterId, 'orchestrator_read', { resource: `ticket/${ticket.id}` }))
+      .toMatchObject({ ticket_id: ticket.id, ended: expect.anything() })
+  } finally {
+    if (writer && writer.exitCode === null && writer.signalCode === null) writer.kill()
+    if (writer) await exited.promise
+  }
+}, 20_000)
+
+it('stops a worker\'s running shell job when its ticket ends', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  const job = jobs.run(sessionId, 'writer')
+  expect(jobs.service.list(sessionId)).toEqual([expect.objectContaining({ id: job, status: 'running' })])
+  runtime.engine.stopTicket(ticket.id)
+  await vi.waitFor(() => expect(jobs.service.list(sessionId)).toEqual([expect.objectContaining({ id: job, status: 'killed' })]))
+  expect(jobs.service.kill).toHaveBeenCalledWith(job, sessionId, expect.any(String))
 })
 
 it('gives an explicit ticket\'s worker a prompt without the limits of an inferred Mandate', async () => {
@@ -1710,38 +2205,57 @@ it('selects its own preset again for a main Session or worker a person switched 
   await expect(presets.select.mock.results[0]!.value).rejects.toMatchObject({ code: 'agent-preset/locked' })
 })
 
-it('gives a subagent of a worker only the worker\'s work tools, and none once the ticket ended', async () => {
+it('restricts a worker\'s subagent to its work tools and none once the ticket ended, leaving other Sessions alone', async () => {
   const { ticket, sessionId } = await acceptedTicket()
   // DSH creates the subagent under the standard preset, with the worker's Session as its parent.
   await (controller.create as (options: { sessionId: string }) => Promise<void>)({ sessionId: 'child-1' })
   const child = agents.get('child-1')! as unknown as { session: { header: { parentSession?: string } } }
   child.session.header = { parentSession: sessionId }
   await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: child } as never)
-  expect(restricts.get('child-1')).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
-  expect(guards.get('child-1')!()).toBeUndefined()
+  const file = join(directory, 'child.txt')
+  expect(await dispatch('child-1', 'write', { path: file, content: 'child' })).toMatchObject({ isError: false })
   runtime.engine.stopTicket(ticket.id)
-  expect(guards.get('child-1')!()).toBe('Ticket ended; new work needs a new authorized ticket')
+  expect(resultText(await dispatch('child-1', 'write', { path: file, content: 'overwrite' }))).toContain('Ticket ended')
+  expect(readFileSync(file, 'utf8')).toBe('child')
   // Another Session's subagent is left as it is.
   await (controller.create as (options: { sessionId: string }) => Promise<void>)({ sessionId: 'child-2' })
   const other = agents.get('child-2')! as unknown as { session: { header: { parentSession?: string } } }
   other.session.header = { parentSession: 'someone-else' }
   await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: other } as never)
-  expect(restricts.get('child-2')).toBeUndefined()
+  const unrelated = join(directory, 'other.txt')
+  expect(await dispatch('child-2', 'write', { path: unrelated, content: 'other' })).toMatchObject({ isError: false })
+  expect(readFileSync(unrelated, 'utf8')).toBe('other')
 })
 
-it('gives a subagent of a worker\'s subagent the same work tools and guard', async () => {
+it('lets a worker and its subagent use the Context7 docs MCP tools, not a messaging MCP tool, and guards both once the ticket ends', async () => {
   const { ticket, sessionId } = await acceptedTicket()
+  // The Hub may inspect and coordinate, but no MCP tool, so a messaging server cannot bypass orchestrator_reply.
+  expect(registered(runtime.masterId, 'mcp__feishu__send_message')).toBeUndefined()
+  // DSH creates the subagent under the standard preset, with the worker's Session as its parent.
   const create = controller.create as (options: { sessionId: string }) => Promise<void>
-  const created = (runtime as unknown as { ctx: Context }).ctx
-  for (const [id, parent] of [['child-1', sessionId], ['grandchild-1', 'child-1']] as const) {
-    await create({ sessionId: id })
-    const agent = agents.get(id)! as unknown as { session: { header: { parentSession?: string } } }
-    agent.session.header = { parentSession: parent }
-    await created.parallel('agent/created', { agent } as never)
+  await create({ sessionId: 'mcp-child' })
+  const child = agents.get('mcp-child')! as unknown as { session: { header: { parentSession?: string } } }
+  child.session.header = { parentSession: sessionId }
+  // The Service keeps its Cordis context private; tests drive it to announce the host-created child.
+  const host = (runtime as unknown as { ctx: Context }).ctx
+  await host.parallel('agent/created', { agent: child } as never)
+  const docs = { libraryId: '/vitest-dev/vitest', query: 'fake timers' }
+  for (const session of [sessionId, 'mcp-child']) {
+    expect(await dispatch(session, 'mcp__context7__resolve-library-id', { libraryName: 'vitest', query: 'fake timers' }))
+      .toMatchObject({ isError: false, value: { called: 'mcp__context7__resolve-library-id' } })
+    expect(await dispatch(session, 'mcp__context7__query-docs', docs))
+      .toMatchObject({ isError: false, value: { called: 'mcp__context7__query-docs' } })
+    const sent = await dispatch(session, 'mcp__feishu__send_message', { text: 'bypass the Hub' })
+    expect(sent.isError, session).toBe(true)
+    expect(resultText(sent), session).toMatch(/unknown tool/i)
   }
-  expect(restricts.get('grandchild-1')).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
   runtime.engine.stopTicket(ticket.id)
-  expect(guards.get('grandchild-1')!()).toBe('Ticket ended; new work needs a new authorized ticket')
+  // Both the worker and its descendant are guarded on the Context7 tools too, not only on the file tools.
+  for (const session of [sessionId, 'mcp-child']) {
+    const ended = await dispatch(session, 'mcp__context7__query-docs', docs)
+    expect(ended.isError, session).toBe(true)
+    expect(resultText(ended), session).toContain('Ticket ended; new work needs a new authorized ticket')
+  }
 })
 
 it('gives the Assignment a restart starts the messages the replaced one had delivered but no step took, once', async () => {
@@ -1770,7 +2284,7 @@ it('ends the main Session\'s prompt with its Policy section, each rule on one li
   expect(policy.trimEnd().split('\n').slice(2)).toEqual(runtime.store.settings().policy.rules.filter(rule => rule.enabled)
     .map(rule => rule.id === 'copy' ? '- Copy fixes (copy): Fix typos. - Keep the tone. ## Not a heading' : `- ${rule.name} (${rule.id}): ${rule.instruction}`))
   expect(prompt.indexOf('## Policy')).toBeGreaterThan(prompt.indexOf('Execution environment'))
-  expect((tools.get(runtime.masterId)!.get('orchestrator_eval') as unknown as { description: string }).description).not.toMatch(/rules/)
+  expect(registered(runtime.masterId, 'orchestrator_eval')!.description).not.toMatch(/rules/)
 })
 
 it('keeps the Policy the main Session judges by in its prompt, after admission and the rest, as the latest save left it', async () => {

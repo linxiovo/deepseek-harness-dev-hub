@@ -39,7 +39,7 @@ interface Skill { name: string; description: string; content: string }
  */
 const BUDGET: Record<Role, number> = { orchestrator: 60_000, worker: 40_500 }
 const PROMPTS = 'prompts/, skills/', TOOLS = 'src/app/tools/', SESSIONS = 'src/app/sessions.ts'
-const NOTICES = 'src/app/notices.ts', LINKS = 'src/app/links.ts', ASSESSMENT = 'src/app/assessment.ts'
+const NOTICES = 'src/app/notices.ts', LINKS = 'src/app/links.ts'
 const EXECUTOR = 'src/executor/dsh.ts', ERRORS = 'src/core/errors.ts'
 const TICKETS = 'src/core/tickets.ts', ASSIGNMENTS = 'src/core/assignments.ts'
 /** Regex patterns compiled from `orchestrator_read` resource templates (`<…>` matches one path segment; `…` matches the rest). */
@@ -96,6 +96,8 @@ async function start() {
     return { done: Promise.resolve({ exitCode: 0, signal: null }), collected }
   } }
   const agents = new Map<string, { status: string }>()
+  // DSH's agents service lists the Sessions still loaded.
+  Object.assign(agents, { list: () => [...agents.values()] })
   const tools = new Map<string, Map<string, Tool>>()
   const sections = new Map<string, Section>()
   const skills = new Map<string, Skill[]>()

@@ -1,23 +1,21 @@
-/** Executor Session tools for reading ticket context, acknowledging requests, managing threads, handing back out-of-scope triggers, and reporting status. */
+/** Executor Session tools for reading ticket context, taking requests up internally, managing threads, handing back out-of-scope triggers, and reporting status. */
 import { z } from 'zod'
 import { liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
-import { IM_WORDS } from '../../infra/text.ts'
 import { claimPull, readPull } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
 import { readResource, type ResourceHost } from '../resources.ts'
 import type { Store } from '../store.ts'
 import { reportRelay, threadFollowedNotice } from '../notices.ts'
 import type { Sessions } from '../sessions.ts'
-import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
+import { readTool, tool, type Tool } from './tool.ts'
 
 export interface ExecutorToolsHost {
-  readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext'>
-  readonly store: Pick<Store, 'tickets' | 'replyStatus' | 'atomic'>
+  readonly engine: Pick<EngineForExecutor, 'report' | 'takeUp' | 'markUnrelated' | 'handback' | 'followForContext'>
+  readonly store: Pick<Store, 'tickets' | 'atomic'>
   readonly sessions: Pick<Sessions, 'relay' | 'notify'>
   readonly resources: ResourceHost
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
-  sendReplies(): Promise<void>
 }
 
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
@@ -27,15 +25,13 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
     tool({
       name: 'orchestrator_ack',
-      description: 'Acknowledge one original human request before substantial work, as the replies section says; it posts as a reply to that message.',
+      description: 'Record that you take this human request up as work within this ticket, before substantial work, as the replies section says; the record stays internal and sends nothing to the person.',
       schema: z.object({
-        trigger_id: z.string(),
-        text: AcknowledgementSchema.describe(`At most ${IM_WORDS} words; Markdown is supported.`),
+        trigger_id: z.string().describe('The trigger_id of the original human message, which must have reached this ticket.'),
       }).strict(),
       execute: async args => {
-        const reply = host.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: args.trigger_id, text: args.text })
-        if (reply.status !== 'sent') await host.sendReplies()
-        return { trigger_id: args.trigger_id, acknowledgement: host.store.replyStatus(reply.id)!, reused: reply.reused }
+        const takeUp = host.engine.takeUp(ticketId, args.trigger_id)
+        return { trigger_id: args.trigger_id, taken_up: true, reused: takeUp.reused }
       },
     }),
     tool({

@@ -57,42 +57,31 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 /**
- * The DSH tools an Executor Session works with: files, search, the shell and its jobs, the web, skills, its todo list and
- * subagents. It gets no other tool the profile has, whenever it was registered: none that asks or shows a person something,
- * changes the profile, schedules work or starts goals outside the worker slots, the pause and a person's hold, starts or
- * messages other Sessions, or edits documents.
+ * The DSH tools the main Session inherits from its read-only router preset: inspection only. Its own orchestrator_* tools
+ * are registered on its scope, which `tools.restrict` does not mask, so reading tickets and resources, evaluating candidates,
+ * routing, replying, requesting status and relaying summaries stay available.
  */
-const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
-  'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
+const HUB_TOOLS = ['skill', 'read', 'read_image', 'glob', 'grep']
 /** Only read-only DSH capabilities and explicit specification tools are usable by a planner. */
 const PLANNER_TOOLS: readonly string[] = ['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch', 'skill']
 const SHARED_HOST_TOOLS: readonly string[] = ['orchestrator_read']
 const PLANNER_HOST_TOOLS: readonly string[] = ['orchestrator_spec_question', 'orchestrator_spec_publish']
 const PLANNER_INACTIVE = promptFile('planner-inactive'), PLANNER_DENIED = promptFile('planner-denied')
-/** What the main Session is told when it would wait: what it waits for comes to it, and a waiting step holds back the next. */
-const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job\'s end with its output arrive by themselves as messages; '
-  + 'end the turn instead of waiting for them.'
-/** What a main Session under `standard` is told when its command would wait the shell's default. */
-const DEFAULT_WAIT = 'This shell waits up to 60 seconds by default: pass timeoutMs of at most 30000, or run_in_background, '
-  + 'as a waiting step holds back new candidates.'
-/** `sleep` at a command position: the start, after ; & | ( { ! ` or a newline, or after a keyword or a command that runs it. */
-const SLEEP = /(?:^|[;&|({!`\n]|\b(?:do|then|else|elif|if|while|until|time|exec|nohup|command|env)\s)\s*(?:\S*\/)?sleep\b/
 /**
- * The main Session's guard: it refuses a bash command that runs sleep or asks to hold the step longer than 30 seconds, and a
- * job wait longer than 5 seconds. Under `standard`, as a main Session created before the router preset runs, the shell holds
- * a command 60 seconds and a job wait lasts 30 seconds by default, so a command needs a timeout or the background, and a
- * job wait its timeout; the router preset ends both after 5 seconds.
+ * The DSH tools an Executor Session works with: files, search, the shell and its jobs, the web, skills, its todo list and
+ * subagents. It gets no other DSH tool the profile has, whenever it was registered: none that asks or shows a person
+ * something, changes the profile, schedules work or starts goals outside the worker slots, the pause and a person's hold,
+ * starts or messages other Sessions, or edits documents. Its only MCP tools are the Context7 documentation lookups below.
  */
-function noWait({ name, arguments: input }: { name: string; arguments: unknown }, routed: () => boolean): string | undefined {
-  const args = (input ?? {}) as { command?: unknown; timeoutMs?: unknown; run_in_background?: unknown; wait?: unknown; timeout_ms?: unknown }
-  if (name === 'bash') {
-    const sleeps = typeof args.command === 'string' && SLEEP.test(args.command)
-    if (sleeps || typeof args.timeoutMs === 'number' && args.timeoutMs > 30_000) return NO_WAIT
-    if (args.timeoutMs === undefined && args.run_in_background !== true && !routed()) return DEFAULT_WAIT
-  }
-  if (name === 'job_output' && args.wait === true && (typeof args.timeout_ms === 'number' ? args.timeout_ms > 5_000 : !routed())) return NO_WAIT
-  return undefined
-}
+const WORK_TOOLS = ['read', 'write', 'edit', 'apply_patch', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list',
+  'job_kill', 'web_search', 'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents',
+  'interrupt_agent']
+/**
+ * The MCP tools an Executor Session may use, by the exact `mcp__<server>__<tool>` names Context7 registers: its read-only
+ * documentation lookups. Messaging and other MCP servers stay out, so a Worker cannot send a person a message directly and
+ * bypass the Hub. DSH's tool schema has no server or policy metadata, so the development server is named explicitly.
+ */
+const DEV_MCP_TOOLS = ['mcp__context7__resolve-library-id', 'mcp__context7__query-docs']
 
 /**
  * Creates and decorates orchestrator and worker DSH `Agent` sessions with role models, system prompt sections from `Prompts`, runtime skills, and restricted tool sets.
@@ -116,6 +105,13 @@ export class Sessions {
   /** Subscribes to host agent and session events so newly created sessions are decorated and model-budget retries are reflected in health. Call once at startup. */
   install(): void {
     const ctx = this.ctx
+    // A plugin restart while Sessions are live must protect them too, not only those announced after this listener.
+    const live = ctx.agents.list()
+    for (const agent of live) {
+      void this.decorate(agent).catch((error: unknown) => {
+        ctx.logger.warn('dsh-superagent could not decorate a live Session: %s', String(error))
+      })
+    }
     ctx.on('agent/disposed', ({ agent }) => {
       this.release(agent)
       this.retryHealth.clear(agent.id); this.updateModelHealth()
@@ -249,10 +245,20 @@ export class Sessions {
     const master = agent.id === host.masterId
     const plannerId = master ? undefined : plannerHandoffId(agent.id)
     const ticket = master || plannerId ? undefined : this.ticketOf(agent)
-    if (!master && !plannerId && !ticket) { this.limitSubagent(agent); return }
+    if (!master && !plannerId && !ticket) { await this.limitSubagent(agent); return }
     const role: PromptRole = master ? 'orchestrator' : plannerId ? 'planner' : 'worker'
     const binding: SessionBinding = { disposers: [], role }
     this.bindings.set(agent, binding)
+    if (master) {
+      // The router preset omits the shell, jobs and every write tool; restrict the inherited surface too, so a profile that
+      // still mounts one cannot hand it to the Hub. The Hub's own orchestrator_* tools are scoped registrations and stay.
+      binding.disposers.push(agent.ctx.tools.restrict({ allow: HUB_TOOLS }))
+    } else if (plannerId) {
+      binding.disposers.push(...this.plannerOnly(agent, plannerId))
+    } else {
+      // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
+      binding.disposers.push(...this.workOnly(agent, ticket!.id))
+    }
     this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
     if (agent.status === 'idle') this.retryHealth.clear(agent.id)
     this.updateModelHealth()
@@ -279,28 +285,6 @@ export class Sessions {
         : PLANNER_HOST_TOOLS.includes(tool.name)) continue
       register(tool.name, tool.description, tool.schema, tool.execute)
     }
-    if (master) {
-      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
-        agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
-    } else if (plannerId) {
-      binding.disposers.push(...this.plannerOnly(agent, plannerId))
-    } else {
-      // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
-      binding.disposers.push(...this.workOnly(agent, ticket!.id))
-    }
-  }
-  /**
-   * Whether a Session runs the router preset: as DSH's preset registry last selected it, read through the session projection
-   * on a DSH whose registry has no `presetForSession`, else as it was created; `standard`, the safer caps, when unreadable.
-   */
-  private routed(agent: Agent): boolean {
-    try {
-      const presets = this.ctx.get('agentPresets') as { presetForSession?: (session: Agent['session']) => string | null } | undefined
-      const projections = this.ctx.get('sessionProjections') as { stateOf?: (session: Agent['session'], key: string) => unknown } | undefined
-      const selected = typeof presets?.presetForSession === 'function' ? presets.presetForSession(agent.session)
-        : projections?.stateOf?.(agent.session, 'agentPreset')
-      return (selected ?? agent.session.header.agentPreset) === ROUTER_PRESET
-    } catch { return false }
   }
   /** Restrict every planner turn to read-only tools and its own handoff tools, including restored Sessions. */
   private plannerOnly(agent: Agent, handoffId: string): (() => void)[] {
@@ -312,34 +296,56 @@ export class Sessions {
     })]
   }
   /**
-   * An Executor Session's tools: only the profile's work tools, which DSH requires to be known, and none once its ticket
-   * ended. A failed or blocked worker keeps its tools, so a person may continue it in its Session; only automated input waits
-   * (see the executor). Read inherited tools through the parent scope, which includes the preset's tools. The global view
-   * misses preset tools; the agent's own view also includes local tools such as subagent, which restrict refuses to name.
+   * An Executor Session's tools: only the profile's work tools, the Context7 documentation MCP tools its preset mounts, and
+   * none once its ticket ended. A failed or blocked worker keeps its tools, so a person may continue it in its Session; only
+   * automated input waits (see the executor). Read inherited tools through the parent scope, which includes the preset's
+   * tools. The global view misses preset tools; the agent's own view also includes local tools such as subagent, which
+   * restrict refuses to name.
    */
   private workOnly(agent: Agent, ticketId: string): (() => void)[] {
     const store = this.host.store
     const parent = scopeParentOf(agent)
-    const allow = WORK_TOOLS.filter(name => agent.ctx.tools.get(name, parent))
+    const allow = [...WORK_TOOLS, ...DEV_MCP_TOOLS].filter(name => agent.ctx.tools.get(name, parent))
     return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
       const current = store.tickets.get(ticketId)
       return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : undefined
     })]
   }
   /**
+   * The ticket a Session belongs to, following `parentSession` from any depth. A loaded ancestor's session header answers;
+   * an ancestor that is not loaded is inspected in persistence, so a reloaded or created child is protected even when an
+   * intermediate Session is no longer live. A cycle or a chain proven not to reach a worker ends the search; an inspection
+   * failure does not prove non-ownership and must leave the Session guarded.
+   */
+  private async owningTicket(agent: Agent): Promise<string | undefined> {
+    const seen = new Set<string>()
+    let parent = agent.session.header.parentSession
+    while (parent !== undefined && !seen.has(parent)) {
+      seen.add(parent)
+      const ticketId = ticketOfSession(parent)
+      if (ticketId !== undefined) return ticketId
+      const loaded = this.ctx.agents.get(parent)
+      if (loaded) { parent = loaded.session.header.parentSession; continue }
+      parent = (await this.ctx.sessionController.inspect(parent)).meta?.parentSession
+    }
+    return undefined
+  }
+  /**
    * A subagent of an Executor Session, or of one of its subagents, which runs under DSH's `standard` preset with the worker's
    * permissions, gets the same work tools as the worker, and none once the worker's ticket ended. Any other agent is left as
    * it is.
    */
-  private limitSubagent(agent: Agent): void {
-    let parent = agent.session.header.parentSession
-    // Up the subagents' parents to the worker, which are loaded while their subagents run.
-    for (let depth = 0; parent !== undefined && ticketOfSession(parent) === undefined && depth < 8; depth++) {
-      parent = this.ctx.agents.get(parent)?.session.header.parentSession
-    }
-    const ticketId = parent === undefined ? undefined : ticketOfSession(parent)
-    if (ticketId === undefined || !this.host.store.tickets.get(ticketId)) return
-    this.bindings.set(agent, { disposers: this.workOnly(agent, ticketId), subagent: true })
+  private async limitSubagent(agent: Agent): Promise<void> {
+    if (agent.session.header.parentSession === undefined) return
+    // A live Session reloaded on startup can invoke tools while persistence resolves an unloaded parent.
+    const pending: SessionBinding = { disposers: [agent.ctx.tools.guard(() => 'Worker ancestry is being resolved; work tools are temporarily unavailable')], subagent: true }
+    this.bindings.set(agent, pending)
+    const ticketId = await this.owningTicket(agent)
+    if (this.bindings.get(agent) !== pending || this.host.closing()) return
+    if (ticketId === undefined) { this.release(agent); return }
+    // Install the ticket guard before lifting the temporary one; an inspection error leaves the latter in place.
+    pending.disposers.push(...this.workOnly(agent, ticketId))
+    pending.disposers.shift()!()
   }
   /** Register the skills of a prompt version in the agent's skill scope, in place of an earlier version's. */
   private bindSkills(binding: SessionBinding, version: PromptVersion): void {

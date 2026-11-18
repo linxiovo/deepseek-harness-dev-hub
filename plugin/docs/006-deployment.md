@@ -16,7 +16,7 @@ The bundle defines `dsh-superagent-worker` for Executors and `dsh-superagent-rou
 
 Opening a blank managed Session in the Web UI can select the profile's default preset. dsh-superagent restores its role-specific preset before the first turn.
 
-Both presets run with `danger-full-access` as the operator's OS user and read messages from subscribed Threads. Account wrappers choose the agent's credentials by default; they do not isolate the process. A worker can execute programs by path and read the operator's home directory. For isolation, use a dedicated OS account containing only the agent's credentials.
+Both presets run with `danger-full-access` as the operator's OS user and read messages from subscribed Threads. Account wrappers choose the agent's credentials, and the worker's command shims refuse the ordinary human-facing send commands by name, but neither isolates the process: a worker can run an installed CLI by absolute path, post over HTTP with another credential, and read the operator's home directory. dsh-superagent provides no container, no network isolation and no separate OS user; workers need the network for dependency installs and for the two read-only Context7 MCP tools they may use. Use a dedicated OS account containing only the agent's credentials if you want process isolation; it is optional operator hardening, not part of the agent boundary.
 
 ## Prerequisites
 
@@ -172,7 +172,7 @@ Setup must succeed before polling or work starts. Overview lists missing require
    git -C /home/me/src/widgets worktree add -b "agent/$DSH_SUPERAGENT_NAME" "$DSH_SUPERAGENT_DIR" "refs/dsh-superagent/$DSH_SUPERAGENT_TICKET"
    ```
 
-   List personal CLIs, such as one signed in to your own account, as blocked commands.
+   List personal CLIs, such as one signed in to your own account, as blocked commands. A blocked name fails only when called by that name; an absolute path still runs.
 4. **Prompts.** Set the team sections: the GitHub disclosure line, review bots, the commit author and the auto-merge condition.
 
 ### Management API
@@ -240,7 +240,7 @@ Setup verifies the GitHub repository and the agent's push access, writes the wor
 
 The process environment that setup writes:
 
-- **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's CLI; `lark-cli` runs the bot's CLI; blocked commands fail. A shim removes its own directory from `PATH` before it runs its target.
+- **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's CLI; `lark-cli` runs the bot's CLI; blocked commands fail. The forwarding shim removes its own directory from `PATH` before running its target to avoid wrapper recursion. The CLI policy, platform entry points and limits are specified in `010-session-boundaries.md`.
 - **git configuration** in `<stateDir>/worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
 
 A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
@@ -262,7 +262,14 @@ A database migrated by a newer version cannot be opened by an older one. Rollbac
 
 ### Agent presets
 
-The worker and router presets move shell commands to the background after 5 seconds. A Session cannot load without its preset. Keep the `dsh-superagent-worker` and `dsh-superagent-router` rows in `cordis.patch.yml` while their Sessions are in use; otherwise resume fails with `agent-preset/not-found`.
+The worker preset moves shell commands to the background after 5 seconds; the router preset has no shell, background jobs or write tools. A Session cannot load without its preset. Keep the `dsh-superagent-worker` and `dsh-superagent-router` rows in `cordis.patch.yml` while their Sessions are in use; otherwise resume fails with `agent-preset/not-found`.
+
+## Verification
+
+Run `pnpm -C plugin verify:linux` from the repository root (`pnpm verify:linux` inside `plugin/`, passing script flags after `--`, or `node scripts/verify-linux.mjs --help` for all options) to execute `pnpm install --frozen-lockfile && pnpm check` on a committed Linux snapshot, natively or through WSL from Windows.
+
+- **Committed snapshot and Linux/WSL isolation.** The script resolves `HEAD` from its own repository checkout (clearing inherited Git location variables so the caller's working directory cannot select another worktree) and exports only committed `DOCS.md` and `plugin/` into an isolated Linux `mktemp -d` directory, never reading uncommitted changes, untracked files or Windows `node_modules`. On Windows, it invokes `wsl.exe` directly (`WSL_UTF8=1`) and requires native Linux `node` and `pnpm` (or native `corepack` / explicit Linux `--pnpm` path): if `PATH` resolves a Windows tool (such as `/mnt/<drive>/...` or `.exe`/`.cmd`/`.bat`) first, preflight fails immediately rather than falling back silently.
+- **Evidence, failure and cleanup.** Each run writes a separate directory under `plugin/.artifacts/verify/` containing full per-stage logs and `manifest.json` (recording CI identity, environment versions, stage exit status and snapshot cleanup), and prints a concise summary to standard output. Any failed stage stops subsequent stages and exits non-zero while preserving the logs and manifest; cleanup deletes the temporary Linux snapshot after the run and fails non-zero (marking the snapshot uncleaned in the manifest and summary) if removal fails.
 
 ## Troubleshooting
 

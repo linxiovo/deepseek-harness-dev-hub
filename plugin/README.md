@@ -18,18 +18,7 @@ It asks one short question at a time, shows the full plan once, and then install
 
 ## Documentation
 
-Read the numbered documents in order; each builds only on the ones before it.
-
-- [000 Philosophy](docs/000-philosophy.md)
-- [001 Domain model](docs/001-domain.md)
-- [002 Authorization](docs/002-authorization.md)
-- [003 Execution](docs/003-execution.md)
-- [004 Prompts](docs/004-prompts.md)
-- [005 Panel](docs/005-panel.md)
-- [006 Deployment](docs/006-deployment.md): manual setup, configuration, upgrades and troubleshooting
-- [007 Architecture](docs/007-architecture.md)
-- [008 Cookbook](docs/008-cookbook.md): adding a Source
-- [009 Handoff](docs/009-handoff.md): a confirmed Harness handoff, the read-only planner session and the published spec
+Read the documents through [DOCS.md](DOCS.md), which routes this module's source and numbered-document leaves; each numbered document builds only on the ones before it.
 
 ## Development
 

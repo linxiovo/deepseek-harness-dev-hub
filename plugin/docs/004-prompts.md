@@ -34,7 +34,7 @@ The generated sections are editable templates. They must retain these placeholde
 - `runtime/policy`: `{version}`, `{mode}` and `{rules}`, with one line per enabled rule.
 - `runtime/policy/none`: `{version}` and `{mode}`, used when no rule is enabled.
 
-Editing a part changes the instructions the model receives. It does not change the gate, Mandates, tool checks or account wrappers, which remain enforced by code.
+Editing a part changes the instructions the model receives. It does not change the gate, Mandates, tool checks, channel delivery or account wrappers, which remain enforced by code; the host also queues the acknowledgement an accept carries, pull-request end notices and Source notices itself. The Hub's tool set is such a fact; `plugin/docs/010-session-boundaries.md` records the boundary and the code that enforces it, and no prompt section creates or widens it. A rule stated only in prompt text, such as a worker's duty not to reach a person itself, is behavior, not enforcement.
 
 On an explicit human request, the main Session can also save overrides with `orchestrator_prompts_save`. If a save omits an override's `base`, it keeps the saved base. A removed part already present in the saved configuration is dropped on save; any other unknown part is refused.
 
@@ -56,6 +56,8 @@ The system prompt is assembled in this order:
 8. `runtime/policy`, for the main Session only.
 
 Admission instructions come from `prompts/admission.md`. They describe proactive assessment and when an irrelevant candidate can be ignored from its card. `orchestrator_eval` returns context rather than repeating these instructions.
+
+Built-in files under `prompts/` and `skills/` are loaded by `src/app/skill-files.ts`: `promptFile` normalizes line endings, joins lines within each paragraph with spaces (so source files stay one sentence per line without changing rendered prompt length), and preserves blank-line paragraph breaks; `bundledSkills` parses the frontmatter and body of each built-in `SKILL.md`. Two test suites enforce prompt budgets: `tests/cards.spec.ts` caps each role's own instructions (`masterPrompt` and `workerPrompt`), and `tests/model-surface.spec.ts` caps each role's combined composed system prompt and registered tool schemas.
 
 The environment section gives the main Session deployment-wide values and each Executor its Ticket-specific values. The Policy section is regenerated from settings on every model request. It contains the Policy version, accept mode, the explicit-request exemption, and enabled rules as `- <name> (<id>): <instruction>`, or a statement that none is enabled. It is last so a Policy change leaves the preceding prompt text unchanged.
 
@@ -79,19 +81,19 @@ From strongest to weakest:
 
 These apply [000 Philosophy](000-philosophy.md) to the agents:
 
-- **Separate roles.** The main Session only routes: it forwards the original Trigger and the routing facts, and makes no technical decisions, through one routing tool that takes the decisions on several waiting candidates in one call. A routing note has at most 30 words. The Executor reads the original sources, judges the scope, implements and verifies.
-- **The main Session does not wait.** Reports, follow-up notices, candidates and completed background jobs arrive automatically as messages. It ends the turn when nothing remains to do. A guard refuses `sleep`, shell timeouts over 30 seconds and job waits over 5 seconds, because a blocked step delays new candidates. These instructions replace DeepSeek Harness's own job-notification note in the main Session's complete prompt.
+- **Separate roles.** The main Session coordinates and inspects state and evidence for routing: it forwards the original Trigger and the routing facts, and makes no technical decisions, through one routing tool that takes the decisions on several waiting candidates in one call. A routing note has at most 30 words. The Executor reads the original sources, judges the scope, implements and verifies.
+- **The main Session coordinates without executing.** It has no shell, background job or file-write tool; it inspects, routes, assigns and relays only through the tools `plugin/docs/010-session-boundaries.md` lists. Reports, follow-up notices, candidates and completed work arrive automatically as messages, and it ends the turn when nothing remains. The preset and `tools.restrict` enforce the missing tools at invocation; this text only describes how to work within them.
 - **Message only when a person must act or can use a result:** a result can be reviewed or used, a decision or resource is needed, or the work cannot be finished. Chat messages are one sentence by default, with a hard limit of 100 words.
-- **Executors decide their follow-ups.** Each Executor handles and acknowledges in-scope requests, and hands back requests beyond its Ticket or for another Ticket. A message becomes new work only after all its owners hand it back or end without taking it up. The main Session receives follow-up notices but may act on them only to stop work. Handed-back messages then arrive as candidates with the Executors' reasons.
+- **Executors decide their follow-ups.** Each Executor handles and takes up in-scope requests, and hands back requests beyond its Ticket or for another Ticket. A message becomes new work only after all its owners hand it back or end without taking it up. The main Session receives follow-up notices but may act on them only to stop work. Handed-back messages then arrive as candidates with the Executors' reasons.
 - **Coordinate through subscriptions and the main Session.** An Executor follows related Threads for context. The main Session can send a fact from another Ticket in a note of at most 100 words. Neither the Subscription nor the note grants authority.
 - **Attach only on an explicit reference.** A message must point to a Ticket's pull request, Issue, source message or acknowledgement, or to a recent change with exactly one matching Ticket. Topic similarity alone is not enough. Attachment subscribes the Ticket to the entire Thread; an Executor finding it unrelated uses `orchestrator_thread_unrelated` and does not answer there.
-- **Confirm concretely, once.** Before substantial work, the Executor confirms each new request and names the object and the expected result, as a reply under the original message.
+- **Take a request up once, internally.** Before substantial work, the Executor calls `orchestrator_ack` with the request's trigger. This records an internal take-up and sends nothing; calling it again reuses the record. The host automatically queues the acknowledgement an accept carries. The main Session sends later answers, results and attention messages through `orchestrator_reply`; a Worker's take-up or report queues no Channel message directly.
 - **Ask through `human_action`.** The Executor puts one concrete question in its Report, and the main Session forwards it unchanged. If a person's message prompted the question, it names that message and the host asks there. Otherwise it asks in the Ticket's original conversation. Already authorized work can continue meanwhile.
 - **Honest delivery.** Opening a pull request is not readiness; a draft is marked unfinished; a UI change without a real before screenshot is not ready.
 - **A person's pause holds** across follow-ups, new Executor Sessions and restarts until a person lifts it. Automatic feedback never resumes paused work.
 - **Examples only show format.** An example sentence is not a fact the agent may claim.
 - **Handle reviews by outcome.** A fixed and verified comment is resolved silently; a declined one gets one sentence of reason. An automated reviewer's thread is resolved once it has an answer, and each automated reviewer gets at most three rounds per pull request.
-- **Yield to duplicate work.** When a person's branch or pull request already contains the Ticket's change, the Executor closes its own pull request with one sentence pointing to theirs.
+- **Yield to duplicate work.** When a person's branch or pull request already contains the Ticket's change, the Executor closes its own pull request with `gh` immediately and attaches no comment; it reports the reason through `orchestrator_report`, naming theirs, and sends no other message. The Hub routes the report only where the existing delivery rules allow. Work that is merely related, or does not contain the Ticket's change, is not a reason to close.
 
 ## Versions
 

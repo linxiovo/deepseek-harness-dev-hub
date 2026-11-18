@@ -215,6 +215,8 @@ A check passes only when the workflow run and the job both completed with `succe
 
 `satisfied` requires every configured job to pass. The GitHub Source's explicit `requiredChecks` list supplies the exact names; the provider returns `required_checks_unconfigured` without querying Actions when the list is empty. It does not infer checks from branch protection or PR state and does not replace `pullChecks`, the Source's existing polling for Trigger events. See [development checks](006-deployment.md#development-checks) for this repository's required Windows and Ubuntu jobs.
 
+For live verification, use the private [isolated fixture PR](https://github.com/linxiovo/deepseek-harness-actions-evidence-test/pull/1) and its [Actions run](https://github.com/linxiovo/deepseek-harness-actions-evidence-test/actions/runs/44128511139). With a `gh` account that can read the fixture, query `actions/runs` with the PR head SHA (`ae03511396978eb5a198ce845e23cb5fef270ded`), then read the run's attempt jobs and artifacts. The `check` job reports the PR head; the artifact name and its `commit.txt` identify the built merge commit. Download it with `gh run download 44128511139 -R linxiovo/deepseek-harness-actions-evidence-test` from an empty directory. These are real GitHub API queries and an actual artifact download, separate from `tests/actions-evidence.spec.ts`, which uses simulated REST responses and neither contacts GitHub nor downloads artifacts.
+
 ### DshExecutor
 
 `DshExecutor` (`src/executor/dsh.ts`) provides one Session and one verified Git worktree per Ticket. `start` and `deliver` enqueue `launch` and `delivery` effects. `stop` cancels the turn through `Store.afterCommit`, so a rolled-back end does not stop the worker.
@@ -308,6 +310,9 @@ Validation: `tests/session-meter.spec.ts` covers the read seam (absent vs corrup
 
 - **Explicit, narrow dependencies.** Each class receives an interface that names what it uses, mostly as `Pick` types of other classes: `ExecutorHost`, `AssessorHost`, `SessionsHost`, `SettingsHost`, `SetupHost`, `PassesHost` and `OutboxHost` for the core classes, and `HttpHost`, `MainToolsHost`, `ExecutorToolsHost`, `ResourceHost`, `LinkHost` and `SourceContextDeps` for the glue, with the Engine as the `Pick` of the role that calls it. The Runtime passes itself only behind such an interface. A Source plugin injects the `orchestrator` service, which its type names as a `SourceHost`: the registry and `context(kind)`; its kind's code sees only its `SourceContext`.
 - **What may import what.** `src/core` imports nothing outside itself apart from Node's hashing, and does no I/O. `src/sources` imports nothing from `src/app`. The panel imports only types from the host side, and the plain values of `src/admission.ts`, `src/limits.ts`, `src/setup.ts`, `src/navigation.ts`, `src/sources/host.ts`, `src/core/errors.ts`, `src/core/reasons.ts` and the filter lists of `src/app/api.ts`.
+
+  `scripts/check-core-imports.mjs` runs first in `pnpm check` as `check:core`. It parses TypeScript module references and allows only relative paths that stay inside `src/core` and the `node:crypto` hashing exception. Runtime `import()` is disallowed even for those targets. See `tests/core-imports.spec.ts` for the command's boundary cases.
+
 - **One writer per state.** Each kind of state has one writer, and the others read it or ask that writer.
 
   | State | Writer |
@@ -469,13 +474,14 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | Test | Covers |
 | --- | --- |
 | `tests/core-engine.spec.ts` | Domain rules on in-memory repositories: receiving, Eval, fan-out, resume and stop, interrupted Assignments, the pause, Policy changes, reports and outcomes, attaching, replies, take-up, failed deliveries and dismissed problems |
+| `tests/core-imports.spec.ts` | The core boundary command: internal paths and `node:crypto` pass; paths escaping core, other built-ins, packages, and dynamic `import()` fail; type imports, re-exports and `require` are also checked |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, cross-platform Feishu event consumer launch and cancellation, health |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
-| `tests/actions-evidence.spec.ts` | GitHub Actions evidence at the REST seam: candidate-SHA runs, PR provenance matching (`number`, `head.sha`, `base.sha`) and `mergeSha` context, workflow and job `success` gates, queued/waiting runs without jobs vs `not_run`, run and job URLs, downloadable artifact references, stale SHAs, newer attempts, an empty required set and paginated lists |
+| `tests/actions-evidence.spec.ts` | Simulated GitHub REST responses: candidate-SHA runs, PR provenance matching (`number`, `head.sha`, `base.sha`) and `mergeSha` context, workflow and job `success` gates, queued/waiting runs without jobs vs `not_run`, run and job URLs, artifact references, stale SHAs, newer attempts, an empty required set and paginated lists |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, a host that stops, and bounded subagent release |

@@ -13,3 +13,7 @@ coverage/
 .env
 .env.*
 !.env.example
+/.omp/
+
+# 本地辅助工作树
+/worktrees/

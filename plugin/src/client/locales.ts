@@ -477,6 +477,7 @@ const TEXT = {
   'promptPart.skill/feishu': ['飞书技能', 'Feishu skill'],
   'promptPart.skill/github': ['GitHub 技能', 'GitHub skill'],
   'promptPart.skill/to-spec': ['转规格技能', 'To-spec skill'],
+  'promptPart.skill/doc-tree': ['文档树技能', 'Doc Tree skill'],
   'promptPart.runtime/environment': ['执行环境', 'Execution environment'],
   promptViewEdit: ['编辑', 'Edit'],
   promptViewFull: ['完整提示词', 'Full prompt'],

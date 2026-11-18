@@ -131,7 +131,7 @@ export class Runtime extends Service implements SourceHost {
         closing: () => this.closing(), environment, plannerActive: id => handoffs.isPlanning(id),
         workerAuthorized: (ticketId, sessionId) => runtime.executor?.writerAuthorized(ticketId, sessionId) === true,
         tools: (agent, ticket, role) => role === 'planner' ? plannerTools(this.toolHost, agent)
-          : ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent) })
+          : ticket ? executorTools(this.toolHost, ticket, agent.id) : mainTools(this.toolHost, agent) })
       this.planning = new Planning({ handoffs, effects, sessions, paused: () => this.paused(), closing: () => this.closing() })
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
@@ -171,7 +171,7 @@ export class Runtime extends Service implements SourceHost {
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
-      this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources, handoffs,
+      this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, settings: this.settings, assessor, resources, handoffs,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }

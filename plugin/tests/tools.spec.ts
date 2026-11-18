@@ -1,5 +1,7 @@
 /** Session tool registration, role-scoped resource reads, and routing/settings tool contracts. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { TICKET_STATES } from '../src/app/cards.ts'
 import { builtInBase, builtInParts, defaultPrompts } from '../src/app/prompts.ts'
 import { key, UserError } from '../src/core/index.ts'
@@ -54,7 +56,7 @@ it('reads the lists, a ticket, a decision, the settings, the prompts and the mod
   }
   expect(JSON.parse((await read('settings/policy') as { text: string }).text).value.sources.feishu.allowed).toEqual([{ id: 'ou_alice', name: 'Alice' }])
   await expect(read('settings/source:retired')).rejects.toThrow('Unknown settings block')
-  const skills = { built_in: ['dsh-superagent-feishu', 'dsh-superagent-github'], team: [] }
+  const skills = { built_in: ['dsh-superagent-feishu', 'dsh-superagent-github', 'dsh-superagent-doc-tree'], team: [] }
   expect(await read('prompts')).toMatchObject({ revision: 0, read: 'prompts/0', skills, items: [expect.objectContaining({ revision: 0 })], next_offset: null })
   const models = [{ id: 'm1', name: 'One' }, { id: 'm2', name: 'Two' }]
   const catalog = { default: { provider: 'p', model: 'm1' }, groups: [{ id: 'p', name: 'Provider', models }], failures: [] }
@@ -97,6 +99,61 @@ it('reads verified worktree ownership, actual worker Session, active writer, and
   const rejectedPage = (await h.api('GET', `tickets/${ticket.id}`)).body
   expect(rejectedPage).toMatchObject({ execution: shownRejected })
   expect(rejectedPage).not.toHaveProperty('execution.ownership')
+})
+
+it('checks documentation impact in the active worker candidate and never approves its semantics', async () => {
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot Add a backend API contract'))
+  const worktree = ticket.execution!.directory
+  const git = (...args: string[]) => h.localGit!.git('-C', worktree, ...args)
+  mkdirSync(join(worktree, 'docs'))
+  writeFileSync(join(worktree, 'DOCS.md'), '# Docs\n\n| Name | Responsibility | Path |\n| --- | --- | --- |\n| API | Widget API | [Contract](docs/api.markdown) |\n')
+  writeFileSync(join(worktree, 'docs/api.markdown'), '# Widget API\n\nPOST /widgets\n')
+  git('add', 'DOCS.md', 'docs/api.markdown')
+  git('commit', '-qm', 'add API documentation')
+  const candidate = git('rev-parse', 'HEAD')
+  writeFileSync(join(worktree, 'docs/api.markdown'), '# Uncommitted\n\n[Broken](missing.md)\n')
+  const args = { candidate, root: 'DOCS.md', routes: [], leaves: ['docs/api.markdown'],
+    impact: { kind: 'updated', documents: ['DOCS.md', 'docs/api.markdown'], contracts: ['docs/api.markdown'] } }
+  const check = (input: unknown = args) => h.runTool(sessionId, 'orchestrator_doc_impact', input)
+  await expect(h.runTool(h.runtime.masterId, 'orchestrator_doc_impact', args)).rejects.toThrow(/not registered/i)
+  await expect(check()).resolves.toMatchObject({ candidate, base: h.localGit!.base.sha, structure: 'checked', issues: [], semantic_review: 'required', impact: args.impact })
+  await expect(check({ ...args, impact: { kind: 'unchanged', reason: 'Internal-only refactor.' } })).rejects.toThrow(/changed/i)
+  await expect(check({ ...args, impact: { ...args.impact, contracts: ['DOCS.md'] } })).rejects.toThrow(/leaf/i)
+  git('add', 'docs/api.markdown')
+  git('commit', '-qm', 'change candidate')
+  await expect(check()).rejects.toThrow(/candidate|head/i)
+  await expect(check({ ...args, candidate: git('rev-parse', 'HEAD') })).resolves.toMatchObject({
+    structure: 'issues', issues: [expect.objectContaining({ kind: 'broken-link', path: 'docs/api.markdown' })], semantic_review: 'required',
+  })
+  git('switch', '-qc', 'wrong-branch')
+  await expect(check({ ...args, candidate: git('rev-parse', 'HEAD') })).rejects.toThrow(/branch/i)
+})
+
+it('retains an unchanged impact rationale without treating missing navigation as checked', async () => {
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot Refactor a private helper'))
+  const worktree = ticket.execution!.directory
+  const git = (...args: string[]) => h.localGit!.git('-C', worktree, ...args)
+  writeFileSync(join(worktree, 'helper.ts'), 'const normalize = (name: string) => name.trim()\n')
+  git('add', 'helper.ts')
+  git('commit', '-qm', 'refactor helper')
+  const candidate = git('rev-parse', 'HEAD')
+  const reason = 'Only the private helper changed; callers still trim whitespace through the same entry point.'
+  const impact = { kind: 'unchanged', reason }
+  const args = { candidate, root: null, routes: [], leaves: [], impact }
+  const report = await h.runTool(sessionId, 'orchestrator_doc_impact', args)
+  expect(report).toMatchObject({ candidate, structure: 'not-applicable', issues: [], impact, semantic_review: 'required' })
+  const summary = JSON.stringify(report)
+  await h.runTool(sessionId, 'orchestrator_report', { state: 'progress', summary })
+  const assignment = ticket.assignments[0]!.id
+  writeFileSync(join(worktree, 'helper.ts'), 'const normalize = (name: string) => name.trimStart().trimEnd()\n')
+  git('commit', '-qam', 'update the candidate')
+  const amended = git('rev-parse', 'HEAD')
+  await h.restart()
+  await h.runtime.idle()
+  expect(await read(`ticket/${ticket.id}/report/${assignment}`)).toMatchObject({ text: summary })
+  await expect(h.runTool(sessionId, 'orchestrator_doc_impact', args)).rejects.toThrow(/candidate|HEAD/)
+  await expect(h.runTool(sessionId, 'orchestrator_doc_impact', { ...args, candidate: amended }))
+    .resolves.toMatchObject({ candidate: amended, semantic_review: 'required' })
 })
 
 it('reads configured GitHub Actions evidence for a ticket at its complete commit SHA', async () => {

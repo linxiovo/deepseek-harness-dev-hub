@@ -15,6 +15,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Commands } from '../infra/commands.ts'
 import type { Handoffs } from './handoffs.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
+import type { SessionMeter } from './session-meter.ts'
 import type { Sessions } from './sessions.ts'
 import type { Settings } from './settings.ts'
 import type { Store } from './store.ts'
@@ -53,6 +54,8 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'prompt-preview/<id>', holds: 'a composed prompt that orchestrator_prompts_save previewed' },
   { name: 'models', holds: 'model providers, the DSH default and each role\'s model' },
   { name: 'models/<provider>', holds: 'one provider\'s models' },
+  { name: 'session/<id>', holds: 'one Session by id: its context snapshot with model, request-plus-response capacity, occupancy, '
+    + 'sampling range and quality, and its cumulative usage by bucket with what is missing or still in flight; never a provider bill' },
   { name: 'feishu/<trigger-id>/…', holds: 'a Feishu original, as the dsh-superagent-feishu skill describes', executor: true },
   { name: 'github/…', holds: 'a GitHub original, as the dsh-superagent-github skill describes', executor: true },
 ]
@@ -66,6 +69,7 @@ export interface ResourceHost {
   readonly commands: Commands
   readonly masterId: string
   readonly context: Context
+  readonly meter: Pick<SessionMeter, 'read'>
   promptVersion(sessionId: string): PromptVersion
   /** Whether a Session may read `revision` (the revision it currently runs under or any revision it ran under previously). */
   mayRead(sessionId: string, revision: number): boolean
@@ -212,6 +216,12 @@ const ROUTES: readonly Route[] = [
     const models = (await main(read).context.sessionController.modelCatalog()).groups.find(group => group.id === read.rest)?.models
     if (!models) throw new Error('Unknown model provider')
     return list(read, (offset, count) => models.slice(offset, offset + count))
+  }],
+  // One reading for the Hub and the panel: the meter owns the persistence cursor, so neither entry recomputes usage.
+  ['session/', async read => {
+    const view = await main(read).meter.read(read.rest, read.signal)
+    if (!view) throw new Error('Unknown session')
+    return view
   }],
   ['feishu/', async read => {
     const source = trigger(read.host, read.rest.split('/')[0]!, read.ticketId)

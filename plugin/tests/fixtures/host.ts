@@ -9,6 +9,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { vi, type Mock } from 'vitest'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
+import type { SessionId } from '@deepseek-ai/dsh-session'
+import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 import { Runtime } from '../../src/app/runtime.ts'
 import { Store } from '../../src/app/store.ts'
 import { SettingsSchema } from '../../src/policy.ts'
@@ -38,6 +40,7 @@ type FakeAgent = {
   id: string; status: string; inbox: { nextTurn: UserMessage[]; nextStep: UserMessage[] }
   cancel: Mock; inject: Mock<(message: UserMessage) => void>; steer: Mock<(message: UserMessage) => void>; followup: Mock<(message: UserMessage) => void>
   directUserMessage: (text: string) => void
+  session?: { id: string }
 }
 /** A text message, as DSH's job tools and subagents send their notices. */
 const notice = (id: string, text: string) => ({ id, role: 'user', content: [{ type: 'text', text }], source: { kind: 'tool-jobs', form: 'notice' } }) as unknown as UserMessage
@@ -194,7 +197,11 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     return { done, collected: { stdout: reader(() => answers[argv.join(' ')] ?? ''), stderr: reader(() => '') } }
   }) }
   const agents = new Map<string, FakeAgent>()
-  const sessionHistory = new Map<string, { seq: number; type: string; data: UserMessage }[]>()
+  /** One durable entry of a Session's log; controller-made messages carry no `time`, as their creation time is not an event. */
+  type StoredEvent = { seq: number; time?: number; type: string; data: unknown }
+  const sessionHistory = new Map<string, StoredEvent[]>()
+  /** Fork-inherited prefix lengths, which a real persistence backend stores beside the log. */
+  const inheritedEvents = new Map<string, number>()
   let directMessageSequence = 0
   // DSH's agents service lists the Sessions still loaded; Sessions install reads it after a service restart.
   Object.assign(agents, { list: () => [...agents.values()] })
@@ -232,7 +239,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
           taken.add(message.id)
           ctx.emit('agent/inbox/claimed', { agent, message, turn } as never)
           if (!cut) {
-            const event = { seq: sessionEvents.length, type: 'user/message', data: message }
+            const event = { seq: sessionEvents.length, time: Date.now(), type: 'user/message', data: message }
             sessionEvents.push(event)
             ctx.emit('session/event', session as never, event as never)
           }
@@ -269,7 +276,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
       })
       const directUserMessage = (text: string) => {
         const message = { id: `direct-user-${++directMessageSequence}`, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } } as unknown as UserMessage
-        const event = { seq: sessionEvents.length, type: 'user/message', data: message }
+        const event = { seq: sessionEvents.length, time: Date.now(), type: 'user/message', data: message }
         sessionEvents.push(event)
         ctx.emit('session/event', session as never, event as never)
       }
@@ -283,10 +290,20 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     prompt: vi.fn(() => { throw new Error('Plugin delivery must not use user RPC') }),
     inspect: vi.fn(async () => ({ events: [] })),
   }
-  const persistence = { flush: vi.fn(async () => {}), open: vi.fn(async (sessionId: string) => ({
-    read: async (offset = 0, count = 512) => ({ events: (sessionHistory.get(sessionId) ?? []).slice(offset, offset + count) }),
-    [Symbol.asyncDispose]: async () => {},
-  })) }
+  // A real backend knows only created Sessions and keeps the fork cut beside the log; the meter must see the same answers.
+  const persistence = { flush: vi.fn(async () => {}), open: vi.fn(async (sessionId: string) => {
+    const id = sessionId as SessionId
+    const events = sessionHistory.get(sessionId)
+    if (!events) throw new SessionPersistenceNotFoundError(id)
+    const inherited = inheritedEvents.get(sessionId) ?? 0
+    return {
+      id, access: 'read' as const, inheritedEventCount: inherited,
+      header: { id, version: 4, createdAt: 0, isSeeded: inherited > 0 },
+      read: async (offset = 0, count = 512) => ({ eventState: 'detached' as const, events: events.slice(offset, offset + count) }),
+      close: async () => {},
+      [Symbol.asyncDispose]: async () => {},
+    }
+  }) }
   const webServer = { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }
   const jobs = jobRegistry(id => agents.get(id))
   const subagents = subagentRuntime(agents)
@@ -343,6 +360,21 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     if (!agent) throw new Error(`Session ${sessionId} does not exist`)
     agent.directUserMessage(text)
   }
+  /**
+   * Appends durable events to a Session's log, as DSH does at a turn's checkpoint, and announces them as the live Session does.
+   * `inherited` sets the fork prefix stored beside the log, which the meter must not count as the child's own calls.
+   */
+  const record = (sessionId: string, events: readonly (Omit<StoredEvent, 'seq'> & { seq?: number })[], inherited?: number) => {
+    if (inherited !== undefined) inheritedEvents.set(sessionId, inherited)
+    const log = sessionHistory.get(sessionId) ?? []
+    sessionHistory.set(sessionId, log)
+    const session = agents.get(sessionId)?.session
+    for (const event of events) {
+      const stored = { ...event, seq: event.seq ?? log.length, time: event.time ?? Date.now() } as StoredEvent
+      log.push(stored)
+      if (session) ctx.emit('session/event', session as never, stored as never)
+    }
+  }
   const idlePlanning = () => runtime.effects.idle('planning')
   const idleRelay = () => runtime.effects.idle('relay')
   /** Route one decision with the main Session's orchestrator_route, answering its result; a refused one throws its reason. */
@@ -371,7 +403,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   const step = (sessionId: string) => { steps.get(sessionId)!() }
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
-  return { get runtime() { return runtime }, get ctx() { return ctx }, restart, idlePlanning, idleRelay, directory, localGit, agents, tools, deliveries, relays, candidates, runTool, sendUserMessage, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
+  return { get runtime() { return runtime }, get ctx() { return ctx }, restart, idlePlanning, idleRelay, directory, localGit, agents, tools, deliveries, relays, candidates, runTool, sendUserMessage, record, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
     jobs, subagents, step, claim }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>

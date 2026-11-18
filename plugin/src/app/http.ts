@@ -17,6 +17,7 @@ import type { DshExecutor } from '../executor/dsh.ts'
 import type { Health } from '../sources/host.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import type { Sessions } from './sessions.ts'
+import type { SessionMeter } from './session-meter.ts'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
@@ -38,6 +39,8 @@ export interface HttpHost {
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
   readonly engine: EngineForPeople
   readonly executor: Pick<DshExecutor, 'activeCount'>
+  /** Session context snapshots and cumulative usage, shared with the Hub's `session/<id>` resource. */
+  readonly meter: Pick<SessionMeter, 'read'>
   readonly health: Record<string, Health>
   readonly machine: Machine
   readonly masterId: string
@@ -204,6 +207,12 @@ function routes(runtime: HttpHost): Routes {
     'POST policy-sync/:id': async ({ params }) => ({ policy: await runtime.settings.sync(params.id) }),
     'POST setup/check': () => { runtime.checkSetup(); return { restarting: true } },
     'GET models': () => runtime.models(),
+    'GET sessions/:id/meter': async ({ params }) => {
+      // The Hub reads the same view; a corrupt Session log is not a missing Session and keeps its 500.
+      const view = await runtime.meter.read(params.id)
+      if (!view) throw new RouteError(404, 'Session not found')
+      return view
+    },
     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
     'PUT prompts': async input => {
       const request = z.object({ config: z.unknown(), baseRevision: z.number().int().nonnegative() }).parse(await promptBody(input))

@@ -135,6 +135,36 @@ it('keeps the main Session\'s resources from an Executor Session, which lists on
   expect(offered).not.toMatch(/preview/i)
 })
 
+it('reads one Session\'s meter through the Hub resource and the HTTP route from the same persisted cursor, refusing unknown Sessions', async () => {
+  const master = h.runtime.masterId, at = Date.parse('2026-11-18T02:00:00.000Z')
+  const usage = { inputTokens: 120, cacheReadTokens: 30, cacheWriteTokens: 10, outputTokens: 40, reasoningTokens: 8, totalTokens: 200 }
+  h.record(master, [
+    { type: 'request/header', time: at, data: { header: { config: { provider: 'p', model: 'm1' } }, reason: 'initial' } },
+    { type: 'request/context', time: at, data: { provider: 'p', model: 'm1', contextWindow: 128000 } },
+    // The message and its stream report the one settlement; the meter must count the call once.
+    { type: 'assistant/message', time: at + 1, data: { turn: 0, step: 0, usage,
+      stream: [{ type: 'chunk', time: at + 1, chunk: { type: 'usage', usage } }],
+      message: { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] } } },
+  ])
+  const view = await read(`session/${master}`)
+  expect(view).toMatchObject({ session_id: master, inherited_events: 0, cursor: expect.any(Number),
+    context: { provider: 'p', model: 'm1', capacity_tokens: 128000, occupied_tokens: null },
+    usage: { input_tokens: 120, cache_read_tokens: 30, cache_write_tokens: 10, output_tokens: 40, reasoning_tokens: 8,
+      known_components_total_tokens: 200, reported_total_tokens: 200, counted_calls: 1, total_complete: true, billing_status: 'not-final' } })
+  // Both public entries answer from the one reading the meter persisted, so the same call is not counted again.
+  const response = await h.api('GET', `sessions/${encodeURIComponent(master)}/meter`)
+  expect(response.status).toBe(200)
+  expect(response.body).toEqual(view)
+  await expect(read('session/no-such-session')).rejects.toThrow('Unknown session')
+  const { sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  await expect(h.runTool(sessionId, 'orchestrator_read', { resource: `session/${master}` })).rejects.toThrow('belongs to the main Session')
+  await expect(h.runTool(sessionId, 'orchestrator_read', { resource: `session/${sessionId}` })).rejects.toThrow('belongs to the main Session')
+  // The Hub may read any Session's meter, while a worker can read neither its own nor another one.
+  expect(await read(`session/${sessionId}`)).toMatchObject({ session_id: sessionId })
+  // The grammar lists the resource to the main Session only; a worker's omits it, and the planner lists no resources at all.
+  expect(RESOURCES.find(resource => resource.name === 'session/<id>')?.executor).toBeUndefined()
+})
+
 it('answers every routing tool in one shape: the decision it recorded, why, and the ticket card', async () => {
   const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
   const card = expect.objectContaining({ ticket_id: ticket.id })

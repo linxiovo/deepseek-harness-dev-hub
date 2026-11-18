@@ -5,6 +5,7 @@
 import type { Handoff, ProjectRef, Spec } from './core/handoff.ts'
 import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
+import type { SessionMeterState } from './app/session-meter.ts'
 import type { SettingsSave } from './policy.ts'
 import type { Retry } from './sources/github.ts'
 
@@ -34,6 +35,8 @@ export const KV = {
   runtime: { masterId: record<string>('master-id') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
   sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
+  /** Session meter: durable exclusive log cursor and its cumulative, own-event projection. */
+  meter: { state: family<SessionMeterState, [session: string]>('session-meter:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */
   queues: { relays: record<{ id: string; text: string }[]>('relay-queue'), unsubscribed: record<string[]>('subscription-results'),
     prompts: record<number | null>('prompt-notification'), settings: record<number | null>('settings-notification') },

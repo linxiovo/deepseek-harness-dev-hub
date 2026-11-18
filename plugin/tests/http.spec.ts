@@ -1,6 +1,7 @@
 import { expect, it } from 'vitest'
 import { z } from 'zod'
 import { registerHttp } from '../src/app/http.ts'
+import type { SessionMeterView } from '../src/app/session-meter.ts'
 import { PromptConflict } from '../src/app/prompts.ts'
 import { SettingsConflict } from '../src/app/settings.ts'
 import type { HttpHost } from '../src/app/http.ts'
@@ -127,4 +128,38 @@ it('answers a prompt save that lost a race with 409, and a settings body over 12
   expect(await call('PUT', 'settings/executor', { value, revision: 0 })).toEqual({ status: 400,
     body: { error: `Request exceeds ${128 * 1024} bytes` } })
   expect(saves).toEqual([])
+})
+
+it('answers the Session meter view the Hub reads, decoded from the path, and 404 for an unknown Session', async () => {
+  const range = { from: 1, through: 9 }
+  const view: SessionMeterView = { session_id: 'worker/a b', inherited_events: 3, cursor: 9,
+    context: { model: 'worker-model', provider: 'host', capacity_tokens: 128_000, occupied_tokens: 4_096, quality: 'measured',
+      source: 'session-events', sampled_at: '2026-11-18T00:00:00.000Z', range, last_input_tokens: 12_000,
+      last_input_at: '2026-11-18T00:00:00.000Z', last_input_range: range, stale: false },
+    usage: { input_tokens: 10, cache_read_tokens: 2, cache_write_tokens: 0, output_tokens: 3, reasoning_tokens: 0,
+      known_components_total_tokens: 15, reported_total_tokens: 15, reported_total_calls: 1, total_complete: true,
+      counted_calls: 1, missing: [], in_flight: null, range, sampled_at: '2026-11-18T00:00:00.000Z', source: 'session-events',
+      quality: 'measured', billing_status: 'not-final' } }
+  const asked: string[] = []
+  const read = async (id: string): Promise<SessionMeterView | undefined> => {
+    asked.push(id); return id === view.session_id ? view : undefined
+  }
+  const call = serve({ meter: { read } })
+  expect(await call('GET', `sessions/${encodeURIComponent(view.session_id)}/meter`)).toEqual({ status: 200, body: view })
+  expect(asked).toEqual([view.session_id])
+  expect(await call('GET', 'sessions/worker-t9/meter')).toEqual({ status: 404, body: { error: 'Session not found' } })
+  expect(asked).toEqual([view.session_id, 'worker-t9'])
+  // The meter route keeps the panel's same-origin protection.
+  expect(await call('GET', `sessions/${encodeURIComponent(view.session_id)}/meter`, undefined, { 'x-orchestrator-request': undefined }))
+    .toEqual({ status: 403, body: { error: 'Same-origin management request required' } })
+  expect(asked).toEqual([view.session_id, 'worker-t9'])
+})
+
+it('answers a corrupt Session log with 500 instead of claiming the Session is missing', async () => {
+  const read = async (id: string): Promise<SessionMeterView | undefined> => {
+    throw new Error(`Session log for ${id} is corrupt`)
+  }
+  const call = serve({ meter: { read } })
+  expect(await call('GET', 'sessions/worker-t1/meter'))
+    .toEqual({ status: 500, body: { error: 'Session log for worker-t1 is corrupt' } })
 })

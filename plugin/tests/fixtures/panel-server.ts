@@ -92,6 +92,8 @@ export interface PanelServer {
   tickets: { open: TicketRow[]; ended: TicketRow[] }; ticketDetails: Record<string, TicketPageView>
   threads: ThreadRow[]
   threadPages: (key: string, query: { before?: string; around?: string }) => ThreadPageView | undefined
+  /** Session meter views keyed by Session id; an id absent here is answered as a missing Session. */
+  meters: Record<string, ApiResponse<'GET sessions/:id/meter'>>
   person: TicketRow[]; search: Pick<ApiResponse<'GET search'>, 'items' | 'threads'>; history: HistoryView
   requests: { path: string; method: string; body?: unknown }[]
   /** Requests with undeclared query params or invalid body presence; asserted empty after each test. */
@@ -238,6 +240,18 @@ function threadPage(key: string, { before, around }: { before?: string; around?:
   return { ...base, earlier: 'cursor-1', timeline: [trigger('e3', '2026-09-23T00:00:00Z', { disposition: { fanout: ['t1'] } }),
     trigger('e4', '2026-09-23T00:01:00Z', { disposition: { filtered: { code: 'not_a_member' } } })] }
 }
+/** A main-Session meter: the host's estimate of the current window and the cumulative usage settled from its events. */
+const meterView = (id: string): ApiResponse<'GET sessions/:id/meter'> => {
+  const range = { from: 1, through: 42 }
+  return { session_id: id, inherited_events: 0, cursor: 42,
+    context: { model: 'default', provider: 'host', capacity_tokens: 128_000, occupied_tokens: 34_000, quality: 'estimated',
+      source: 'dsh-token-meter', sampled_at: '2026-09-23T00:00:00Z', range, last_input_tokens: 30_000,
+      last_input_at: '2026-09-23T00:00:00Z', last_input_range: range, stale: false },
+    usage: { input_tokens: 12_000, cache_read_tokens: 3_000, cache_write_tokens: 1_000, output_tokens: 1_500, reasoning_tokens: 200,
+      known_components_total_tokens: 17_500, reported_total_tokens: 17_500, reported_total_calls: 6, total_complete: true,
+      counted_calls: 6, missing: [], in_flight: null, range, sampled_at: '2026-09-23T00:00:00Z', source: 'session-events',
+      quality: 'measured', billing_status: 'not-final' } }
+}
 function initial(): PanelServer {
   const settings = SettingsSchema.parse({
     policy: { sources: { feishu: { allowed: [{ id: 'ou_alice', name: 'Alice' }], syncChat: 'oc_team' },
@@ -264,7 +278,7 @@ function initial(): PanelServer {
       defaults: defaultPrompts(), parts: Object.entries(builtInParts()).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) })),
       defaultChanged: [], revisions: [{ ...defaults, changed: [] }], sessions: [], notificationPending: false, next_offset: null },
     tickets: { open: [ticketSummary()], ended: [ended] }, ticketDetails: { t1: ticketDetail() },
-    threads: [threadSummary()], threadPages: threadPage,
+    threads: [threadSummary()], threadPages: threadPage, meters: { master: meterView('master') },
     person: [ticketSummary({ attention: { id: 'q1', question: '需要确认按钮颜色' }, note: { text: '需要确认按钮颜色', error: false }, reply },
       { stage: 'person', action: 'answer' }),
       ticketSummary({ id: 't4', title: '截图工具', actions: { retry: true, stop: true }, sessionId: 'worker-t4',
@@ -379,6 +393,7 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET models': { answer: () => ({ default: { provider: 'host', model: 'default' }, routableProviders: [], failures: [],
     groups: [{ id: 'worker-provider', name: 'Worker provider', models: [{ id: 'worker-model', name: 'Worker model',
       reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }] }) },
+  'GET sessions/:id/meter': { answer: ({ params }) => server.meters[params.id] ?? refuse(404, 'Session not found') },
   'GET prompts': { query: ['revision', 'offset'], answer: () => server.prompts },
   'PUT prompts': { body: true, answer: ({ body }) => {
     const { revision } = server.prompts

@@ -28,7 +28,7 @@ flowchart TB
 
 ### Runtime
 
-`Runtime` is the composition root; it contains no domain rules. Its constructor locks the state directory, opens the Store and builds each component. If construction fails, it closes the Store and releases the lock.
+`Runtime` is the composition root; it contains no domain rules. Its constructor locks the state directory, opens the Store and builds each component. If construction fails, it closes the Store and releases the lock. It also builds the one `SessionMeter` and gives the same instance to the management routes and the resource host, so `GET sessions/<id>/meter` and `orchestrator_read` of `session/<id>` answer from the same meter and its persisted cursor rather than recomputing usage.
 
 Startup registers management routes and runs Setup. After setup resolves, it installs Session and Executor hooks, ensures the main Session exists, starts Policy syncs, resumes interrupted Assignments, and starts passes and effects. `ready` marks completion of startup.
 
@@ -40,6 +40,7 @@ Shutdown cancels turns, waits for passes, effects and agents, restores the proce
 | Passes | `src/app/passes.ts` | One pass at a time, every two seconds and whenever a command asks: the due effects, then `Engine.evaluateDue`; a Source's Trigger reaches the Engine through it |
 | Outbox | `src/app/outbox.ts` | The `Outbox` port for every Channel message and the only writer of its receipts: the Hub's replies, the acceptance acknowledgement, pull-request end notices and Source notices all go through `send`, which keeps a message's receipt and queues its `reply` effect in one transaction, and the effect's handler sends it through `SourceRegistry.send`; a message waits while its Source is off, and is dropped when the conversation is gone or not listened to |
 | Notices | `src/app/notices.ts` | Converts domain events and worker activity into main-Session messages. `eventNotice` handles domain notices; `reportRelay` forwards questions immediately, keeps ordinary progress on its Ticket, and relays other reports; `followupRelay` names the Tickets that own a human follow-up. Relays arriving during a turn are delivered together at its next step through the DeepSeek Harness inbox |
+| Session meter | `src/app/session-meter.ts` | One Session's context snapshot and cumulative usage read from its durable event log, with provenance, coverage ranges and the persisted exclusive cursor; a fork's inherited prefix is not charged to the child |
 
 ### Engine
 
@@ -252,6 +253,35 @@ Each model request binds the Session to the current prompt revision. The revisio
 
 `status` and `promptVersion` serve prompt pages. Saves go through `Prompts.save` and notify the main Session. `modelRetry` exposes model-budget retry state.
 
+### Session metering
+
+`SessionMeter` (`src/app/session-meter.ts`) answers two separate questions per Session: what its context looks like now, and what it has spent cumulatively. `read(sessionId, signal?)` flushes `ctx.sessionPersistence`, opens the stored Session read-only, folds its own events into usage and returns one `SessionMeterView`; only route metadata (`provider`, `model`, `capacity_tokens`) comes from a fork's inherited prefix. A Session that does not exist returns `undefined`. A stored log that exists but cannot be read, has non-contiguous sequence numbers, is shorter than its persisted cursor or fork cut, or changed its fork cut throws, so the management API answers 500 rather than calling it missing. When it has read events, it flushes again before persisting its cursor, so a write accepted during the read is not skipped. The read closes its handle, and the lifetime signal cancels it.
+
+The view is `{session_id, inherited_events, cursor, context, usage}`. `cursor` is the exclusive upper bound of the folded own events, and the seq the next read starts at: an event with that seq is not counted yet. It is persisted with the view (alongside open compaction and retry-wait state) under `KV.meter.state(sessionId)` in one `atomic` transaction, so a restart or two concurrent queries do not count the same settlement twice. Events with `seq < inherited_events` are a fork's inherited prefix: they may seed route metadata (`provider`, `model`, `capacity_tokens`), but they never count as the child's own calls, input samples, or clock. Every `range` is half-open, `[from, through)`; `context.range` and `usage.range` cover the own events folded so far, from `inherited_events` through `cursor`. `sampled_at` is stable for the same event range: the last folded own event's time, or the child Session header's creation time (`createdAt`) when the own range is empty (`inherited_events === cursor`), never an ancestor event's time.
+
+`context` is a snapshot, not a total: `model` and `provider` from the latest routing event (`request/context` or `request/header`'s call config), `capacity_tokens` (the request-plus-response `contextWindow` when `request/context` publishes one, cleared if a `request/header` changes provider or model without a matching `request/context`), `occupied_tokens`, `quality` (`measured`, `estimated` or `unknown`), `source` (`dsh-token-meter`, `session-events` or `none`), `sampled_at` and `range`, plus `last_input_tokens` (the uncached `inputTokens` of the latest `assistant/message` or `assistant/attempt` settlement that reported input, not its whole prompt), `last_input_at`, its one-event `last_input_range`, and `stale`. Any later own event makes that input a past sample (`stale: true`) until another assistant settlement reports input. For current occupancy, `SessionMeter.read` optionally inspects the host's `sessionProjections` service (`snapshot(session, ['contextPressure'])` on the active agent `Session`) at read time only, never persisting projections into durable meter state or `usage`. When `contextPressure.projectedTokens` is a finite non-negative number and its `asOfSeq` matches the durable `cursor` (`asOfSeq === cursor - 1`), `occupied_tokens` reports `projectedTokens` with `quality: 'estimated'` and `source: 'dsh-token-meter'`. When the projection service or active `Session` is absent, fails, returns no valid `projectedTokens`, or is stale or misaligned (`asOfSeq !== cursor - 1`), `occupied_tokens` is `null` and `quality` is `'unknown'`, with `source` naming `'session-events'` once routing metadata has been read and `'none'` before that. While `'measured'` remains in `context.quality`, neither `last_input_tokens` nor compaction `shadowedTokenCount` is ever reported as `occupied_tokens` or marked `'measured'`.
+
+`usage` is separate and cumulative: `input_tokens` (uncached input), `cache_read_tokens`, `cache_write_tokens` and `output_tokens` are disjoint buckets; `reasoning_tokens` details `output_tokens` and is not added again. Only reported usage is counted: `known_components_total_tokens` sums the disjoint buckets that have evidence and is `null` when none does, while `reported_total_tokens` sums only authoritative provider totals, over `reported_total_calls`; unreported buckets stay `null`, never `0` or estimated, and `compaction/prune` (`shadowedTokenCount`) is never counted as usage. `total_complete` is true only when at least one settlement was counted, every counted settlement reported its own total, and nothing is missing or in flight. `counted_calls` counts settlements, and `missing` lists `{from, through, reason}` ranges: `no-usage` for a settlement with no usage and `coverage-gap` where the log cannot cover a call, never as zero. A settlement is counted once even when both an `assistant/message` and its stream carry usage; an `assistant/attempt`'s stream counts once, at its last usage chunk; a `compaction/summary`'s usage counts as the compaction call, while an `assistant/message`, `assistant/attempt` or `compaction/summary` without usage adds a `no-usage` range. `in_flight` is the half-open range of an open request, step, retry or compaction at sampling time (`request/header`, `step/start`, `llm/retry-started` or `compaction/start`). After a failed `assistant/attempt` within a step, the attempt's own reported usage (or `no-usage`) is folded immediately, while `in_flight` stays open from that attempt until the step or turn closes or another event supersedes it, because a retry may still follow. If `llm/retry-started` or a subsequent `request/header` arrives, `in_flight` moves to that new request without flagging the settled `assistant/attempt` as a gap, and becomes a `coverage-gap` only if that new request closes at `step/end` or `turn/end` (or is superseded by `step/start` or another `llm/retry-started`) without a settlement. If `step/end`, `turn/end` or `compaction/start` arrives after the failed attempt with no second request started, `in_flight` clears without fabricating a `coverage-gap`. By contrast, an open `request/header`, `step/start` or `llm/retry-started` closed without a settlement, or a `compaction/start` closed by `compaction/end` without a `compaction/summary`, records a `coverage-gap`. `quality` is `unknown` before any counted usage (`counted_calls === 0`), `partial` while `missing` is non-empty or `in_flight` is non-null, and `measured` otherwise, even when some settlements lack an authoritative total, which `total_complete` reports separately. `billing_status` is always `not-final`: this is observability from the Session log, not the provider's invoice, and `RetryHealth` is not usage.
+
+### Session meter API
+
+`GET /orchestrator/api/sessions/:id/meter` returns the `SessionMeterView` above, with `context` and `usage` as separate objects. It takes no query parameter and no body; `:id` is the Session id, decoded from the path. The route has the management API's loopback host and `x-orchestrator-request: 1` same-origin check. An unknown Session is `404` with `Session not found`; a stored log that exists but cannot be read is `500`; a Session with no usage still answers `200`, with null usage token fields (`occupied_tokens` also `null` unless a matching `dsh-token-meter` projection is available) and any `missing` or `in_flight` ranges. The Hub resource `session/<id>` returns the same view from the same meter instance, for the main Session only; an unknown id is refused as `Unknown session`.
+
+Its fields, grouped by object:
+
+```
+{session_id, inherited_events, cursor,
+ context: {model, provider, capacity_tokens, occupied_tokens, quality, source, sampled_at, range,
+   last_input_tokens, last_input_at, last_input_range, stale},
+ usage: {input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
+   known_components_total_tokens, reported_total_tokens, reported_total_calls, total_complete,
+   counted_calls, missing, in_flight, range, sampled_at, source, quality, billing_status}}
+```
+
+Each `range`, including one in `missing`, is `{from, through}`; a `missing` entry adds `reason` (`no-usage` or `coverage-gap`). `context.source` is `dsh-token-meter`, `session-events` or `none`; `usage.source` is `session-events`. `context.quality` is `measured`, `estimated` or `unknown`; `usage.quality` is `measured`, `partial` or `unknown`. A token field whose evidence is absent is `null`, not zero, and `billing_status` is always `not-final`.
+
+Validation: `tests/session-meter.spec.ts` covers the read seam (absent vs corrupt logs, capacity present and absent, stale input samples after tool results and compaction, fresh vs absent or stale DSH `contextPressure.projectedTokens` projections, one settlement across message and stream, attempts and compaction summaries without treating `shadowedTokenCount` as usage or occupancy, failed attempts kept `in_flight` until close without fabricating gaps, unsettled retries as `coverage-gap`, `no-usage` ranges, the four buckets against authoritative totals, fork prefixes with child `createdAt` sampling on empty own ranges, and cursor replay and durability flushes across restarts and concurrent reads); `tests/http.spec.ts` covers the route's statuses and parameters; `tests/tools.spec.ts` covers the Hub resource, its main-Session restriction and equality with the HTTP read.
+
 ### Glue
 
 | Glue | Translates |
@@ -346,6 +376,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
 | `src/app/sessions.ts` | Sessions |
+| `src/app/session-meter.ts` | `SessionMeter`: one Session's context snapshot and cumulative usage from its durable event log, with provenance, missing and in-flight ranges, and the persisted exclusive cursor; forked prefixes are excluded |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
@@ -450,10 +481,11 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/delivery.spec.ts` | `AgentDelivery` |
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
-| `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role (including verified worktree, active writer and rejection facts), the shapes and checks of the other main Session tools, and the Worker's internal take-up without an outbound message |
+| `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
+| `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, worktree and writer facts, Hub-only `session/<id>` metering, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
-| `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, `GET tickets/:id` worktree and writer projections, the body limit, path parameters and queries |
+| `tests/http.spec.ts` | Management request bounds; ticket worktree and writer projections; Session meter success, errors, ID decoding and same-origin protection |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, the refusals of the pause, a sync and a block, and the required local repository and base ref with their preparation variables |
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |
 | `tests/timeline.spec.ts` | A Thread's pages and a Trigger's neighbours by time and then id, with every received Trigger's time in one form |
@@ -503,6 +535,7 @@ A generated column is computed from its row's JSON and is empty outside its set,
 | Prompt versions | `prompt-revision`, `prompt-version:<n>` |
 | Main Session | `master-id` |
 | Session prompt history | `session-prompts:<session id>` |
+| Session meter | `session-meter:<session id>`: the durable meter state, whose `cursor` is the exclusive upper bound of the folded own events and the next read's first seq |
 | Source state | Read positions such as `github-cursor:<number>`, PR CI fingerprints and seen Feishu-topic messages; keys begin with the kind or `thread-` plus a Thread key |
 | Display names | `source-labels:<source id>` |
 
@@ -592,6 +625,7 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 | `settings`, `settings/<block>` | Revisions and summaries, or a complete block ready to save |
 | `prompts`, `prompts/<revision>`, `prompts/current`, `prompts/defaults`, `prompt-preview/<id>` | Prompt configurations and composed text |
 | `models`, `models/<provider>` | Available models |
+| `session/<id>` | The `SessionMeterView` of one Session: its `context` snapshot and cumulative `usage`, with provenance, quality, sampled ranges and missing ranges; main Session only |
 | `feishu/<trigger id>/…`, `github/…` | Original Source records, described in the Source skills |
 
 Ticket Threads are marked `context` for context-only follows and `bound` for Source bindings. Assignment pages are newest first and include report previews. Continue lists with `next_offset`. `/input/<id>` accepts an Input's name or id. `settings` includes small blocks in full and summarizes Policy and Source blocks.
@@ -600,7 +634,7 @@ Source resources include message neighborhoods, `github/pulls/<n>/thread/<commen
 
 An original's messages read in one compact shape, `{id, from, at, text, reply_to?, path?, line?, url?}`, not as GitHub or Feishu records them.
 
-An Executor Session reads only its own Ticket, its Threads, the Triggers that reached it or that its request held, the prompt versions it worked under and the originals, and its pages leave out the ids of what it cannot read, Decisions and other Tickets.
+An Executor Session reads only its own Ticket, its Threads, the Triggers that reached it or that its request held, the prompt versions it worked under and the originals, and its pages leave out the ids of what it cannot read, Decisions and other Tickets. `session/<id>` belongs to the main Session: neither an Executor nor a planner Session may read it.
 
 Every id a page shows reads through one of these, so a Session walks from one object to the next; hashes nothing reads by, such as an Eval's id or a Policy version, stay off the pages.
 

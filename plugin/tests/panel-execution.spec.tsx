@@ -75,6 +75,47 @@ it('shows a Ticket with its stage, its Mandate details with the Trigger and Deci
   expect(tab(zh['tab.trigger']).getAttribute('aria-selected')).toBe('true')
 })
 
+it('displays verified worktree identity and actual writer, then names a rejected preparation without inventing Git facts', async () => {
+  const t1 = server.ticketDetails.t1!
+  const execution = { name: 'fix-regression', directory: '/w/t1', repository: '/srv/widgets', worktree: '/w/t1',
+    branch: 'ticket/fix-regression', base: { ref: 'refs/heads/main', sha: '0123456789abcdef0123456789abcdef01234567' },
+    session: 'actual-session-19',
+    active_writer: { assignment: 'a1', session: 'actual-session-19' }, preparation: { state: 'verified' as const } }
+  server.ticketDetails.t1 = { ...t1, execution }
+  at({ page: 'execution', id: 't1' })
+  await mount()
+  expect(document.querySelector('.dt-status-line')?.textContent).toContain(zh['preparation.verified'])
+  await click(zh.identifiers)
+  const rows = () => all('.dt-disclosure-body .dt-kv > div').map(row => [row.querySelector('dt')?.textContent, row.querySelector('dd')?.textContent])
+  expect(rows()).toEqual(expect.arrayContaining([[zh.workerSession, 'actual-session-19'], [zh.executionRepository, '/srv/widgets'],
+    [zh.executionWorktree, '/w/t1'], [zh.executionBranch, 'ticket/fix-regression'], [zh.executionBaseRef, 'refs/heads/main'],
+    [zh.executionBaseSha, '0123456789abcdef0123456789abcdef01234567'], [zh.activeWriter, 'a1 · actual-session-19'],
+    [zh.preparationState, zh['preparation.verified']]]))
+
+  const reason = 'Wrong base; existing files were preserved.'
+  server.ticketDetails.t1 = { ...t1, execution: { name: 'fix-regression', directory: '/w/t1', active_writer: null,
+    preparation: { state: 'rejected', reason } } }
+  await remount(en)
+  expect(document.querySelector('.dt-status-line')?.textContent).toContain(en['preparation.rejected'])
+  expect(document.querySelector('.dt-banner.dt-danger.dt-mono')?.textContent).toBe(`${en.preparationRejectedPrefix}${reason}`)
+  await click(en.identifiers)
+  expect(rows()).toEqual(expect.arrayContaining([[en.activeWriter, en.activeWriterNone], [en.preparationState, en['preparation.rejected']]]))
+  expect(rows().map(([label]) => label)).not.toContain(en.executionRepository)
+  expect(rows().map(([label]) => label)).not.toContain(en.executionBaseSha)
+})
+
+it('marks an old directory-only Ticket unverified without guessing repository, branch, or writer', async () => {
+  const t1 = server.ticketDetails.t1!
+  server.ticketDetails.t1 = { ...t1, execution: { name: 'old-ticket', directory: '/w/t1', preparation: { state: 'unverified' } } }
+  at({ page: 'execution', id: 't1' })
+  await mount()
+  await click(zh.identifiers)
+  const rows = all('.dt-disclosure-body .dt-kv > div').map(row => [row.querySelector('dt')?.textContent, row.querySelector('dd')?.textContent])
+  expect(rows).toContainEqual([zh.preparationState, zh.unverified])
+  for (const label of [zh.executionRepository, zh.executionWorktree, zh.executionBranch, zh.executionBaseRef,
+    zh.executionBaseSha, zh.activeWriter]) expect(rows.map(([name]) => name)).not.toContain(label)
+})
+
 it('reports a missing Ticket instead of rendering an empty page', async () => {
   at({ page: 'execution', id: 'missing' })
   await mount()

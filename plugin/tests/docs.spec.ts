@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+/** Repo-relative and Markdown paths compare with `/`, whichever separator this platform reports. */
+const slash = (path: string): string => path.split(sep).join('/')
 const NUMBERED = /^(\d{3})-[a-z0-9-]+\.md$/
 const entries = ['DOCS.md', 'README.md', 'SETUP.md']
 function indexedLinks(markdown: string, heading: string, row: RegExp): Set<string> {
@@ -46,7 +48,7 @@ function listedIn(docFile: string, heading: string): string[] {
       if (!name!.includes('/')) return posix.join(directory, name!)
       directory = posix.dirname(name!)
       return name!
-    })
+    }).map(slash)
   })
 }
 function inspectDocumentation(pluginRoot: string, repoRoot = resolve(pluginRoot, '..')) {

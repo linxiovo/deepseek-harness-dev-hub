@@ -149,6 +149,22 @@ it('shows a trigger and a ticket as cards with a short preview and references to
     preview: expect.stringMatching(/^Long note\./), chars: 110, read: `ticket/ticket-1/input/${key('text:long')}` },
     { kind: 'text', at: '11', text: 'Note 11', undelivered: true }, 'ticket/ticket-1/inputs', 10])
 })
+
+it('exposes only verified worktree facts and a rejected preparation reason on ticket cards and details', () => {
+  expect(ticketCard(ticket)).not.toHaveProperty('execution')
+  const execution = { ...ticket.execution!, repository: '/srv/widgets', worktree: '/worktrees/ticket-1', branch: 'ticket/ticket-1',
+    base: { ref: 'refs/heads/main', sha: '0123456789abcdef0123456789abcdef01234567' }, session: 'session-actual-17',
+    active_writer: { assignment: 'a1', session: 'session-actual-17' }, preparation: { state: 'verified' as const } }
+  const verified = { ...ticket, execution }
+  const { assignment: _assignment, ...shownExecution } = execution
+  expect(ticketCard(verified).execution).toEqual(shownExecution)
+  expect(ticketDetails(verified, [], []).execution).toEqual(shownExecution)
+  const rejected = { ...ticket, execution: { ...ticket.execution!, session: 'session-actual-17', active_writer: null,
+    preparation: { state: 'rejected' as const, reason: 'Directory belongs to another repository; no files were removed.' } } }
+  const { assignment: _rejectedAssignment, ...shownRejected } = rejected.execution
+  expect(ticketCard(rejected).execution).toEqual(shownRejected)
+  expect(ticketDetails(rejected, [], []).execution).toEqual(shownRejected)
+})
 it('shows a ticket card\'s state from a closed set: the open ticket\'s stage, the ended ticket\'s outcome', () => {
   const report = (state: string) => ({ ...ticket, assignments: [{ ...ticket.assignments[0]!, report: { state, summary: '', at: '' } }] }) as Ticket
   const cases: [Ticket, string][] = [

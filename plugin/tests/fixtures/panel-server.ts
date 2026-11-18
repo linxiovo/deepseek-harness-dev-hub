@@ -172,7 +172,14 @@ const settingsView = (): ApiResponse<'GET settings'> => ({
   environment: { root: '/srv/dsh-superagent/work', variables: [
     { owner: 'executor', enabled: true, variables: [{ key: 'DSH_SUPERAGENT_DIR', description: { zh: '工单的执行目录',
       en: 'The ticket directory' } },
-      { key: 'DSH_SUPERAGENT_NAME', description: { zh: '工单短名', en: 'Short name' } }] },
+      { key: 'DSH_SUPERAGENT_NAME', description: { zh: '工单短名', en: 'Short name' } },
+      { key: 'DSH_SUPERAGENT_REPOSITORY', description: { zh: '执行器确认的本地仓库规范绝对路径，不是 GitHub 仓库名',
+        en: 'Canonical absolute path to the executor-selected local repository, not the GitHub repository name' } },
+      { key: 'DSH_SUPERAGENT_BASE_REF', description: { zh: '创建工单工作树时解析的明确 Git 基准引用',
+        en: 'Explicit Git base ref resolved for this ticket worktree' } },
+      { key: 'DSH_SUPERAGENT_BASE_SHA', description: { zh: '该基准引用解析出的完整、固定 Git 提交 ID',
+        en: 'Full pinned Git commit ID resolved from the base ref; use this immutable commit for preparation' } },
+      { key: 'DSH_SUPERAGENT_BRANCH', description: { zh: '此工单唯一的 Git 分支名', en: 'Git branch reserved for this ticket worktree' } }] },
     { owner: 'github', enabled: false, variables: [{ key: 'DSH_SUPERAGENT_GITHUB_REPOSITORY', description: { zh: '仓库',
       en: 'Repository' } }] }] },
 })

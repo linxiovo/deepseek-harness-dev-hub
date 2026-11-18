@@ -3,6 +3,7 @@
  * orchestrator and worker roles against tool schemas, environment variables, glossary rules (`docs/001`), and size budgets.
  */
 import { Context } from '@deepseek-ai/cordis'
+import { execFileSync } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,6 +24,7 @@ import { SettingsSchema } from '../src/policy.ts'
 import { feishuKind, feishuTrigger } from '../src/sources/feishu.ts'
 import { githubKind } from '../src/sources/github.ts'
 import { testMachine } from './fixtures/deployment.ts'
+import { gitEnv, gitRepository } from './fixtures/git.ts'
 
 type Role = 'orchestrator' | 'worker'
 interface Surface { where: string; owner: string; role: Role | 'both'; text: string }
@@ -69,16 +71,17 @@ const words = (count: number) => Array.from({ length: count }, () => 'word').joi
 /** Start a configured Runtime on a fake DSH host (as in tests/runtime.spec.ts) that records registered tools, prompts, skills, and delivered messages per session. */
 async function start() {
   const directory = mkdtempSync(join(tmpdir(), 'model-surface-'))
+  const localGit = gitRepository(directory)
+  const gitEnvironment = gitEnv({ GIT_CONFIG_GLOBAL: join(directory, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' })
   const AGENT = join(directory, 'agent-gh'), BOT = join(directory, 'lark-bot')
   for (const cli of [AGENT, BOT]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
   const repository = { default_branch: 'master', permissions: { push: true } }
   vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : repository)
   vi.spyOn(Commands.prototype, 'lark').mockResolvedValue({ users: [{ member_id: MEMBER, name: 'Alice' }], has_more: false })
-  vi.spyOn(Commands.prototype, 'git').mockResolvedValue('')
+  vi.spyOn(Commands.prototype, 'git').mockImplementation(async (args, cwd) =>
+    execFileSync('git', args, { cwd, env: gitEnvironment, encoding: 'utf8' }))
   vi.spyOn(Commands.prototype, 'run').mockResolvedValue('{"ok":true,"data":{}}')
   const answers: Record<string, string> = {
-    [`git -C ${directory} rev-parse --show-toplevel`]: `${directory}\n`,
-    [`git -C ${directory} remote get-url --push origin`]: 'https://github.com/acme/widgets.git\n',
     [`${AGENT} api user`]: '{"login":"agent-bot","id":7}',
     [`${AGENT} api repos/acme/widgets --jq {name: .full_name, push: .permissions.push}`]: '{"name":"acme/widgets","push":true}\n',
     [`${BOT} auth status`]: JSON.stringify({ appId: 'cli_bot', brand: 'feishu', identities: { bot: { status: 'ready' } } }),
@@ -98,11 +101,12 @@ async function start() {
   const agents = new Map<string, { status: string }>()
   // DSH's agents service lists the Sessions still loaded.
   Object.assign(agents, { list: () => [...agents.values()] })
+  const ctx = new Context()
   const tools = new Map<string, Map<string, Tool>>()
   const sections = new Map<string, Section>()
   const skills = new Map<string, Skill[]>()
   const inputs: { sessionId: string; text: string }[] = []
-  const create = async ({ sessionId }: { sessionId: string }) => {
+  const create = async ({ sessionId, workspaceId }: { sessionId: string; workspaceId: string }) => {
     if (agents.has(sessionId)) return
     const agentCtx = new Context()
     const own = new Map<string, Tool>(), registered: Skill[] = []
@@ -123,14 +127,36 @@ async function start() {
       inputs.push({ sessionId, text: message.content.map(block => block.type === 'text' ? block.text : '').join('') })
     }
     const deliver = (queue: UserMessage[]) => (message: UserMessage) => {
-      queue.push(message); record(message); agents.get(sessionId)!.status = 'running'
+      queue.push(message); record(message)
+      const agent = agents.get(sessionId)!
+      if (agent.status !== 'running') {
+        agent.status = 'running'
+        ctx.emit('agent/status', { agent, status: 'running' } as never)
+      }
     }
-    const session = { id: sessionId, snapshotEvents: () => [], requestHeader: () => undefined, append: () => {} }
-    agents.set(sessionId, { id: sessionId, ctx: agentCtx, inbox, followup: deliver(inbox.nextTurn), steer: deliver(inbox.nextStep),
-      inject: record, status: 'idle', cancel: () => {}, whenIdle: async () => {}, session } as never)
+    const session = { id: sessionId, header: { cwd: workspaceId }, snapshotEvents: () => [], requestHeader: () => undefined, append: () => {} }
+    let status = 'idle'
+    const idle: (() => void)[] = []
+    const agent = { id: sessionId, ctx: agentCtx, inbox, followup: deliver(inbox.nextTurn), steer: deliver(inbox.nextStep), inject: record,
+      get status() { return status }, set status(next: string) { status = next; if (next === 'idle') for (const wake of idle.splice(0)) wake() },
+      cancel: (_cause: unknown, options?: { keepInbox?: boolean }) => {
+        if (!options?.keepInbox) { inbox.nextTurn.length = 0; inbox.nextStep.length = 0 }
+        if (status === 'idle') return
+        queueMicrotask(() => {
+          if (agent.status === 'idle') return
+          agent.status = 'idle'
+          ctx.emit('agent/status', { agent, status: 'idle' } as never)
+        })
+      },
+      whenIdle: () => {
+        if (status === 'idle') return Promise.resolve()
+        const { promise, resolve } = Promise.withResolvers<void>()
+        idle.push(resolve)
+        return promise
+      }, session }
+    agents.set(sessionId, agent as never)
   }
   const resolveAgent = async (id: string) => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }
-  const ctx = new Context()
   const history = { read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} }
   const services = { agents, llm: { resolveCallConfig: async (value: unknown) => value },
     workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }) },
@@ -140,7 +166,9 @@ async function start() {
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   const seed = new Store(join(directory, 'orchestrator.sqlite'))
   const github = { enabled: true, config: { repository: 'acme/widgets', cli: AGENT } }
-  seed.saveSettings(SettingsSchema.parse({ ...seed.settings(), sources: { github, feishu: { enabled: true, config: { cli: BOT } } } }))
+  const initial = seed.settings()
+  seed.saveSettings(SettingsSchema.parse({ ...initial, executor: { ...initial.executor,
+    repository: localGit.repository, baseRef: localGit.base.ref }, sources: { github, feishu: { enabled: true, config: { cli: BOT } } } }))
   seed.close()
   const runtime = new Runtime(ctx, testMachine({ stateDir: directory }), () => {})
   await runtime.ready
@@ -201,10 +229,17 @@ async function drive(host: Host) {
   await runtime.pump()
   await runtime.idle()
   await run(workerA, 'orchestrator_report', { state: 'ready', summary: 'Done.' })
+  // A ready report does not end the Session's turn; DSH emits idle only after its final answer.
+  const finished = host.agents.get(workerA)!
+  finished.status = 'idle'
+  host.ctx.emit('agent/status', { agent: finished, status: 'idle' } as never)
+  await vi.waitFor(() => expect(runtime.store.tickets.get(a)!.execution?.active_writer).toBeNull())
   await runtime.receive(feishu('2', '再加一个按钮', { mentions: [], root_id: 'om_1' }))
   await vi.waitFor(async () => {
     await runtime.pump()
-    expect(runtime.store.tickets.get(a)!.inputs.some(input => input.kind === 'resumed')).toBe(true)
+    const resumed = runtime.store.tickets.get(a)!.inputs.find(input => input.kind === 'resumed')
+    expect(resumed).toBeDefined()
+    expect(host.inputs.some(input => input.sessionId === workerA && input.text === inputMessage(resumed!))).toBe(true)
   })
   const policy = runtime.store.settings().policy
   // The rule ticket b was accepted under changes, so its worker is told how; the one it was not is disabled, which tells no one.

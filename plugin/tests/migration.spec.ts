@@ -130,6 +130,10 @@ it('writes a schema 10 database in its current shape once, so nothing reads an o
     answers: ['trig-3'],
     mandate: { basis: { via: 'listed', source: 'feishu', scope: { chatId: 'oc_team', direct: false }, sender: 'ou_alice', addressed: 'mention' } },
   })
+  // A legacy workspace path and branch are not proof of a Git worktree, pinned base, or owner.
+  expect(migrated.execution).not.toHaveProperty('ownership')
+  expect(migrated.execution).not.toHaveProperty('base')
+  expect(migrated.execution).not.toHaveProperty('verified', true)
   expect(migrated.inputs[0]).toMatchObject({ id: 'i1', kind: 'text', text: expect.stringContaining('"resumed":true') })
   expect(migrated.inputs[0]).not.toMatchObject({ text: expect.stringContaining('reopen') })
   expect(migrated.inputs[1]).toEqual({ id: 'i2', kind: 'reopen', decisionId: 'd0', at: '0' })
@@ -137,6 +141,9 @@ it('writes a schema 10 database in its current shape once, so nothing reads an o
   expect(migrated).not.toHaveProperty('execution.recoveries')
   expect(store.tickets.get('t2')).toMatchObject({ execution: { name: 'task-2', assignment: 'Read event/old' },
     mandate: { basis: { via: 'followup', authority: 'thread_followup' } } })
+  expect(store.tickets.get('t2')!.execution).not.toHaveProperty('ownership')
+  expect(store.tickets.get('t2')!.execution).not.toHaveProperty('base')
+  expect(store.tickets.get('t2')!.execution).not.toHaveProperty('verified', true)
   expect(store.tickets.get('t2')).not.toHaveProperty('follows')
   // An end's reason that only repeats its outcome is not kept.
   expect(store.tickets.get('t2')!.ended).toEqual({ at: '6', by: 'executor', outcome: 'merged' })

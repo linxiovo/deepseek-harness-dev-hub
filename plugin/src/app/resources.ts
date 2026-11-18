@@ -30,8 +30,9 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'decision/<id>', holds: 'one decision with its audit' },
   { name: 'handoff/<id>', holds: 'the persisted, explicitly confirmed project and product intent, including planner questions and answers' },
   { name: 'spec/<id>', holds: 'the published specification for this handoff, with observable acceptance and test interfaces; pending until publication' },
-  { name: 'ticket/<id>', holds: 'a ticket\'s card, the trigger, decision and threads it is tied to, its latest assignments with the start of each '
-    + 'report, and its inputs, newest first', executor: true },
+  { name: 'ticket/<id>', holds: 'a ticket\'s card, recorded preparation status and rejection reason, verified repository, worktree, '
+    + 'branch, base, worker Session and active writer when available; its trigger, decision and threads, latest assignments with the '
+    + 'start of each report, and inputs, newest first', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
   { name: 'ticket/<id>/assignments', holds: 'its assignments, newest first, with the start of each report', executor: true },
   { name: 'ticket/<id>/inputs', holds: 'its inputs, newest first', executor: true },

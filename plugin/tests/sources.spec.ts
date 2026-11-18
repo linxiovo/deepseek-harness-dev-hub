@@ -1034,6 +1034,8 @@ describe('feishu event consumer', () => {
   const until = { timeout: 10_000 }
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'feishu-consumer-')); controller = new AbortController() })
   afterEach(async () => {
+    // Release a fake CLI waiting at the events handshake even when the test failed before it did.
+    try { writeFileSync(join(dir, 'go'), '') } catch { /* The directory may already be gone. */ }
     controller.abort()
     await running
     vi.useRealTimers()
@@ -1053,7 +1055,7 @@ describe('feishu event consumer', () => {
     warn) echo '[event] ready' >&2; echo 'WARN the connection was reset' >&2; exec sleep 60 ;;
     ready) echo '[event] ready' >&2; exec sleep 60 ;;
     flaky) echo '[event] ready' >&2; [ "$n" -gt 1 ] && exec sleep 60; exit 1 ;;
-    events) echo '[event] ready' >&2; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
+    events) echo '[event] ready' >&2; while [ ! -f '${dir}/go' ]; do sleep 0.05; done; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
     late) echo '[event] ready' >&2; sleep 1; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
     late-ready) cat '${dir}/events'; while [ ! -f '${dir}/release-ready' ]; do sleep 0.01; done; echo '[event] ready' >&2; touch '${dir}/ready-emitted'; exec sleep 60 ;;
   esac
@@ -1106,6 +1108,22 @@ describe('feishu event consumer', () => {
       controller.abort(); await running; store.close()
     }
     expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
+  }, 20_000)
+  it('keeps a malformed event error when readiness precedes the event lines', async () => {
+    writeFileSync(join(dir, 'events'), [event('om_1', 'oc_group', 'group'), event('om_2', 'oc_dm', 'p2p'), 'not json',
+      event('om_3', 'oc_group', 'group')].join('\n') + '\n')
+    const { ctx, health, store } = consumerSource(cli('events'))
+    running = runFeishu(ctx, controller.signal)
+    try {
+      await vi.waitFor(() => expect(health.feishu).toMatchObject({ state: 'ready' }), until)
+      writeFileSync(join(dir, 'go'), '')
+      await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_3'))).toBeDefined(), until)
+      expect(['om_1', 'om_2'].map(id => store.triggers.get(feishuTriggerId(id))?.meta.direct)).toEqual([false, true])
+      expect(store.get(KV.feishu.chats)).toEqual({ oc_group: false, oc_dm: true })
+      await vi.waitFor(() => expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') }), until)
+    } finally {
+      controller.abort(); await running; store.close()
+    }
   }, 20_000)
   it('drops the events it reads once the Source is off', async () => {
     writeFileSync(join(dir, 'events'), event('om_9', 'oc_group', 'group') + '\n')

@@ -56,6 +56,37 @@ it('reads the lists, a ticket, a decision, the settings, the prompts and the mod
   expect(await read('prompts', { limit: 8000 })).toMatchObject({ items: expect.objectContaining({ length: 50 }), next_offset: 50 })
 })
 
+it('reads verified worktree ownership, actual worker Session, active writer, and preparation rejection through ticket resources and management', async () => {
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const execution = ticket.execution!
+  const ownership = execution.ownership!
+  expect(ownership).toMatchObject({ ticket: ticket.id, verified: true, identity: { base: h.localGit!.base } })
+  expect(execution).toMatchObject({ repository: h.localGit!.repository, worktree: execution.directory,
+    base: h.localGit!.base, session: sessionId, active_writer: { assignment: ticket.assignments[0]!.id, session: sessionId },
+    preparation: { state: 'verified' } })
+  const { assignment: _assignment, ownership: _ownership, ...shownExecution } = execution
+  expect(await read('tickets')).toMatchObject({ items: expect.arrayContaining([expect.objectContaining({ ticket_id: ticket.id,
+    execution: shownExecution })]) })
+  expect(await read(`ticket/${ticket.id}`)).toMatchObject({ ticket_id: ticket.id, execution: shownExecution })
+  expect(await h.runTool(sessionId, 'orchestrator_read', { resource: `ticket/${ticket.id}` })).toMatchObject({ execution: shownExecution })
+  const verifiedPage = (await h.api('GET', `tickets/${ticket.id}`)).body
+  expect(verifiedPage).toMatchObject({ execution: shownExecution, sessionId })
+  expect(verifiedPage).not.toHaveProperty('execution.ownership')
+
+  const reason = 'Worker preparation failed; existing files were preserved.'
+  const claim = { ...ownership.identity, ticket: ticket.id, assignment: ticket.assignments[0]!.id,
+    generation: ownership.generation, verified: ownership.verified }
+  expect(h.runtime.engine.rejectExecution(claim, reason)).toBe(true)
+  const shownRejected = { ...shownExecution, preparation: { state: 'rejected', reason } }
+  expect(await read('tickets')).toMatchObject({ items: expect.arrayContaining([expect.objectContaining({ ticket_id: ticket.id,
+    execution: shownRejected })]) })
+  expect(await read(`ticket/${ticket.id}`)).toMatchObject({ ticket_id: ticket.id, execution: shownRejected })
+  expect(await h.runTool(sessionId, 'orchestrator_read', { resource: `ticket/${ticket.id}` })).toMatchObject({ execution: shownRejected })
+  const rejectedPage = (await h.api('GET', `tickets/${ticket.id}`)).body
+  expect(rejectedPage).toMatchObject({ execution: shownRejected })
+  expect(rejectedPage).not.toHaveProperty('execution.ownership')
+})
+
 it('lists in prompts the built-in parts whose text changed since the team overrode them, and the built-in parts in prompts/defaults', async () => {
   const read = (resource: string, offset = 0) => h.runTool(h.runtime.masterId, 'orchestrator_read', { resource, offset, limit: 8000 })
   expect(await read('prompts')).not.toHaveProperty('default_changed')
@@ -352,14 +383,18 @@ it('reads a thread by the key cards show: its label, tickets, latest decisions a
 
 it('reads a ticket with the ids it is tied to, its reports by assignment, and its assignments and inputs a page at a time, each by the name its line gives or by its id', async () => {
   const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
-  const stored = h.runtime.store.tickets.get(ticket.id)!
+  // Build pagination around the persisted live assignment rather than replacing its fenced writer.
   const at = (n: number) => `2026-10-05T00:${String(n).padStart(2, '0')}:00.000Z`
   const report = (n: number) => ({ state: 'progress' as const, summary: `Report ${n}: ${'checked the config and the build. '.repeat(46)}`.slice(0, 1500), at: at(n) })
-  const assignments = [1, 2, 3, 4, 5, 6, 7].map(n => ({ ...stored.assignments[0]!, id: `a${n}`, state: n < 7 ? 'ended' as const : 'running' as const, report: report(n), createdAt: at(n) }))
+  const earlierAssignments = [1, 2, 3, 4, 5, 6].map(n => ({ id: `a${n}`, state: 'ended' as const,
+    report: report(n), createdAt: at(n) }))
   const inputs = Array.from({ length: 24 }, (_, n) => n === 23 ? { id: 'text:long', kind: 'text' as const, text: `Note: ${'check the margin on mobile as well. '.repeat(4)}`, at: at(n) }
     : n % 2 ? { id: `text:${n}`, kind: 'text' as const, text: `Note ${n}: check the margin.`, at: at(n) }
     : { id: `trigger:${n}`, kind: 'trigger' as const, triggerId: `trigger-${n}`, at: at(n) })
-  h.runtime.store.tickets.save({ ...stored, assignments, inputs: [...stored.inputs, ...inputs] })
+  const current = h.runtime.store.tickets.get(ticket.id)!
+  const latest = current.assignments.at(-1)!
+  h.runtime.store.tickets.save({ ...current, assignments: [...earlierAssignments, ...current.assignments.slice(0, -1),
+    { ...latest, report: report(7) }], inputs: [...current.inputs, ...inputs] })
   type Page = { items: { read?: string; report: { read: string } }[]; next_resource?: string; next_offset?: number }
   const details = await read(`ticket/${ticket.id}`) as { inputs: Page; assignments: Page }
   expect(details).toMatchObject({ trigger_id: ticket.origin.triggerId, decision_id: ticket.decisionId, threads: [{ thread: `feishu:${CHAT}:om_1` }],

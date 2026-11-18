@@ -4,10 +4,11 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import { realpath } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { z } from 'zod'
 import { key, liveTicket, type Ticket } from '../core/index.ts'
-import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
+import { mandateInstructions, ticketOfSession, workerSessionId } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { AgentDelivery, messageId } from './delivery.ts'
 import type { Effects } from './effects.ts'
@@ -36,6 +37,8 @@ export interface SessionsHost {
   environment(ticket: Ticket): Variable[]
   /** Whether the persisted handoff is in its active planning state; all other statuses deny planner tools. */
   plannerActive(handoffId: string): boolean
+  /** In-process writer grant; a stored lease cannot authorize worker turns after a restart. */
+  workerAuthorized?(ticketId: string, sessionId: string): boolean
   /** Tools for the main Session, a worker ticket, or an explicit planner role; the planner receives only its own tools. */
   tools(agent: Agent, ticket?: Ticket, role?: 'planner'): Tool[]
 }
@@ -67,6 +70,9 @@ const PLANNER_TOOLS: readonly string[] = ['read', 'read_image', 'glob', 'grep', 
 const SHARED_HOST_TOOLS: readonly string[] = ['orchestrator_read']
 const PLANNER_HOST_TOOLS: readonly string[] = ['orchestrator_spec_question', 'orchestrator_spec_publish']
 const PLANNER_INACTIVE = promptFile('planner-inactive'), PLANNER_DENIED = promptFile('planner-denied')
+const WORKER_TICKET_ENDED = promptFile('worker-ticket-ended')
+const WORKER_WRITER_REQUIRED = promptFile('worker-writer-required')
+const WORKER_ANCESTRY_PENDING = promptFile('worker-ancestry-pending')
 /**
  * The DSH tools an Executor Session works with: files, search, the shell and its jobs, the web, skills, its todo list and
  * subagents. It gets no other DSH tool the profile has, whenever it was registered: none that asks or shows a person
@@ -146,6 +152,10 @@ export class Sessions {
     if (role === 'planner' && (!plannerId || !this.host.plannerActive(plannerId))) {
       throw new Error('A planner Session needs an active, persisted planning handoff and planner-<handoffId> session ID')
     }
+    const ticketId = role === 'worker' ? ticketOfSession(id) : undefined
+    if (role === 'worker' && (!ticketId || this.host.workerAuthorized?.(ticketId, id) === false)) {
+      throw new Error(`Worker ${id} has no verified writer grant; refusing to create its Session`)
+    }
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
@@ -156,6 +166,14 @@ export class Sessions {
       result = await ctx.sessionController.resolveAgent(id as SessionId)
     }
     if ('error' in result) throw result.error
+    if (role === 'worker') {
+      const createdIn = result.agent.session.header.cwd
+      if (!createdIn) throw new Error(`Worker ${id} has no recorded workspace directory`)
+      const [sessionPath, expectedPath] = await Promise.all([realpath(createdIn), realpath(cwd)])
+      const same = process.platform === 'win32' ? sessionPath.toLowerCase() === expectedPath.toLowerCase() : sessionPath === expectedPath
+      if (!same) throw new Error(`Worker ${id} belongs to ${createdIn}, not the verified ticket worktree ${cwd}`)
+      if (this.host.workerAuthorized?.(ticketId!, id) === false) throw new Error(`Worker ${id} lost its writer grant before Session setup`)
+    }
     const settings = this.host.store.settings()
     await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
     await this.decorate(result.agent)
@@ -171,9 +189,17 @@ export class Sessions {
   /** Deliver a message once per request id: to the next turn, the current one, or `inject`ed with its label without waking the agent. */
   async prompt(sessionId: string, requestId: string, text: string, mode: 'queue' | 'steer' | { inject: string }, authorize?: () => void,
     accepted?: () => void): Promise<void> {
+    const ticketId = ticketOfSession(sessionId)
+    const granted = () => {
+      if (ticketId && this.host.workerAuthorized?.(ticketId, sessionId) === false) {
+        throw new Error(`Worker ${sessionId} has no verified writer grant; refusing its turn`)
+      }
+      authorize?.()
+    }
+    granted()
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
     if ('error' in result) throw result.error
-    await this.agentDelivery.send(result.agent, key(requestId), text, mode, this.host.lifetime, authorize, accepted)
+    await this.agentDelivery.send(result.agent, key(requestId), text, mode, this.host.lifetime, granted, accepted)
   }
   /** The id of the message `prompt` delivers under `requestId`, which DSH's inbox events name it by. */
   promptedId(requestId: string): MessageId { return messageId(key(requestId)) }
@@ -296,11 +322,9 @@ export class Sessions {
     })]
   }
   /**
-   * An Executor Session's tools: only the profile's work tools, the Context7 documentation MCP tools its preset mounts, and
-   * none once its ticket ended. A failed or blocked worker keeps its tools, so a person may continue it in its Session; only
-   * automated input waits (see the executor). Read inherited tools through the parent scope, which includes the preset's
-   * tools. The global view misses preset tools; the agent's own view also includes local tools such as subagent, which
-   * restrict refuses to name.
+   * An Executor Session uses inherited work tools and the preset's Context7 documentation tools only while its ticket has
+   * a verified live writer grant. Read inherited tools through the parent scope, which includes the preset's tools;
+   * the global view misses preset tools and the agent's own view also includes local tools that `restrict` refuses to name.
    */
   private workOnly(agent: Agent, ticketId: string): (() => void)[] {
     const store = this.host.store
@@ -308,7 +332,9 @@ export class Sessions {
     const allow = [...WORK_TOOLS, ...DEV_MCP_TOOLS].filter(name => agent.ctx.tools.get(name, parent))
     return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
       const current = store.tickets.get(ticketId)
-      return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : undefined
+      if (!current || !liveTicket(current)) return WORKER_TICKET_ENDED
+      if (this.host.workerAuthorized?.(ticketId, workerSessionId(ticketId)) === false) return WORKER_WRITER_REQUIRED
+      return undefined
     })]
   }
   /**
@@ -338,7 +364,7 @@ export class Sessions {
   private async limitSubagent(agent: Agent): Promise<void> {
     if (agent.session.header.parentSession === undefined) return
     // A live Session reloaded on startup can invoke tools while persistence resolves an unloaded parent.
-    const pending: SessionBinding = { disposers: [agent.ctx.tools.guard(() => 'Worker ancestry is being resolved; work tools are temporarily unavailable')], subagent: true }
+    const pending: SessionBinding = { disposers: [agent.ctx.tools.guard(() => WORKER_ANCESTRY_PENDING)], subagent: true }
     this.bindings.set(agent, pending)
     const ticketId = await this.owningTicket(agent)
     if (this.bindings.get(agent) !== pending || this.host.closing()) return

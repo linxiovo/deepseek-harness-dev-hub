@@ -1,7 +1,7 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
 import { isoTime, liveTicket } from './model.ts'
-import type { Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { Decision, Execution, ExecutionClaim, ExecutionIdentity, ExecutionResult, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
@@ -167,12 +167,42 @@ export class Engine {
 
   // The Executor
 
+  /** Atomically reserve exclusive preparation rights before filesystem writes or Session creation. */
+  reserveExecution(ticketId: string, assignmentId: string, identity: ExecutionIdentity): ExecutionResult<ExecutionClaim> {
+    return this.repo.atomic(() => this.tickets.reserveExecution(ticketId, assignmentId, identity))
+  }
+  /** Persist facts from real Git verification against the fenced claim's immutable identity. */
+  recordExecutionVerified(claim: ExecutionClaim, identity: ExecutionIdentity): ExecutionResult<Execution> {
+    return this.repo.atomic(() => this.tickets.recordExecutionVerified(claim, identity))
+  }
+  /** Record a preparation failure; does not release the write lease. */
+  rejectExecution(claim: ExecutionClaim, reason: string): boolean {
+    return this.repo.atomic(() => this.tickets.rejectExecution(claim, reason))
+  }
+  /** Bind the real Session ID while retaining exclusive rights from preparation into worker execution. */
+  acquireExecutionWriter(claim: ExecutionClaim, session: string): boolean {
+    return this.repo.atomic(() => this.tickets.acquireExecutionWriter(claim, session))
+  }
+  /** Confirm actual idle with generation, Assignment and Session fencing, including ended Assignments. */
+  releaseExecutionWriter(claim: ExecutionClaim, session?: string): boolean {
+    return this.repo.atomic(() => this.tickets.releaseExecutionWriter(claim, session))
+  }
+
   /**
    * The Executor's fact that an Assignment runs; the Inputs that wait for it go out.
    * @throws UserError when the ticket is unknown.
    */
   assignmentStarted(ticketId: string, assignmentId: string): void {
-    this.repo.atomic(() => { this.assignments.started(ticketId, assignmentId) })
+    this.repo.atomic(() => {
+      const ticket = this.repo.tickets.get(ticketId)
+      if (ticket?.execution?.ownership) {
+        const writer = ticket.assignments.find(item => item.id === assignmentId)?.writer
+        const active = ticket.execution.active_writer
+        if (writer?.state !== 'active' || writer.generation !== ticket.execution.ownership.generation
+          || active?.assignment !== assignmentId || active.session !== writer.session) return
+      }
+      this.assignments.started(ticketId, assignmentId)
+    })
   }
   /**
    * The Executor's fact that Inputs reached the Assignment that runs the ticket, which clears a failed delivery. A fact about
@@ -275,4 +305,5 @@ export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reeva
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
 export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
-  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'takeUp'>
+  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'takeUp'
+  | 'reserveExecution' | 'recordExecutionVerified' | 'rejectExecution' | 'acquireExecutionWriter' | 'releaseExecutionWriter'>

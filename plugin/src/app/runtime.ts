@@ -126,14 +126,16 @@ export class Runtime extends Service implements SourceHost {
       const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
         lifetime: this.lifetime,
         closing: () => this.closing(), environment, plannerActive: id => handoffs.isPlanning(id),
+        workerAuthorized: (ticketId, sessionId) => runtime.executor?.writerAuthorized(ticketId, sessionId) === true,
         tools: (agent, ticket, role) => role === 'planner' ? plannerTools(this.toolHost, agent)
           : ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent) })
       this.planning = new Planning({ handoffs, effects, sessions, paused: () => this.paused(), closing: () => this.closing() })
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
         sourceHost: this, setup, requestPass: () => { this.passes.request() } })
-      this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
-        lifetime: this.lifetime, sessions, closing: () => this.closing(), paused: () => this.paused(), environment, sourceLink: link,
+      this.executor = new DshExecutor({ context: ctx, commands, get engine() { return runtime.engine }, store, effects,
+        health: board.claim('worker'), machine, lifetime: this.lifetime, sessions, closing: () => this.closing(),
+        paused: () => this.paused(), environment, sourceLink: link,
         repliedTo: trigger => repliedTo({ store, sources }, trigger) })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
@@ -199,7 +201,11 @@ export class Runtime extends Service implements SourceHost {
   }
   checkSetup(): void { this.setup.check() }
   receive(trigger: Trigger): ReceiveResult { return this.passes.receive(trigger) }
-  idle(): Promise<void> { return this.passes.idle() }
+  async idle(): Promise<void> {
+    await this.passes.idle()
+    await this.executor.idleHandoffs()
+    await this.passes.idle()
+  }
   pump(): Promise<void> { return this.passes.pump() }
   sendReplies(): Promise<void> { return this.outbox.sent() }
   private closing(): boolean { return this.closingFlag }

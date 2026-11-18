@@ -30,8 +30,8 @@ export interface Machine {
 }
 const MOVED: Record<string, string> = {
   repository: 'on the GitHub Source', branchPrefix: 'in the prepare command of the Execution settings', github: 'on the GitHub Source',
-  feishu: 'on the Feishu Source', author: 'prompt text', repositoryPath: 'in the prepare command of the Execution settings',
-  worktreeRoot: 'the ticket directory of the Execution settings', blockedCommands: 'in the Execution settings',
+  feishu: 'on the Feishu Source', author: 'prompt text', repositoryPath: 'executor.repository in the Execution settings',
+  baseRef: 'executor.baseRef in the Execution settings', worktreeRoot: 'the ticket directory of the Execution settings', blockedCommands: 'in the Execution settings',
 }
 
 /** Read machine settings and reject unknown configuration keys (naming where deprecated keys moved). */

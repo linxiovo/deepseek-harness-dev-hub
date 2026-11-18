@@ -64,6 +64,8 @@ it('defines a read-only router preset with inspection tools but no shell, jobs o
     expect(named(name).length, name).toBeGreaterThan(0)
   }
   const names = plugins.map(row => row.name)
+  expect(names.filter(name => name.startsWith('@deepseek-ai/dsh-tool-')).sort()).toEqual([
+    '@deepseek-ai/dsh-tool-fs', '@deepseek-ai/dsh-tool-fs-search', '@deepseek-ai/dsh-tool-skill'])
   for (const name of ['@deepseek-ai/dsh-bash-sandbox', '@deepseek-ai/dsh-pwsh-sandbox', '@deepseek-ai/dsh-tool-bash',
     '@deepseek-ai/dsh-tool-pwsh', '@deepseek-ai/dsh-tool-jobs', '@deepseek-ai/dsh-tool-subagent', '@deepseek-ai/dsh-tool-subagent-control',
     '@deepseek-ai/dsh-tool-web', '@deepseek-ai/dsh-tool-todo', '@deepseek-ai/dsh-tool-ask-user', '@deepseek-ai/dsh-tool-present',

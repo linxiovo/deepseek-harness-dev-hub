@@ -1,7 +1,7 @@
 /** Ticket detail page: stage and actions, Mandate details, undelivered/delivered Inputs, subscribed Threads, and Assignments. */
 import { useState, type ReactNode } from 'react'
 import { ApiError, usePoll, type TicketPageView } from './api.ts'
-import { DisclosureRow, Dot, Icon, Tag, type IconName } from './controls.tsx'
+import { DisclosureRow, Dot, Icon, Tag, type IconName, type TagTone } from './controls.tsx'
 import { decisionMark, reportDot, ticketMark } from './marks.ts'
 import { usePanel } from './provider.tsx'
 import { settingsRoute } from './route.ts'
@@ -125,6 +125,33 @@ export function TicketPage({ id }: { id: string }) {
     return reason ? t('endedAt', { time, outcome, reason }) : t('endedAtShort', { time, outcome })
   })()
   const channel = data.channels[0]
+  const execution = data.execution
+  // A Ticket's started Assignments all run in its one Worker Session; the execution projection fills this in when it records it.
+  const session = execution?.session || data.sessionId || undefined
+  const preparation = execution?.preparation
+  const preparationState = preparation?.state
+  const preparationLabel = !preparationState || preparationState === 'unverified' ? t('unverified')
+    : valueLabel(t, 'preparation', preparationState)
+  const preparationTone: TagTone = preparationState === 'verified' ? 'success' : preparationState === 'rejected' ? 'danger' : 'neutral'
+  const writer = execution?.active_writer
+  const writerLabel = writer ? `${writer.assignment} · ${writer.session}` : t('activeWriterNone')
+  const base = execution?.base
+  const preparationReason = preparation && 'reason' in preparation ? preparation.reason : undefined
+  const showPreparationReason = !!preparationReason
+  const identifiers: [string, ReactNode][] = [
+    [t('ticketId'), <span className="dt-mono">{data.id}</span>],
+    [t('ticketDirectory'), <span className="dt-mono">{execution?.directory ?? data.directory ?? t('empty')}</span>],
+  ]
+  if (session) identifiers.push([t('workerSession'), <span className="dt-mono">{session}</span>])
+  if (execution?.repository) identifiers.push([t('executionRepository'), <span className="dt-mono">{execution.repository}</span>])
+  if (execution?.worktree) identifiers.push([t('executionWorktree'), <span className="dt-mono">{execution.worktree}</span>])
+  if (execution?.branch) identifiers.push([t('executionBranch'), <span className="dt-mono">{execution.branch}</span>])
+  if (base?.ref) identifiers.push([t('executionBaseRef'), <span className="dt-mono">{base.ref}</span>])
+  if (base?.sha) identifiers.push([t('executionBaseSha'), <span className="dt-mono">{base.sha}</span>])
+  if (execution && 'active_writer' in execution) identifiers.push([t('activeWriter'), <span className="dt-mono">{writerLabel}</span>])
+  if (execution) identifiers.push([t('preparationState'), <Tag tone={preparationTone}>{preparationLabel}</Tag>])
+  if (legacy && data.mandate.scope) identifiers.push([t('legacyAssignment'), <span
+    className="dt-mono dt-clamp">{data.mandate.scope}</span>])
   return <>
     <PageHead title={data.title}>
       {opening?.url && <ActionLink href={opening.url}>{t('openThread', { source: valueLabel(t, 'source', opening.source) })}</ActionLink>}
@@ -139,6 +166,8 @@ export function TicketPage({ id }: { id: string }) {
       <LabelValue label={t('ticketMandateLabel')} value={valueLabel(t, 'strength', data.mandate.strength)} />
       <LabelValue label={t('ticketActorLabel')} value={`${valueLabel(t, 'source', data.mandate.actor.source)} · ${actor}`} />
       <LabelValue label={t('ticketUpdatedLabel')} value={when(data.updatedAt, t('lang'))} />
+      {execution && <Tag tone={preparationTone} title={t('preparationState')}>{t('preparationState')}{t('labelSeparator')}
+        {preparationLabel}</Tag>}
     </div>
     {ended && <Hint>{ended}</Hint>}
     {data.attention && <div className="dt-banner"><span className="dt-banner-label">{t('attentionPrefix')}</span><MarkdownLite
@@ -152,6 +181,9 @@ export function TicketPage({ id }: { id: string }) {
     </p>}
     {data.deliveryError && <p className="dt-banner dt-danger dt-mono">
       <span className="dt-banner-label">{t('deliveryFailedPrefix')}</span>{data.deliveryError}
+    </p>}
+    {showPreparationReason && <p className="dt-banner dt-danger dt-mono">
+      <span className="dt-banner-label">{t('preparationRejectedPrefix')}</span>{preparationReason}
     </p>}
     <MandateDetails ticket={data} actor={actor} />
     {undelivered.length > 0 && <Section title={t('undeliveredInputs')} count={undelivered.length}>
@@ -183,10 +215,7 @@ export function TicketPage({ id }: { id: string }) {
         <InputList inputs={data.inputs.filter(input => input.delivered)} />
       </Details>}
       <Details icon="hash" title={t('identifiers')}>
-        <KeyValues rows={[[t('ticketId'), <span className="dt-mono">{data.id}</span>], [t('executionDirectory'), <span
-          className="dt-mono">{data.directory ?? t('empty')}</span>],
-          ...legacy && data.mandate.scope ? [[t('legacyAssignment'), <span
-            className="dt-mono dt-clamp">{data.mandate.scope}</span>] as [string, ReactNode]] : []]} />
+        <KeyValues rows={identifiers} />
       </Details>
     </div>
     {data.actions.stop && <div className="dt-danger-zone">

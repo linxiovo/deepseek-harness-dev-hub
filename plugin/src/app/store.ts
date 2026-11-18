@@ -1,7 +1,7 @@
 /** SQLite persistence for domain aggregates, key-value state, settings history, and the channel outbox. */
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
-import { chmodSync, mkdirSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { chmodSync, mkdirSync, realpathSync } from 'node:fs'
+import { basename, dirname, isAbsolute, resolve } from 'node:path'
 import { key, threadKey, type ChannelRef, type Decision, type OutboundMessage, type ReplyStatus, type Repositories, type Thread, type ThreadFact,
   type ThreadFacts, type Ticket, type Trigger, type TriggerDisposition } from '../core/index.ts'
 import { KV, type Family, type Key } from '../kv.ts'
@@ -42,6 +42,21 @@ const SETS: Record<string, Record<string, string>> = {
   outbox: { dropped: "TEXT AS (value ->> '$.dropped.at')", pending: `TEXT AS (CASE WHEN value ->> '$.status' = 'pending'
     AND value ->> '$.ticketId' IS NOT NULL THEN (value ->> '$.ticketId') || ' ' || (value ->> '$.channel.thread') END)` },
 }
+
+/** Resolve missing worktree targets through their nearest existing parent, including any symlinks. */
+function canonicalTarget(path: string): string {
+  if (typeof path !== 'string' || !isAbsolute(path)) throw new Error('Worktree ownership requires absolute paths')
+  let parent = resolve(path)
+  const missing: string[] = []
+  for (;;) {
+    try { return resolve(realpathSync.native(parent), ...missing.reverse()) }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || dirname(parent) === parent) throw error
+      missing.push(basename(parent)); parent = dirname(parent)
+    }
+  }
+}
+const sameDirectory = (a: string, b: string): boolean => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b
 export { SCHEMA_VERSION }
 /**
  * SQLite backing store implementing domain `Repositories`, view read queries, versioned settings, outbox receipts, and key-value state.
@@ -84,6 +99,16 @@ export class Store implements Repositories {
             CREATE INDEX IF NOT EXISTS trigger_thread_at ON trigger_thread(thread, at);
             CREATE INDEX IF NOT EXISTS decision_thread ON decision(thread);
             CREATE INDEX IF NOT EXISTS effect_due ON effect(kind, due, seq);
+            CREATE UNIQUE INDEX IF NOT EXISTS ticket_worktree_owner
+              ON ticket((value ->> '$.execution.ownership.identity.worktree') COLLATE NOCASE)
+              WHERE value ->> '$.execution.ownership.identity.worktree' IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS ticket_worktree_session_writer
+              ON ticket((value ->> '$.execution.active_writer.session'))
+              WHERE value ->> '$.execution.active_writer.session' IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS ticket_worktree_branch_owner
+              ON ticket((value ->> '$.execution.ownership.identity.commonDir') COLLATE NOCASE,
+                (value ->> '$.execution.ownership.identity.branch'))
+              WHERE value ->> '$.execution.ownership.identity.commonDir' IS NOT NULL;
           `)
           this.addColumns()
           if (migrating) migrateTo11(this)
@@ -232,7 +257,88 @@ export class Store implements Repositories {
   }
   readonly tickets = {
     get: (id: string): Ticket | undefined => { const row = this.db.prepare('SELECT value FROM ticket WHERE id=?').get(id); return row ? JSON.parse(String(row.value)) as Ticket : undefined },
-    save: (ticket: Ticket): void => { this.db.prepare('INSERT INTO ticket VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(ticket.id, JSON.stringify(ticket)) },
+    save: (ticket: Ticket): void => this.atomic(() => {
+      const stored = this.tickets.get(ticket.id)
+      const before = stored?.execution?.ownership
+      const after = ticket.execution?.ownership
+      if (before) {
+        const a = before.identity, b = after?.identity
+        if (!after || after.ticket !== before.ticket || after.generation < before.generation || before.verified && !after.verified
+          || !b || a.repository !== b.repository || a.commonDir !== b.commonDir || a.worktree !== b.worktree
+          || a.branch !== b.branch || a.base.ref !== b.base.ref || a.base.sha !== b.base.sha) {
+          throw new Error('Ticket worktree ownership and its pinned base cannot be removed, reassigned or overwritten by a stale generation')
+        }
+      }
+      for (const previous of stored?.assignments ?? []) {
+        const writer = previous.writer
+        if (!writer) continue
+        const next = ticket.assignments.find(item => item.id === previous.id)?.writer
+        if (!next || next.generation < writer.generation || next.generation === writer.generation && writer.session && next.session !== writer.session
+          || writer.state !== 'idle' && next.generation !== writer.generation
+          || writer.state === 'idle' && next.generation === writer.generation && next.state !== 'idle'
+          || writer.state === 'stopping' && next.state !== 'stopping' && next.state !== 'idle'
+          || writer.state === 'active' && next.state === 'preparing') {
+          throw new Error('A persisted writer cannot be removed, rebound or revived by a stale ticket save')
+        }
+        if (after && before && after.generation > before.generation && writer.state !== 'idle') {
+          throw new Error('A new generation cannot replace a writer before it is confirmed idle')
+        }
+      }
+      if (after && after.ticket !== ticket.id) throw new Error('A worktree reservation must belong to its ticket')
+      if (!after && ticket.execution?.active_writer) throw new Error('An unverified execution cannot claim an active writer')
+      if (after) {
+        const held = ticket.assignments.filter(item => item.writer && item.writer.state !== 'idle')
+        const holder = held[0]
+        const active = ticket.execution?.active_writer
+        const mismatched = holder?.writer?.session
+          ? !active || active.assignment !== holder.id || active.session !== holder.writer.session
+          : !!active
+        if (!Number.isSafeInteger(after.generation) || after.generation < 1 || held.length > 1
+          || holder && holder.writer!.generation !== after.generation || mismatched) {
+          throw new Error('Execution metadata must identify exactly its fenced active writer')
+        }
+        if (after.verified) {
+          const execution = ticket.execution!
+          const identity = after.identity
+          if (execution.repository !== identity.repository || execution.worktree !== identity.worktree
+            || execution.branch !== identity.branch || execution.base?.ref !== identity.base.ref
+            || execution.base?.sha !== identity.base.sha) {
+            throw new Error('A verified execution must preserve its public repository, worktree, branch and pinned base')
+          }
+        }
+      }
+      // The executor supplies the identity; the Store is the final atomic authority over physical paths and branches.
+      // Check again when verification or a writer grant changes, not on unrelated ticket/status saves.
+      if (after && (!before || after.generation > before.generation || after.verified && !before.verified
+        || ticket.execution?.active_writer && !stored?.execution?.active_writer)) {
+        const { repository, commonDir, worktree, branch } = after.identity
+        const directory = ticket.execution!.directory
+        const canonical = canonicalTarget(worktree)
+        if (!branch || !sameDirectory(canonical, worktree)
+          || !sameDirectory(canonicalTarget(repository), repository)
+          || !sameDirectory(canonicalTarget(commonDir), commonDir)
+          || !isAbsolute(directory) || !sameDirectory(resolve(directory), worktree)
+          || !sameDirectory(canonicalTarget(directory), canonical)) {
+          throw new Error('Execution ownership requires the canonical repository, common directory and ticket worktree paths')
+        }
+        // Older stored identities or public worktree paths may predate the canonical indexes. Resolve them too:
+        // a symlink alias or Windows drive-name casing must not grant a second ticket the same writer.
+        for (const other of this.tickets.list()) {
+          if (other.id === ticket.id) continue
+          const owned = other.execution?.ownership?.identity
+          const previousPath = owned?.worktree ?? other.execution?.worktree
+            ?? (other.assignments.some(item => item.startedAt && !item.writer) ? other.execution?.directory : undefined)
+          if (previousPath && isAbsolute(previousPath) && sameDirectory(canonicalTarget(previousPath), canonical)) {
+            throw new Error(`The worktree directory is owned by ticket ${other.id}`)
+          }
+          if (owned?.commonDir && isAbsolute(owned.commonDir)
+            && sameDirectory(canonicalTarget(owned.commonDir), commonDir) && owned.branch === branch) {
+            throw new Error(`The repository branch is owned by ticket ${other.id}`)
+          }
+        }
+      }
+      this.db.prepare('INSERT INTO ticket VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(ticket.id, JSON.stringify(ticket))
+    }),
     /** Newest first. */
     list: (): Ticket[] => this.values('SELECT value FROM ticket ORDER BY rowid DESC'),
     /** Newest first. */

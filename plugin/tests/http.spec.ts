@@ -6,6 +6,7 @@ import { SettingsConflict } from '../src/app/settings.ts'
 import type { HttpHost } from '../src/app/http.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { SetupError } from '../src/setup.ts'
+import type { Ticket } from '../src/core/index.ts'
 
 type Handler = (req: unknown, res: unknown) => Promise<void>
 type Headers = Record<string, string | undefined>
@@ -65,6 +66,37 @@ it('decodes path parameters and parses each route\'s query', async () => {
   // Invalid offsets default to 0, and limits above the route maximum are clamped.
   expect(await call('GET', 'decisions?kind=accept%2Creopen&limit=500&offset=x&window=24h')).toEqual({ status: 200, body: { items: [], next_offset: null } })
   expect(seen).toEqual(['feishu:oc_1:om/root', { filter: { kinds: ['accept', 'reopen'], since: expect.any(String) }, offset: 0, limit: 200 }])
+})
+
+it('shows a Ticket\'s verified worktree facts and writer, and a rejected preparation reason', async () => {
+  const at = '2026-09-22T00:00:00Z'
+  const ticket = (id: string, execution: NonNullable<Ticket['execution']>): Ticket => ({ id, title: id, decisionId: `d-${id}`,
+    channels: [], inputs: [], undelivered: [],
+    mandate: { strength: 'explicit', policyVersion: 'v1', basis: { via: 'listed' }, actor: { source: 'github', id: 'alice' }, scope: '' },
+    assignments: [{ id: 'a1', state: 'running', createdAt: at, startedAt: at }],
+    createdAt: at, updatedAt: at, origin: { triggerId: 'e1', triggerIds: ['e1'] }, execution })
+  const base = { ref: 'refs/heads/main', sha: '0123456789abcdef0123456789abcdef01234567' }
+  const tickets: Record<string, Ticket> = {
+    t1: ticket('t1', { name: 'fix-regression', directory: '/srv/worktrees/fix-regression', assignment: 'Fix regression',
+      repository: '/srv/widgets', worktree: '/srv/worktrees/fix-regression', branch: 'agent/fix-regression', base,
+      session: 'actual-session-19', active_writer: { assignment: 'a1', session: 'actual-session-19' },
+      preparation: { state: 'verified' } }),
+    t2: ticket('t2', { name: 'fix-other', directory: '/srv/worktrees/fix-other', assignment: 'Fix other',
+      repository: '/srv/widgets', worktree: '/srv/worktrees/fix-other', branch: 'agent/fix-other', base,
+      active_writer: null, preparation: { state: 'rejected', reason: 'Another Ticket owns this worktree; nothing was changed.' } }),
+  }
+  const call = serve({
+    store: { tickets: { get: (id: string) => tickets[id] }, decisions: { get: () => undefined }, triggers: { get: () => undefined },
+      settings: () => SettingsSchema.parse({}), read: { subscribedThreads: () => [] } },
+    sources: { kind: () => undefined }, links: () => () => ({ url: '', label: { zh: '', en: '' } }), configured: () => false,
+  })
+  expect(await call('GET', 'tickets/t1')).toMatchObject({ status: 200, body: { sessionId: 'actual-session-19', execution: {
+    repository: '/srv/widgets', worktree: '/srv/worktrees/fix-regression', branch: 'agent/fix-regression', base,
+    session: 'actual-session-19', active_writer: { assignment: 'a1', session: 'actual-session-19' },
+    preparation: { state: 'verified' } } } })
+  expect(await call('GET', 'tickets/t2')).toMatchObject({ status: 200, body: { execution: {
+    repository: '/srv/widgets', worktree: '/srv/worktrees/fix-other', branch: 'agent/fix-other', base,
+    active_writer: null, preparation: { state: 'rejected', reason: 'Another Ticket owns this worktree; nothing was changed.' } } } })
 })
 
 it('answers only a same-origin request from the panel on the loopback address', async () => {

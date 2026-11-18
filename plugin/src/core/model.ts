@@ -230,6 +230,8 @@ export interface Assignment {
    * into a step before, the worker read.
    */
   idleAt?: string
+  /** Fenced write lease; ending an Assignment requests a stop but does not prove this lease idle. */
+  writer?: { generation: number; state: 'preparing' | 'active' | 'stopping' | 'idle'; session?: string }
 }
 
 export type TicketInput =
@@ -312,7 +314,41 @@ export interface Ticket {
  * Thread closed; the ticket then ends unless its work has not finished (see `Tickets.unfinished`).
  */
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
-export interface Execution { name: string; directory: string; assignment: string }
+/** Git facts supplied by the executor's verifier; paths are canonical absolute identities, not display paths. */
+export interface ExecutionIdentity {
+  repository: string
+  /** Canonical Git common directory; distinguishes clones even when their remotes are identical. */
+  commonDir: string
+  worktree: string
+  branch: string
+  base: { ref: string; sha: string }
+}
+/** A capability for one preparation/write attempt; stale generations never authorize a mutation. */
+export interface ExecutionClaim extends ExecutionIdentity {
+  ticket: string
+  assignment: string
+  generation: number
+  /** True only when an earlier attempt verified this ticket's ownership and pinned base. */
+  verified: boolean
+}
+export type ExecutionResult<T> = { ok: true; value: T } | { ok: false; reason: string }
+export interface Execution {
+  name: string
+  directory: string
+  assignment: string
+  /** Verified facts only; absent on legacy or not-yet-verified executions. */
+  repository?: string
+  worktree?: string
+  branch?: string
+  base?: { ref: string; sha: string }
+  /** Actual Session ID most recently bound to a writer, never derived from a naming convention. */
+  session?: string
+  /** Remains present while a stop is requested, until the executor confirms that writer truly idle. */
+  active_writer?: { assignment: string; session: string } | null
+  preparation?: { state: 'reserved' | 'verified' | 'rejected'; reason?: string }
+  /** Durable reservation, retained after rejection, terminal state and release; not evidence that a tree exists. */
+  ownership?: { ticket: string; generation: number; identity: ExecutionIdentity; verified: boolean }
+}
 
 /** Whether a ticket is open: it has not ended. */
 export const liveTicket = (ticket: Pick<Ticket, 'ended'>): boolean => !ticket.ended

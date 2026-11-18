@@ -91,6 +91,11 @@ Callers receive only their role's `Pick` of the Engine: `EngineForSources`, `Eng
 | Executor | `followForContext(ticketId, thread)` | Subscribes an open Ticket to a related Thread for context: its messages reach the Ticket but lend it no follow-up strength and do not resume it |
 | Executor | `handback(ticketId, triggerId, reason)` | Records that the Ticket hands back a Trigger that reached it, with the reason its candidate carries, and queues it for a fresh Eval once no other Ticket decides it, if this Ticket did; it answers whether it queued it. A Ticket hands back each Trigger once and keeps its Subscription |
 | Executor | `assignmentInterrupted(ticketId, assignmentId)` | An Assignment was running when the host stopped: one interrupted mid-work, or one that received an Input after its latest Report, starts again with a recovery note and the Inputs delivered to it that its Executor Session did not take, as a retry does; one that had reported since keeps its Session. The DshExecutor reports each at start (`resume`), oldest Ticket first, and queues again a launch that waits |
+| Executor | `reserveExecution(ticketId, assignmentId, identity)` | Reserves a Ticket's canonical repository, worktree, branch and pinned base in one transaction, with a new writer generation, before any prepare command or Session exists. It refuses an ended or replaced Assignment, a live or legacy writer whose idle state is unknown, a different ownership, or a worktree owned by another Ticket, and records the reason without discarding the existing claim |
+| Executor | `recordExecutionVerified(claim, identity)` | Stores the Git-verified repository, worktree, branch and base and marks the preparation `verified`; a stale claim or a changed identity is refused |
+| Executor | `rejectExecution(claim, reason)` | Records a readable rejection on the Ticket while keeping its ownership and write lease, so nothing is handed to another writer |
+| Executor | `acquireExecutionWriter(claim, session)` | Binds the actual Worker Session to the claim and sets `active_writer` before the Session may write; refuses a Session already writing for another Ticket |
+| Executor | `releaseExecutionWriter(claim, session?)` | Clears `active_writer` only after the Executor confirms the Session, its shell jobs and its subagents idle; a stale Assignment or generation cannot release a newer writer |
 | Passes | `evaluateDue()` | Unless processing is paused: starts the Evals of the Threads whose queued Triggers wait, one per Thread with the Triggers queued meanwhile as one batch; queues the Triggers of an Eval past its deadline again, twice in a row, and records it `unavailable` the third time; and resumes the ended Tickets a person's message reached during a pause, if their Mandates still hold. An Eval whose candidate has not reached the main Session does not expire. While processing is paused, no Eval expires, and once it resumes each deadline moves later by the pause's length |
 | Settings | `policyChanged(from, to, effects)` | Tells each live Ticket the change bears on how (`policyEffects` in `src/policy.ts`: a rule it was accepted under changed or no longer applies, its requester may no longer start work, or proactive work is no longer accepted), and restarts the Evals in progress under the new version |
 
@@ -117,7 +122,9 @@ The core's codes, such as `timeout`, `policyChanged`, `routed` and `startedTicke
 
 A Ticket keeps each fact once. It is open while it has no `ended`, which records when, by whom, why and with what outcome it ended; what it last said is its latest Assignment Report (`latestReport`); and its Executor Session is named after it (`workerSessionId` in `src/executor/dsh.ts`).
 
-Its fields are typed: `origin`, the admissible Trigger that gave its Eval's batch its strength and the batch itself (`triggerId`, `triggerIds`); `execution`, what the Executor chose (`name`, `directory` and `assignment`); `delivery`, the last failed Input delivery (`error`, `at`), until a delivery succeeds, a new Assignment starts or the Ticket ends; and `follows`, the Threads a Source made it follow, each `{thread, own, closed?}`: `own` when the Ticket opened it, and `closed` with `at` and `outcome` once it closed. Tickets alone writes `follows`; the GitHub Source reads its pull requests with `pullsOf` and `pullOf` (`src/sources/github-pull.ts`).
+Its fields are typed: `origin`, the admissible Trigger that gave its Eval's batch its strength and the batch itself (`triggerId`, `triggerIds`); `execution`, what the Executor chose and later verified — its `name`, `directory` and `assignment`, plus the optional `repository`, `worktree`, `branch`, `base` (`ref`, `sha`), `session`, `active_writer` and `preparation` (`reserved`, `verified` or `rejected` with a reason), and the durable `ownership` of its directory and branch; `delivery`, the last failed Input delivery (`error`, `at`), until a delivery succeeds, a new Assignment starts or the Ticket ends; and `follows`, the Threads a Source made it follow, each `{thread, own, closed?}`: `own` when the Ticket opened it, and `closed` with `at` and `outcome` once it closed. Tickets alone writes `follows`; the GitHub Source reads its pull requests with `pullsOf` and `pullOf` (`src/sources/github-pull.ts`).
+
+`ExecutionIdentity` names the repository, worktree, branch and `base` a Ticket claims; an `ExecutionClaim` adds `ticket`, `assignment`, `generation` and whether an earlier attempt verified it, and `ExecutionResult<T>` answers `{ok: true, value}` or `{ok: false, reason}`. An Assignment's `writer` records its `generation`, `state` and bound `session`, so a stale claim can never act for a newer writer.
 
 An Input that carries a Trigger records whether a person wrote it, which `waitsForPerson` reads. A Thread also lists in `context` the subscribed Tickets that follow it only for context, and counts in `expired` the Evals of its queued Triggers that expired in a row; an Evaluation records its `primary` Trigger and when its candidate was `delivered`.
 
@@ -147,13 +154,15 @@ Trigger and Thread `meta` belong to the Source. The core does not interpret them
 
 `policyEffects(tickets, old, now, scope)` identifies which open Tickets a change affects and how. `Engine.policyChanged` notifies only those Tickets. `policyVersion` hashes rules, accept mode and the Sources' Policy parts, including bot lists.
 
+`worktreePreparationConfig(executor)` returns the configured local repository and base ref, or a refusal naming the setting still missing. A launch that cannot prepare this way fails its Ticket; it does not fall back to an empty directory.
+
 ### Store
 
 `Store` (`src/app/store.ts`) owns one SQLite database. Runtime acquires the directory lock before opening it, preventing a second process from migrating or writing the same state.
 
 Its interfaces are grouped by purpose:
 
-- **Domain repositories:** `atomic`, plus `triggers`, `threads`, `tickets` and `decisions`, each with `get`, `save` and list queries. Indexed working sets are `threads.active()`, `tickets.open()`, `tickets.active()` and `read.subscribedThreads`.
+- **Domain repositories:** `atomic`, plus `triggers`, `threads`, `tickets` and `decisions`, each with `get`, `save` and list queries. `tickets.save` refuses to remove, reassign or revert a Ticket's worktree ownership or change its pinned base, and a unique index admits one Ticket per canonical worktree path. Indexed working sets are `threads.active()`, `tickets.open()`, `tickets.active()` and `read.subscribedThreads`.
 - **Read queries:** `read` serves views, tools and Source polls through methods such as `threadTriggers`, `triggerStats`, `search` and `droppedReplies`. These methods never write.
 - **Source metadata:** `threads.describe` and `threads.patchMeta` update Source-owned Thread metadata.
 - **Settings:** `settings`, `saveSettings`, `blockRevision` and `settingsHistory`. Settings and prompts use numbered `Versions` (`src/app/versions.ts`).
@@ -173,7 +182,7 @@ Failures retry with exponential backoff. Throwing `Later` defers work without co
 | Kind | Handler | Does | At once | Retry |
 | --- | --- | --- | --- | --- |
 | `assessment` | MasterAssessor | Steers an Eval's candidate card into the main Session's turn, then tells the Engine it was delivered, which starts the Eval's deadline | 4, none while paused | 2 s doubling to 60 s |
-| `launch` | DshExecutor | Launches a pending Assignment: prepare command, Executor Session, assignment message | The free worker slots, none while paused | A passing failure of the model provider or the network runs again after 5 s doubling to 300 s, three times; any other failure, and a failed prepare command, fails its Ticket. One held by a pause or by full worker slots tries again after 5 s |
+| `launch` | DshExecutor | Launches a pending Assignment: reserves and verifies its worktree, runs the prepare command when one is set, creates the Executor Session, and sends the assignment message | The free worker slots, none while paused | A passing failure of the model provider or the network runs again after 5 s doubling to 300 s, three times; any other failure, and a failed prepare command or worktree verification, fails its Ticket. One held by a pause or by full worker slots tries again after 5 s |
 | `delivery` | DshExecutor | Hands a Ticket's waiting Inputs to its running Assignment, in order | 4, none while paused | 2 s doubling to 60 s; one that waits for a worker slot tries again after 2 s |
 | `relay` | Sessions | Steers a worker's report or question, or a person's follow-up, into the main Session's turn | 1, in queue order | 2 s doubling to 60 s |
 | `notice` | Sessions | Injects a notice into the main Session without waking it | 1, in queue order | 2 s doubling to 60 s |
@@ -197,7 +206,9 @@ That context supplies deployment and commands, setup readiness (`ready`, `config
 
 ### DshExecutor
 
-`DshExecutor` (`src/executor/dsh.ts`) provides one Session and directory per Ticket. `start` and `deliver` enqueue `launch` and `delivery` effects. `stop` cancels the turn through `Store.afterCommit`, so a rolled-back end does not stop the worker.
+`DshExecutor` (`src/executor/dsh.ts`) provides one Session and one verified Git worktree per Ticket. `start` and `deliver` enqueue `launch` and `delivery` effects. `stop` cancels the turn through `Store.afterCommit`, so a rolled-back end does not stop the worker.
+
+A launch first waits for the previous writer's turn, jobs and subagents to stop, then checks the repository and destination read-only. `validateRepositoryIdentity` (`src/executor/repository-identity.ts`) requires the clone's single local `remote.origin.url` to be a direct github.com HTTPS, SSH or Git URL for the GitHub Source's `owner/name`, refusing an unset target, a missing, ambiguous, lookalike or different origin. `validateWorktreeDestination` (`src/executor/worktree.ts`) refuses a Ticket directory or configured worktree root that resolves inside the clone's primary checkout, a linked worktree registered there or an unrelated Git checkout, including through symlink aliases. Neither guard writes, so a refusal fails the Ticket before any prepare command and leaves every file as it was. The launch then resolves the configured repository to its canonical main checkout and `executor.baseRef` to a pinned commit, and reserves the directory and branch for its Assignment, before any prepare command or Session exists. With an empty `prepare` it creates the linked worktree itself, and otherwise runs that command with the pinned variables. `inspectWorktree` then checks the result and `recordExecutionVerified` stores the canonical repository, worktree, branch and base; a refusal records `preparation.rejected` with its reason, starts no Session and removes nothing. `acquireExecutionWriter` binds the actual Session before it is prompted; `releaseExecutionWriter` only after the worker's turn, shell jobs and subagents are idle. Every claim carries its Assignment and generation, so a late callback cannot release or overwrite a newer writer.
 
 `prepare(ticket, outcome)` supplies the Engine's `prepareTicket` hook: short name, directory and `ticketExecution` assignment text. `workerSessionId(ticket.id)` derives the Session id.
 
@@ -233,7 +244,7 @@ Validation inherits an omitted base from the saved override, drops removed parts
 
 ### Sessions
 
-`Sessions` (`src/app/sessions.ts`) manages DeepSeek Harness Sessions for both roles. `ensure` creates a Session with its role's model. `install` decorates currently loaded agents from `agents.list()` and follows agent events to register prompts, skills and tools. `decorate` installs role tool restrictions before awaiting the skill scope; `owningTicket` and `limitSubagent` enforce the Worker and subagent boundary specified in `010-session-boundaries.md`.
+`Sessions` (`src/app/sessions.ts`) manages DeepSeek Harness Sessions for the main, worker and planner roles. `ensure` creates a Session with its role's preset and model, checking a planner's active planning state or a worker's verified workspace path and live writer grant. `install` decorates currently loaded agents from `agents.list()` and follows agent events to register prompts, skills and tools. `decorate` installs role tool restrictions before awaiting the skill scope; `plannerOnly` restricts planner Sessions, and `owningTicket`, `limitSubagent` and `workOnly` enforce the Worker, live-writer and subagent boundary specified in `010-session-boundaries.md`.
 
 `prompt` delivers once per request id. `relay` and `notify` enqueue main-Session messages handled by the `relay` and `notice` effects. `src/app/notices.ts` defines their content; `delivery` checks whether a message arrived.
 
@@ -262,6 +273,7 @@ Each model request binds the Session to the current prompt revision. The revisio
   | State | Writer |
   | --- | --- |
   | Triggers, Threads, Decisions, Tickets, Assignments | Engine |
+  | A Ticket's worktree ownership and write access (`execution.ownership`, `execution.active_writer`) | `Tickets`, through `reserveExecution`, `recordExecutionVerified`, `rejectExecution`, `acquireExecutionWriter` and `releaseExecutionWriter`; the Executor supplies the Git verification and confirms the previous writer idle |
   | A Source's read positions, and the meta it keeps on its Threads (`label`, `url`, `facts` and its own keys) | That Source, through `SourceContext` |
   | Settings and their history | Settings |
   | Prompt versions | Prompts |
@@ -294,7 +306,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/index.ts` | The main plugin entry: reads the machine settings, starts the Runtime, and gives it the restart that a save of a Source's account uses |
 | `src/deployment.ts` | The plugin `Config` and `Machine`; `resolveDeployment` and `resolveFeishuBot` read the repository and the accounts from the Source settings, each CLI run as Executor shells run it; `SETUP_FIELDS` lists the Source fields setup reads. The code names no person, account or organization |
 | `src/setup.ts` | Setup problems: `SetupError`, with a code, the place that fixes it and the English text the log, the main Session and the panel share |
-| `src/policy.ts` | The Policy: the settings schemas by block, the Policy version, the gate and Mandate revalidation |
+| `src/policy.ts` | The Policy: the settings schemas by block, the Policy version, the gate and Mandate revalidation, and `worktreePreparationConfig`, whether the Execution settings name a repository and base ref able to prepare a real worktree |
 | `src/admission.ts` | The admission table's values, each cell's options and defaults, shared with the panel |
 | `src/limits.ts` | The limits of the values a person sets, which the settings schemas check and the panel's fields offer |
 | `src/kv.ts` | `KV`: every family of `kv` records with its key, its value's type and its owner, and the `Key` and `Family` types the Store and `SourceContext.state` take |
@@ -305,7 +317,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/part.ts` | `EnginePart`, the base of the Engine's parts, and `EngineOptions` |
 | `src/core/intake.ts` | `Intake`: Triggers from Sources, to their Tickets and, unless a person's message reached one, to Eval |
 | `src/core/evals.ts` | `Evals`: the Evals of Threads and their Decisions |
-| `src/core/tickets.ts` | `Tickets`: the Ticket lifecycle, the Threads a Ticket follows, Subscriptions and Inputs |
+| `src/core/tickets.ts` | `Tickets`: the Ticket lifecycle, worktree ownership and writer lease, the Threads a Ticket follows, Subscriptions and Inputs |
 | `src/core/assignments.ts` | `Assignments`: the Executor's facts and its workers' Reports |
 | `src/core/replies.ts` | `Replies`, with `ReplyRequest`, `Reply` and `TakeUp`: `reply` queues the Hub's answer, result and attention messages for a Channel; `acknowledgeAccepted` queues the acceptance acknowledgement from `Tickets.create`; `takeUpInternally` records a Worker's take-up on a Trigger's disposition |
 | `src/core/stage.ts` | `ticketStage` and `canRetry`: the Ticket stages of [003 Execution](003-execution.md) |
@@ -338,7 +350,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
 | `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers |
-| `src/app/execution-environment.ts` | The execution environment: its variables, a Ticket's values, the directory root and the lines of the prompt section, which `src/app/prompts.ts` fills into its template |
+| `src/app/execution-environment.ts` | The execution environment: its variables, including the pinned repository, base ref and SHA and the reserved branch, a Ticket's values, the worktree root and the lines of the prompt section, which `src/app/prompts.ts` fills into its template |
 | `src/app/source-context.ts` | `sourceContextOf`: each Source kind's `SourceContext` |
 | `src/app/links.ts` | `sourceLink`, the page of a Trigger's message, and `candidateCard` |
 | `src/app/cards.ts` | Compact cards of Triggers, Tickets, Threads and Decisions for models, the closed set of ticket card states `TICKET_STATES`, and `textPage` |
@@ -350,14 +362,16 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
 | `src/app/views/text.ts` | The two forms of a view's text: `preview`, plain text on one line, and `markdown` without HTML; `plain` and `readable` |
-| `src/app/views/records.ts` | The rows the views share: Triggers, Tickets, Threads, Decisions and Channel links, and `ownersOf`, the owners of follow-ups as one request reads them |
+| `src/app/views/records.ts` | The rows the views share: Triggers, Tickets, Threads, Decisions and Channel links; `ticketExecution`, the public projection of verified worktree facts that reads a legacy record as unverified; and `ownersOf`, the owners of follow-ups as one request reads them |
 | `src/app/views/tickets.ts` | The Ticket lists by stage, a Ticket's page, the Mandate basis facts and the Executor's load |
 | `src/app/views/threads.ts` | The Thread lists, a Thread's timeline, the search and the Decision list |
 | `src/app/views/sources.ts` | The Source status: each Source instance's state, its last day's counts, and what it filtered and dropped in that day |
 | `src/app/views/settings.ts` | The settings page's view: each block with its revision, each Source's settings with its kind's form, and the execution environment |
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
-| `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
+| `src/executor/dsh.ts` | The DshExecutor, its worktree preparation and writer-claim flow, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents` (descendant cleanup per `010-session-boundaries.md`), `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
+| `src/executor/worktree.ts` | `inspectRepository`, `inspectWorktree` and `validateWorktreeDestination`, read-only Git checks through `Commands.git`: the configured repository must be a clone's main checkout, a Ticket's `worktree` must be its canonical linked secondary worktree with the same common git directory, `--show-toplevel`, branch, pinned base (exact on a fresh path, an ancestor for reuse) and, on reuse, a previously verified `ExecutionClaim` of the same ticket and assignment, and a Ticket destination or worktree root must lie outside the clone's checkouts and any unrelated Git checkout; refusals are `WorktreeRejected` with a `WorktreeRejectionCode`, and it never creates, repairs or deletes |
+| `src/executor/repository-identity.ts` | `validateRepositoryIdentity` reads the clone's local `remote.origin.url` without modifying it or contacting GitHub; it accepts one direct github.com HTTPS, SSH or Git URL for the configured owner/name, case-insensitively and with an optional `.git` suffix, and refuses missing, ambiguous, unsupported or mismatched origins with `WorktreeRejected` |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
@@ -422,7 +436,10 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, a host that stops, and bounded subagent release |
-| `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the worker and read-only router presets it defines |
+| `tests/worktrees.spec.ts` | Real Git worktrees through acceptance and the Ticket query: each Ticket's Session, branch and pinned base, isolated writes, refusal of an ordinary directory, another Ticket's worktree or a wrong base without cleanup, one writer for concurrent claims, and a retry only after the previous writer stops and ownership matches |
+| `tests/worktree-inspector.spec.ts` | `inspectRepository`, `inspectWorktree` and `validateWorktreeDestination` on temporary Git repositories: a canonical clone and linked worktree accepted, while an ordinary folder, a foreign repository or worktree, a wrong branch or base, and an alias path are refused without changing the tree; destination isolation refuses the primary checkout, registered worktrees, symlink aliases and unrelated Git checkouts without creating paths; reuse requires a previously verified claim |
+| `tests/repository-identity.spec.ts` | Real Git clones: the fixture's matching origin, GitHub HTTPS/SSH/Git variants, and refusals of wrong owner or repository, missing or duplicate origins, and disguised or unsupported URLs without modifying the clone |
+| `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the worker, read-only router and planner presets it defines |
 | `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown |
 | `tests/passes.spec.ts` | Passes: one at a time, the ones asked for during a pass run as one after it, and the runtime health a failed pass reports |
 | `tests/outbox.spec.ts` | The Outbox on a running Runtime: messages wait while processing is paused or their Source is not installed |
@@ -433,11 +450,11 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/delivery.spec.ts` | `AgentDelivery` |
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
-| `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, the shapes and checks of the other main Session tools, and the Worker's internal take-up without an outbound message |
+| `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role (including verified worktree, active writer and rejection facts), the shapes and checks of the other main Session tools, and the Worker's internal take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
-| `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
-| `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
+| `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, `GET tickets/:id` worktree and writer projections, the body limit, path parameters and queries |
+| `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, the refusals of the pause, a sync and a block, and the required local repository and base ref with their preparation variables |
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |
 | `tests/timeline.spec.ts` | A Thread's pages and a Trigger's neighbours by time and then id, with every received Trigger's time in one form |
 | `tests/migration.spec.ts` | The schema 11 migration: every stored record in its current shape, and the refusal of older schemas |
@@ -469,7 +486,7 @@ One SQLite file, `<stateDir>/orchestrator.sqlite`, which only the Store opens.
 | `disposition` | Where each Trigger went: `filtered` with the Source's reason code, its Eval and Decision, the Tickets it reached, by fan-out or attachment, whether it was requeued, the Tickets that handed it back with their reasons, and those whose Executor took it up or answered it | Engine |
 | `trigger_thread` | Which Threads each Trigger is on, with its time and whether a person wrote it, so a Thread's Triggers are read without scanning every Trigger, in order of time and then id: a page of a Thread's timeline continues from a `<at>|<id>` cursor, and Triggers that share a time are not skipped | Store, with each Trigger |
 | `thread` | Threads: Subscriptions, the Tickets that follow it for context, queued Triggers, the Eval in progress, the count of its expiries and `meta`; the generated columns `active`, set while Triggers are queued or an Eval runs, and `subscribed`, its Source while a Ticket subscribes to it | Engine; Sources write `meta` |
-| `ticket` | Tickets with their Mandate, origin, execution, Assignments, Channels, Inputs and the Threads they follow; the generated columns `open`, set while it has not ended, and `active`, set while Inputs are undelivered or the latest Assignment is pending or running | Engine |
+| `ticket` | Tickets with their Mandate, origin, execution (including worktree ownership, pinned base and active writer), Assignments, Channels, Inputs and the Threads they follow; the generated columns `open`, set while it has not ended, and `active`, set while Inputs are undelivered or the latest Assignment is pending or running | Engine |
 | `decision` | Decisions, by Thread | Engine |
 | `effect` | The effect queue: per kind and key, the payload, its order, failed attempts with the last error, and when it is due | Effects; the schema 11 migration queues what earlier versions kept for the main Session |
 | `outbox` | The receipt of each message for a Channel, by id, with the Ticket it is for and its `status`, `pending`, `sent` or `dropped`, kept so an id is never queued twice; for a dropped message, when and why, as the generated column `dropped`, its time, and a reason code. A message that waits has a `reply` effect, which holds its attempts | The Outbox |
@@ -540,7 +557,7 @@ Each Executor has six application tools:
 
 A hand-back returns `queued: false` if another Ticket still owns the message, or this Ticket never owned it. For example, a bot message went to Eval independently.
 
-The worker preset is defined in `cordis.patch.yml` and selected through `WORKER_PRESET`. `WORK_TOOLS` in `src/app/sessions.ts` retains available file, search, shell, job, web, skill, todo and subagent tools. Workers do not receive tools for asking or presenting to a person, changing the profile, scheduling work outside worker slots, starting or messaging other Sessions, or editing external documents. Tool calls are refused once the Ticket ends, for the worker and for every subagent at any depth below it.
+The worker preset is defined in `cordis.patch.yml` and selected through `WORKER_PRESET`. `WORK_TOOLS` in `src/app/sessions.ts` retains available file, search, shell, job, web, skill, todo and subagent tools. Workers do not receive tools for asking or presenting to a person, changing the profile, scheduling work outside worker slots, starting or messaging other Sessions, or editing external documents. Tool calls are refused once the Ticket ends, and while no live verified writer grant authorizes the worker, for the worker and for every subagent at any depth below it.
 
 ### Result shapes and assessment context
 

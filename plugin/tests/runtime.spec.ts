@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { Context } from '@deepseek-ai/cordis'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import { ToolRuntime, type ToolDefinition } from '@deepseek-ai/dsh-tools'
@@ -12,6 +12,7 @@ import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { Runtime } from '../src/app/runtime.ts'
 import { ROUTER_PRESET, WORKER_PRESET } from '../src/app/sessions.ts'
 import { jobRegistry } from './fixtures/host.ts'
+import { gitEnv, gitRepository, type GitRepository } from './fixtures/git.ts'
 import { evalsHealth } from '../src/app/views/overview.ts'
 import { mandateInstructions } from '../src/executor/dsh.ts'
 import { reference, testMachine } from './fixtures/deployment.ts'
@@ -41,6 +42,7 @@ let runtime: Runtime
 const viewsOf = (value: Runtime) => ({ store: value.store, sources: value.sources, links: value.links() })
 const overviewOf = (value: Runtime) => overview(viewsOf(value), value.health, policyVersion(value.store.settings()), executorLoad(value.store, value.executor.activeCount()), value.setupProblem ?? value.feishuProblem)
 let directory: string
+let repository: GitRepository
 let controller: { create: ReturnType<typeof vi.fn>; selectModel: ReturnType<typeof vi.fn>; resolveAgent: ReturnType<typeof vi.fn>; rename: ReturnType<typeof vi.fn>; prompt: ReturnType<typeof vi.fn>; inspect: ReturnType<typeof vi.fn> }
 type RegisteredTool = { name: string; description: string; parameters: Record<string, unknown>; output: { render: (args: unknown, result: unknown) => unknown }; execute: (args: unknown, execution: { signal: AbortSignal }) => Promise<unknown> }
 type ContainerResult = { isError: boolean; content: { type: string; text?: string }[]; value?: unknown; error?: { message: string } }
@@ -60,6 +62,14 @@ const registered = (sessionId: string, name: string): RegisteredTool | undefined
   const agent = agents.get(sessionId)
   if (!agent) return undefined
   return (agent.ctx.tools.get(name, agent) as unknown as RegisteredTool | undefined)
+}
+function finishSessionTurn(sessionId: string): void {
+  const agent = agents.get(sessionId)
+  if (!agent) throw new Error(`Session ${sessionId} is no longer loaded`)
+  if (agent.status === 'idle') return
+  agent.status = 'idle'
+  const host = runtime as unknown as { ctx: Context }
+  host.ctx.emit('agent/status', { agent, status: 'idle' } as never)
 }
 const runTool = async (sessionId: string, name: string, args: unknown) => {
   const tool = registered(sessionId, name)
@@ -127,13 +137,33 @@ const OTHER = () => join(directory, 'other-gh')
 const BOT = () => join(directory, 'lark-bot')
 const HELPERS = 'git config -z --show-origin --get-all credential.https://github.com.helper'
 const SCOPED = 'git config -z --show-scope --get-regexp ^(credential\\..*|http\\..*extraheader)$'
-const subprocess = { spawn: vi.fn((spec: { argv: readonly string[] }) => {
-  // Strip leading `env` and `KEY=VALUE` arguments before looking up the command response.
+const subprocess = { spawn: vi.fn((spec: { argv: readonly string[]; cwd?: string; env?: Record<string, string> }) => {
+  // Explicit answers continue to simulate startup checks and prepare failures before any real Git execution.
   const argv = [...spec.argv]
   while (argv[0] === 'env' || /^[A-Z_]+=/.test(argv[0] ?? '')) argv.shift()
-  const answer = answers[argv.join(' ')] ?? ''
-  const reader = (text: string) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
-  return { done: Promise.resolve({ exitCode: answer instanceof Error ? 1 : 0, signal: null }), collected: { stdout: reader(answer instanceof Error ? '' : answer), stderr: reader(answer instanceof Error ? answer.message : '') } }
+  const answer = answers[argv.join(' ')]
+  const reader = (text: () => string) => ({ readFrom: () => ({ text: text(), nextOffset: text().length, lossy: false }) })
+  if (answer !== undefined || (argv[0] !== 'git' && (argv[0] !== 'sh' || argv[2] !== prepareWorktree))) {
+    const output = answer ?? ''
+    return { done: Promise.resolve({ exitCode: output instanceof Error ? 1 : 0, signal: null }),
+      collected: { stdout: reader(() => output instanceof Error ? '' : output), stderr: reader(() => output instanceof Error ? output.message : '') } }
+  }
+  let stdout = '', stderr = ''
+  const done = Promise.resolve().then(() => {
+    const args = argv[0] === 'sh'
+      ? ['-C', repository.repository, 'worktree', 'add', '-b', `agent/${spec.env?.DSH_SUPERAGENT_NAME}`,
+        spec.env?.DSH_SUPERAGENT_DIR ?? '', spec.env?.DSH_SUPERAGENT_BASE_SHA ?? '']
+      : argv.slice(1)
+    try {
+      stdout = execFileSync('git', args, { cwd: spec.cwd, env: gitEnv(spec.env), encoding: 'utf8' })
+      return { exitCode: 0, signal: null }
+    } catch (error) {
+      const failure = error && typeof error === 'object' ? error : {}
+      stderr = 'stderr' in failure ? String(failure.stderr) : String(error)
+      return { exitCode: 'status' in failure && typeof failure.status === 'number' ? failure.status : 1, signal: null }
+    }
+  })
+  return { done, collected: { stdout: reader(() => stdout), stderr: reader(() => stderr) } }
 }) }
 /** Source account overrides for test setup; `feishu: null` disables the Feishu source. */
 interface Accounts { github?: Record<string, unknown>; feishu?: Record<string, unknown> | null }
@@ -145,8 +175,13 @@ function seed(store: Store, accounts: Accounts = {}): void {
 }
 let restarts: ReturnType<typeof vi.fn<() => void>>
 async function restart(machine: Partial<Machine> = {}, accounts: Accounts = {}): Promise<Runtime> {
+  const writers = runtime.lifetime.aborted ? [] : runtime.store.tickets.list().filter(ticket => ticket.execution?.active_writer).map(ticket => ticket.id)
   await runtime.stop()
-  const store = new Store(join(directory, 'orchestrator.sqlite')); seed(store, accounts); store.close()
+  const store = new Store(join(directory, 'orchestrator.sqlite'))
+  // A new Runtime cannot inherit an unconfirmed writer claim from the old one.
+  for (const id of writers) expect(store.tickets.get(id)?.execution?.active_writer).toBeNull()
+  seed(store, accounts)
+  store.close()
   const ctx = new Context()
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   runtime = new Runtime(ctx, testMachine({ stateDir: directory, ...machine }), restarts)
@@ -162,6 +197,7 @@ function feishu(id: string, text: string, overrides: Record<string, unknown> = {
   return feishuTrigger({ message_id: `om_${id}`, chat_id: CHAT, chat_type: 'group', sender_id: MEMBER, sender_type: 'user', content: text, create_time: String(Date.parse('2026-09-09T00:00:00Z') + Number(id.replace(/\D/g, '') || 0) * 1000), mentions: [{ id: 'ou_bot' }], ...overrides }, 'ou_bot', 'cli_bot')!
 }
 const worktreeName = 'fix-regression'
+const prepareWorktree = 'git -C "$DSH_SUPERAGENT_REPOSITORY" worktree add -b "agent/$DSH_SUPERAGENT_NAME" "$DSH_SUPERAGENT_DIR" "$DSH_SUPERAGENT_BASE_SHA"'
 /** Route one decision with the main Session's orchestrator_route, answering its result; a refused one throws its reason. */
 async function route(item: Record<string, unknown>): Promise<Record<string, unknown>> {
   const { results } = await runTool(runtime.masterId, 'orchestrator_route', { decisions: [item] }) as { results: Record<string, unknown>[] }
@@ -173,15 +209,18 @@ async function acceptedTicket(trigger = feishu('1', '@bot 修一下回归')) {
   expect(relays(runtime.masterId).some(item => item.trigger_id === trigger.id)).toBe(true)
   const result = await route({ kind: 'accept', trigger_id: trigger.id, title: '修复回归',
     worktree_name: worktreeName, acknowledgement: '收到，修复回归。' })
+  await runtime.idle()
   const ticket = runtime.store.tickets.get((result.ticket as { ticket_id: string }).ticket_id)!
   return { trigger, ticket, sessionId: `worker-${ticket.id}` }
 }
 beforeEach(async () => {
   directory = mkdtempSync(join(tmpdir(), 'orchestrator-runtime-'))
+  repository = gitRepository(directory)
   vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : args[1]?.includes('/pulls/') ? { state: 'open', user: { login: 'agent-bot' }, html_url: 'https://github.com/acme/widgets/pull/' + args[1].split('/').at(-1), head: { ref: `agent/${String(runtime.store.tickets.list()[0]?.execution?.name)}`, sha: 'head-1', repo: { full_name: 'acme/widgets' } } } : { default_branch: 'master', permissions: { push: true } })
   vi.spyOn(Commands.prototype, 'lark').mockResolvedValue({ users: [{ member_id: MEMBER, name: 'Alice' }], has_more: false })
-  vi.spyOn(Commands.prototype, 'git').mockResolvedValue('')
-  vi.spyOn(Commands.prototype, 'run').mockResolvedValue('{"ok":true,"data":{}}')
+  vi.spyOn(Commands.prototype, 'git').mockImplementation(async (args, cwd) => execFileSync('git', args, { cwd, env: gitEnv(), encoding: 'utf8' }))
+  vi.spyOn(Commands.prototype, 'run').mockImplementation(async (program, args, cwd) => program === 'git'
+    ? execFileSync('git', args, { cwd, env: gitEnv(), encoding: 'utf8' }) : '{"ok":true,"data":{}}')
   restarts = vi.fn()
   answers = {
     [`git -C ${directory} rev-parse --show-toplevel`]: `${directory}\n`,
@@ -203,15 +242,29 @@ beforeEach(async () => {
   deliveries = vi.fn()
   const presets = new Map<string, object>()
   controller = {
-    create: vi.fn(async ({ sessionId, agentPreset }) => {
+    create: vi.fn(async ({ sessionId, agentPreset, workspaceId }: { sessionId: string; agentPreset?: string; workspaceId?: string }) => {
       if (agents.has(sessionId)) return
       const preset = agentPreset === ROUTER_PRESET ? presets.get(ROUTER_PRESET)!
         : agentPreset === WORKER_PRESET ? presets.get(WORKER_PRESET)! : presets.get('standard')!
       const modelEvents: { type: string; data: unknown }[] = []
       const agent = { id: sessionId, status: 'idle', inject: vi.fn(),
-        session: { id: sessionId, header: { agentPreset }, snapshotEvents: () => modelEvents, requestHeader: () => undefined,
+        session: { id: sessionId, header: { agentPreset, cwd: workspaceId }, snapshotEvents: () => modelEvents, requestHeader: () => undefined,
           append: vi.fn((type: string, data: unknown) => { modelEvents.push({ type, data }) }) },
-        cancel: vi.fn(), whenIdle: async () => {} } as unknown as { ctx: Context } & Record<string, unknown>
+        cancel: vi.fn(() => finishSessionTurn(sessionId)),
+        whenIdle: () => {
+          const current = agents.get(sessionId)
+          if (!current) return Promise.reject(new Error(`Session ${sessionId} is no longer loaded`))
+          if (current.status === 'idle') return Promise.resolve()
+          const host = runtime as unknown as { ctx: Context }
+          const { promise, resolve } = Promise.withResolvers<void>()
+          const dispose = host.ctx.on('agent/status', ({ agent: changed, status }) => {
+            if (changed.id !== current.id || status !== 'idle' || current.status !== 'idle') return
+            dispose()
+            resolve()
+          })
+          if (current.status === 'idle') { dispose(); resolve() }
+          return promise
+        } } as unknown as { ctx: Context } & Record<string, unknown>
       const scoped = createScope(ctx, agent, { parent: preset }).ctx
       const agentCtx = scoped.isolate('systemPrompt')
       agent.ctx = agentCtx
@@ -251,7 +304,11 @@ beforeEach(async () => {
     presets.set(id, key)
   }
   for (const cli of [AGENT(), OTHER(), BOT()]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
-  const store = new Store(join(directory, 'orchestrator.sqlite')); seed(store); store.close()
+  const store = new Store(join(directory, 'orchestrator.sqlite'))
+  seed(store)
+  store.saveSettings({ ...store.settings(), executor: { ...store.settings().executor,
+    repository: repository.repository, baseRef: 'HEAD', prepare: prepareWorktree } })
+  store.close()
   runtime = new Runtime(ctx, testMachine({ stateDir: directory }), restarts)
   await runtime.ready
   // Source kinds are normally registered by plugins that are not loaded in unit tests.
@@ -271,6 +328,7 @@ afterEach(async () => {
   vi.restoreAllMocks()
   rmSync(directory, { recursive: true, force: true })
 })
+vi.setConfig({ testTimeout: 30_000 })
 
 it('relays an explicit member mention as a candidate and creates the ticket, acknowledgement, subscription and worker on accept', async () => {
   const { trigger, ticket, sessionId } = await acceptedTicket()
@@ -730,7 +788,7 @@ it('records an admission table change in the Policy history as one line for its 
 })
 
 it('retries only a failed, blocked or undelivered ticket with a new assignment, and finds tickets by title in search, and reports unavailable Evals as a problem', async () => {
-  const { ticket } = await acceptedTicket()
+  const { ticket, trigger } = await acceptedTicket()
   expect(() => runtime.engine.retryTicket(ticket.id)).toThrow(new UserError('notRetryable'))
   const current = runtime.store.tickets.get(ticket.id)!
   await runTool(`worker-${ticket.id}`, 'orchestrator_report', { state: 'failed', summary: 'LlmError: offline' })
@@ -741,18 +799,40 @@ it('retries only a failed, blocked or undelivered ticket with a new assignment, 
   expect(readFileSync(reviewed, 'utf8')).toBe('still works')
   const retried = await runtime.engine.retryTicket(ticket.id)
   await runtime.idle()
+  const waiting = runtime.store.tickets.get(ticket.id)!
+  expect(waiting.assignments.map(item => item.state)).toEqual(['ended', expect.stringMatching(/^(pending|running)$/)])
+  if (waiting.assignments.at(-1)!.state === 'pending') {
+    // The old writer still owns its worktree until it becomes idle; the new assignment cannot take its grant.
+    expect(waiting.execution!.active_writer?.assignment).not.toBe(retried.assignments.at(-1)!.id)
+    if (waiting.execution!.active_writer) expect(waiting.execution!.active_writer).toMatchObject({ assignment: current.assignments.at(-1)!.id, session: `worker-${ticket.id}` })
+    const worker = agents.get(`worker-${ticket.id}`)!
+    worker.status = 'idle'
+    // The fixture exposes the runtime Context privately; emit the same idle event as a real Session.
+    const host = runtime as unknown as { ctx: Context }
+    host.ctx.emit('agent/status', { agent: worker, status: 'idle' } as never)
+    await runtime.idle()
+  }
   expect(waitsForPerson(runtime.store.tickets.get(ticket.id)!)).toBe(false)
   expect(runtime.store.tickets.get(ticket.id)!.assignments.map(item => item.state)).toEqual(['ended', 'running'])
+  expect(runtime.store.tickets.get(ticket.id)!.execution!.active_writer).toMatchObject({ assignment: retried.assignments.at(-1)!.id, session: `worker-${ticket.id}` })
   expect(retried.assignments.length).toBeGreaterThan(current.assignments.length)
   expect(retried.assignments.at(-2)!.endedReason).toBe('retried')
   // The worker's Session holds the assignment, so the new one says only that a person retried it.
   expect(relays(`worker-${ticket.id}`).at(-1)).toEqual({ ticket_id: ticket.id, assignment: 2, note: expect.stringContaining('A person retried this ticket') })
-  // A Session someone deleted gets the whole first message again with the next Assignment.
+  // The existing Session retains the original request; a later Assignment adds only its retry context.
   runtime.store.atomic(() => { runtime.engine.report(ticket.id, { state: 'failed', summary: 'LlmError: offline' }) })
-  agents.delete(`worker-${ticket.id}`)
-  runtime.engine.retryTicket(ticket.id)
+  // A failed report does not end the worker's turn; only its idle event may release the writer.
+  finishSessionTurn(`worker-${ticket.id}`)
+  await vi.waitFor(() => expect(runtime.store.tickets.get(ticket.id)!.execution!.active_writer).toBeNull(), { timeout: 3000 })
+  const resumed = await runtime.engine.retryTicket(ticket.id)
   await runtime.idle()
-  expect(relays(`worker-${ticket.id}`).at(-1)).toMatchObject({ ticket_id: ticket.id, title: '修复回归', trigger: expect.objectContaining({ text: '@bot 修一下回归' }) })
+  expect(resumed.assignments).toHaveLength(3)
+  expect(runtime.store.tickets.get(ticket.id)!.assignments.at(-1)!.state).toBe('running')
+  expect(relays(`worker-${ticket.id}`).at(-1)).toEqual({ ticket_id: ticket.id, assignment: 3,
+    note: expect.stringContaining('A person retried this ticket') })
+  expect(ticketDetail(viewsOf(runtime), ticket.id)).toMatchObject({ title: '修复回归' })
+  expect(await runTool(`worker-${ticket.id}`, 'orchestrator_read', { resource: `trigger/${trigger.id}` }))
+    .toMatchObject({ trigger_id: trigger.id, text: trigger.text })
   expect(search(viewsOf(runtime), '修复', new TextCache(0)).tickets).toEqual([expect.objectContaining({ id: ticket.id })])
   expect(decisionList(viewsOf(runtime), [], 0, 10, '2999-01-01T00:00:00Z').items).toEqual([])
   const accepted = runtime.store.read.recentDecisions(0, 1)[0]!
@@ -1048,9 +1128,14 @@ it('writes worker shims and the agent environment from the configuration only, a
   expect(readdirSync(bin).sort()).toEqual([...workerShimFiles, ...blockedGhShimFiles].sort())
   expect(readFileSync(join(bin, 'personal-gh'), 'utf8')).toContain('personal-gh is blocked in this installation; use gh, which acts as agent-bot.')
   expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain('lark-cli is unavailable: this installation has no Feishu bot.')
-  // The helper is a git config double-quoted value: its backslashes are escaped, so a Windows path stays one value.
-  const helper = credentialHelper(AGENT()).replace(/[\\"]/g, char => `\\${char}`)
-  expect(readFileSync(workerGitConfig(directory), 'utf8')).toContain(`[credential "https://github.com"]\n\thelper = "${helper}"`)
+  // Git config quotes and escapes Windows helper paths; Git must still resolve the original value.
+  const escapedHelper = credentialHelper(AGENT()).replace(/[\\"]/g, char => `\\${char}`)
+  expect(readFileSync(workerGitConfig(directory), 'utf8')).toContain(`[credential "https://github.com"]\n\thelper = "${escapedHelper}"`)
+  expect(readFileSync(join(bin, 'gh'), 'utf8')).toContain(`gh '${AGENT().replaceAll("'", "'\\''")}' "$@"`)
+  const effectiveHelper = execFileSync('git', ['-C', repository.repository, 'config', '--get', 'credential.https://github.com.helper'],
+    { env: gitEnv({ GIT_CONFIG_GLOBAL: workerGitConfig(directory), GIT_CONFIG_NOSYSTEM: '1' }), encoding: 'utf8' }).trim()
+  expect(effectiveHelper).toBe(credentialHelper(AGENT()))
+  expect(readFileSync(workerGitConfig(directory), 'utf8')).toContain('[credential]\n\thelper =\n')
   expect(process.env).toMatchObject({ GIT_CONFIG_GLOBAL: workerGitConfig(directory), GIT_CONFIG_NOSYSTEM: '1' })
   expect(process.env.GIT_AUTHOR_NAME).toBeUndefined()
   expect(process.env.PATH?.split(delimiter)[0]).toBe(bin)
@@ -1146,36 +1231,42 @@ it('leaves auto-merge to the delivery requirements, with the agent\'s own gh and
 })
 
 it('runs the prepare command once for a new ticket, under the execution root with the ticket\'s environment, and fails the ticket with its output', async () => {
-  const prepare = (command: string) => runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, prepare: command } })
-  const runs = () => subprocess.spawn.mock.calls.map(([spec]) => spec as { argv: string[]; cwd: string; env?: Record<string, string> }).filter(spec => spec.argv[0] === 'sh')
-  prepare('git -C /srv/widgets worktree add "$DSH_SUPERAGENT_DIR" -b "agent/$DSH_SUPERAGENT_NAME"')
+  const runs = (ticketId: string) => subprocess.spawn.mock.calls.map(([spec]) => spec as { argv: string[]; cwd: string; env?: Record<string, string> })
+    .filter(spec => spec.argv[0] === 'sh' && spec.argv[2] === prepareWorktree && spec.env?.DSH_SUPERAGENT_TICKET === ticketId)
   const { ticket } = await acceptedTicket()
-  expect(runs()).toEqual([expect.objectContaining({ argv: ['sh', '-c', 'git -C /srv/widgets worktree add "$DSH_SUPERAGENT_DIR" -b "agent/$DSH_SUPERAGENT_NAME"'], cwd: join(directory, 'work'),
-    env: expect.objectContaining({ DSH_SUPERAGENT_DIR: ticket.execution!.directory, DSH_SUPERAGENT_NAME: ticket.execution!.name, DSH_SUPERAGENT_GITHUB_REPOSITORY: 'acme/widgets', DSH_SUPERAGENT_FEISHU_CHAT: CHAT }) })])
+  expect(runs(ticket.id)).toEqual([expect.objectContaining({ argv: ['sh', '-c', prepareWorktree], cwd: join(directory, 'work'),
+    env: expect.objectContaining({ DSH_SUPERAGENT_REPOSITORY: repository.repository, DSH_SUPERAGENT_BASE_SHA: repository.base.sha,
+      DSH_SUPERAGENT_TICKET: ticket.id, DSH_SUPERAGENT_DIR: ticket.execution!.directory, DSH_SUPERAGENT_NAME: ticket.execution!.name,
+      DSH_SUPERAGENT_GITHUB_REPOSITORY: 'acme/widgets', DSH_SUPERAGENT_FEISHU_CHAT: CHAT }) })])
+  expect(repository.git('-C', ticket.execution!.directory, 'rev-parse', 'HEAD')).toBe(repository.base.sha)
   // A retry reuses the prepared directory.
   await runTool(`worker-${ticket.id}`, 'orchestrator_report', { state: 'failed', summary: 'offline' })
   await runtime.engine.retryTicket(ticket.id)
   await runtime.idle()
-  expect(runs()).toHaveLength(1)
-  answers['sh -c exit 3'] = new Error('fatal: no such clone')
-  prepare('exit 3')
+  expect(runs(ticket.id)).toHaveLength(1)
+  answers[`sh -c ${prepareWorktree}`] = new Error('fatal: no such clone')
   const failed = await acceptedTicket(feishu('9', '@bot 修一下标题'))
   await runtime.idle()
-  expect(runtime.store.tickets.get(failed.ticket.id)!.assignments.at(-1)).toMatchObject({ report: expect.objectContaining({ state: 'failed', summary: expect.stringContaining('The prepare command failed: fatal: no such clone') }) })
+  expect(runtime.store.tickets.get(failed.ticket.id)!.assignments.at(-1)).toMatchObject({ report: expect.objectContaining({ state: 'failed', summary: expect.stringContaining('The prepare command failed; its files were preserved: fatal: no such clone') }) })
   expect(waitsForPerson(runtime.store.tickets.get(failed.ticket.id)!)).toBe(true)
 })
 
-it('counts a ticket whose directory the host prepared before prepare commands existed as prepared', async () => {
+it('reuses a verified ticket worktree without rerunning prepare after its configuration changes', async () => {
   const { ticket, sessionId } = await acceptedTicket()
+  const worker = agents.get(sessionId)! as unknown as { session: { header: { cwd?: string } } }
+  expect(worker.session.header.cwd).toBe(ticket.execution!.directory)
   await runTool(sessionId, 'orchestrator_report', { state: 'failed', summary: 'offline' })
-  // A ticket from before prepare commands has its worktree.
-  const stored = runtime.store.tickets.get(ticket.id)!
-  runtime.store.tickets.save({ ...stored, execution: { ...stored.execution!, directory } })
+  // A retry inspects this ticket's existing, pinned worktree rather than treating an arbitrary directory as prepared.
+  expect(repository.git('-C', ticket.execution!.directory, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe(`agent/${ticket.execution!.name}`)
+  expect(repository.git('-C', ticket.execution!.directory, 'rev-parse', 'HEAD')).toBe(repository.base.sha)
   runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, prepare: 'exit 1' } })
   subprocess.spawn.mockClear()
   await runtime.engine.retryTicket(ticket.id)
   await runtime.idle()
+  expect(agents.get(sessionId)).toBe(worker)
+  expect(worker.session.header.cwd).toBe(ticket.execution!.directory)
   expect(subprocess.spawn.mock.calls.some(([spec]) => spec.argv[0] === 'sh')).toBe(false)
+  expect(repository.git('-C', ticket.execution!.directory, 'rev-parse', 'HEAD')).toBe(repository.base.sha)
   expect(runtime.store.tickets.get(ticket.id)!.assignments.at(-1)!.state).toBe('running')
 })
 
@@ -1295,7 +1386,11 @@ it('resumes several ended tickets on one thread from one message without the lau
   await receive(another)
   await runTool(first.sessionId, 'orchestrator_trigger_handback', { trigger_id: another.id, reason: 'Another change.' })
   const second = await acceptedTicket(another)
-  for (const ticket of [first, second]) await runTool(ticket.sessionId, 'orchestrator_report', { state: 'dropped', summary: 'nothing to do' })
+  for (const ticket of [first, second]) {
+    await runTool(ticket.sessionId, 'orchestrator_report', { state: 'dropped', summary: 'nothing to do' })
+    finishSessionTurn(ticket.sessionId)
+  }
+  await vi.waitFor(() => expect([first, second].map(ticket => runtime.store.tickets.get(ticket.ticket.id)!.execution!.active_writer)).toEqual([null, null]), { timeout: 3000 })
   await receive(feishu('32', '还有问题', { mentions: [], root_id: 'om_1', sender_id: 'ou_guest' }))
   await vi.waitFor(() => expect([first, second].map(ticket => runtime.store.tickets.get(ticket.ticket.id)!.ended)).toEqual([undefined, undefined]), { timeout: 3000 })
   await vi.waitFor(() => expect([first, second].map(ticket => runtime.store.tickets.get(ticket.ticket.id)!.assignments.at(-1)!.state)).toEqual(['running', 'running']), { timeout: 3000 })
@@ -2068,16 +2163,17 @@ it('gives an explicit ticket\'s worker a prompt without the limits of an inferre
 })
 
 it('runs a launch that fails for a passing reason again on the launch backoff three times, then fails its ticket; a failed prepare fails at once', async () => {
-  const original = controller.resolveAgent.getMockImplementation()! as (id: string) => Promise<unknown>
+  const originalGit = vi.mocked(Commands.prototype.git).getMockImplementation()!
   const later = async (now: number) => {
     vi.useFakeTimers({ toFake: ['Date'], now })
     try { await runtime.pump(); await runtime.idle() } finally { vi.useRealTimers() }
   }
   for (const [index, error] of [Object.assign(new Error('Service Unavailable'), { status: 503 }), Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })].entries()) {
     let tries = 0
-    controller.resolveAgent.mockImplementation(async (id: string) => {
-      if (String(id).startsWith('worker-')) { tries++; throw error }
-      return original(id)
+    vi.mocked(Commands.prototype.git).mockImplementation(async (args, cwd) => {
+      // Base resolution precedes ownership reservation; transient errors here retain the launch backoff contract.
+      if (args[0] === 'rev-parse' && args[1] === '--verify' && args[2] === 'HEAD^{commit}') { tries++; throw error }
+      return originalGit(args, cwd)
     })
     const { ticket } = await acceptedTicket(feishu(String(30 + index), `@bot 修 ${index}`, { root_id: undefined }))
     await runtime.idle()
@@ -2089,19 +2185,18 @@ it('runs a launch that fails for a passing reason again on the launch backoff th
     }
     expect(tries).toBe(4)
     expect(runtime.store.tickets.get(ticket.id)!.assignments.at(-1)!.report).toMatchObject({ state: 'failed' })
-    controller.resolveAgent.mockImplementation(original)
+    vi.mocked(Commands.prototype.git).mockImplementation(originalGit)
   }
   // A prepare command whose output names a passing failure is not run again on its own.
   const runs = () => subprocess.spawn.mock.calls.filter(([spec]) => (spec as { argv: string[] }).argv[0] === 'sh').length
-  runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, prepare: 'exit 3' } })
-  answers['sh -c exit 3'] = new Error('fatal: unable to access: The requested URL returned error: 503')
+  answers[`sh -c ${prepareWorktree}`] = new Error('fatal: unable to access: The requested URL returned error: 503')
   const before = runs()
   const prepared = await acceptedTicket(feishu('40', '@bot 修 prepare', { root_id: undefined }))
   await runtime.idle()
   expect(runtime.store.tickets.get(prepared.ticket.id)!.assignments.at(-1)!.report).toMatchObject({ state: 'failed', summary: expect.stringContaining('503') })
   expect(runs()).toBe(before + 1)
   // A retry runs the prepare command again, for the directory it left empty was removed; resuming relaunches no failed launch.
-  delete answers['sh -c exit 3']
+  delete answers[`sh -c ${prepareWorktree}`]
   runtime.executor.resume()
   await runtime.idle()
   expect(runs()).toBe(before + 1)
@@ -2109,19 +2204,21 @@ it('runs a launch that fails for a passing reason again on the launch backoff th
   await runtime.idle()
   expect(runs()).toBe(before + 2)
   expect(runtime.store.tickets.get(prepared.ticket.id)!.assignments.at(-1)).toMatchObject({ state: 'running' })
+  expect(repository.git('-C', prepared.ticket.execution!.directory, 'rev-parse', 'HEAD')).toBe(repository.base.sha)
 })
 
 it('launches a queued Assignment once when the host resumes, and gives a failed launch\'s slot back', async () => {
-  runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, maxWorkers: 1, prepare: 'exit 3' } })
-  answers['sh -c exit 3'] = new Error('fatal: no such clone')
+  runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, maxWorkers: 1 } })
+  answers[`sh -c ${prepareWorktree}`] = new Error('fatal: no such clone')
   const failed = await acceptedTicket(feishu('50', '@bot 修 一', { root_id: undefined }))
   await runtime.idle()
   expect(runtime.store.tickets.get(failed.ticket.id)!.assignments.at(-1)!.report).toMatchObject({ state: 'failed' })
   // The failed launch holds no slot: the next ticket launches in the only one.
-  delete answers['sh -c exit 3']
+  delete answers[`sh -c ${prepareWorktree}`]
   const next = await acceptedTicket(feishu('51', '@bot 修 二', { root_id: undefined }))
   await runtime.idle()
   expect(runtime.store.tickets.get(next.ticket.id)!.assignments.at(-1)).toMatchObject({ state: 'running' })
+  expect(repository.git('-C', next.ticket.execution!.directory, 'rev-parse', 'HEAD')).toBe(repository.base.sha)
   // A third waits for the slot; resuming queues its launch again, which runs once the slot frees.
   const queued = await acceptedTicket(feishu('52', '@bot 修 三', { root_id: undefined }))
   await runtime.idle()
@@ -2132,6 +2229,7 @@ it('launches a queued Assignment once when the host resumes, and gives a failed 
   await runtime.pump(); await runtime.idle()
   await vi.waitFor(() => expect(runtime.store.tickets.get(queued.ticket.id)!.assignments.at(-1)).toMatchObject({ state: 'running' }))
   expect(launches()).toBe(1)
+  expect(repository.git('-C', queued.ticket.execution!.directory, 'rev-parse', 'HEAD')).toBe(repository.base.sha)
 })
 
 it('shows the settings history when one revision holds values its Source kind no longer accepts, without that revision\'s changes', async () => {
@@ -2213,6 +2311,8 @@ it('restricts a worker\'s subagent to its work tools and none once the ticket en
   child.session.header = { parentSession: sessionId }
   await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: child } as never)
   const file = join(directory, 'child.txt')
+  expect(registered('child-1', 'bash')).toBeDefined()
+  expect(registered('child-1', 'ask_user_question')).toBeUndefined()
   expect(await dispatch('child-1', 'write', { path: file, content: 'child' })).toMatchObject({ isError: false })
   runtime.engine.stopTicket(ticket.id)
   expect(resultText(await dispatch('child-1', 'write', { path: file, content: 'overwrite' }))).toContain('Ticket ended')

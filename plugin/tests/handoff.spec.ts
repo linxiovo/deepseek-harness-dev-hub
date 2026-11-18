@@ -86,9 +86,9 @@ describe.each([
       handoffId,
       body: 'A signed-in shopper can save a product from its product page. Saved products are private, and the saved-products page lists them with links back to their product pages.',
       acceptance: [
-        { statement: 'A saved product appears on the saved-products page.', observable: 'The product is listed after saving.' },
-        { statement: 'Unsaving removes a product from that page.', observable: 'The product is absent after unsaving.' },
-        { statement: 'Saved products are private to their owner.', observable: 'Another shopper cannot see the saved product.' }
+        { statement: 'A saved product appears on the saved-products page.', observable: 'The product is listed after saving.', delivery: 'cross-end' },
+        { statement: 'Unsaving removes a product from that page.', observable: 'The product is absent after unsaving.', delivery: 'cross-end' },
+        { statement: 'Saved products are private to their owner.', observable: 'Another shopper cannot see the saved product.', delivery: 'backend' }
       ],
       testInterfaces: [{ seam: 'Product page save controls and saved-products page', kind: 'proposed', note: 'Exercise saving and unsaving, then verify the page and account isolation.' }],
       outOfScope: ['Anonymous saved products.', 'Sharing saved-products lists with other shoppers.']
@@ -160,9 +160,9 @@ describe.each([
       handoffId,
       body: 'A shopper can save products to a private saved-products page and remove them later.',
       acceptance: [
-        { statement: 'A saved product appears on the owner’s page.', observable: 'The owner sees the saved product.' },
-        { statement: 'Another shopper cannot see it.', observable: 'A different account does not see the saved product.' },
-        { statement: 'Unsaving removes it from the owner’s page.', observable: 'The product disappears after unsaving.' }
+        { statement: 'A saved product appears on the owner’s page.', observable: 'The owner sees the saved product.', delivery: 'cross-end' },
+        { statement: 'Another shopper cannot see it.', observable: 'A different account does not see the saved product.', delivery: 'backend' },
+        { statement: 'Unsaving removes it from the owner’s page.', observable: 'The product disappears after unsaving.', delivery: 'cross-end' }
       ],
       testInterfaces: [{ seam: 'Saved-products page and account isolation', kind: 'proposed', note: 'Save as one account and verify visibility only from that account.' }],
       outOfScope: ['Public saved-product lists.']
@@ -176,7 +176,7 @@ describe.each([
     await expect(h.runTool(plannerId, 'orchestrator_spec_publish', {
       handoffId,
       body: 'A shopper can save products.',
-      acceptance: [{ statement: 'Saved products are visible.', observable: 'A saved product appears in a page.' }],
+      acceptance: [{ statement: 'Saved products are visible.', observable: 'A saved product appears in a page.', delivery: 'cross-end' }],
       testInterfaces: [],
       outOfScope: []
     })).rejects.toThrow()
@@ -190,7 +190,7 @@ describe.each([
     await expect(h.runTool(h.runtime.masterId, 'orchestrator_spec_publish', {
       handoffId,
       body: 'A shopper can save products.',
-      acceptance: [{ statement: 'Saving shows the product on the saved-products page.', observable: 'The product is listed after saving.' }],
+      acceptance: [{ statement: 'Saving shows the product on the saved-products page.', observable: 'The product is listed after saving.', delivery: 'cross-end' }],
       testInterfaces: [{ seam: 'Product page save controls', kind: 'proposed', note: 'Save through the product page.' }],
       outOfScope: ['Sharing lists.']
     })).rejects.toThrow()

@@ -14,6 +14,8 @@ The Hub keeps the coordination and assessment tools registered by `mainTools` in
 
 If DeepSeek Harness selects another preset for the main Session before its first turn, `Sessions` selects `ROUTER_PRESET` again. A main Session the host creates or reloads is decorated with the runtime restriction, so it cannot recover shell, job or write tools even when the profile mounts one.
 
+The Hub also owns `orchestrator_handoff_confirm`, `orchestrator_handoff_answer` and `orchestrator_plan_context`. Neither planning Session owns these tools. [009 Handoff](009-handoff.md) describes the planner and splitter scopes; they can submit only their own planning artifact, never issue a Channel reply or start a Worker.
+
 ## Worker Session
 
 An Executor Session is created with `WORKER_PRESET` (`dsh-superagent-worker`) and keeps the file, search, shell, job, web, skill, todo and subagent tools listed in `WORK_TOOLS` (`src/app/sessions.ts`). `Sessions.workOnly` adds only the MCP tools named in `DEV_MCP_TOOLS`, the read-only Context7 lookups `mcp__context7__resolve-library-id` and `mcp__context7__query-docs`. No other MCP server is allowed: a mounted tool such as `mcp__feishu__send_message` is not in the allow list, so a Worker cannot send a person a message through MCP. The preset also keeps the shell's network access: a worker installs dependencies and reaches the Context7 service its MCP tools use. It works in its Ticket directory and may create subagents, which run under DeepSeek Harness's `standard` preset with the worker's permissions. It receives no tool for asking or presenting to a person, changing the deployment profile, scheduling work outside the worker slots, or sending a Channel message.

@@ -1,6 +1,6 @@
 # 009 Handoff
 
-This document follows a confirmed Harness handoff from the conversation to a published specification. It builds on [001 Domain model](001-domain.md), [003 Execution](003-execution.md), [004 Prompts](004-prompts.md) and [007 Architecture](007-architecture.md).
+This document follows a confirmed Harness handoff from the conversation to a published specification and registered Plan DAG. It builds on [001 Domain model](001-domain.md), [003 Execution](003-execution.md), [004 Prompts](004-prompts.md) and [007 Architecture](007-architecture.md).
 
 A handoff is one product brief a person confirmed in the main Session ("the Hub") conversation. It is not a Source Trigger and not a Ticket: it carries the project, goal, constraints, acceptance scope and authorization, and a read-only planner Session turns it into a specification. The Hub confirms, relays and reads the result; repository investigation and specification writing belong to the planner, and the Hub does not modify the repository.
 
@@ -20,7 +20,7 @@ Statuses:
 | `confirmed` | The brief is stored; the planner has not started | `planning`, by `begin` |
 | `planning` | The planner may read, ask or publish | `awaiting`, by its one question; `specified`, by publication |
 | `awaiting` | One question waits for a person | `planning`, by the answer |
-| `specified` | The specification is published | Terminal |
+| `specified` | The immutable specification is published and a separate Plan DAG can be registered | Terminal for the handoff |
 
 `Handoffs` (`src/app/handoffs.ts`) is the only writer; record types are in `src/core/handoff.ts`. Store `kv` families in `src/kv.ts` hold projects, each project's current handoff, immutable handoff records and specifications, and `handoff-confirmation:<session/message>` receipts binding a direct user event to one brief. Commands use `Store.atomic`; equal normalized briefs have equal `key` ids. The flow needs no schema migration.
 
@@ -32,7 +32,7 @@ Statuses:
 | `begin(id)` | Moves `confirmed` to `planning`; any other status is returned unchanged, so a resumed delivery cannot overwrite `awaiting` or `specified` |
 | `question(id, input)` | Stores the single question and moves the handoff to `awaiting` |
 | `answer(id, questionId, answer)` | Records the first answer, or the same answer again; moves the handoff to `planning` and enqueues a planning effect |
-| `publish(id, input)` | Stores the immutable specification and moves the handoff to `specified` |
+| `publish(id, input)` | Stores the immutable specification, moves the handoff to `specified` and enqueues splitting |
 | `spec(id)` | Reads the published specification |
 
 ## Confirmation
@@ -55,13 +55,15 @@ Its host tools are limited to the same handoff:
 | --- | --- |
 | `orchestrator_read` | Reads only `handoff/<its id>` or `spec/<its id>` |
 | `orchestrator_spec_question` | Atomically stores the single product-intent question and queues a Hub conversation relay |
-| `orchestrator_spec_publish` | Atomically publishes the specification and queues a Hub conversation relay |
+| `orchestrator_spec_publish` | Atomically publishes the specification and queues a Hub conversation relay and the splitter task |
 
 `orchestrator_spec_question` requires `handoffId`, `text`, `why` and `affectedAcceptance[]`. The handoff must be `planning` and have no earlier question, and each affected criterion must already be in `acceptanceScope`. The tool refuses known technical-boundary and file-organization formulations; the planner prompt forbids those questions altogether. The question becomes `awaiting`, and the planner stops until an answer resumes it.
 
 The same state transaction queues a relay to the Hub naming the project, question, reason and affected acceptance; no Outbox reply is written. Its text comes from the `prompts/handoff-relay.md` template, which fills the project, kind, content, resource and handoff id; the publication relay uses the same template. The Hub presents the question in Harness and calls `orchestrator_handoff_answer` (`handoffId`, `questionId`, `answer`) only with the exact latest direct user's answer. `Handoffs.answer` accepts the matching first answer, repeats that answer idempotently and rejects a changed answer, unknown question or handoff not awaiting an answer. The first answer resumes `planning` and enqueues a planning effect for the same Session.
 
 `orchestrator_spec_publish` requires `handoffId`, a non-empty `body`, observable `acceptance` entries, at least one selected public `testInterfaces` entry of kind `existing` or `proposed`, and a required `outOfScope` list. `outOfScope: []` is accepted only as the explicit statement that there are no confirmed exclusions; each non-empty entry names an actual excluded item, and a caller neither omits the field nor fabricates entries. Only a `planning` handoff may publish. The immutable revision `1` and `specified` status are stored together with a Hub relay containing the `spec/<id>` read resource; the requester sees that result in Harness without IM. A second publication is refused.
+
+Each acceptance entry includes `delivery: backend | frontend | cross-end`, decided during specification planning and immutable after publication. A spec published without those classifications remains readable (`unclassified-spec` in the plan read) but cannot start splitting; the host does not guess execution roles for it.
 
 ## Reads
 
@@ -71,8 +73,10 @@ The main Session reads the flow with `orchestrator_read`:
 | --- | --- |
 | `handoff/<id>` | The whole handoff record: project, brief, confirmation, status, question and answer |
 | `spec/<id>` | The published specification, or `{handoffId, status: 'pending'}` before publication |
+| `plan/<id>` | The Plan DAG with roles, acceptance references, blocked-by edges, role totals and delivered counts, plus root background. `offset` and `limit` page the nodes and background in parallel. Before registration the status is `awaiting-spec`, `pending`, or `unclassified-spec` |
+| `plan/<id>/node/<node-id>` | One registered Slice Ticket with a page of its addressed instructions, without root background or other nodes' instructions |
 
-Both are main-Session resources, so a worker Session is refused. A planner's own `orchestrator_read` accepts only its two matching resources and only while its handoff is `planning`.
+These are main-Session resources, so a Worker Session is refused. A planner's own `orchestrator_read` accepts only its two matching resources while its handoff is `planning`.
 
 ## Durable planning
 
@@ -80,7 +84,21 @@ Both are main-Session resources, so a worker Session is refused. A planner's own
 
 It ensures `planner-<id>` in `project.workspace` and sends the full persisted brief (handoff id, project, goal, constraints, acceptance scope, authorization and confirming message) with the unattended to-spec task under request id `handoff:<id>:task`. When the handoff has an answered question, it also sends that question and answer under `handoff:<id>:answer:<question id>`. The first delivery's task text is `prompts/planner-task.md`; the answer delivery's task text is `prompts/planner-resume.md`. Both are built-in prompt files loaded through `promptFile`, so the code carries no inline prompt copy. The stable request ids let `AgentDelivery` deliver each of these at most once across retries and restarts, and the same Session is reused.
 
-At startup, before effects and passes start, `Planning.resume` enqueues a `planning` effect for every stored handoff in `confirmed` or `planning`. Crash recovery therefore continues unfinished work and never wakes a question waiting for a person or a published specification. A missing or disposed Session is retried through `Later`. Shutdown cancels every `planner-<id>` Session, including one created while stopping.
+At startup, before effects and passes start, `Planning.resume` enqueues planning for stored handoffs in `confirmed` or `planning`. A missing or disposed Session is retried through `Later`. Shutdown cancels planning Sessions, including ones created while stopping.
+
+## Automatic Plan registration
+
+Publication also persists a `splitting` effect for the exact handoff and spec. The effect starts `splitter-<handoff id>` in the handoff workspace with the read-only planning preset and sends `prompts/splitter-task.md`, the two IDs and scoped resource pointers under `handoff:<id>:plan:<specId>`. The splitter loads `dsh-superagent-to-tickets`, reads only that handoff and its immutable spec, and calls `orchestrator_plan_register`. Stable delivery IDs prevent duplicate queue deliveries on restart. The Hub does not read or write the draft to continue the pipeline, and no user approval is needed.
+
+The effect remains parked after a successful prompt until registration cancels it in the same transaction as the Plan write. On restart the host rearms only persisted splitting intents, checks for the last message in the Session history or inbox, and either delivers it once or steers an idle splitter with a new, persisted continuation ID. No continuation is enqueued for a registered Plan. An idle unfinished turn is not retried in a loop on the same Runtime.
+
+The registration takes `handoffId`, `specId`, `features[]` and `nodes[]`. A feature declares its `id` and `kind` (`backend`, `frontend`, `cross-end`); its nodes hold stable `id`, `featureId`, `title`, one execution `role`, one-based `acceptance` indices into the spec, a `demonstration` and explicit `blockedBy` IDs. A cross-end feature needs one backend node with a repository-relative `interfaceContract {path, requirements}` deliverable and one frontend node explicitly blocked by it. A single-end feature gets one matching node. The splitter judges fit to the prose and the demonstrations; the registry validates the submitted roles, graph and acceptance coverage before writing. An identical replay reuses the registered graph; malformed submissions and attempts to replace it do not mutate the old graph.
+Every backend predecessor explicitly referenced by a frontend node needs an interface contract, including when the two nodes belong to different features.
+The registry compares each acceptance reference with its immutable delivery classification. A `cross-end` criterion must be referenced by both an interface-contract backend node and a frontend node explicitly blocked by that node, even if the draft labels the feature as single-end. Role labels in a draft cannot weaken a specification.
+
+Only `blockedBy` creates an edge. A node without predecessors is `waiting-for-slot`; a node with predecessors is `blocked`. Registration creates no executable Ticket, Worker Session, Assignment, or worktree. `stats` reports registered and delivered counts separately for `backend` and `frontend`; none are delivered at this stage.
+
+For an already registered plan, `orchestrator_plan_context` takes the verbatim latest direct Hub user message as `message`. That message is JSON with `planId`, `target: {"kind":"background"}` or `target: {"kind":"node","nodeId":"…"}`, and `text`. The tool parses the plan and target from the message itself, records the event once, and stores root background separately from the addressed node's instructions. Neither record, message visibility nor Thread subscription creates authorization, alters the graph, or starts work.
 
 ## Tests
 
@@ -88,8 +106,9 @@ At startup, before effects and passes start, `Planning.resume` enqueues a `plann
 
 Run it with `pnpm test tests/handoff.spec.ts`.
 
+`pnpm test tests/plans.spec.ts` exercises automatic delegation, restart deduplication, graph validation and reads, and message isolation through the Hub and splitter tools using a simulated Harness host.
+
 ## Limitations
 
 - No IM or Feishu: the question, answer and publication notice travel only through the Harness Sessions. No Feishu binding, chat message or Outbox reply is created.
-- No to-tickets: a `specified` handoff ends this flow and creates no Ticket, worktree or worker Assignment. Splitting a specification into tickets is a later flow (`to-tickets` is not part of this document).
 - One immutable specification: revision `1` is the only revision and publication is one-way. A changed brief is a new handoff after the prior one is `specified`.

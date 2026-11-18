@@ -7,6 +7,7 @@ import { UserError, followupOwners, key, reasonText, type Decision, type Decisio
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
 import type { Handoffs } from '../handoffs.ts'
+import { PlanTargetSchema, type Plans } from '../plans.ts'
 import { ticketCard } from '../cards.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
@@ -33,6 +34,11 @@ const ApprovalSchema = z.object({
   confirmed: z.literal(true),
   brief: HandoffConfirmationSchema.omit({ confirmation: true }),
 }).strict()
+const PlanMessageSchema = z.object({
+  planId: z.string().trim().min(1),
+  target: PlanTargetSchema,
+  text: z.string().trim().min(1).max(4000),
+}).strict()
 const handoffErrors = z.object({
   latestConfirmation: z.string().min(1),
   latestAnswer: z.string().min(1),
@@ -40,9 +46,10 @@ const handoffErrors = z.object({
   answerSession: z.string().min(1),
   invalidConfirmation: z.string().min(1),
   mismatchedBrief: z.string().min(1),
+  latestPlanMessage: z.string().min(1),
 }).strict().parse(JSON.parse(promptFile('handoff-errors')))
-/** Only the latest direct Hub user event may authorize a confirmation or answer. */
-function latestDirectUserMessageId(agent: Agent, text: string, kind: 'confirmation' | 'answer'): string {
+/** Only the latest direct Hub user event may authorize a handoff or address a plan. */
+function latestDirectUserMessageId(agent: Agent, text: string, mismatch: string): string {
   const events = agent.session.snapshotEvents()
   for (let index = events.length - 1; index >= 0; index--) {
     const event = events[index]
@@ -51,7 +58,7 @@ function latestDirectUserMessageId(agent: Agent, text: string, kind: 'confirmati
     if (message === text) return String(event.seq)
     break
   }
-  throw new Error(kind === 'confirmation' ? handoffErrors.latestConfirmation : handoffErrors.latestAnswer)
+  throw new Error(mismatch)
 }
 export interface MainToolsHost {
   readonly context: Context
@@ -63,6 +70,7 @@ export interface MainToolsHost {
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
   readonly handoffs: Pick<Handoffs, 'confirm' | 'answer' | 'get' | 'spec'>
+  readonly plans: Pick<Plans, 'view' | 'node' | 'append'>
   /** Schedules a pass to carry out work queued by an Engine command (such as an Eval or ticket resume). */
   requestPass(): void
   sendReplies(): Promise<void>
@@ -190,7 +198,7 @@ function routeTool(host: MainToolsHost): Tool {
 }
 /** Builds the main Session's tools; `agent` scopes prompt preview resources to that Session. */
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
-  const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings, handoffs: host.handoffs }
+  const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings, handoffs: host.handoffs, plans: host.plans }
   return [
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
@@ -200,7 +208,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       schema: HandoffConfirmationSchema,
       execute: async ({ confirmation, ...brief }) => {
         if (agent.id !== host.resources.masterId) throw new Error(handoffErrors.confirmationSession)
-        const messageId = latestDirectUserMessageId(agent, confirmation, 'confirmation')
+        const messageId = latestDirectUserMessageId(agent, confirmation, handoffErrors.latestConfirmation)
         let parsed: unknown
         try { parsed = JSON.parse(confirmation) } catch {
           throw new Error(handoffErrors.invalidConfirmation)
@@ -221,7 +229,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         const { handoff, reused } = host.handoffs.confirm({ ...approvedBrief,
           confirmedBy: { sessionId: agent.id, messageId, text: confirmation } })
         return { id: handoff.id, reused, handoff, spec: handoff.spec ?? null,
-          read: { handoff: `handoff/${handoff.id}`, spec: `spec/${handoff.id}` } }
+          read: { handoff: `handoff/${handoff.id}`, spec: `spec/${handoff.id}`, plan: `plan/${handoff.id}` } }
       },
     }),
     tool({
@@ -231,9 +239,24 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         answer: z.string().min(1).refine(text => !!text.trim(), 'Answer cannot be blank') }).strict(),
       execute: async ({ handoffId, questionId, answer }) => {
         if (agent.id !== host.resources.masterId) throw new Error(handoffErrors.answerSession)
-        latestDirectUserMessageId(agent, answer, 'answer')
+        latestDirectUserMessageId(agent, answer, handoffErrors.latestAnswer)
         const handoff = host.handoffs.answer(handoffId, questionId, answer)
         return { handoffId, handoff, read: `handoff/${handoffId}`, spec: `spec/${handoffId}` }
+      },
+    }),
+    tool({
+      name: 'orchestrator_plan_context',
+      description: 'Record plan background or one node’s instruction from the direct user.',
+      schema: z.object({ message: z.string().min(1).max(32_000)
+        .describe('Verbatim user JSON: {planId, target: {kind: "background"} or {kind: "node", nodeId}, text}.') }).strict(),
+      execute: async ({ message }) => {
+        if (agent.id !== host.resources.masterId) throw new Error('Only the Hub may record plan messages')
+        const messageId = latestDirectUserMessageId(agent, message, handoffErrors.latestPlanMessage)
+        let value: unknown
+        try { value = JSON.parse(message) } catch { throw new Error('Plan context needs a JSON message with planId, target and text') }
+        const { planId, target, text } = PlanMessageSchema.parse(value)
+        host.plans.append(planId, target, { sessionId: agent.id, messageId, text })
+        return { read: target.kind === 'node' ? `plan/${planId}/node/${target.nodeId}` : `plan/${planId}` }
       },
     }),
     routeTool(host),

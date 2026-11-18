@@ -178,8 +178,9 @@ it('leaves Feishu out of a GitHub-only deployment', async () => {
   at({ page: 'settings', query: { group: 'prompts' } })
   await mount()
   await click(tab(zh.promptViewFull))
-  expect([...field<HTMLSelectElement>(zh.promptPreviewTarget).options].map(option => option.textContent)).toEqual(['主 Session',
-    '执行器 Session', 'dsh-superagent-github'])
+  const targets = [...field<HTMLSelectElement>(zh.promptPreviewTarget).options].map(option => option.value)
+  expect(targets).toContain('skill/github')
+  expect(targets).not.toContain('skill/feishu')
 })
 
 it('shows the Sources waiting for the deployment check, and the problem on the Source that fixes it, with its link', async () => {

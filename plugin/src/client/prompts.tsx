@@ -139,7 +139,7 @@ function TeamEditor({ config, view, selected, onSelect, onEdit }: {
 }
 /** The part's read-by hint, by the role that alone reads it. */
 const READ_BY = { orchestrator: 'promptReadBy.orchestrator', worker: 'promptReadBy.worker',
-  planner: 'promptReadBy.planner' } as const
+  planner: 'promptReadBy.planner', splitter: 'promptReadBy.splitter' } as const
 /**
  * A built-in part: its text, the team's override or the built-in one, with a reset; a template says which placeholders it
  * keeps; an override whose built-in text changed since shows the change and offers to keep the team's text or take the new one.
@@ -178,7 +178,7 @@ function BuiltInEditor({ config, view, part, onEdit }: {
 }
 
 type Preview = ApiResponse<'POST prompts/preview'>
-type Target = 'orchestrator' | 'worker' | `skill/${string}`
+type Target = keyof Preview['parts'] | `skill/${string}`
 const KIND_LABEL = { team: 'promptPartTeam', fixed: 'promptPartFixed', generated: 'promptPartGenerated' } as const
 function FullPrompt({ config, view, dirty, revision, onEdit }: {
   config: PromptConfig; view: PromptsView; dirty: boolean; revision: number; onEdit: (name: string) => void
@@ -207,10 +207,9 @@ function FullPrompt({ config, view, dirty, revision, onEdit }: {
     <div className="dt-subhead">
       <select className="dt-select dt-inline-select" aria-label={t('promptPreviewTarget')} value={target}
         onChange={event => setTarget(event.target.value as Target)}>
-        <option value="orchestrator">{valueLabel(t, 'promptRole', 'orchestrator')}</option>
-        <option value="worker">{valueLabel(t, 'promptRole', 'worker')}</option>
+        {Object.keys(READ_BY).map(role => <option key={role} value={role}>{valueLabel(t, 'promptRole', role)}</option>)}
         {Object.keys(preview.value.skills).map(name => <option key={name} value={`skill/${name}`}>{sectionLabel(t, view,
-          `skill/${name}`)}</option>)}
+          `${Object.hasOwn(preview.config.skills, name) ? '' : 'part/'}skill/${name}`)}</option>)}
       </select>
       <Hint>{t('promptFullState', { count: parts.length, chars: parts.reduce((sum, part) => sum + part.text.length, 0),
         state: dirty ? t('promptPreviewDraft') : t('promptPreviewSaved', { revision }) })}</Hint>

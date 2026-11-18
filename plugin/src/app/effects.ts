@@ -3,6 +3,9 @@
  * Effects reschedules the row after the initial retry delay without incrementing its failure count, and DshExecutor throws it from launch and delivery handlers.
  */
 export class Later extends Error {}
+/** Keep the row durable but stop dispatching it until startup reconciliation. */
+export const Park = Symbol('park effect')
+const PARKED_DUE = Number.MAX_SAFE_INTEGER
 /** Consecutive failures before an effect kind reports an error, matching the Sources poll failure threshold. */
 export const FAILURES_BEFORE_ERROR = 3
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
@@ -15,6 +18,8 @@ export interface EffectPayloads {
   launch: { ticketId: string; assignmentId: string }
   /** Start or resume a confirmed handoff's planner; the key is the handoff ID. */
   planning: { handoffId: string }
+  /** Delegate an immutable published spec to its splitter; the key is the handoff ID. */
+  splitting: { handoffId: string; specId: string; pass?: number }
   /** Hand a ticket's waiting Inputs to its running Assignment; the key is the Ticket ID. */
   delivery: { ticketId: string }
   /** Steer a report or a candidate into the main Session; the key is the request ID. */
@@ -26,7 +31,7 @@ export interface EffectPayloads {
 }
 export type EffectKind = keyof EffectPayloads
 interface Handler<K extends EffectKind> {
-  run: (payload: EffectPayloads[K], key: string) => Promise<void>
+  run: (payload: EffectPayloads[K], key: string) => Promise<void | typeof Park>
   /** How many may run at once now; 0 holds the kind, such as while processing is paused. */
   limit: () => number
   /** Initial and maximum retry backoff delays, in milliseconds. */
@@ -82,6 +87,10 @@ export class Effects {
     this.store.db.prepare('DELETE FROM effect WHERE kind = ? AND key = ?').run(kind, key)
     this.store.afterCommit(() => { this.report(kind) })
   }
+  /** Rearm parked rows of a kind without creating intent for any other records. Call before start. */
+  wakeParked(kind: EffectKind): void {
+    this.store.db.prepare('UPDATE effect SET due = ? WHERE kind = ? AND due = ?').run(this.now(), kind, PARKED_DUE)
+  }
   start(): void { this.started = true; this.kick() }
   kick(): void {
     if (this.scheduled) return
@@ -131,10 +140,12 @@ export class Effects {
   }
   private async attempt(kind: EffectKind, handler: Handler<never>, row: Row): Promise<void> {
     let failure: { error: unknown } | undefined
-    try { await handler.run(JSON.parse(row.value) as never, row.key) } catch (error) { failure = { error } }
+    let result: void | typeof Park = undefined
+    try { result = await handler.run(JSON.parse(row.value) as never, row.key) } catch (error) { failure = { error } }
     // Match seq and generation so a row replaced or re-queued while running is not overwritten.
     const own = 'kind = ? AND key = ? AND seq = ? AND generation = ?', ownRow = [kind, row.key, row.seq, row.generation] as const
-    if (!failure) this.store.db.prepare(`DELETE FROM effect WHERE ${own}`).run(...ownRow)
+    if (result === Park) this.store.db.prepare(`UPDATE effect SET due = ?, attempts = 0, error = '' WHERE ${own}`).run(PARKED_DUE, ...ownRow)
+    else if (!failure) this.store.db.prepare(`DELETE FROM effect WHERE ${own}`).run(...ownRow)
     // Leave running rows untouched on shutdown so they retry on the next start.
     else if (this.stopped) return
     else if (failure.error instanceof Later) {

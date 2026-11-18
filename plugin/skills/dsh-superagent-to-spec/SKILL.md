@@ -38,7 +38,7 @@ Publish when the spec is ready with `orchestrator_spec_publish`:
 
 - `handoffId`: the same id from your planner message; it must select this session.
 - `body`: the human-readable spec, structured as below.
-- `acceptance[]`: user-observable acceptance conditions, each stating behavior a person can observe or check, including rejection and error paths where relevant. Cover the whole feature without file names, internal functions or test mechanics, and write each condition so an implementer can verify it through a public interface.
+- `acceptance[]`: user-observable acceptance conditions, each with `statement`, `observable` (including relevant error paths), and `delivery`: `backend` for service-only changes, `frontend` for client-only changes, or `cross-end` if the outcome needs changes at both ends. Decide this from the specification and repository, not the requested implementation order. Cover the whole goal with criteria verifiable through public interfaces.
 - `testInterfaces[]`: the public seams you chose, each with the observable behavior checked there. Prefer existing public interfaces and never list private helpers.
 - `outOfScope[]`: explicit non-goals and adjacent work this handoff does not cover.
 

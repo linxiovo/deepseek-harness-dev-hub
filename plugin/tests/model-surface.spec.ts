@@ -233,14 +233,13 @@ async function drive(host: Host) {
   const finished = host.agents.get(workerA)!
   finished.status = 'idle'
   host.ctx.emit('agent/status', { agent: finished, status: 'idle' } as never)
-  await vi.waitFor(() => expect(runtime.store.tickets.get(a)!.execution?.active_writer).toBeNull())
+  await runtime.idle()
+  expect(runtime.store.tickets.get(a)!.execution?.active_writer).toBeNull()
   await runtime.receive(feishu('2', '再加一个按钮', { mentions: [], root_id: 'om_1' }))
-  await vi.waitFor(async () => {
-    await runtime.pump()
-    const resumed = runtime.store.tickets.get(a)!.inputs.find(input => input.kind === 'resumed')
-    expect(resumed).toBeDefined()
-    expect(host.inputs.some(input => input.sessionId === workerA && input.text === inputMessage(resumed!))).toBe(true)
-  })
+  await runtime.idle()
+  const resumed = runtime.store.tickets.get(a)!.inputs.find(input => input.kind === 'resumed')
+  expect(resumed).toBeDefined()
+  expect(host.inputs.some(input => input.sessionId === workerA && input.text === inputMessage(resumed!))).toBe(true)
   const policy = runtime.store.settings().policy
   // The rule ticket b was accepted under changes, so its worker is told how; the one it was not is disabled, which tells no one.
   const rules = policy.rules.map(rule => rule.id === 'visual' ? { ...rule, enabled: false }

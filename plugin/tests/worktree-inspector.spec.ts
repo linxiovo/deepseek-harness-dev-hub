@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -45,7 +46,7 @@ const unregisterWorktrees = async (repositoryPath: string): Promise<void> => {
     let canonical: string
     try { canonical = realpathSync(path) } catch { continue /* Its test already deleted this worktree directory. */ }
     if (process.platform === 'win32' ? canonical.toLowerCase() === main.toLowerCase() : canonical === main) continue
-    // Worktrees are dirty or carry untracked files by design; force is required, and a failure still leaves rmSync below.
+    // Worktrees are dirty or carry untracked files by design; force is required, and a failure still leaves directory cleanup below.
     await git('-C', repositoryPath, 'worktree', 'remove', '--force', path).catch(() => {})
   }
 }
@@ -61,7 +62,7 @@ beforeEach(async () => {
 afterEach(async () => {
   for (const repositoryPath of repositories.splice(0)) await unregisterWorktrees(repositoryPath)
   // Windows can hold a directory handle briefly after Git exits; retry only those transient errors and still throw if they persist.
-  if (directory) rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  if (directory) await rm(directory, { recursive: true, force: true, maxRetries: 12, retryDelay: 100 })
 })
 
 describe('Git worktree inspection', () => {

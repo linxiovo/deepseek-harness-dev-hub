@@ -502,7 +502,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
 | `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
-| `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
+| `tests/runtime-concurrency.spec.ts` | Overlapping Triggers, deliveries and launches; Worker inbox recovery after restart, checked after the runtime drains launch and delivery effects against real Git worktrees |
 | `tests/http.spec.ts` | Management request bounds; ticket worktree and writer projections; Session meter success, errors, ID decoding and same-origin protection |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, the refusals of the pause, a sync and a block, and the required local repository and base ref with their preparation variables |
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |

@@ -21,11 +21,11 @@ Overrides use these keys:
 
 | Parts | Keys |
 | --- | --- |
-| Shared instructions and roles | `runtime/shared`, `runtime/orchestrator`, `runtime/worker`, `runtime/planner` |
+| Shared instructions and roles | `runtime/shared`, `runtime/orchestrator`, `runtime/worker`, `runtime/planner`, `runtime/splitter` |
 | Working instructions | `runtime/subscriptions`, `runtime/replies`, `runtime/dispatch`, `runtime/work`, `runtime/admission` |
 | Handoff instructions | `runtime/handoff/orchestrator`, `runtime/handoff/worker` |
 | Source skills | `skill/feishu`, `skill/github` |
-| Planner skill | `skill/to-spec` |
+| Planning skills | `skill/to-spec`, `skill/splitter/to-tickets` |
 | Worker skill | `skill/doc-tree` |
 | Generated sections | `runtime/environment`, `runtime/policy`, `runtime/policy/none` |
 
@@ -72,7 +72,9 @@ Executors work unattended. Their tools exclude those that ask a person, present 
 
 Planner Sessions receive only `runtime/planner` and `skill/to-spec`, with neither Ticket policy nor Source/team skills. Their confirmed handoff arrives inline; specification research and writing belong to the planner, while the Hub may inspect context read-only and does not modify repository files.
 
-The planner's task and resume turns and the Hub's handoff relays are packaged templates, not override parts: `Planning` sends `prompts/planner-task.md` with the confirmed brief and `prompts/planner-resume.md` with the recorded answer, and `Handoffs` fills `prompts/handoff-relay.md` for a product question or a published specification. `Sessions` loads `prompts/planner-inactive.md` and `prompts/planner-denied.md` once at module load, as the guard's refusals for a handoff that is no longer `planning` and for a tool outside a planner Session's allowance. The main Session's tools load `prompts/handoff-errors.md` once, strictly checking its six keys, for their Hub handoff refusals.
+Splitter Sessions receive only `runtime/splitter` and the `dsh-superagent-to-tickets` skill (`skill/splitter/to-tickets` in prompt settings). The installed planning preset is shared; the role determines the prompt, skill and host tools. `plugin/docs/009-handoff.md` describes the task and registered graph.
+
+`Planning` loads the packaged planner task and resume templates; `Handoffs` fills `prompts/handoff-relay.md` for a product question or published specification. Planner and splitter guard refusals are fixed templates in `prompts/`. The Hub tools load and validate `prompts/handoff-errors.md` for their direct-message refusals.
 
 From strongest to weakest:
 

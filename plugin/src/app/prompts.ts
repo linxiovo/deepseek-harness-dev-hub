@@ -4,7 +4,7 @@ import { UserError, key } from '../core/index.ts'
 import { policyVersion, type Settings, type SettingsOrigin } from '../policy.ts'
 import { masterPrompt, workerPrompt, sharedPrompt, guides, mainAdmissionPolicy, handoffPolicy, teamDefaults, sourceSkills, cliNotes } from './context.ts'
 import { environmentLines, type Variable } from './execution-environment.ts'
-import { bundledSkills, isBundledSkill, promptFile } from './skill-files.ts'
+import { bundledSkills, isBundledSkill, promptFile, splitterSkill } from './skill-files.ts'
 import { promptsNotice } from './notices.ts'
 import type { Sessions } from './sessions.ts'
 import type { Store } from './store.ts'
@@ -20,10 +20,13 @@ export const SKILL_NAME = /^[a-z][a-z0-9-]*$/
 /** Prefix prepended to skill names when registering them in DSH Sessions. */
 export const SKILL_PREFIX = 'dsh-superagent-'
 const SkillNameSchema = z.string().regex(SKILL_NAME).refine(name => !isBundledSkill(name), 'This name belongs to a built-in skill')
+/** A preview key outside the team skill name grammar, independent of the splitter's runtime skill name. */
+export const SPLITTER_SKILL_KEY = `splitter/${splitterSkill.shortName}` as const
+const SPLITTER_SKILL_PART = `skill/${SPLITTER_SKILL_KEY}` as const
 /** The built-in parts a team may override, by key: all roles' parts, bundled skills, and generated templates. */
-const PART_KEYS = ['runtime/shared', 'runtime/orchestrator', 'runtime/worker', 'runtime/planner', 'runtime/subscriptions', 'runtime/replies',
+const PART_KEYS = ['runtime/shared', 'runtime/orchestrator', 'runtime/worker', 'runtime/planner', 'runtime/splitter', 'runtime/subscriptions', 'runtime/replies',
   'runtime/dispatch', 'runtime/work', 'runtime/admission', 'runtime/handoff/orchestrator', 'runtime/handoff/worker', 'runtime/environment',
-  'runtime/policy', 'runtime/policy/none', 'skill/feishu', 'skill/github', 'skill/to-spec', 'skill/doc-tree'] as const
+  'runtime/policy', 'runtime/policy/none', 'skill/feishu', 'skill/github', 'skill/to-spec', 'skill/doc-tree', SPLITTER_SKILL_PART] as const
 export type PartKey = typeof PART_KEYS[number]
 /** A team's text for a built-in part, and `base`, the key of the built-in text it was edited from. */
 const OverrideSchema = z.object({ text: z.string(),
@@ -43,18 +46,20 @@ export const defaultPrompts = (): PromptConfig => ({ ...teamDefaults, skills: {}
 
 const ENVIRONMENT_HEADING = 'Execution environment (from this installation\'s settings; it takes precedence over any repository or account named elsewhere in these instructions; an empty value means that part is not configured here). The prepare command of a ticket directory reads the same variables:'
 const POLICY_HEAD = '## Policy\nPolicy version {version}; accept mode {mode}. The accept mode and the rules decide proactive candidates only: an explicit request is routed as dispatch says, in any mode and whatever the rules.'
-export type Role = 'orchestrator' | 'worker' | 'planner'
+export type Role = 'orchestrator' | 'worker' | 'planner' | 'splitter'
 /** A built-in part a team may override: the roles that read it, its text, and the placeholders a template's override keeps. */
 interface BuiltInPart { roles: readonly Role[]; text: string; placeholders?: readonly string[] }
 const BOTH: readonly Role[] = ['orchestrator', 'worker'], MAIN: readonly Role[] = ['orchestrator'], WORKER: readonly Role[] = ['worker'], PLANNER: readonly Role[] = ['planner']
+const SPLITTER: readonly Role[] = ['splitter']
 let parts: Readonly<Record<PartKey, BuiltInPart>> | undefined
 /**
- * The built-in parts of both roles' prompts, the two Source skills, and the templates of the generated parts, whose data the
- * system fills in, by the key an override names them by. Built on first use, as the texts it reads are imported in a cycle.
+ * The built-in role prompts, bundled skills, and generated templates, by the key an override names them by.
+ * Built on first use, as the texts it reads are imported in a cycle.
  */
 export const builtInParts = (): Readonly<Record<PartKey, BuiltInPart>> => parts ??= {
   'runtime/shared': { roles: BOTH, text: sharedPrompt }, 'runtime/orchestrator': { roles: MAIN, text: masterPrompt },
   'runtime/worker': { roles: WORKER, text: workerPrompt }, 'runtime/planner': { roles: PLANNER, text: promptFile('planner') },
+  'runtime/splitter': { roles: SPLITTER, text: promptFile('splitter') },
   'runtime/subscriptions': { roles: BOTH, text: `## subscriptions\n${guides.subscriptions}` },
   'runtime/replies': { roles: BOTH, text: `## replies\n${guides.replies}` },
   'runtime/dispatch': { roles: MAIN, text: `## dispatch\n${guides.dispatch}` }, 'runtime/work': { roles: WORKER, text: `## work\n${guides.work}` },
@@ -69,6 +74,7 @@ export const builtInParts = (): Readonly<Record<PartKey, BuiltInPart>> => parts 
   'skill/github': { roles: BOTH, text: `${sourceSkills.github}\n\n## CLI usage\n${cliNotes}` },
   'skill/to-spec': { roles: PLANNER, text: bundledSkills['to-spec'].content },
   'skill/doc-tree': { roles: WORKER, text: bundledSkills['doc-tree'].content },
+  [SPLITTER_SKILL_PART]: { roles: SPLITTER, text: splitterSkill.content },
 }
 /** The key of a built-in text, which an override's `base` records. */
 export const builtInBase = (text: string): string => key('prompt-built-in', text)
@@ -106,8 +112,8 @@ export function promptParts(config: PromptConfig, role: Role, environment?: stri
   const fixed = (name: string, part = name) => ({ name, kind: 'fixed' as const, key: part, text: builtIn(config, part as PartKey) })
   const team = (name: TeamSection) => ({ name, kind: 'team' as const, heading: `## ${TEAM_HEADINGS[name]}`,
     text: config[name] ? `## ${TEAM_HEADINGS[name]}\n${config[name]}` : '' })
-  // Planner receives neither ticket policy nor source communications; the confirmed handoff is delivered as input.
-  if (role === 'planner') return [fixed('runtime/planner')]
+  // The handoff roles receive isolated instructions, without ticket policy, project environment or Source communications.
+  if (role === 'planner' || role === 'splitter') return [fixed(`runtime/${role}`)]
   return [
     fixed('runtime/shared'), fixed(`runtime/${role}`),
     ...TEAM_SECTIONS.map(team),
@@ -121,7 +127,9 @@ export function promptParts(config: PromptConfig, role: Role, environment?: stri
 export function composePrompt(config: PromptConfig, role: Role, environment?: string, policy?: { key: string; text: string }): string {
   return promptParts(config, role, environment, policy).map(part => part.text).join('\n\n')
 }
+/** Renders a skill by its preview key; only the splitter uses a scoped key. */
 export function composeSkill(config: PromptConfig, name: string): string {
+  if (name === SPLITTER_SKILL_KEY) return builtIn(config, SPLITTER_SKILL_PART)
   return isBundledSkill(name) ? builtIn(config, `skill/${name}`) : config.skills[name] ?? ''
 }
 
@@ -143,13 +151,14 @@ export class Prompts {
     this.versions = new Versions(store, KV.prompts.revision, KV.prompts.version)
   }
   /** A role's prompt; the main Session's Policy section follows the settings as they are now, at each model request. */
-  compose(config: PromptConfig, role: Role, variables = this.environment()): string {
-    if (role === 'planner') return composePrompt(config, role)
-    return composePrompt(config, role, environmentSection(config, variables), role === 'orchestrator' ? policySection(this.store.settings(), config) : undefined)
+  compose(config: PromptConfig, role: Role, variables?: Variable[]): string {
+    if (role === 'planner' || role === 'splitter') return composePrompt(config, role)
+    return composePrompt(config, role, environmentSection(config, variables ?? this.environment()), role === 'orchestrator' ? policySection(this.store.settings(), config) : undefined)
   }
-  /** Register only the bundled specification skill for planner; existing Source and team skills remain on other roles. */
+  /** Isolate unattended workflow skills; preserve Source and team skills for the Hub and workers. */
   skills(config: PromptConfig, role: Role = 'worker'): [string, string][] {
     if (role === 'planner') return [['to-spec', composeSkill(config, 'to-spec')]]
+    if (role === 'splitter') return [[splitterSkill.shortName, composeSkill(config, SPLITTER_SKILL_KEY)]]
     const names = [...this.feishu() ? ['feishu'] : [], 'github', ...role === 'worker' ? ['doc-tree'] : []]
     return names.map((name): [string, string] => [name, composeSkill(config, name)])
       .concat(Object.entries(config.skills).filter(([name]) => !isBundledSkill(name)))
@@ -203,11 +212,13 @@ export class Prompts {
   preview(value: unknown) {
     const config = this.validate(value)
     const environment = environmentSection(config, this.environment()), policy = policySection(this.store.settings(), config)
+    const skills = Object.fromEntries(this.skills(config))
+    skills[SPLITTER_SKILL_KEY] = composeSkill(config, SPLITTER_SKILL_KEY)
     return { orchestrator: composePrompt(config, 'orchestrator', environment, policy), worker: composePrompt(config, 'worker', environment),
-      planner: composePrompt(config, 'planner'),
+      planner: composePrompt(config, 'planner'), splitter: composePrompt(config, 'splitter'),
       parts: { orchestrator: promptParts(config, 'orchestrator', environment, policy), worker: promptParts(config, 'worker', environment),
-        planner: promptParts(config, 'planner') },
-      skills: Object.fromEntries(this.skills(config)), scope: 'Team sections, skills, and overrides of built-in parts, which follow their built-in text until overridden. Workers additionally inherit the host prompt and repository AGENTS.md. Prompt text changes what the agents are told, not what dsh-superagent allows: tool permissions, the gate and account wrappers stay.' }
+        planner: promptParts(config, 'planner'), splitter: promptParts(config, 'splitter') },
+      skills, scope: 'Team sections, skills, and overrides of built-in parts, which follow their built-in text until overridden. Workers additionally inherit the host prompt and repository AGENTS.md. Prompt text changes what the agents are told, not what dsh-superagent allows: tool permissions, the gate and account wrappers stay.' }
   }
   save(value: unknown, baseRevision: number, source: SettingsOrigin): PromptVersion {
     const config = this.validate(value)

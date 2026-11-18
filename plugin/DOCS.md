@@ -27,6 +27,6 @@
 | 006 部署 | 安装、账户、机器配置、启停、设置、升级、验证与排障 | [docs/006-deployment.md](docs/006-deployment.md) |
 | 007 架构 | 类与胶水层、依赖规则、源码与测试索引、持久化及模型接口 | [docs/007-architecture.md](docs/007-architecture.md) |
 | 008 扩展手册 | 新增 Source 的逐步实现示例 | [docs/008-cookbook.md](docs/008-cookbook.md) |
-| 009 交棒 | Harness 交棒确认、只读规划会话、单一问题与规格发布 | [docs/009-handoff.md](docs/009-handoff.md) |
+| 009 交棒 | Harness 交棒确认、只读规格与拆票会话、Plan DAG 登记和查询 | [docs/009-handoff.md](docs/009-handoff.md) |
 | 010 会话边界 | Hub Agent、Worker Session 及任意深度子会话的工具与对外消息边界契约、代码与测试入口 | [docs/010-session-boundaries.md](docs/010-session-boundaries.md) |
 | 011 文档影响 | Worker 候选的 Doc Tree 结构检查、接口契约与独立审查证据 | [docs/011-doc-tree-impact.md](docs/011-doc-tree-impact.md) |

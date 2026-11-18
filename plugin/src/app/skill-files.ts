@@ -15,14 +15,17 @@ function readText(path: string): { path: string; text: string } {
   if (!text.trim()) throw new Error(`Empty packaged file: ${path}`)
   return { path, text }
 }
-function load(name: string) {
+function load<Name extends string>(name: Name) {
   const { path, text } = readText(packagePath('skills', `dsh-superagent-${name}`, 'SKILL.md'))
   const match = /^---\nname: ([^\n]+)\ndescription: ([^\n]+)\n---\n\n([\s\S]*)$/.exec(text)
   if (!match) throw new Error(`Invalid packaged skill: ${path}`)
-  return { name: match[1]!, description: match[2]!, content: match[3]!, path }
+  return { shortName: name, name: match[1]!, description: match[2]!, content: match[3]!, path }
 }
 /** Packaged skills whose short names are reserved in team configuration. */
 export const bundledSkills = { feishu: load('feishu'), github: load('github'), 'to-spec': load('to-spec'), 'doc-tree': load('doc-tree') }
+
+/** Only splitter Sessions register this skill, leaving the team name `to-tickets` available. */
+export const splitterSkill = load('to-tickets')
 
 export const isBundledSkill = (name: string): name is keyof typeof bundledSkills => Object.hasOwn(bundledSkills, name)
 function promptPath(name: string): string {

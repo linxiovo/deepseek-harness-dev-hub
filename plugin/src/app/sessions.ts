@@ -1,10 +1,11 @@
-/** Lifecycle, prompt/tool/skill decoration, message delivery, and budget retry tracking for orchestrator, planner and worker DSH sessions. */
+/** Lifecycle, prompt/tool/skill decoration, message delivery, and budget retry tracking for managed DSH Sessions. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { dirname } from 'node:path'
+import { realpathSync } from 'node:fs'
+import { dirname, isAbsolute, relative } from 'node:path'
 import { z } from 'zod'
 import { key, liveTicket, type Ticket } from '../core/index.ts'
 import { mandateInstructions, ticketOfSession, workerSessionId } from '../executor/dsh.ts'
@@ -15,7 +16,7 @@ import type { Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
 import { RetryHealth } from './retry-health.ts'
 import { initializeRoleModel } from './role-models.ts'
-import { bundledSkills, isBundledSkill, promptFile } from './skill-files.ts'
+import { bundledSkills, isBundledSkill, promptFile, splitterSkill } from './skill-files.ts'
 import { SKILL_PREFIX, type PromptVersion, type Prompts, type Role as PromptRole } from './prompts.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
@@ -37,22 +38,29 @@ export interface SessionsHost {
   environment(ticket: Ticket): Variable[]
   /** Whether the persisted handoff is in its active planning state; all other statuses deny planner tools. */
   plannerActive(handoffId: string): boolean
+  /** Workspace authorized by a persisted published specification, including after registration for idempotent replay. */
+  splitterWorkspace(handoffId: string): string | undefined
   /** In-process writer grant; a stored lease cannot authorize worker turns after a restart. */
   workerAuthorized?(ticketId: string, sessionId: string): boolean
-  /** Tools for the main Session, a worker ticket, or an explicit planner role; the planner receives only its own tools. */
-  tools(agent: Agent, ticket?: Ticket, role?: 'planner'): Tool[]
+  /** Handoff roles receive only their own tools, rather than the Hub's or a worker ticket's. */
+  tools(agent: Agent, ticket?: Ticket, role?: 'planner' | 'splitter'): Tool[]
 }
 
 /**
  * What Sessions registered for an agent it decorated: the releases of its prompt section, tools and skill scope, the scope
  * its skills are registered in, and the skills of one prompt revision; for a worker's subagent, only its tool limits.
  */
-interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; role?: PromptRole; subagent?: true }
+interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void };
+  role?: PromptRole; subagent?: true; ready?: Promise<void> }
 
 /** The agent presets Executor, planner and main Sessions are created with, which the bundle's patch defines. */
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router', PLANNER_PRESET = 'dsh-superagent-planner'
 const plannerHandoffId = (sessionId: string): string | undefined =>
   sessionId.startsWith('planner-') && sessionId.length > 'planner-'.length ? sessionId.slice('planner-'.length) : undefined
+const SPLITTER_PREFIX = 'splitter-'
+export const splitterSessionId = (handoffId: string): string => `${SPLITTER_PREFIX}${handoffId}`
+export const splitterHandoffId = (sessionId: string): string | undefined =>
+  sessionId.startsWith(SPLITTER_PREFIX) && sessionId.length > SPLITTER_PREFIX.length ? sessionId.slice(SPLITTER_PREFIX.length) : undefined
 declare module '@deepseek-ai/cordis' {
   interface Events {
     /** DSH's agent preset registry selected `agentPreset` for a Session. */
@@ -69,7 +77,10 @@ const HUB_TOOLS = ['skill', 'read', 'read_image', 'glob', 'grep']
 const PLANNER_TOOLS: readonly string[] = ['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch', 'skill']
 const SHARED_HOST_TOOLS: readonly string[] = ['orchestrator_read']
 const PLANNER_HOST_TOOLS: readonly string[] = ['orchestrator_spec_question', 'orchestrator_spec_publish']
+const SPLITTER_TOOLS: readonly string[] = ['skill']
+const SPLITTER_HOST_TOOLS: readonly string[] = ['orchestrator_plan_register']
 const PLANNER_INACTIVE = promptFile('planner-inactive'), PLANNER_DENIED = promptFile('planner-denied')
+const SPLITTER_INACTIVE = promptFile('splitter-inactive'), SPLITTER_DENIED = promptFile('splitter-denied')
 const WORKER_TICKET_ENDED = promptFile('worker-ticket-ended')
 const WORKER_WRITER_REQUIRED = promptFile('worker-writer-required')
 const WORKER_ANCESTRY_PENDING = promptFile('worker-ancestry-pending')
@@ -135,7 +146,8 @@ export class Sessions {
     ctx.inject(['agentPresets'], child => {
       child.on('agent-preset/selected', (sessionId, preset) => {
         const ticketId = ticketOfSession(sessionId), agent = ctx.agents.get(sessionId as SessionId)
-        const ours = sessionId === this.host.masterId ? ROUTER_PRESET : plannerHandoffId(sessionId) ? PLANNER_PRESET
+        const ours = sessionId === this.host.masterId ? ROUTER_PRESET
+          : plannerHandoffId(sessionId) || (agent && this.isSplitterSession(agent)) ? PLANNER_PRESET
           : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
         if (!ours || preset === ours || !agent) return
         const presets = child.get('agentPresets') as { select(agent: Agent, preset: string): Promise<string> }
@@ -152,6 +164,10 @@ export class Sessions {
     if (role === 'planner' && (!plannerId || !this.host.plannerActive(plannerId))) {
       throw new Error('A planner Session needs an active, persisted planning handoff and planner-<handoffId> session ID')
     }
+    const splitterId = role === 'splitter' ? splitterHandoffId(id) : undefined
+    if (role === 'splitter' && (!splitterId || this.host.splitterWorkspace(splitterId) !== cwd)) {
+      throw new Error('A splitter Session needs its persisted published spec and project workspace')
+    }
     const ticketId = role === 'worker' ? ticketOfSession(id) : undefined
     if (role === 'worker' && (!ticketId || this.host.workerAuthorized?.(ticketId, id) === false)) {
       throw new Error(`Worker ${id} has no verified writer grant; refusing to create its Session`)
@@ -162,10 +178,14 @@ export class Sessions {
       const workspace = await ctx.workspaceRegistry.create(cwd)
       // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml).
       await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id,
-        agentPreset: role === 'planner' ? PLANNER_PRESET : role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
+        agentPreset: role === 'planner' || role === 'splitter' ? PLANNER_PRESET : role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
       result = await ctx.sessionController.resolveAgent(id as SessionId)
     }
     if ('error' in result) throw result.error
+    if (splitterId) {
+      this.host.lifetime.throwIfAborted()
+      if (!this.isSplitterSession(result.agent)) throw new Error(`Splitter ${id} is outside its published handoff workspace`)
+    }
     if (role === 'worker') {
       const createdIn = result.agent.session.header.cwd
       if (!createdIn) throw new Error(`Worker ${id} has no recorded workspace directory`)
@@ -265,14 +285,31 @@ export class Sessions {
     const ticketId = ticketOfSession(agent.id)
     return ticketId === undefined ? undefined : this.host.store.tickets.get(ticketId)
   }
+  /** Reserve splitter tools for the live root Session in this published handoff's workspace. */
+  isSplitterSession(agent: Agent): boolean {
+    const id = splitterHandoffId(agent.id), { cwd, parentSession } = agent.session.header
+    if (!id || !cwd || !isAbsolute(cwd) || parentSession !== undefined || this.ctx.agents.get(agent.id) !== agent) return false
+    const workspace = this.host.splitterWorkspace(id)
+    if (workspace === undefined) return false
+    if (relative(workspace, cwd) === '') return true
+    // DSH canonicalizes the workspace at creation; a confirmed path may name a directory symlink.
+    try { return relative(realpathSync.native(workspace), realpathSync.native(cwd)) === '' } catch { return false }
+  }
   private async decorate(agent: Agent): Promise<void> {
-    if (this.bindings.has(agent)) return
+    const prior = this.bindings.get(agent)
+    if (prior) {
+      if (prior.role !== 'splitter' || prior.ready || !this.isSplitterSession(agent)) { await prior.ready; return }
+      // A reserved Session seen before publication had only a denying guard, not the splitter registrations.
+      this.release(agent)
+    }
     const host = this.host
     const master = agent.id === host.masterId
     const plannerId = master ? undefined : plannerHandoffId(agent.id)
-    const ticket = master || plannerId ? undefined : this.ticketOf(agent)
-    if (!master && !plannerId && !ticket) { await this.limitSubagent(agent); return }
-    const role: PromptRole = master ? 'orchestrator' : plannerId ? 'planner' : 'worker'
+    const splitterId = master ? undefined : splitterHandoffId(agent.id)
+    const ticket = master || plannerId || splitterId ? undefined : this.ticketOf(agent)
+    if (!master && !plannerId && !splitterId && !ticket) { await this.limitSubagent(agent); return }
+    const handoffRole = plannerId ? 'planner' : splitterId ? 'splitter' : undefined
+    const role: PromptRole = handoffRole ?? (master ? 'orchestrator' : 'worker')
     const binding: SessionBinding = { disposers: [], role }
     this.bindings.set(agent, binding)
     if (master) {
@@ -281,6 +318,9 @@ export class Sessions {
       binding.disposers.push(agent.ctx.tools.restrict({ allow: HUB_TOOLS }))
     } else if (plannerId) {
       binding.disposers.push(...this.plannerOnly(agent, plannerId))
+    } else if (splitterId) {
+      binding.disposers.push(...this.splitterOnly(agent))
+      if (!this.isSplitterSession(agent)) return
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
       binding.disposers.push(...this.workOnly(agent, ticket!.id))
@@ -294,7 +334,7 @@ export class Sessions {
       const current = ticket && host.store.tickets.get(ticket.id)
       const composed = host.prompts.compose(version.config, role, current ? host.environment(current) : undefined)
       return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${current ? mandateInstructions(current.mandate) : ''}`
-    }, ...(master || plannerId ? { complete: true } : {}) }))
+    }, ...(master || handoffRole ? { complete: true } : {}) }))
     // A recreated skill scope (e.g. after the skills service restarts) starts empty, so reset `binding.skills` before rebinding.
     const skillScope = agent.ctx.inject(['skills'], scope => {
       binding.scope = scope
@@ -302,15 +342,18 @@ export class Sessions {
       this.bindSkills(binding, host.prompts.current())
     })
     binding.disposers.push(() => { skillScope.dispose().catch((error: unknown) => { this.ctx.logger.warn('dsh-superagent could not release a skill scope: %s', String(error)) }) })
-    await skillScope
-    // Bail out if the agent was disposed while awaiting the skill scope.
-    if (this.bindings.get(agent) !== binding) return
-    const register = this.registerTool(agent, binding)
-    for (const tool of host.tools(agent, ticket, plannerId ? 'planner' : undefined)) {
-      if (plannerId ? !SHARED_HOST_TOOLS.includes(tool.name) && !PLANNER_HOST_TOOLS.includes(tool.name)
-        : PLANNER_HOST_TOOLS.includes(tool.name)) continue
-      register(tool.name, tool.description, tool.schema, tool.execute)
-    }
+    binding.ready = Promise.resolve(skillScope).then(() => {
+      // Bail out if the agent was disposed while awaiting the skill scope.
+      if (this.bindings.get(agent) !== binding) return
+      const register = this.registerTool(agent, binding)
+      for (const tool of host.tools(agent, ticket, handoffRole)) {
+        const shared = SHARED_HOST_TOOLS.includes(tool.name)
+        const planner = PLANNER_HOST_TOOLS.includes(tool.name), splitter = SPLITTER_HOST_TOOLS.includes(tool.name)
+        if (plannerId ? !shared && !planner : splitterId ? !shared && !splitter : planner || splitter) continue
+        register(tool.name, tool.description, tool.schema, tool.execute)
+      }
+    })
+    await binding.ready
   }
   /** Restrict every planner turn to read-only tools and its own handoff tools, including restored Sessions. */
   private plannerOnly(agent: Agent, handoffId: string): (() => void)[] {
@@ -319,6 +362,17 @@ export class Sessions {
       if (!this.host.plannerActive(handoffId)) return PLANNER_INACTIVE
       return PLANNER_TOOLS.includes(name) || SHARED_HOST_TOOLS.includes(name) || PLANNER_HOST_TOOLS.includes(name) ? undefined
         : PLANNER_DENIED
+    })]
+  }
+  /** Deny inherited research, writes, delegation, and user communication even when the preset exposes them. */
+  private splitterOnly(agent: Agent): (() => void)[] {
+    const allow = SPLITTER_TOOLS.filter(name => agent.ctx.tools.get(name, scopeParentOf(agent)))
+    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(({ name, arguments: args }) => {
+      if (this.host.lifetime.aborted || !this.isSplitterSession(agent)) return SPLITTER_INACTIVE
+      if (name === 'skill') {
+        return (args as { name?: unknown } | null)?.name === splitterSkill.name ? undefined : SPLITTER_DENIED
+      }
+      return SHARED_HOST_TOOLS.includes(name) || SPLITTER_HOST_TOOLS.includes(name) ? undefined : SPLITTER_DENIED
     })]
   }
   /**
@@ -380,10 +434,10 @@ export class Sessions {
     previous?.dispose()
     const disposers: (() => void)[] = []
     for (const [name, content] of this.host.prompts.skills(version.config, binding.role)) {
-      const bundled = isBundledSkill(name) ? bundledSkills[name] : undefined
+      const bundled = binding.role === 'splitter' ? splitterSkill : isBundledSkill(name) ? bundledSkills[name] : undefined
       const body = version.config.skills[name] ?? ''
       const description = bundled?.description ?? (body.replace(/\s+/g, ' ').slice(0, 120) || 'Custom dsh-superagent operational skill.')
-      disposers.push(scope.skills.register({ name: `${SKILL_PREFIX}${name}`, description, content, source: 'runtime',
+      disposers.push(scope.skills.register({ name: bundled?.name ?? `${SKILL_PREFIX}${name}`, description, content, source: 'runtime',
         ...(bundled ? { resourceBase: { kind: 'directory' as const, path: dirname(bundled.path) } } : {}) }))
     }
     binding.skills = { revision: version.revision, dispose: () => { disposers.forEach(dispose => dispose()) } }

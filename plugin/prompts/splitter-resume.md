@@ -1,0 +1,1 @@
+Resume the unfinished Plan DAG for the supplied handoff and immutable spec IDs. Read the linked resources if needed; use the bundled to-tickets skill and register the complete graph. If the earlier task is also queued, treat both messages as one assignment. Do not ask for confirmation or start execution.

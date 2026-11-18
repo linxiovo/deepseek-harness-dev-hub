@@ -29,6 +29,7 @@ import { TextCache } from './cache.ts'
 import { Effects } from './effects.ts'
 import { Handoffs } from './handoffs.ts'
 import { Planning } from './planning.ts'
+import { Plans } from './plans.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import type { LinkTarget } from './views/records.ts'
@@ -42,12 +43,13 @@ import { Setup } from './setup.ts'
 import { feishuSettings } from '../sources/feishu.ts'
 import { health, type Health, type SourceContext, type SourceHost } from '../sources/host.ts'
 import { SessionMeter } from './session-meter.ts'
-import { Sessions } from './sessions.ts'
+import { Sessions, splitterSessionId } from './sessions.ts'
 import { Settings } from './settings.ts'
 import { sourceContextOf, type SourceContextDeps } from './source-context.ts'
 import type { ResourceHost } from './resources.ts'
 import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { plannerTools, type PlannerToolsHost } from './tools/planner.ts'
+import { splitterTools, type SplitterToolsHost } from './tools/splitter.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
@@ -65,6 +67,7 @@ export class Runtime extends Service implements SourceHost {
   readonly prompts: Prompts
   readonly effects: Effects
   readonly handoffs: Handoffs
+  readonly plans: Plans
   readonly planning: Planning
   readonly sources: SourceRegistry
   readonly commands: Commands
@@ -87,7 +90,7 @@ export class Runtime extends Service implements SourceHost {
   private closingFlag = false
   private stopping?: Promise<void>
   private readonly sourceDeps: SourceContextDeps
-  private readonly toolHost: MainToolsHost & ExecutorToolsHost & PlannerToolsHost
+  private readonly toolHost: MainToolsHost & ExecutorToolsHost & PlannerToolsHost & SplitterToolsHost
   /** Non-zero while a main-Session tool is executing an Engine command, suppressing self-triggered domain event notices. */
   private quiet = 0
   constructor(ctx: Context, readonly machine: Machine, restart: () => void) {
@@ -114,6 +117,7 @@ export class Runtime extends Service implements SourceHost {
       const board = this.board
       const effects = this.effects = new Effects(store, board)
       const handoffs = this.handoffs = new Handoffs(store, effects)
+      const plans = this.plans = new Plans(store, handoffs, effects)
       const sources = this.sources = new SourceRegistry(() => store.settings(), board, kind => {
         // Sync source member lists once startup completes when a source plugin loads dynamically.
         if (kind.policy?.sync) void this.ready?.then(() => this.settings.syncable().includes(kind.kind) ? this.settings.sync(kind.kind) : undefined)
@@ -129,10 +133,15 @@ export class Runtime extends Service implements SourceHost {
       const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
         lifetime: this.lifetime,
         closing: () => this.closing(), environment, plannerActive: id => handoffs.isPlanning(id),
+        splitterWorkspace: id => {
+          const handoff = handoffs.get(id)
+          return handoff?.id === id && handoff.status === 'specified' && handoff.spec?.handoffId === id ? handoff.project.workspace : undefined
+        },
         workerAuthorized: (ticketId, sessionId) => runtime.executor?.writerAuthorized(ticketId, sessionId) === true,
         tools: (agent, ticket, role) => role === 'planner' ? plannerTools(this.toolHost, agent)
+          : role === 'splitter' ? splitterTools(this.toolHost, agent)
           : ticket ? executorTools(this.toolHost, ticket, agent.id) : mainTools(this.toolHost, agent) })
-      this.planning = new Planning({ handoffs, effects, sessions, paused: () => this.paused(), closing: () => this.closing() })
+      this.planning = new Planning({ handoffs, plans, effects, sessions, paused: () => this.paused(), closing: () => this.closing() })
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
         sourceHost: this, setup, requestPass: () => { this.passes.request() } })
@@ -171,7 +180,7 @@ export class Runtime extends Service implements SourceHost {
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
-      this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, settings: this.settings, assessor, resources, handoffs,
+      this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, settings: this.settings, assessor, resources, handoffs, plans, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
@@ -249,16 +258,18 @@ export class Runtime extends Service implements SourceHost {
     this.closingFlag = true; const passes = this.passes.stop(); this.stopped.abort()
     try {
       this.assessor.stop()
-      const ids = [this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id)),
-        ...this.handoffs.list().map(handoff => `planner-${handoff.id}`)]
-      const agents = ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
+      const handoffSessions = () => this.handoffs.list().flatMap(({ id }) => {
+        const splitter = this.ctx.agents.get(splitterSessionId(id) as SessionId)
+        return splitter && this.sessions.isSplitterSession(splitter) ? [`planner-${id}`, splitter.id] : [`planner-${id}`]
+      })
+      const live = (ids: string[]) => ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
+      const agents = live([this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id)), ...handoffSessions()])
       for (const agent of agents) agent.cancel({ kind: 'user' }, { keepInbox: true })
       await Promise.allSettled([passes, this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
-      // A planning effect may finish creating its Session after the first snapshot; cancel it before disposing Session hooks.
-      const latePlanners = this.handoffs.list().map(handoff => this.ctx.agents.get(`planner-${handoff.id}` as SessionId))
-        .filter((agent): agent is Agent => agent !== undefined && !agents.includes(agent))
-      for (const agent of latePlanners) agent.cancel({ kind: 'user' }, { keepInbox: true })
-      await Promise.allSettled(latePlanners.map(agent => agent.whenIdle()))
+      // An effect may have been creating a planner or splitter when shutdown took the first snapshot.
+      const lateHandoffs = live(handoffSessions()).filter(agent => !agents.includes(agent))
+      for (const agent of lateHandoffs) agent.cancel({ kind: 'user' }, { keepInbox: true })
+      await Promise.allSettled(lateHandoffs.map(agent => agent.whenIdle()))
       // The workers' jobs and subagents stop too: their ends would start worker turns without the tool limits released below.
       await this.executor.shutdown()
       this.executor.dispose()

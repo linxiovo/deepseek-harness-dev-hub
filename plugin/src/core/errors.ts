@@ -1,6 +1,9 @@
 /** User-facing error codes mapped to their category ('missing' or 'refused') and English message template. */
 export const USER_ERRORS = {
   unknownTicket: ['missing', 'Unknown ticket'],
+  unknownPlan: ['missing', 'Unknown Plan {id}'],
+  unknownPlanNode: ['missing', 'Unknown Plan node {id}/{node}'],
+  invalidPlan: ['refused', 'Plan refused: {detail}'],
   unknownProblem: ['missing', 'Unavailable Eval not found'],
   unknownTrigger: ['missing', 'Unknown trigger'],
   unknownAssignment: ['missing', 'Unknown assignment'],

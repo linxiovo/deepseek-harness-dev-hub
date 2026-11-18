@@ -1,0 +1,1 @@
+Load `dsh-superagent-to-tickets`. Use the linked handoff and immutable specification to register one Plan DAG for the supplied handoff and spec IDs. Resolve technical slicing and dependency choices yourself; the requester has already confirmed the product goal.

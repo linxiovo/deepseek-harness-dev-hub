@@ -5,4 +5,4 @@ repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
 pnpm -C plugin typecheck
-pnpm -C plugin exec vitest run tests/docs.spec.ts tests/tickets.spec.ts tests/handoff.spec.ts
+pnpm -C plugin exec vitest run tests/docs.spec.ts tests/tickets.spec.ts tests/handoff.spec.ts tests/plans.spec.ts tests/model-surface.spec.ts tests/prompts.spec.ts

@@ -3,6 +3,7 @@
  * Readers and writers refer to a record by its entry here so each key is spelled once with its value type.
  */
 import type { Handoff, ProjectRef, Spec } from './core/handoff.ts'
+import type { Plan, PlanMessage } from './core/plan.ts'
 import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { SessionMeterState } from './app/session-meter.ts'
@@ -66,4 +67,11 @@ export const KV = {
     spec: family<Spec, [handoffId: string]>('handoff-spec:'),
     confirmationReceipt: family<{ handoffId: string }, [sessionId: string, messageId: string]>(
       'handoff-confirmation:', (sessionId, messageId) => JSON.stringify([sessionId, messageId])) },
+  /** Plans: one immutable DAG per handoff, with separate append-only context, instructions, and source receipts. */
+  plans: { record: family<Plan, [id: string]>('plan:'),
+    background: family<PlanMessage[], [id: string]>('plan-background:'),
+    instructions: family<PlanMessage[], [id: string, nodeId: string]>('plan-instructions:',
+      (id, nodeId) => JSON.stringify([id, nodeId])),
+    receipt: family<string, [id: string, sessionId: string, messageId: string]>('plan-message-receipt:',
+      (id, sessionId, messageId) => JSON.stringify([id, sessionId, messageId])) },
 }

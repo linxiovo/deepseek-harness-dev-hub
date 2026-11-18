@@ -18,6 +18,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Commands } from '../infra/commands.ts'
 import { sameDirectory } from '../infra/environment.ts'
 import type { Handoffs } from './handoffs.ts'
+import type { Plans } from './plans.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
 import type { SessionMeter } from './session-meter.ts'
 import type { Sessions } from './sessions.ts'
@@ -35,6 +36,8 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'decision/<id>', holds: 'one decision with its audit' },
   { name: 'handoff/<id>', holds: 'the persisted, explicitly confirmed project and product intent, including planner questions and answers' },
   { name: 'spec/<id>', holds: 'the published specification for this handoff, with observable acceptance and test interfaces; pending until publication' },
+  { name: 'plan/<id>', holds: 'the handoff’s Plan DAG, roles, dependencies, per-role progress and root background' },
+  { name: 'plan/<id>/node/<node-id>', holds: 'one Slice Ticket and its addressed instructions' },
   { name: 'ticket/<id>', holds: 'a ticket\'s card, recorded preparation status and rejection reason, verified repository, worktree, '
     + 'branch, base, worker Session and active writer when available; its trigger, decision and threads, latest assignments with the '
     + 'start of each report, and inputs, newest first', executor: true },
@@ -85,6 +88,7 @@ export interface MainResourceHost extends ResourceHost {
   readonly sessions: Pick<Sessions, 'status' | 'modelRetry'>
   readonly settings: Pick<Settings, 'view' | 'block'>
   readonly handoffs: Pick<Handoffs, 'get' | 'spec'>
+  readonly plans: Pick<Plans, 'view' | 'node'>
 }
 interface Read {
   host: ResourceHost; resource: string; rest: string; offset: number; limit?: number
@@ -197,6 +201,30 @@ const ROUTES: readonly Route[] = [
     const host = main(read), handoff = host.handoffs.get(read.rest)
     if (!handoff || !read.rest || read.rest.includes('/')) throw new Error('Unknown handoff')
     return host.handoffs.spec(read.rest) ?? { handoffId: read.rest, status: 'pending' }
+  }],
+  ['plan/', read => {
+    const { plans, handoffs } = main(read)
+    const [id, section, nodeId, ...extra] = read.rest.split('/')
+    if (!id || extra.length || (section !== undefined && (section !== 'node' || !nodeId))) throw new Error('Unknown plan resource')
+    if (nodeId) {
+      const node = plans.node(id, nodeId)
+      if (!node) throw new UserError('unknownPlanNode', { id, node: nodeId })
+      const { instructions, ...detail } = node
+      const page = list(read, (offset, count) => instructions.slice(offset, offset + count))
+      return { ...detail, instructions: page.items, next_offset: page.next_offset }
+    }
+    const handoff = handoffs.get(id)
+    if (!handoff) throw new UserError('unknownPlan', { id })
+    const graph = plans.view(id)
+    if (graph) {
+      const { nodes, context, ...header } = graph
+      const nodePage = list(read, (offset, count) => nodes.slice(offset, offset + count))
+      const contextPage = list(read, (offset, count) => context.slice(offset, offset + count))
+      return { ...header, nodes: nodePage.items, context: contextPage.items, next_offset: nodePage.next_offset ?? contextPage.next_offset }
+    }
+    if (!handoff.spec) return { id, handoffId: id, status: 'awaiting-spec' }
+    return { id, handoffId: id, specId: handoff.spec.id,
+      status: handoff.spec.acceptance.every(item => item.delivery) ? 'pending' : 'unclassified-spec' }
   }],
   ['settings', read => main(read).settings.view()],
   ['settings/', read => text(read, JSON.stringify(main(read).settings.block(read.rest)))],

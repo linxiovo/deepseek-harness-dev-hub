@@ -1,6 +1,7 @@
 import { resolve } from 'node:path'
 import { key } from '../core/ids.ts'
 import type { Handoff, HandoffInput, HandoffQuestion, ProjectRef, Spec, SpecInput } from '../core/handoff.ts'
+import { PLAN_FEATURE_KINDS } from '../core/plan.ts'
 import { KV } from '../kv.ts'
 import type { Effects } from './effects.ts'
 import type { Store } from './store.ts'
@@ -113,7 +114,8 @@ export class Handoffs {
     return this.store.atomic(() => {
       const handoff = this.require(id)
       if (handoff.status !== 'planning') throw new Error(`Handoff ${id} is not planning`)
-      if (!input.body.trim() || input.acceptance.length === 0 || input.acceptance.some(item => !item.statement.trim() || !item.observable.trim()) ||
+      if (!input.body.trim() || input.acceptance.length === 0 || input.acceptance.some(item => !item.statement.trim() || !item.observable.trim() ||
+          !PLAN_FEATURE_KINDS.includes(item.delivery)) ||
           input.testInterfaces.length === 0 || input.testInterfaces.some(item => !item.seam.trim() || !item.note.trim() ||
             (item.kind !== 'existing' && item.kind !== 'proposed')) ||
           input.outOfScope.some(item => !item.trim())) {
@@ -127,6 +129,7 @@ export class Handoffs {
       this.effects.enqueue('relay', `handoff:${id}:spec`, {
         text: this.relay(handoff, 'published specification', `Goal: ${handoff.goal}`, `spec/${id} (revision ${spec.revision})`),
       })
+      this.effects.enqueue('splitting', id, { handoffId: id, specId: spec.id })
       return specified
     })
   }

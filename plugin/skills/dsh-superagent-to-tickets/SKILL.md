@@ -1,0 +1,11 @@
+---
+name: dsh-superagent-to-tickets
+description: Split a published specification into independent, contract-first Slice Tickets and register its Plan DAG unattended.
+---
+
+1. Read the handoff and published specification through their task pointers. Treat the goal, constraints, acceptance, test interfaces and exclusions as settled. The task supplies both IDs for registration.
+   The specification fixes each criterion's `delivery`. A `cross-end` criterion must appear on a backend contract node and a frontend node explicitly blocked by it; a single-end criterion stays on its declared role.
+2. Choose stable lowercase hyphenated IDs and independent, demonstrable feature slices. In `features`, classify each as `backend`, `frontend`, or `cross-end`. A maintenance task confined to one end is one feature and one node. Split by observable behavior rather than file or implementation step; decide size without asking for approval.
+3. For each `cross-end` feature, write a `backend` node for the backend and interface contract and a separate `frontend` node for the page. The backend node's `interfaceContract` names the repository-relative Doc Tree leaf (`path`) and its `requirements`: operations, inputs and outputs, error behavior and verification entry. The frontend node's `blockedBy` must explicitly include that backend node's ID. A single-end feature gets one node of the matching role.
+4. Give every node a `title`, matching `featureId`, one execution `role`, `acceptance` references (one-based indexes into the spec's acceptance list), a concrete `demonstration`, and `blockedBy` (the IDs of all required predecessors, or `[]`). Record only genuine prerequisites. Every backend predecessor of a frontend node needs its own `interfaceContract`, even across features. A shared topic, accessible message or subscription is not a dependency or authorization.
+5. Check that every acceptance criterion is covered without changing the commitment; each node has a public verification path; and dependencies are explicit, acyclic and contract-first. Submit `features` and `nodes` with `handoffId` and `specId` to `orchestrator_plan_register`. On validation errors, correct the draft and submit it again. A successful registration is your result; the Hub handles any communication, and registration does not start execution.

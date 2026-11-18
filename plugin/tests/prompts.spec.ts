@@ -136,6 +136,18 @@ it('mounts the bundled Doc Tree skill only for workers, even with an older same-
   })
 })
 
+it('round-trips a team to-tickets skill without replacing the splitter’s bundled skill', () => {
+  withStore(store => {
+    const prompts = promptsOf(store)
+    const team = 'Document our team ticket workflow.'
+    const saved = prompts.save({ ...defaultPrompts(), skills: { 'to-tickets': team } }, 0, 'panel')
+    const preview = prompts.preview(prompts.version(saved.revision).config)
+    expect(preview.skills['to-tickets']).toBe(team)
+    expect(preview.skills['splitter/to-tickets']).toBeTruthy()
+    expect(prompts.skills(saved.config, 'splitter')).toEqual([['to-tickets', preview.skills['splitter/to-tickets']]])
+  })
+})
+
 
 describe('overrides of built-in parts', () => {
   const settings = () => SettingsSchema.parse({})

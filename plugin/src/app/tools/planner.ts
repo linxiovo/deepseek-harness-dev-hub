@@ -1,6 +1,7 @@
 /** Planner Session tools: read only its handoff, request product clarification, and publish its specification. */
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
+import { PLAN_FEATURE_KINDS } from '../../core/plan.ts'
 import type { Handoffs } from '../handoffs.ts'
 import { tool, type Tool } from './tool.ts'
 
@@ -48,8 +49,9 @@ const ProductQuestionSchema = z.string().trim().min(1)
   .describe('One unanswered product behavior or acceptance decision for the user; never ask them to choose API protocols, files, modules, architecture, test frameworks, assertion libraries, or other implementation details.')
 const SpecInputSchema = z.object({
   body: z.string().trim().min(1).describe('One implementable product specification for this handoff’s confirmed goal, not a bundle of unrelated intents.'),
-  acceptance: z.array(z.object({ statement: z.string().trim().min(1), observable: z.string().trim().min(1) }).strict()).min(1)
-    .describe('User-visible, observable acceptance criteria for the one confirmed product intent.'),
+  acceptance: z.array(z.object({ statement: z.string().trim().min(1), observable: z.string().trim().min(1),
+    delivery: z.enum(PLAN_FEATURE_KINDS) }).strict()).min(1)
+    .describe('Observable acceptance criteria, each classified by the implementation roles it requires: backend, frontend, or cross-end (both).'),
   testInterfaces: z.array(z.object({ seam: z.string().trim().min(1), kind: z.enum(['existing', 'proposed']),
     note: z.string().trim().min(1) }).strict()).min(1).describe('At least one existing or proposed public test interface for the confirmed product intent.'),
   outOfScope: z.array(z.string().trim().min(1)).describe('Explicit exclusions, not additional product goals.'),

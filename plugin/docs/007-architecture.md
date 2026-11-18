@@ -184,6 +184,8 @@ Failures retry with exponential backoff. Throwing `Later` defers work without co
 | --- | --- | --- | --- | --- |
 | `assessment` | MasterAssessor | Steers an Eval's candidate card into the main Session's turn, then tells the Engine it was delivered, which starts the Eval's deadline | 4, none while paused | 2 s doubling to 60 s |
 | `launch` | DshExecutor | Launches a pending Assignment: reserves and verifies its worktree, runs the prepare command when one is set, creates the Executor Session, and sends the assignment message | The free worker slots, none while paused | A passing failure of the model provider or the network runs again after 5 s doubling to 300 s, three times; any other failure, and a failed prepare command or worktree verification, fails its Ticket. One held by a pause or by full worker slots tries again after 5 s |
+| `planning` | Planning | Sends the confirmed brief or recorded answer to the planner Session | 1 | 2 s doubling to 60 s; defers while paused |
+| `splitting` | Planning | Gives a published spec to its splitter; the durable intent is retired with Plan registration | 1 | 2 s doubling to 60 s for delivery failures; resumes unfinished work on restart |
 | `delivery` | DshExecutor | Hands a Ticket's waiting Inputs to its running Assignment, in order | 4, none while paused | 2 s doubling to 60 s; one that waits for a worker slot tries again after 2 s |
 | `relay` | Sessions | Steers a worker's report or question, or a person's follow-up, into the main Session's turn | 1, in queue order | 2 s doubling to 60 s |
 | `notice` | Sessions | Injects a notice into the main Session without waking it | 1, in queue order | 2 s doubling to 60 s |
@@ -257,13 +259,17 @@ Validation inherits an omitted base from the saved override, drops removed parts
 
 ### Sessions
 
-`Sessions` (`src/app/sessions.ts`) manages DeepSeek Harness Sessions for the main, worker and planner roles. `ensure` creates a Session with its role's preset and model, checking a planner's active planning state or a worker's verified workspace path and live writer grant. `install` decorates currently loaded agents from `agents.list()` and follows agent events to register prompts, skills and tools. `decorate` installs role tool restrictions before awaiting the skill scope; `plannerOnly` restricts planner Sessions, and `owningTicket`, `limitSubagent` and `workOnly` enforce the Worker, live-writer and subagent boundary specified in `010-session-boundaries.md`.
+`Sessions` (`src/app/sessions.ts`) manages DeepSeek Harness Sessions for the Hub, Worker, planner and splitter roles. `ensure` checks the persisted handoff and workspace for a splitter, the active handoff for a planner, or verified worktree and writer grant for a Worker. `install` decorates loaded and newly created agents with role-specific prompts, skills and tools. Tool restrictions precede skill registration; `plugin/docs/010-session-boundaries.md` describes the enforced Session surface.
 
 `prompt` delivers once per request id. `relay` and `notify` enqueue main-Session messages handled by the `relay` and `notice` effects. `src/app/notices.ts` defines their content; `delivery` checks whether a message arrived.
 
 Each model request binds the Session to the current prompt revision. The revisions it used are stored durably: `promptVersion` identifies the active one and `mayRead` restricts which versions a worker can inspect. Registrations are tracked in one map per agent.
 
 `status` and `promptVersion` serve prompt pages. Saves go through `Prompts.save` and notify the main Session. `modelRetry` exposes model-budget retry state.
+
+### Plan handoff navigation
+
+The implementation path is summarized in the **Plan handoff change map** in `plugin/docs/009-handoff.md`: specification publication → the durable `Planning` splitting effect → a scoped splitter Session and its tools → the `Plans` registry → Hub `orchestrator_read` plan resources → no Worker Session or Ticket. Session restrictions are enforced as described in `plugin/docs/010-session-boundaries.md`; `tests/plans.spec.ts` covers the simulated-host path.
 
 ### Session metering
 
@@ -319,6 +325,8 @@ Validation: `tests/session-meter.spec.ts` covers the read seam (absent vs corrup
   | --- | --- |
   | Triggers, Threads, Decisions, Tickets, Assignments | Engine |
   | A Ticket's worktree ownership and write access (`execution.ownership`, `execution.active_writer`) | `Tickets`, through `reserveExecution`, `recordExecutionVerified`, `rejectExecution`, `acquireExecutionWriter` and `releaseExecutionWriter`; the Executor supplies the Git verification and confirms the previous writer idle |
+  | Confirmed handoffs and immutable specifications | `Handoffs` |
+  | Plan DAGs, root background, and addressed node instructions | `Plans` |
   | A Source's read positions, and the meta it keeps on its Threads (`label`, `url`, `facts` and its own keys) | That Source, through `SourceContext` |
   | Settings and their history | Settings |
   | Prompt versions | Prompts |
@@ -340,7 +348,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 - Runtime sends `pullEndNotices` through the Outbox for merged or closed Tickets.
 - Executor tools bind reported pull requests with `readPull` and `claimPull`, using the GitHub context exposed by Runtime.
 - MasterAssessor reads repository files with `readRepositoryPath`.
-- Sessions and Prompts register Source skills for GitHub and Feishu and an isolated unattended to-spec skill for planner Sessions. Migration converts the Source skills' schema-10 records.
+- Sessions and Prompts register Source skills for GitHub and Feishu and separate unattended skills for specification and Plan DAG preparation. Migration converts the Source skills' schema-10 records.
 - Setup probes only GitHub and Feishu account fields (`SETUP_FIELDS`). Only those Sources receive account setup problems through `SourceContext.problem`.
 
 
@@ -370,6 +378,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/reasons.ts` | `Reason`, `REASONS` and `reasonText`: why the core recorded a Decision or set a Trigger aside, by code |
 | `src/core/ids.ts` | `key`: ids derived from their inputs, equal for equal inputs |
 | `src/core/handoff.ts` | The handoff records: `ProjectRef`, `HandoffInput`, `HandoffQuestion`, `SpecInput`, `Spec` and `Handoff`, with the fields and statuses 009 Handoff describes |
+| `src/core/plan.ts` | Plan DAG records and domain validation: role separation, acceptance coverage and explicit dependencies |
 | `src/core/memory.ts` | `MemoryRepositories`: the Store's repositories in memory, in the Store's order and with its nested rollback, for domain tests |
 | `src/core/index.ts` | The core's exports, including `TakeUp` |
 | `src/app/runtime.ts` | The Runtime, the composition root, with its start and stop |
@@ -382,7 +391,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/migration.ts` | The schema 11 migration: one step from schema 10 that writes every stored record in its current shape |
 | `src/app/effects.ts` | Effects |
 | `src/app/handoffs.ts` | `Handoffs`: the durable project and handoff records, their single question, answer and immutable specification |
-| `src/app/planning.ts` | `Planning`: the `planning` effect that starts or resumes a confirmed handoff's `planner-<id>` Session |
+| `src/app/planning.ts` | `Planning`: durable `planning` and `splitting` effects for the specification planner and the Plan DAG splitter |
+| `src/app/plans.ts` | `Plans`: validates and atomically registers authorized Plan DAGs; keeps plan background separate from node instructions |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
 | `src/app/settings.ts` | Settings |
@@ -404,6 +414,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/tool.ts` | The `Tool` type, `readTool`, the `orchestrator_read` of both roles, and `AcknowledgementSchema` |
 | `src/app/tools/main.ts` | The main Session's tools |
 | `src/app/tools/planner.ts` | `plannerTools`: a planner Session's own handoff read, product-intent question and specification publication |
+| `src/app/tools/splitter.ts` | The splitter's scoped handoff and spec read and Plan DAG registration |
 | `src/app/tools/executor.ts` | An Executor Session's tools |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
@@ -504,6 +515,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
 | `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
+| `tests/plans.spec.ts` | Automatic spec continuation, idempotent restart and registration, graph and role queries, invalid graph refusal, and root/node message isolation through the public Session tools |
 | `tests/runtime-concurrency.spec.ts` | Overlapping Triggers, deliveries and launches; Worker inbox recovery after restart, checked after the runtime drains launch and delivery effects against real Git worktrees |
 | `tests/http.spec.ts` | Management request bounds; ticket worktree and writer projections; Session meter success, errors, ID decoding and same-origin protection |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, the refusals of the pause, a sync and a block, and the required local repository and base ref with their preparation variables |

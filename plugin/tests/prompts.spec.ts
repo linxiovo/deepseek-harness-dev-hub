@@ -1,6 +1,6 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, relative } from 'node:path'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { Store } from '../src/app/store.ts'
 import { Prompts, builtInBase, composePrompt, defaultPrompts, policySection, promptParts, type PromptConfig } from '../src/app/prompts.ts'
@@ -9,7 +9,6 @@ import { KV } from '../src/kv.ts'
 import { SettingsSchema, policyVersion } from '../src/policy.ts'
 import { guides, handoffPolicy, mainAdmissionPolicy, masterPrompt, sharedPrompt, workerPrompt } from '../src/app/context.ts'
 import { promptFile } from '../src/app/skill-files.ts'
-import { packagePath } from '../src/infra/paths.ts'
 import type { Variable } from '../src/app/execution-environment.ts'
 
 /** The execution environment outside any ticket, as the runtime passes it once setup has finished. */
@@ -59,14 +58,15 @@ it('assembles every role from fixed sections around the team sections, whatever 
 
 it('reads a prompt file whatever its line ends and blank lines, and names a missing or empty one', () => {
   const dir = mkdtempSync(join(tmpdir(), 'prompt-file-'))
-  // promptFile resolves paths relative to prompts/; use a relative path to reach the temp dir.
-  const name = (file: string) => relative(packagePath('prompts'), join(dir, file))
   try {
     writeFileSync(join(dir, 'crlf.md'), 'One.\r\nTwo. \r\n \t\r\n\r\nThree.\r\n')
     writeFileSync(join(dir, 'blank.md'), ' \n\t\n')
-    expect(promptFile(name('crlf'))).toBe('One. Two.\nThree.')
-    expect(() => promptFile(name('blank'))).toThrow(`Empty packaged file: ${join(dir, 'blank.md')}`)
-    expect(() => promptFile(name('absent'))).toThrow(`Missing packaged file: ${join(dir, 'absent.md')}`)
+    expect(promptFile(join(dir, 'crlf'))).toBe('One. Two.\nThree.')
+    expect(() => promptFile(join(dir, 'blank'))).toThrow(`Empty packaged file: ${join(dir, 'blank.md')}`)
+    expect(() => promptFile(join(dir, 'absent'))).toThrow(`Missing packaged file: ${join(dir, 'absent.md')}`)
+    expect(promptFile('team/communication')).toContain('Return to the source conversation to deliver.')
+    expect(() => promptFile('../package')).toThrow('escapes prompts directory')
+    expect(() => promptFile('team/../../package')).toThrow('escapes prompts directory')
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 

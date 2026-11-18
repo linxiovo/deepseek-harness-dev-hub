@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { SettingsSchema, assessmentOutcome, policyEffects, settingsPolicy, policyVersion, allowedSender, anyoneAllowed, type Settings } from '../src/policy.ts'
+import { SettingsSchema, assessmentOutcome, policyEffects, settingsPolicy, policyVersion, allowedSender, anyoneAllowed, worktreePreparationConfig, type Settings } from '../src/policy.ts'
 import type { MandateBasis } from '../src/core/index.ts'
 import { migrateSettings } from '../src/app/migration.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
@@ -229,6 +229,17 @@ describe('revalidate and version', () => {
     expect(setup({ ...base, policy: { ...base.policy, sources: { ...base.policy.sources, github: { allowed: [], admission: {} } } } }).version).not.toBe(version)
   })
 })
+it('accepts POSIX and native Windows absolute paths without accepting drive-relative or incomplete UNC paths', () => {
+  for (const path of ['/srv/work', '//legacy/posix', 'C:\\work', 'D:/work', '\\\\host\\share\\repo']) {
+    expect(SettingsSchema.parse({ executor: { directory: path, repository: path } }).executor)
+      .toMatchObject({ directory: path, repository: path })
+  }
+  for (const path of ['relative', 'C:relative', '\\rooted', '\\\\host', '\\\\host\\', '\\\\.\\pipe\\repo']) {
+    expect(() => SettingsSchema.parse({ executor: { directory: path } })).toThrow()
+    expect(() => SettingsSchema.parse({ executor: { repository: path } })).toThrow()
+  }
+})
+
 describe('settings migration', () => {
   it('moves each member\'s identity into each Source\'s part of the Policy and drops the fields prompts and the execution environment replaced', () => {
     const saved = SettingsSchema.parse(migrateSettings({
@@ -272,6 +283,24 @@ it('renames the variables a stored prepare command reads from earlier project na
 it('reads a stored GitHub Source configuration that names a merge account without it', () => {
   const settings = SettingsSchema.parse(migrateSettings({ sources: { github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh-agent', mergeCli: 'gh-merge-account', pollSeconds: 120 } } } }))
   expect(settings.sources.github!.config).toEqual({ repository: 'acme/widgets', cli: 'gh-agent', pollSeconds: 120 })
+})
+
+describe('worktree preparation config', () => {
+  it('refuses to prepare a worktree while the executor has no local repository', () => {
+    const legacy = { ...base.executor }
+    expect(worktreePreparationConfig(legacy)).toMatchObject({ ok: false, reason: expect.stringContaining('executor.repository') })
+    expect(worktreePreparationConfig({ ...legacy, baseRef: 'refs/heads/main' })).toMatchObject({ ok: false, reason: expect.stringContaining('executor.repository') })
+    expect(worktreePreparationConfig({ ...legacy, repository: '', baseRef: 'refs/heads/main' })).toMatchObject({ ok: false, reason: expect.stringContaining('executor.repository') })
+  })
+  it('refuses to prepare a worktree until the local repository has an explicit base ref', () => {
+    const executor = { ...base.executor, repository: '/srv/clone' }
+    expect(worktreePreparationConfig(executor)).toMatchObject({ ok: false, reason: expect.stringContaining('executor.baseRef') })
+    expect(worktreePreparationConfig({ ...executor, baseRef: '' })).toMatchObject({ ok: false, reason: expect.stringContaining('executor.baseRef') })
+  })
+  it('hands the configured local repository and base ref to preparation unchanged', () => {
+    const executor = { ...base.executor, repository: '/srv/clone', baseRef: 'refs/heads/main' }
+    expect(worktreePreparationConfig(executor)).toEqual({ ok: true, repository: '/srv/clone', baseRef: 'refs/heads/main' })
+  })
 })
 
 describe('assessment outcomes', () => {

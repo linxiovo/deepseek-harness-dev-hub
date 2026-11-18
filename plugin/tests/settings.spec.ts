@@ -3,7 +3,9 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { UserError } from '../src/core/index.ts'
 import { Commands } from '../src/infra/commands.ts'
 import { Setup } from '../src/app/setup.ts'
+import { environmentOf } from '../src/app/execution-environment.ts'
 import { SettingsConflict } from '../src/app/settings.ts'
+import { ExecutorConfigSchema, worktreePreparationConfig } from '../src/policy.ts'
 import { startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host | undefined
@@ -39,6 +41,45 @@ it('refuses a save of a block that another save changed during its model or acco
   accounts.resolve()
   await expect(moved).rejects.toThrow(SettingsConflict)
   expect(store.settings().sources.github!.config).toMatchObject({ cli: value.config.cli, pollSeconds: 90 })
+})
+
+it('keeps legacy executor settings readable while validating and guarding explicit local repository and base ref', async () => {
+  const legacy = ExecutorConfigSchema.parse({ prepare: 'git worktree add "$DSH_SUPERAGENT_DIR"' })
+  expect(legacy).not.toHaveProperty('repository')
+  expect(legacy).not.toHaveProperty('baseRef')
+  expect(worktreePreparationConfig(legacy)).toMatchObject({ ok: false, reason: expect.stringContaining('executor.repository') })
+  expect(worktreePreparationConfig(ExecutorConfigSchema.parse({ repository: '/srv/repo' })))
+    .toMatchObject({ ok: false, reason: expect.stringContaining('executor.baseRef') })
+  expect(() => ExecutorConfigSchema.parse({ repository: 'relative/repo', baseRef: 'refs/heads/main' })).toThrow()
+  expect(() => ExecutorConfigSchema.parse({ repository: '/srv/repo\nunsafe', baseRef: 'refs/heads/main' })).toThrow()
+  expect(() => ExecutorConfigSchema.parse({ repository: '/srv/repo', baseRef: '--help' })).toThrow()
+  expect(() => ExecutorConfigSchema.parse({ repository: '/srv/repo', baseRef: 'main\nunsafe' })).toThrow()
+  h = await startRuntime()
+  const { settings, store } = h.runtime
+  const executor = store.settings().executor
+  await settings.save('executor', { ...executor, repository: '/srv/repo', baseRef: 'refs/heads/main' }, store.blockRevision('executor'), 'panel')
+  expect(store.settings().executor).toMatchObject({ repository: '/srv/repo', baseRef: 'refs/heads/main' })
+  expect(worktreePreparationConfig(store.settings().executor)).toEqual({ ok: true, repository: '/srv/repo', baseRef: 'refs/heads/main' })
+  const saved = store.settings().executor
+  await expect(settings.save('executor', { ...saved, repository: '/srv/other' }, store.blockRevision('executor'), 'tool'))
+    .rejects.toThrow(new UserError('panelOnlyEnvironment'))
+  await expect(settings.save('executor', { ...saved, baseRef: 'refs/heads/other' }, store.blockRevision('executor'), 'sync'))
+    .rejects.toThrow(new UserError('panelOnlyEnvironment'))
+  expect(store.settings().executor).toMatchObject({ repository: '/srv/repo', baseRef: 'refs/heads/main' })
+})
+
+it('exposes immutable worktree preparation facts only when the executor supplies an identity', async () => {
+  h = await startRuntime()
+  const context = { deployment: h.runtime.deployment, sources: h.runtime.sources, settings: h.runtime.store.settings() }
+  const ticket = { id: 't-prepare', name: 'prepare', directory: '/srv/work/prepare' }
+  const unclaimed = environmentOf({ ...context, ticket })
+  expect(unclaimed.map(variable => variable.key)).not.toContain('DSH_SUPERAGENT_BASE_SHA')
+  const identity = { repository: '/srv/clone', branch: 'agent/prepare', base: { ref: 'refs/heads/main', sha: 'a'.repeat(40) } }
+  const prepared = environmentOf({ ...context, ticket: { ...ticket, identity } })
+  expect(Object.fromEntries(prepared.map(variable => [variable.key, variable.value]))).toMatchObject({
+    DSH_SUPERAGENT_REPOSITORY: '/srv/clone', DSH_SUPERAGENT_BASE_REF: 'refs/heads/main',
+    DSH_SUPERAGENT_BASE_SHA: identity.base.sha, DSH_SUPERAGENT_BRANCH: 'agent/prepare',
+  })
 })
 
 it('refuses a Policy sync that a Policy save outran, reports it on sync:feishu, and keeps the save', async () => {

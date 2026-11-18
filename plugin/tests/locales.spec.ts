@@ -32,9 +32,11 @@ it('names every health entry of dsh-superagent itself, which the overview shows 
   expect(Object.keys(entries).filter(name => !(`health.${name}` in zh))).toEqual([])
 })
 
-it('words every refusal the host words by code, in both languages', () => {
-  expect(Object.keys(USER_ERRORS).filter(code => !zh[`userError.${code}` as DshSuperagentKey]
-    || !en[`userError.${code}` as DshSuperagentKey])).toEqual([])
+it('has exactly the host refusal codes in both languages', () => {
+  const keys = Object.keys(USER_ERRORS).map(code => `userError.${code}`).sort()
+  for (const locale of [zh, en]) {
+    expect(Object.keys(locale).filter(key => key.startsWith('userError.')).sort()).toEqual(keys)
+  }
 })
 
 it('has words for every reason code the core records', () => {

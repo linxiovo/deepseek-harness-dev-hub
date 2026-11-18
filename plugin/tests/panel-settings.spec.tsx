@@ -38,13 +38,20 @@ it('saves the Eval block on the Policy settings and the Executor with its execut
   // An empty root uses the default directory, which the field names instead of looking set.
   expect(field<HTMLInputElement>(zh.executionDirectory).closest('.dt-field')!.querySelector('small')?.textContent).toBe('留空时用 /srv/dsh-superagent/work')
   await type(field<HTMLInputElement>(zh.executionDirectory), '/srv/work')
+  // Both stay optional and empty until configured, so an old Executor block still loads.
+  expect(field<HTMLInputElement>(zh.executionRepository).value).toBe('')
+  expect(field<HTMLInputElement>(zh.executionBaseRef).value).toBe('')
+  await type(field<HTMLInputElement>(zh.executionRepository), '/srv/widgets')
+  await type(field<HTMLInputElement>(zh.executionBaseRef), 'refs/heads/main')
   // A variable picked from the list goes where the caret is in the prepare command.
   const prepare = field<HTMLTextAreaElement>(zh.prepareCommand)
   await type(prepare, 'git worktree add ')
   prepare.setSelectionRange(17, 17)
-  await click('可用的环境变量 3')
-  expect(all('.dt-table tbody tr').map(row => row.textContent)).toEqual(['DSH_SUPERAGENT_DIR工单的执行目录执行器', 'DSH_SUPERAGENT_NAME工单短名执行器',
-    'DSH_SUPERAGENT_GITHUB_REPOSITORY仓库GitHub · 已关闭'])
+  await click('可用的环境变量 7')
+  expect(all('.dt-table tbody tr').map(row => row.textContent)).toEqual(['DSH_SUPERAGENT_DIR工单的执行目录执行器',
+    'DSH_SUPERAGENT_NAME工单短名执行器', 'DSH_SUPERAGENT_REPOSITORY执行器确认的本地仓库规范绝对路径，不是 GitHub 仓库名执行器',
+    'DSH_SUPERAGENT_BASE_REF创建工单工作树时解析的明确 Git 基准引用执行器', 'DSH_SUPERAGENT_BASE_SHA该基准引用解析出的完整、固定 Git 提交 ID执行器',
+    'DSH_SUPERAGENT_BRANCH此工单唯一的 Git 分支名执行器', 'DSH_SUPERAGENT_GITHUB_REPOSITORY仓库GitHub · 已关闭'])
   await click('DSH_SUPERAGENT_DIR')
   expect(field<HTMLTextAreaElement>(zh.prepareCommand).value).toBe('git worktree add "$DSH_SUPERAGENT_DIR"')
   await type(field<HTMLInputElement>(zh.blockedCommands), 'gh-personal  gh.other')
@@ -53,7 +60,7 @@ it('saves the Eval block on the Policy settings and the Executor with its execut
     'worker-model'); await type(effort as HTMLInputElement, 'high')
   expect([...document.querySelectorAll('#dt-worker-model-efforts option')].map(option => option.getAttribute('value'))).toEqual(['high'])
   await click(zh.save)
-  expect(server.settings.executor).toEqual({ maxWorkers: 5, directory: '/srv/work',
+  expect(server.settings.executor).toEqual({ maxWorkers: 5, directory: '/srv/work', repository: '/srv/widgets', baseRef: 'refs/heads/main',
     prepare: 'git worktree add "$DSH_SUPERAGENT_DIR"', blockedCommands: ['gh-personal', 'gh.other'], model: { provider: 'worker-provider',
       model: 'worker-model', reasoningEffort: 'high' } })
   expect(server.requests.filter(request => request.method === 'PUT').map(request => request.path)).toEqual(['settings/eval',

@@ -16,7 +16,7 @@ interface Jobs {
 /** What the Executor uses of DSH's subagents: joining a worker's subagents that work, its subagents, and releasing them. */
 interface Subagents {
   waitForChildren(parent: Agent): Promise<boolean>
-  listChildren(parentSessionId: string): Promise<readonly { id: string }[]>
+  listChildren(parentSessionId: string): Promise<readonly { id: string; mode?: string }[]>
   drainChildren(parent: Agent, childIds: readonly string[]): Promise<void>
 }
 /** How long a stop waits for a killed job to end, collecting its end so the worker is not woken to hear of it. */
@@ -134,22 +134,45 @@ export async function collectJob(ctx: Context, sessionId: string, job: { id: str
 }
 
 /**
- * Release the worker's live subagents, for a bounded time. DSH delivers each one's end to the worker before the release
- * returns, which wakes it, so the worker's turn is cancelled after, keeping its inbox when `keepInbox`, and the stop ends
- * with that turn. Its Session still admits subagents.
+ * Stop descendant-owned jobs before the SDK releases its direct managed children (and their subtrees). A reloaded grandchild
+ * can also remain live behind an unloaded intermediate parent without a resident SDK activation; cancel any such descendant
+ * still loaded after the managed drain. Cancel the worker turn woken by child settlement, preserving its inbox when requested.
  */
 export async function stopSubagents(ctx: Context, agent: Agent, keepInbox = false): Promise<void> {
   const subagents = subagentsOf(ctx)
   if (!subagents) return
-  // The catalog lists every subagent the Session had; one that ended has no agent.
-  const live = (await subagents.listChildren(agent.id)).map(child => child.id).filter(id => ctx.agents.get(id as SessionId))
-  if (!live.length) return
-  try { await until(subagents.drainChildren(agent, live), undefined, DRAIN_LIMIT_MS) }
-  finally {
-    if (agent.status !== 'idle') cancelled.add(agent)
-    agent.cancel({ kind: 'user' }, { keepInbox })
-    await until(agent.whenIdle(), undefined, DRAIN_LIMIT_MS)
+  const direct = (await subagents.listChildren(agent.id)).filter(child => child.mode !== 'external')
+  const live = direct.map(child => child.id).filter(id => ctx.agents.get(id as SessionId))
+  const failures: unknown[] = []
+  const pending = direct.map(child => child.id)
+  const seen = new Set([agent.id, ...pending])
+  for (let index = 0; index < pending.length; index++) {
+    try {
+      for (const child of await subagents.listChildren(pending[index]!)) {
+        if (child.mode === 'external' || seen.has(child.id)) continue
+        seen.add(child.id); pending.push(child.id)
+      }
+    } catch (error) { failures.push(error) }
   }
+  if (registry(ctx)) await Promise.all(pending.map(id => killJobs(ctx, id, 'Subagent released by its worker')
+    .catch((error: unknown) => { failures.push(error) })))
+  if (live.length) {
+    try { await until(subagents.drainChildren(agent, live), undefined, DRAIN_LIMIT_MS) }
+    catch (error) { failures.push(error) }
+    if (agent.status !== 'idle') cancelled.add(agent)
+    try { agent.cancel({ kind: 'user' }, { keepInbox }); await until(agent.whenIdle(), undefined, DRAIN_LIMIT_MS) }
+    catch (error) { failures.push(error) }
+  }
+  // A Session restored independently of the subagent manager is not disposed by drainChildren.
+  await Promise.all(pending.map(async id => {
+    const child = ctx.agents.get(id as SessionId)
+    if (!child || child.id !== id || child.status === 'idle') return
+    try {
+      child.cancel({ kind: 'parent' }, { keepInbox })
+      if (await until(child.whenIdle(), undefined, DRAIN_LIMIT_MS) === false) throw new Error(`Subagent ${id} did not stop`)
+    } catch (error) { failures.push(error) }
+  }))
+  if (failures.length) throw new AggregateError(failures, `Stopping the subagents of ${agent.id} failed`)
 }
 
 /**

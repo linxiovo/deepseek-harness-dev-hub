@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { Engine, MemoryRepositories, key, type Assessor, type Executor, type Thread, type Ticket, type Trigger } from '../src/core/index.ts'
+import { Engine, key, type Assessor, type Executor, type Thread, type Ticket, type Trigger } from '../src/core/index.ts'
 import { backfillChat, consumerRetry, feishuKind, feishuTriggerId, feishuRef, feishuTime, feishuTrigger, historyEvent }
   from '../src/sources/feishu.ts'
 import { KV } from '../src/kv.ts'
@@ -1024,39 +1024,79 @@ it('reports GitHub as failing only after the configured number of consecutive fa
   expect(pollFailure(2, 3, eof)).toBeUndefined()
   expect(pollFailure(3, 3, eof)).toEqual({ state: 'error', detail: '3 consecutive failed polls; last: Error: Get "https://api.github.com/x": EOF', code: 'pollFailures', values: { count: '3', error: 'Error: Get "https://api.github.com/x": EOF' } })
   expect(githubKind.schema.parse({})).toEqual({ repository: '', cli: '', pollSeconds: 60, failuresBeforeError: 3, observeIssues: false,
-    observePulls: false, observeComments: false, observeCi: false })
+    observePulls: false, observeComments: false, observeCi: false, requiredChecks: [] })
 })
 describe('feishu event consumer', () => {
   let dir: string
   let controller: AbortController
   let running: Promise<unknown> | undefined
+  let originalTestNode: string | undefined
   // The fake CLI is a real process, which starts slower while the whole suite runs.
   const until = { timeout: 10_000 }
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'feishu-consumer-')); controller = new AbortController() })
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'feishu-consumer-'))
+    controller = new AbortController()
+    originalTestNode = process.env.FEISHU_CONSUMER_TEST_NODE
+  })
   afterEach(async () => {
+    // Release a fake CLI waiting at the events handshake even when the test failed before it did.
+    try { writeFileSync(join(dir, 'go'), '') } catch { /* The directory may already be gone. */ }
     controller.abort()
     await running
     vi.useRealTimers()
+    if (originalTestNode === undefined) delete process.env.FEISHU_CONSUMER_TEST_NODE
+    else process.env.FEISHU_CONSUMER_TEST_NODE = originalTestNode
     rmSync(dir, { recursive: true, force: true })
   })
   /**
-   * A bot CLI whose `event consume` behaves as `mode` says: `never` gets ready, `warn` warns once ready, `ready` stays up,
-   * and `flaky` exits after its first ready. It records each run and the PID of the latest.
+   * A bot CLI whose `event consume` behaves as `mode` says. Both wrappers run the same Node process: POSIX execs it,
+   * and Windows forwards its stdin so ending the consumer also stops the child of cmd.exe.
    */
-  function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late'): string {
-    const path = join(dir, 'lark-bot')
-    writeFileSync(path, `#!/bin/sh
-  [ "$1" = event ] || { echo '{"ok":true,"data":{}}'; exit 0; }
-  n=$(cat '${dir}/runs' 2>/dev/null || echo 0); n=$((n + 1)); echo $n > '${dir}/runs'; echo $$ > '${dir}/pid'
-  case ${mode} in
-    never) exec sleep 60 ;;
-    warn) echo '[event] ready' >&2; echo 'WARN the connection was reset' >&2; exec sleep 60 ;;
-    ready) echo '[event] ready' >&2; exec sleep 60 ;;
-    flaky) echo '[event] ready' >&2; [ "$n" -gt 1 ] && exec sleep 60; exit 1 ;;
-    events) echo '[event] ready' >&2; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
-    late) echo '[event] ready' >&2; sleep 1; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
-  esac
-  `, { mode: 0o755 })
+  function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late' | 'late-ready'): string {
+    process.env.FEISHU_CONSUMER_TEST_NODE = process.execPath
+    writeFileSync(join(dir, 'lark-bot.cjs'), String.raw`
+const fs = require('node:fs')
+const { join } = require('node:path')
+const dir = __dirname
+if (process.argv[2] !== 'event') { console.log('{"ok":true,"data":{}}'); process.exit(0) }
+const runs = join(dir, 'runs')
+const n = (fs.existsSync(runs) ? Number(fs.readFileSync(runs, 'utf8')) : 0) + 1
+fs.writeFileSync(runs, String(n))
+fs.writeFileSync(join(dir, 'pid'), String(process.pid))
+const mode = ${JSON.stringify(mode)}
+const print = () => {
+  fs.writeSync(1, fs.readFileSync(join(dir, 'events')))
+  fs.writeFileSync(join(dir, 'printed'), '')
+}
+const waitForFile = (name, action) => {
+  const waiting = setInterval(() => {
+    if (!fs.existsSync(join(dir, name))) return
+    clearInterval(waiting)
+    action()
+  }, 10)
+}
+if (mode === 'late-ready') {
+  print()
+  waitForFile('release-ready', () => {
+    fs.writeSync(2, '[event] ready\n')
+    fs.writeFileSync(join(dir, 'ready-emitted'), '')
+  })
+} else if (mode !== 'never') {
+  fs.writeSync(2, '[event] ready\n')
+  if (mode === 'warn') fs.writeSync(2, 'WARN the connection was reset\n')
+  if (mode === 'flaky' && n === 1) process.exit(1)
+  if (mode === 'late') setTimeout(print, 1000)
+  if (mode === 'events') waitForFile('go', print)
+}
+process.stdin.resume()
+process.stdin.on('end', () => process.exit(0))
+process.stdin.on('error', () => process.exit(0))
+setInterval(() => {}, 60_000)
+`)
+    const path = join(dir, process.platform === 'win32' ? 'lark-bot.cmd' : 'lark-bot')
+    writeFileSync(path, process.platform === 'win32'
+      ? '@echo off\r\n"%FEISHU_CONSUMER_TEST_NODE%" "%~dp0lark-bot.cjs" %*\r\n'
+      : '#!/bin/sh\nexec "$FEISHU_CONSUMER_TEST_NODE" "$(dirname "$0")/lark-bot.cjs" "$@"\n', { mode: 0o755 })
     return path
   }
   const runs = () => existsSync(join(dir, 'runs')) ? Number(readFileSync(join(dir, 'runs'), 'utf8')) : 0
@@ -1089,14 +1129,38 @@ describe('feishu event consumer', () => {
   it('takes in the event lines it reads, records each chat as direct or not, and reports a malformed line without stopping', async () => {
     writeFileSync(join(dir, 'events'), [event('om_1', 'oc_group', 'group'), event('om_2', 'oc_dm', 'p2p'), 'not json',
       event('om_3', 'oc_group', 'group')].join('\n') + '\n')
-    const { ctx, store } = consumerSource(cli('events'))
+    const { ctx, health, store } = consumerSource(cli('late-ready'))
     const report = vi.spyOn(ctx, 'report')
     running = runFeishu(ctx, controller.signal)
-    await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_3'))).toBeDefined(), until)
-    expect(['om_1', 'om_2'].map(id => store.triggers.get(feishuTriggerId(id))?.meta.direct)).toEqual([false, true])
-    expect(store.get(KV.feishu.chats)).toEqual({ oc_group: false, oc_dm: true })
-    expect(report).toHaveBeenCalledWith('feishu', expect.objectContaining({ state: 'error', detail: expect.stringContaining('JSON') }))
-    controller.abort(); await running; store.close()
+    try {
+      await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_3'))).toBeDefined(), until)
+      expect(['om_1', 'om_2'].map(id => store.triggers.get(feishuTriggerId(id))?.meta.direct)).toEqual([false, true])
+      expect(store.get(KV.feishu.chats)).toEqual({ oc_group: false, oc_dm: true })
+      expect(report).toHaveBeenCalledWith('feishu', expect.objectContaining({ state: 'error', detail: expect.stringContaining('JSON') }))
+      expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
+      // Independent stdout/stderr pipes can deliver readiness after malformed event data.
+      writeFileSync(join(dir, 'release-ready'), 'ready')
+      await vi.waitFor(() => expect(existsSync(join(dir, 'ready-emitted'))).toBe(true), until)
+    } finally {
+      controller.abort(); await running; store.close()
+    }
+    expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
+  }, 20_000)
+  it('keeps a malformed event error when readiness precedes the event lines', async () => {
+    writeFileSync(join(dir, 'events'), [event('om_1', 'oc_group', 'group'), event('om_2', 'oc_dm', 'p2p'), 'not json',
+      event('om_3', 'oc_group', 'group')].join('\n') + '\n')
+    const { ctx, health, store } = consumerSource(cli('events'))
+    running = runFeishu(ctx, controller.signal)
+    try {
+      await vi.waitFor(() => expect(health.feishu).toMatchObject({ state: 'ready' }), until)
+      writeFileSync(join(dir, 'go'), '')
+      await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_3'))).toBeDefined(), until)
+      expect(['om_1', 'om_2'].map(id => store.triggers.get(feishuTriggerId(id))?.meta.direct)).toEqual([false, true])
+      expect(store.get(KV.feishu.chats)).toEqual({ oc_group: false, oc_dm: true })
+      await vi.waitFor(() => expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') }), until)
+    } finally {
+      controller.abort(); await running; store.close()
+    }
   }, 20_000)
   it('drops the events it reads once the Source is off', async () => {
     writeFileSync(join(dir, 'events'), event('om_9', 'oc_group', 'group') + '\n')

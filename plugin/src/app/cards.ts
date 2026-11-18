@@ -3,6 +3,7 @@ import { latestReport, reasonText, threadKey, ticketStage, type Decision, type M
   type Trigger, type TriggerDisposition } from '../core/index.ts'
 import { pullOf } from '../sources/github-pull.ts'
 import { batchLine, inputResource } from '../executor/dsh.ts'
+import { ticketExecution } from './views/records.ts'
 
 /** Collapses whitespace and truncates text for display previews while keeping code, angle brackets, and links intact for model readers. */
 export function preview(text: string): string { return text.replace(/\s+/g, ' ').slice(0, 160) }
@@ -26,10 +27,12 @@ function cardState(ticket: Ticket): TicketCardState {
 export function ticketCard(ticket: Ticket) {
   const ended = ticket.ended && { at: ticket.ended.at, by: ticket.ended.by, reason: ticket.ended.reason ?? ticket.ended.outcome }
   const { attention } = ticket
+  // Legacy directory-only executions have no verification to advertise on compact cards.
+  const execution = ticket.execution?.preparation ? ticketExecution(ticket) : undefined
   return { ticket_id: ticket.id, title: ticket.title, state: cardState(ticket), strength: ticket.mandate.strength,
     ...(pullOf(ticket) ? { pr_number: pullOf(ticket) } : {}), ...(ended ? { ended } : {}),
     ...(attention ? { attention: { question: attention.question, ...attention.triggerId ? { trigger_id: attention.triggerId } : {} } } : {}),
-    preview: preview(latestReport(ticket)?.summary ?? ''), read: `ticket/${ticket.id}` }
+    ...execution ? { execution } : {}, preview: preview(latestReport(ticket)?.summary ?? ''), read: `ticket/${ticket.id}` }
 }
 /** Strips `policyVersion`, an internal hash that callers never query by. */
 const mandateOf = ({ policyVersion: _version, ...mandate }: Mandate) => mandate
@@ -45,9 +48,9 @@ export function inputLine(ticket: Ticket, input: TicketInput, worker = false) {
     : { preview: preview(input.text).slice(0, INPUT_TEXT), chars: input.text.length, ...read }
   return { kind: input.kind, at: input.at, ...names, ...ticket.undelivered.includes(input.id) ? { undelivered: true } : {} }
 }
-export function assignmentLine(ticket: Ticket, item: Ticket['assignments'][number]) {
+export function assignmentLine(ticket: Ticket, item: Ticket['assignments'][number], previewLimit = 100) {
   return { id: item.id, state: item.state, at: item.createdAt, ...(item.endedReason ? { ended_reason: reasonText({ code: item.endedReason }) } : {}),
-    ...(item.report ? { report: { state: item.report.state, at: item.report.at, preview: preview(item.report.summary).slice(0, 100),
+    ...(item.report ? { report: { state: item.report.state, at: item.report.at, preview: preview(item.report.summary).slice(0, previewLimit),
       chars: item.report.summary.length, read: `ticket/${ticket.id}/report/${item.id}` } } : {}) }
 }
 export function newestPage<T, L>(items: readonly T[], offset: number, size: number, line: (item: T) => L, next: string) {
@@ -58,14 +61,17 @@ export function newestPage<T, L>(items: readonly T[], offset: number, size: numb
 export interface TicketThread { thread: string; context?: true; bound?: true }
 /** Projects a ticket with its linked triggers, threads, and first pages of assignments and inputs, omitting decision IDs for workers. */
 export function ticketDetails(ticket: Ticket, threads: TicketThread[], batch: readonly Trigger[], worker = false) {
-  // Drop card preview because the latest report's preview is already shown on the first assignment entry.
-  const { preview: _preview, ...card } = ticketCard(ticket)
-  return { ...card, trigger_id: ticket.origin.triggerId, ...batch.length ? { batch: batch.map(batchLine) } : {},
-    ...worker ? {} : { decision_id: ticket.decisionId }, threads, directory: ticket.execution?.directory,
+  // Drop the latest report preview because the first assignment shows it. Large pages keep the full execution identity,
+  // but omit repeatable self-links and directory (already present in execution); all report bodies remain readable.
+  const compact = !!ticket.execution?.preparation && (ticket.assignments.length > ASSIGNMENTS || ticket.inputs.length > INPUTS)
+  const { preview: _preview, read: self, ...card } = ticketCard(ticket)
+  return { ...card, ...compact ? {} : { read: self }, trigger_id: ticket.origin.triggerId, ...batch.length ? { batch: batch.map(batchLine) } : {},
+    ...worker ? {} : { decision_id: ticket.decisionId }, threads, ...compact ? {} : { directory: ticket.execution?.directory },
     scope: ticket.mandate.scope, requested_by: ticket.mandate.actor.id,
-    assignments: newestPage(ticket.assignments, 0, ASSIGNMENTS, item => assignmentLine(ticket, item), `ticket/${ticket.id}/assignments`),
+    assignments: newestPage(ticket.assignments, 0, ASSIGNMENTS, item => assignmentLine(ticket, item, compact ? 16 : 100), `ticket/${ticket.id}/assignments`),
     inputs: newestPage(ticket.inputs, 0, INPUTS, input => inputLine(ticket, input, worker), `ticket/${ticket.id}/inputs`),
-    assignment: `ticket/${ticket.id}/assignment`, result: `ticket/${ticket.id}/result`, transcript: `ticket/${ticket.id}/transcript` }
+    ...compact ? {} : { assignment: `ticket/${ticket.id}/assignment`, result: `ticket/${ticket.id}/result`,
+      transcript: `ticket/${ticket.id}/transcript` } }
 }
 
 export function threadCard(thread: Thread, label: string) {

@@ -1,6 +1,6 @@
 /** Subprocess wrapper for running gh, lark-cli, and git commands under the deployment's configured accounts. */
-import { execFile } from 'node:child_process'
-import { basename } from 'node:path'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
+import { basename, join } from 'node:path'
 import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { Deployment } from '../deployment.ts'
@@ -13,6 +13,80 @@ const TIMEOUT_MS = 90_000
  */
 export class CliError extends Error {
   constructor(message: string, readonly code?: number, readonly exitCode?: number) { super(message) }
+}
+
+/** cmd.exe requires a shell to start .cmd/.bat files. Keep the fixed executable path and each argument quoted separately. */
+export function batchInvocation(program: string, args: readonly string[]): string {
+  if (/["&|<>^%!\r\n]/.test(program) || args.some(arg => /[\r\n\0]/.test(arg))) throw new CliError('Unsafe batch CLI path or argument')
+  const quote = (arg: string): string => {
+    if (/^[A-Za-z0-9#$*+./:?@\\_-]+$/.test(arg) && !arg.endsWith('\\')) return arg
+    return `"${arg.replace(/(\\*)"/g, (_, slash: string) => `${slash}${slash}""`).replace(/%/g, '%%cd:~,%').replace(/(\\+)$/, '$1$1')}"`
+  }
+  return `""${program}"${args.length ? ` ${args.map(quote).join(' ')}` : ''}"`
+}
+
+/** Keep a process alive above cmd.exe while it runs, so Windows can terminate its entire descendant tree by PID. */
+export const windowsBatchRunner = [
+  "const { spawnSync } = require('node:child_process')",
+  "const child = spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/e:on', '/v:off', '/s', '/c', process.argv[1]], { stdio: 'inherit', windowsVerbatimArguments: true })",
+  'if (child.error) { console.error("Worker CLI could not run: " + child.error.code); process.exit(1) }',
+  'process.exit(child.status ?? 1)',
+].join('; ')
+
+const MAX_OUTPUT = 16 * 1024 * 1024
+async function terminateWindowsTree(child: ChildProcess): Promise<CliError | undefined> {
+  if (child.pid !== undefined) {
+    try {
+      await exec(join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe'), ['/PID', String(child.pid), '/T', '/F'], { timeout: 5_000, windowsHide: true })
+      return undefined
+    } catch { /* Report incomplete tree teardown rather than claiming cancellation succeeded. */ }
+  }
+  child.kill('SIGTERM')
+  child.stdout?.destroy(); child.stderr?.destroy()
+  return new CliError('Windows CLI process tree could not be terminated')
+}
+
+/** Execute a batch CLI through a rooted Node child, collecting bounded output while owning abort and timeout teardown. */
+async function runWindowsBatch(program: string, args: string[], cwd: string | undefined, signal: AbortSignal, env: NodeJS.ProcessEnv): Promise<string> {
+  const command = batchInvocation(program, args)
+  if (signal.aborted) throw new DOMException('The operation was aborted', 'AbortError')
+  const child = spawn(process.execPath, ['-e', windowsBatchRunner, command], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+  const streams = { stdout: { chunks: [] as Buffer[], size: 0 }, stderr: { chunks: [] as Buffer[], size: 0 } }
+  let stopped: 'abort' | 'timeout' | 'maxBuffer' | undefined
+  let cleanup: Promise<CliError | undefined> | undefined
+  const stop = (reason: typeof stopped): void => {
+    if (stopped) return
+    stopped = reason
+    cleanup = terminateWindowsTree(child)
+  }
+  for (const name of ['stdout', 'stderr'] as const) {
+    const collected = streams[name]
+    child[name]?.on('data', (chunk: Buffer) => {
+      if (collected.size + chunk.length > MAX_OUTPUT) { stop('maxBuffer'); return }
+      collected.size += chunk.length
+      collected.chunks.push(chunk)
+    })
+  }
+  const { promise: done, resolve, reject } = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>()
+  child.once('error', reject)
+  child.once('close', (code, reason) => resolve({ code, signal: reason }))
+  const abort = (): void => stop('abort')
+  signal.addEventListener('abort', abort, { once: true })
+  const timeout = setTimeout(() => stop('timeout'), TIMEOUT_MS)
+  if (signal.aborted) abort()
+  try {
+    const { code, signal: endedBy } = await done
+    const failure = await cleanup
+    if (failure) throw failure
+    if (stopped === 'abort') throw new DOMException('The operation was aborted', 'AbortError')
+    if (stopped === 'timeout') throw new CliError(`${basename(program)} timed out after ${TIMEOUT_MS / 1000} s`)
+    if (stopped === 'maxBuffer') throw new CliError(`${basename(program)} printed more output than it may`)
+    if (code !== 0) throw commandError({ code, signal: endedBy, stderr: Buffer.concat(streams.stderr.chunks).toString() }, program)
+    return Buffer.concat(streams.stdout.chunks).toString()
+  } finally {
+    signal.removeEventListener('abort', abort)
+    clearTimeout(timeout)
+  }
 }
 /** Extracts a sanitized error from a failed subprocess without echoing argv, which may contain message text. */
 export function commandError(error: unknown, program = 'command'): Error {
@@ -66,9 +140,13 @@ export class Commands {
   get repository(): string { return this.deployment.repository }
   withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
   async run(program: string, args: string[], cwd?: string): Promise<string> {
+    const environment = { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' }
+    if (process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(program)) {
+      try { return await runWindowsBatch(program, args, cwd, this.signal, environment) }
+      catch (error) { if (error instanceof CliError || error instanceof Error && error.name === 'AbortError') throw error; throw commandError(error, program) }
+    }
     try {
-      const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
-        env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
+      const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: MAX_OUTPUT, env: environment })
       return stdout
     } catch (error) { throw commandError(error, program) }
   }

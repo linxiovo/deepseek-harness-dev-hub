@@ -22,11 +22,11 @@ An `idle` Ticket has finished its turn without an outstanding question. A Trigge
 
 ## The Executor
 
-Each Ticket gets an Executor Session named `worker-<ticket id>` and a directory named after the Ticket's short name. Directories are created under the configured execution root, which defaults to `<stateDir>/work`.
+Each Ticket gets an Executor Session named `worker-<ticket id>` and a Git worktree directory named after the Ticket's short name. Ticket directories are created under the configured worktree root, which defaults to `<stateDir>/work`. The worktree's branch, repository and pinned base are part of the Ticket's execution record.
 
 Executor Sessions run commands without approval as the operator's OS user. Their `dsh-superagent-worker` preset contains the tools needed for work and moves foreground shell commands to background jobs after 5 seconds. This lets a worker receive new messages at the next step instead of waiting for a long command to finish.
 
-The main Session uses `dsh-superagent-router`, with the same 5-second shell and job-wait limits and a smaller tool set for routing. Sessions retain the preset selected at creation. Worker subagents use DeepSeek Harness's `standard` preset.
+The main Session uses `dsh-superagent-router`, a read-only preset with inspection and coordination tools and no shell, background jobs or file writes; `010-session-boundaries.md` states that contract. Sessions retain the preset selected at creation. Worker subagents use DeepSeek Harness's `standard` preset.
 
 ### Background work and worker slots
 
@@ -44,13 +44,51 @@ When an Assignment ends, its shell jobs are killed without waking the Session. I
 
 Stopping or restarting the plugin inside the DeepSeek Harness process uses the same shutdown path. Inputs not yet taken into Session history are retained. Shutdown waits up to 10 seconds for each worker's background work; a process restart ends that work outright. An Assignment interrupted while busy restarts with a recovery note.
 
-Worker subagents, including nested ones, use DeepSeek Harness's `standard` preset with the worker's permissions. They retain only the worker's allowed work tools, and lose those tools when the Ticket ends. Under `standard`, a shell command moves to the background after 60 seconds. A subagent's jobs are killed when it ends.
+Worker subagents at every depth use DeepSeek Harness's `standard` preset with the worker's permissions. They retain only the worker's allowed work tools, and lose them once the Ticket ends, whichever level created them. Under `standard`, a shell command moves to the background after 60 seconds. A subagent's jobs are killed when it ends.
 
-### Preparing a Ticket directory
+### Ticket worktrees
 
-Before the first Assignment, if the Ticket directory does not exist, the prepare command runs once with `sh` in the execution root. It has ten minutes to finish. Without a prepare command, the worker starts in an empty directory.
+A Ticket works in a real Git worktree, not merely in a directory. The Execution settings name the local clone (`executor.repository`) and the ref a Ticket starts from (`executor.baseRef`, such as `refs/heads/main`); `executor.directory` is the root that holds the Ticket's directory, named after its short name. The Ticket's branch is `agent/<short name>`. These facts belong to the Ticket, not to one Session, and they outlive the Ticket's end. Both repository settings must be set before a Ticket can prepare; an empty value fails that Ticket with a reason naming the missing setting and never falls back to an empty directory.
 
-A failed command fails the Ticket and records its output. A retry or a person's message on one of the Ticket's Threads tries preparation again. A typical command uses `git worktree` to create a checkout. A pull request belongs to the Ticket when its branch's last path segment matches the Ticket's short name.
+Before the first Assignment, the Executor resolves the configured repository to its canonical main checkout and `baseRef` to a full commit id, then durably reserves the directory and branch for that Ticket. Inspection, Session startup and persistence compare native physical paths, so a Windows 8.3 path cannot disagree with its long spelling or claim a second writer. The reservation is written before the prepare command runs and before a Session is created. The Execution record then carries these facts, all optional on records written before they existed:
+
+| Field | Meaning |
+| --- | --- |
+| `repository` | Canonical path of the local clone, not the GitHub repository name |
+| `worktree` | Canonical absolute path of the verified worktree; `directory` remains the path first allocated |
+| `branch` | Branch checked out there, `agent/<short name>` |
+| `base` | The configured `ref` and the `sha` it resolved to before preparation |
+| `session` | The actual Worker Session bound to the worktree; a legacy started Ticket may show the derived `worker-<ticket id>` |
+| `active_writer` | The Assignment and Session currently allowed to write, or null when no writer holds the worktree |
+| `preparation` | `unverified`, `reserved`, `verified` or `rejected`, with a readable `reason` when rejected; a legacy record with no stored preparation reads `unverified` |
+
+A record that predates these fields shows only the facts it stores. The Executor never derives a missing base from the worktree's current HEAD, and never treats an existing directory as proof of ownership.
+
+#### Preparing a Ticket worktree
+
+Before it prepares, the Executor checks two boundaries read-only. The configured clone's single local `remote.origin.url` must be a direct github.com HTTPS, SSH or Git URL for the GitHub target configured on the Source (`owner/name`); an unset target, or a missing, duplicated, unsupported or different origin, is refused. The Ticket's directory and the configured worktree root must resolve outside the clone's primary checkout, every linked worktree registered there, and any unrelated Git checkout, including through symlink or junction aliases. Either refusal happens before the prepare command and creates nothing: the files stay as they were, and the Ticket fails with the reason.
+
+Preparation turns the reservation into a verified worktree. The configured repository must name the clone's main checkout, not a subdirectory or another linked worktree. Before preparation runs, the Executor resolves `baseRef` there to a full commit id. Without a prepare command, it creates the worktree itself with `git worktree add -b agent/<short name> <directory> <pinned commit>`. With a prepare command, that command runs once, in the worktree root, with `sh` and the execution variables, including the canonical repository, pinned base ref and commit, and the reserved branch; it has ten minutes to finish and may add repository-specific content. Either way the result must be this Ticket's linked worktree.
+
+Before any Session starts, the Executor verifies the result as the worker sees it: the directory is a linked worktree of the configured clone, not its main checkout; its canonical path, its `--show-toplevel` and the clone's common git directory match the record; the checked-out branch is the Ticket's; and a first preparation has HEAD at the pinned base commit. Only then does `preparation` become `verified`, and only then may the Session start. The command's failure and output, a mismatch, or a directory that is not this Ticket's worktree records `rejected` with the reason; the Ticket fails.
+
+A rejected preparation never deletes, moves or rewrites what it found. An ordinary directory, whether empty or not, another Ticket's worktree, a checkout of another repository, and a worktree of the right repository on another branch or base are all refused with the reason visible on the Ticket. Nothing in them is cleaned up, and no Session is created. Removing or repairing that content is a person's decision.
+
+A retry or a person's message reuses a worktree only when its durable record belongs to this Ticket, was `verified` before the attempt, and its repository and base match. Reuse keeps the Ticket's recorded repository and pinned base, so changing either setting does not repoint an existing claim; those settings select a base for a new Ticket. It still requires `executor.repository` and `executor.baseRef` to stay set, and `executor.repository` to resolve to a main checkout: clearing either fails the Ticket with the missing setting and prevents reuse. The current HEAD may be ahead of the base, because the worker may have committed; the Executor does not reset it and does not require it to equal the base again. Preparation is not repeated for a verified worktree. A record whose ownership or base cannot be proved, including an older Ticket that only stored a directory, has no verified preparation and is refused rather than adopted. A failed prepare command or a rejection is retried only by a new Assignment that reserves the worktree again after the previous writer is confirmed idle. An existing directory by itself never counts as prepared, and content the Executor did not create is left for a person to resolve.
+
+A pull request belongs to the Ticket when its branch's last path segment matches the Ticket's short name.
+
+#### Write access
+
+One worktree has at most one writer. `active_writer` names the Assignment and Session allowed to write, and is recorded before that Session starts. A second Ticket, retry or launch that claims the same canonical directory, or a Session that already writes for another Ticket, is refused before it can prepare or start a Session: it records its own rejection and runs no prepare command. The first writer keeps the worktree.
+
+A retry or a restart ends the previous Assignment first, but that does not by itself release write access. The Executor cancels the old turn, waits for its background shell jobs and subagents to stop, and releases `active_writer` only when the worker is truly idle. The new Assignment acquires the worktree only after that release, and only when its Ticket, repository and base match. A release or a report carrying an older Assignment cannot clear or alter a newer writer. If the previous writer cannot be confirmed stopped, `active_writer` stays set and the new attempt waits or fails; elapsed time alone never proves that a writer is gone.
+
+The reservation stays with the Ticket after it ends, so no other Ticket may claim its worktree.
+
+#### Reading a Ticket's execution
+
+`GET tickets/:id` and `orchestrator_read ticket/<id>` expose an execution block, as do the panel's Ticket details: `name`, `directory`, `repository`, `worktree`, `branch`, `base` with `ref` and `sha`, `session`, `active_writer` and `preparation` with its `reason`. A compact ticket card carries this block only for a Ticket that has a `preparation`; a legacy directory-only Ticket omits the whole block there. Read from the detail routes, nothing is invented for a legacy Ticket: a missing repository, worktree, branch, base or writer stays absent, and its preparation reads `unverified` rather than being filled in. A rejection reason is readable until a later verified preparation replaces it.
 
 ### Concurrency
 
@@ -67,13 +105,14 @@ The prepare command and Executor instructions receive the same execution variabl
 | Variable | Registered by | Value |
 | --- | --- | --- |
 | `DSH_SUPERAGENT_DIR`, `DSH_SUPERAGENT_NAME`, `DSH_SUPERAGENT_TICKET` | Executor | The Ticket's directory, short name and id |
+| `DSH_SUPERAGENT_REPOSITORY`, `DSH_SUPERAGENT_BASE_REF`, `DSH_SUPERAGENT_BASE_SHA`, `DSH_SUPERAGENT_BRANCH` | Executor | The canonical local clone, the configured starting ref, the full commit it resolved to, and the Ticket's reserved branch |
 | `DSH_SUPERAGENT_BLOCKED_COMMANDS` | Executor | Commands the Executor may not run |
 | `DSH_SUPERAGENT_GITHUB_REPOSITORY` | GitHub | The repository the Source watches, `owner/name` |
 | `DSH_SUPERAGENT_GITHUB_ACCOUNT`, `DSH_SUPERAGENT_GITHUB_COMMIT_EMAIL` | GitHub | The agent account and its commit email |
 | `DSH_SUPERAGENT_GITHUB_NUMBER`, `DSH_SUPERAGENT_GITHUB_PR_HEAD` | GitHub | The Issue or pull request that started the Ticket, and its head ref when it is a pull request |
 | `DSH_SUPERAGENT_FEISHU_BOT`, `DSH_SUPERAGENT_FEISHU_CHAT` | Feishu | The bot, and the chat that started the Ticket |
 
-Ticket-specific values come from its directory and originating Trigger. Other values come from the current deployment settings. Only the panel can change execution environment settings; text sent to the main Session cannot change the configured shell command.
+Ticket-specific values come from its execution claim, directory and originating Trigger. Other values come from the current deployment settings. Only the panel can change execution environment settings; text sent to the main Session cannot change the configured shell command.
 
 Workers reach GitHub through the agent account's `gh` and Feishu through the bot's `lark-cli`. Blocked commands fail when invoked by name.
 
@@ -99,9 +138,9 @@ A Ticket follows the pull request it started from once its Executor reports it. 
 
 The Ticket is done when none of the pull requests it opened remain open. If it opened none, all pull requests it follows must be closed. It then ends with the outcome of the last relevant close and keeps its Subscriptions, allowing a later human comment to resume it.
 
-A close does not end the Ticket while resumed, retried or recovered work is unfinished. It also waits if the Executor acknowledged or answered a follow-up it owns but has not since made a non-progress Report or ended a turn after reading that message. A later `ready` Report ends the Ticket once the same pull-request completion rule is satisfied.
+A close does not end the Ticket while resumed, retried or recovered work is unfinished. It also waits if the Executor took up a follow-up it owns (by recording it internally) or answered it but has not since made a non-progress Report or ended a turn after reading that message. A later `ready` Report ends the Ticket once the same pull-request completion rule is satisfied.
 
-Chat Channels receive one final notice about the pull-request outcome. GitHub already displays the outcome on the pull request itself. Removing a Ticket's Subscription to a pull request also stops it following that pull request.
+Chat Channels receive one final notice, queued by the host, about the pull-request outcome. GitHub already displays the outcome on the pull request itself. Removing a Ticket's Subscription to a pull request also stops it following that pull request.
 
 "Awaiting review" therefore means a `ready` Report with a pull request.
 
@@ -109,7 +148,7 @@ Chat Channels receive one final notice about the pull-request outcome. GitHub al
 
 The Executor decides human follow-ups on its Ticket's own Threads. It handles in-scope requests and hands back requests beyond its scope or for another Ticket. Once no Executor owns the message, it becomes a candidate for the main Session. The main Session may otherwise act on the follow-up only to stop work at the person's request.
 
-An Input counts as read after the Session takes it into a step and subsequently reports or ends a turn. When a Ticket ends, unread messages that were not acknowledged, answered or handed back return to Eval, as described in [002 Authorization](002-authorization.md). Read messages left without action, such as thanks, do not.
+An Input counts as read after the Session takes it into a step and subsequently reports or ends a turn. When a Ticket ends, unread messages that its Worker did not take up or answer and did not hand back return to Eval, as described in [002 Authorization](002-authorization.md). Read messages left without action, such as thanks, do not.
 
 Threads followed only for context still deliver messages, but do not give the Ticket ownership of human follow-ups or resume ended Tickets. Those messages can be assessed independently.
 
@@ -138,16 +177,16 @@ Available while an open Ticket is in `person / delivery`, `person / blocked` or 
 
 Once a person's message reached a blocked or failed Ticket, the Executor has the message, so the Ticket shows as working, or as queued when a failed launch starts again, and offers no retry, unless delivering that message failed.
 
-A retry ends the current Assignment and starts a new one in the same Executor Session, directory, branch and pull request.
+A retry ends the current Assignment and starts a new one in the same Executor Session, verified worktree, branch and pull request. The new Assignment gets the worktree only after the previous writer is confirmed idle; if that cannot be established, it stays refused rather than sharing the tree.
 
 The Executor model applies only when a Session is created; an existing Session keeps its model.
 ### Restart
 
-Running Assignments end with "host restarted" and new ones start with a recovery note that tells the Executor to check its directory, git history and GitHub before repeating any outside action, oldest Ticket first.
+Running Assignments end with "host restarted" and new ones start with a recovery note that tells the Executor to check its worktree, git history and GitHub before repeating any outside action, oldest Ticket first. A restart keeps each Ticket's worktree ownership and active writer; the replacement waits until the interrupted worker is confirmed idle, and an idle state that cannot be established keeps the claim and leaves the Ticket waiting instead of sharing the tree.
 
 Assignments that are waiting, ready, blocked or failed stay as they are, unless an Input reached them after that Report, in which case they start again too.
 
-Sessions, directories, Subscriptions, pending messages and the stored work below survive a restart, and so does the record of which messages each Executor Session took into its history, which a step does once it claimed them and before its model call: a message taken by a turn the restart cut off counts as read once a Report or the end of a turn follows, while one a step claimed but a cancel or error cut off before the history counts as unread.
+Sessions, worktrees, Subscriptions, pending messages and the stored work below survive a restart, and so does the record of which messages each Executor Session took into its history, which a step does once it claimed them and before its model call: a message taken by a turn the restart cut off counts as read once a Report or the end of a turn follows, while one a step claimed but a cancel or error cut off before the history counts as unread.
 
 A retry or a restart gives the new Assignment again the messages delivered to the Assignment it replaces that its Executor Session did not take, which a cancel or a cut-off step may have dropped; a copy still waiting in the Session, kept by a restart or persisted across a crash, is taken out before the new Assignment's first message, so the new delivery is the only copy.
 ### Stored work
@@ -174,9 +213,9 @@ The Feishu event consumer reports every failure, and polling of subscribed topic
 A malformed item in a GitHub list or a Feishu page is skipped, and the Source's state counts it.
 ### Channel failure
 
-Outgoing messages are stored and sent as stored work, retried with backoff from 5 seconds, doubling up to 300.
+Outgoing messages are stored and sent as stored work, retried with backoff from 5 seconds, doubling up to 300. The main Session sends an answer, a result or an attention message; the host itself queues the acknowledgement an accept carries and any pull-request end or Source notice. All are outgoing messages; neither a Worker's take-up nor its report queues one directly.
 
-A Ticket's messages to one conversation go out in the order they were queued, so its acknowledgement comes before its later answer or result: a message waits while an earlier one of the same Ticket to the same conversation has not gone out, until that one has failed three times in a row and shows as a problem.
+A Ticket's messages to one conversation go out in the order they were queued, so the acknowledgement an accept carries comes before the Ticket's later answer or result: a message waits while an earlier one of the same Ticket to the same conversation has not gone out, until that one has failed three times in a row and shows as a problem.
 
 Messages of other Tickets, and messages of no Ticket, do not wait for it.
 
@@ -188,7 +227,7 @@ The Sources answer that for a deleted Issue or a locked conversation on GitHub, 
 
 A reply to a review comment that no longer exists goes to the pull request's conversation instead.
 
-A dropped message keeps its record, with when and why it was dropped and the Ticket it was for, so it is never queued again; a dropped acknowledgement reads as dropped, not sent.
+A dropped message keeps its record, with when and why it was dropped and the Ticket it was for, so it is never queued again; a dropped acknowledgement of an accepted Ticket, which only the host queues, reads as dropped, not sent.
 ### Pause processing
 
 Stops dispatch, new Evals, Eval timeouts, Input delivery and replies; a launch already under way waits until processing resumes.

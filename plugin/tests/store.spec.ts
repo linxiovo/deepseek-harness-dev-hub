@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import ts from 'typescript'
 import { Store, SCHEMA_VERSION } from '../src/app/store.ts'
-import { MemoryRepositories, key, type Assignment, type Decision, type Repositories, type Thread, type Ticket } from '../src/core/index.ts'
+import { MemoryRepositories, type Assignment, type Decision, type Repositories, type Thread, type Ticket } from '../src/core/index.ts'
 import { threadFacts } from '../src/app/views/records.ts'
 import { KV } from '../src/kv.ts'
 import { SettingsSchema } from '../src/policy.ts'
@@ -273,10 +273,16 @@ it('lists in the same order in SQLite and in memory, and undoes a failed nested 
   store.close()
 })
 
-it('creates the state directory for its owner alone, and the database readable by its owner alone', () => {
+it('creates a readable state database, with owner-only filesystem permissions where chmod supports them', () => {
   const path = join(directory, 'state', 'orchestrator.sqlite')
   new Store(path).close()
-  expect([statSync(dirname(path)).mode & 0o777, statSync(path).mode & 0o777]).toEqual([0o700, 0o600])
+  const state = statSync(dirname(path))
+  const database = statSync(path)
+  expect(state.isDirectory()).toBe(true)
+  expect(database.isFile()).toBe(true)
+  expect(readFileSync(path).byteLength).toBeGreaterThan(0)
+  // Windows stat mode reflects writable bits, not the directory or file's ACL.
+  if (process.platform !== 'win32') expect([state.mode & 0o777, database.mode & 0o777]).toEqual([0o700, 0o600])
 })
 
 it('reads `%` and `_` in a key prefix and a search query as written, not as patterns', () => {

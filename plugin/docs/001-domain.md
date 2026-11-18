@@ -38,7 +38,7 @@ Source, Thread, Eval, Mandate and Subscription form the core domain; the rest su
 
 A person is not a domain concept. A Trigger carries its actor's identifier as the Source gives it. An allowed list is a Source's part of the Policy, in that Source's identities. That one person has accounts on several Sources is prompt text that the agents read when they need it.
 
-The Executor, with its Sessions and directories, is outside the domain and connects through Assignments.
+The Executor, with its Sessions and Ticket worktrees, is outside the domain and connects through Assignments.
 
 Aggregates: a Source holds its read position. A Thread holds its Subscriptions, its running Eval, which runs serially and merges Triggers that arrive meanwhile into the next batch, and its Decision history. A Ticket holds its Assignments, Channels and Inputs, and refers to Decisions by id.
 
@@ -67,7 +67,7 @@ The concepts above and their rules are reusable. The Source implementations, the
 | --- | --- |
 | Source | Feishu: live events, history recovery, polling of subscribed topics. GitHub: notifications, subscribed Issues and pull requests, CI changes, pull requests merged or closed, and, where switched on, every new Issue, pull request and comment in the repository and the default branch's CI |
 | Policy | Assessment rules, and each Source's allowed list, its sync, its bot list and its admission table |
-| Executor | A DSH Executor Session and a directory per Ticket, in an execution environment whose variables the Executor and the Sources register |
+| Executor | A DSH Executor Session and one verified, independent Git worktree per Ticket, in an execution environment whose variables the Executor and the Sources register |
 | Channel | Feishu topic replies, GitHub comments and review thread replies |
 
 ## Glossary
@@ -78,7 +78,7 @@ A reference list of the terms this and the later documents use, with their Chine
 | --- | --- | --- |
 | Agent | 智能体 | The automated team member dsh-superagent runs, acting on Sources through identities such as a GitHub account and a Feishu bot |
 | Main Session | 主 Session | The DSH Session that evaluates Triggers, accepts and dispatches Tickets, and replies; `orchestrator` in code and prompts |
-| Executor Session | 执行器 Session | The DSH Session an Executor runs for one Ticket; `worker` in code and prompts |
+| Executor Session | 执行器 Session | The DSH Session an Executor runs for one Ticket in that Ticket's verified worktree, also called the Worker Session; `worker` in code and prompts |
 | Source | 来源 | A stream of events: a kind that a plugin provides, plus one instance configuration |
 | Trigger | 触发 | One immutable event from a Source |
 | Thread | 线程 | Triggers in time order; the unit within which Evals run one at a time |
@@ -95,7 +95,7 @@ A reference list of the terms this and the later documents use, with their Chine
 | Assignment | 派工 | The binding of a Ticket to one Executor instance |
 | Subscription | 订阅 | The relation between a Ticket and a Thread |
 | Fan-out | 扇出 | Delivering Triggers of a subscribed Thread to a Ticket as context |
-| Executor | 执行器 | The port that runs Assignments: one Executor Session and one directory per Ticket |
+| Executor | 执行器 | The port that runs Assignments: one Executor Session and one verified, independent Git worktree per Ticket |
 | Execution environment | 执行环境 | Where Executor Sessions and the prepare command run: variables that the Executor and the Sources register, each with a key, a value and a description |
 | Report | 报告 | The state an Assignment reports to its Ticket |
 | Attention | 待人工决定 | A question on a Ticket that waits for a person's answer |

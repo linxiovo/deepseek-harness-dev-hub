@@ -2,6 +2,7 @@
  * Runtime settings schemas, assessment validation, and policy gate evaluation.
  * Who may originate work is configured per Source in that Source's own identities; the Policy never maps a person across Sources.
  */
+import { posix, win32 } from 'node:path'
 import { LIMITS } from './limits.ts'
 import { z } from 'zod'
 import { ADMISSION_DEFAULTS, type Admission, type AdmissionCell, type AdmissionRow } from './admission.ts'
@@ -87,11 +88,18 @@ export const EvalConfigSchema = z.object({
 }).strict()
 const CommandNameSchema = z.string().regex(/^[A-Za-z0-9._-]+$/).refine(name => name !== '.' && name !== '..', 'Not a command name')
   .refine(name => !WORKER_COMMANDS.includes(name), `${WORKER_COMMANDS.join(', ')} cannot be blocked`)
-/** Executor settings: worker model, concurrency, ticket directory root (empty defaults to `<stateDir>/work`), `prepare` command, and blocked commands. */
+/** Accept POSIX roots and complete Windows drive or UNC roots without treating drive-relative or root-relative paths as absolute. */
+const absoluteFilesystemPath = (value: string): boolean => posix.isAbsolute(value)
+  || (/^[A-Za-z]:[\\/]/.test(value) && win32.isAbsolute(value))
+  || (/^\\\\[^\\/.?\0\r\n][^\\/\0\r\n]*[\\/][^\\/:?\0\r\n]+(?:[\\/]|$)/.test(value) && win32.isAbsolute(value))
+/** A configured local clone and base ref are required by the executor before preparing any new worktree.
+ * Optional/empty values keep previously saved settings readable; they never authorize an empty-directory fallback. */
 export const ExecutorConfigSchema = z.object({
   model: RoleModelSchema.nullable().default(null),
   maxWorkers: z.number().int().min(LIMITS.maxWorkers.min).max(LIMITS.maxWorkers.max).default(3),
-  directory: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path, or empty for <stateDir>/work').default(''),
+  directory: z.string().trim().refine(path => path === '' || absoluteFilesystemPath(path), 'An absolute POSIX, drive, or UNC path, or empty for <stateDir>/work').default(''),
+  repository: z.string().trim().refine(path => path === '' || (absoluteFilesystemPath(path) && !/[\0\r\n]/.test(path)), 'An absolute local repository path, or empty until configured').optional(),
+  baseRef: z.string().trim().max(256).refine(ref => ref === '' || (!ref.startsWith('-') && !/[\s\0-\x1f\x7f]/.test(ref)), 'A Git base ref without whitespace or a leading dash, or empty until configured').optional(),
   prepare: z.string().max(LIMITS.prepareCommand).default(''),
   blockedCommands: z.array(CommandNameSchema).default([]),
 }).strict()
@@ -104,6 +112,14 @@ export const SettingsSchema = z.object({
   executor: ExecutorConfigSchema.default(() => ExecutorConfigSchema.parse({})),
 }).strict()
 export type Settings = z.infer<typeof SettingsSchema>
+/** Keep legacy settings loadable, but do not let a new ticket fall back to an unconfigured or empty directory. */
+export function worktreePreparationConfig(executor: Settings['executor']):
+  | { ok: true; repository: string; baseRef: string }
+  | { ok: false; reason: string } {
+  if (!executor.repository) return { ok: false, reason: 'Configure executor.repository as an absolute path to the local Git clone before preparing a ticket worktree.' }
+  if (!executor.baseRef) return { ok: false, reason: 'Configure executor.baseRef as an explicit Git ref before preparing a ticket worktree.' }
+  return { ok: true, repository: executor.repository, baseRef: executor.baseRef }
+}
 export type SettingsBlock = 'policy' | 'eval' | 'executor' | `source:${string}`
 export type SettingsSave = SettingsBlock | 'pause'
 export type SettingsOrigin = 'panel' | 'tool' | 'sync'

@@ -1,6 +1,6 @@
 /** Concurrent runtime behavior across overlapping triggers, deliveries, and worker launches. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { latestAssignment, waitsForPerson, type Ticket, type Trigger } from '../src/core/index.ts'
+import { key, latestAssignment, waitsForPerson, type Ticket, type Trigger } from '../src/core/index.ts'
 import { Later } from '../src/app/effects.ts'
 import { reportRelay } from '../src/app/notices.ts'
 import { WorkerSlots, inputMessage, mandateInstructions, ticketExecution, transient, triggerMessage } from '../src/executor/dsh.ts'
@@ -10,7 +10,7 @@ import { deferred, waitUntil } from './fixtures/async.ts'
 import { CHAT, MEMBER, feishu, startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host
-beforeEach(async () => { h = await startRuntime() })
+beforeEach(async () => { h = await startRuntime(undefined, { realGit: true }) })
 afterEach(async () => { await h.stop() })
 const lark = { users: [{ member_id: MEMBER, name: 'Alice' }], has_more: false }
 const linkLookedUp = (messageId: string) =>
@@ -82,8 +82,6 @@ it('drops a delivery whose ticket a person stopped while it waited for the worke
 })
 
 it('runs prepare commands in the background, side by side, while accepts, intake and passes go on', async () => {
-  const settings = h.runtime.store.settings()
-  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, prepare: 'git -C /srv/widgets worktree add "$DSH_SUPERAGENT_DIR"' } })
   const prepare = deferred()
   h.hooks.prepare = prepare.promise
   const prepares = () => h.subprocess.spawn.mock.calls.filter(([spec]) => spec.argv[0] === 'sh').length
@@ -103,11 +101,14 @@ it('runs prepare commands in the background, side by side, while accepts, intake
   prepare.resolve()
   await h.runtime.idle()
   expect(h.runtime.store.tickets.list().map(ticket => ticket.assignments.at(-1)!.state)).toEqual(['running', 'running'])
+  for (const ticket of h.runtime.store.tickets.list()) {
+    expect(ticket.execution!.base).toEqual(h.localGit!.base)
+    expect(h.localGit!.git('-C', ticket.execution!.directory, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe(ticket.execution!.branch)
+    expect(h.localGit!.git('-C', ticket.execution!.directory, 'rev-parse', 'HEAD')).toBe(h.localGit!.base.sha)
+  }
 })
 
 it('keeps a launch that a pause cut short queued, and finishes it once processing resumes', async () => {
-  const settings = h.runtime.store.settings()
-  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, prepare: 'make worktree' } })
   const prepare = deferred()
   h.hooks.prepare = prepare.promise
   const trigger = feishu('1', '@bot 修一')
@@ -157,7 +158,7 @@ it('wakes an idle worker for a person\'s message at once, in the slot kept beyon
 
 it('counts a launch under way against maxWorkers, so a bot\'s Input for an idle worker waits for the slot', async () => {
   const settings = h.runtime.store.settings()
-  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, maxWorkers: 1, prepare: 'make worktree' } })
+  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, maxWorkers: 1 } })
   const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
   h.agents.get(one.sessionId)!.status = 'idle'
   // Ticket two's launch holds the only slot while its prepare command runs, before its worker's Session does.
@@ -411,18 +412,21 @@ describe('a worker whose work runs in the background', () => {
     const page = await h.api('GET', `tickets/${one.ticket.id}`)
     expect((page.body as { assignments: Record<string, unknown>[] }).assignments[0]).not.toHaveProperty('turnEndedAt')
   })
-  it('keeps a ticket open at a merge while its worker does in the background a message it acknowledged', async () => {
+  it('keeps a ticket open at a merge while its worker does in the background a message it took up', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
     const ticket = () => h.runtime.store.tickets.get(one.ticket.id)!
     h.runtime.engine.bindThread(one.ticket.id, { source: 'github', id: '7' }, true)
     await h.runTool(one.sessionId, 'orchestrator_report', { state: 'ready', summary: 'PR ready' }); await h.runtime.idle()
     idle(one.sessionId); await h.runtime.idle()
-    // A person asks for more; the worker acknowledges it, starts the work in the background and its turn ends.
+    // A person asks for more; the worker takes it up internally, starts the work in the background and its turn ends.
     await new Promise(resolve => setTimeout(resolve, 5))
     const more = feishu('2', '再加个测试', { mentions: [], root_id: 'om_1' })
     h.runtime.receive(more); await h.runtime.idle()
     await vi.waitFor(() => expect(ticket().undelivered).toEqual([]))
-    await h.runTool(one.sessionId, 'orchestrator_ack', { trigger_id: more.id, text: '收到' })
+    expect(await h.runTool(one.sessionId, 'orchestrator_ack', { trigger_id: more.id }))
+      .toEqual({ trigger_id: more.id, taken_up: true, reused: false })
+    expect(h.runtime.store.triggers.disposition(more.id)!.acked).toEqual([one.ticket.id])
+    expect(h.runtime.store.receipts.get(key('ack', more.id))).toBeUndefined()
     h.jobs.run(one.sessionId)
     idle(one.sessionId); await h.runtime.idle()
     h.runtime.engine.threadClosed({ source: 'github', id: '7' }, 'merged', new Date().toISOString())
@@ -837,7 +841,7 @@ it('resumes an ended ticket a person wrote to during a pause once it lifts, unde
   h.runtime.store.saveSettings({ ...settings, policy: { ...settings.policy, sources: { ...settings.policy.sources, feishu: { ...settings.policy.sources.feishu!, allowed: [] } } } })
   await h.runtime.settings.pause(false, 'panel'); await pass()
   expect(h.runtime.store.tickets.get(second)).toMatchObject({ ended: expect.anything(), undelivered: [] })
-})
+}, 30_000)
 
 it('ends a worker\'s turn only when the stop that ended its Assignment commits', async () => {
   const one = await h.acceptedTicket(feishu('1', '@bot 修一'))

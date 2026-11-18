@@ -372,6 +372,7 @@ export function ticketOf(old: Stored, answers = new Map<string, string[]>(), hum
   const triggerIds = Array.isArray(meta.triggerIds) ? meta.triggerIds as string[] : triggerId ? [triggerId] : []
   const directory = text(meta.workspace)
   // Remaining `meta` fields are obsolete: schema 6 task states stay in the `task` table, and accept fields live on `execution` and `mandate`.
+  // Legacy paths are routing hints, not proof of repository identity, ownership, Session state or a Git preparation base.
   const execution: Execution | undefined = directory ? { name: text(meta.name) ?? basename(directory), directory,
     assignment: text(meta.assignment) ?? text(meta.legacyPrompt) ?? '' } : undefined
   const inputs = ticket.inputs.map((input): TicketInput => input.kind === 'trigger' ? { ...input, ...human(input.triggerId) ? { human: true } : {} }
@@ -412,8 +413,8 @@ function pullEnd(stored: unknown): Follow['closed'] {
 }
 /**
  * Strip redundant fields stored twice on legacy tickets: removes `state` (derived from `ended`), moves top-level `summary`
- * onto the latest Assignment as a `progress` report when no Assignment has a report, and removes `execution.session` and
- * per-Assignment `ticketId` and `ref` (derived from `ticket.id`).
+ * onto the latest Assignment as a `progress` report when no Assignment has a report, and retains only legacy execution
+ * routing fields (never verified Git facts, ownership or Session claims) and drops per-Assignment `ticketId` and `ref`.
  */
 export function withoutCopies(old: Stored): Ticket {
   const { state, summary, ...ticket } = old as Stored & Ticket & { state?: string; summary?: unknown }
@@ -425,7 +426,8 @@ export function withoutCopies(old: Stored): Ticket {
   if (latest && typeof summary === 'string' && summary && !assignments.some(item => item.report)) {
     latest.report = { state: 'progress', summary, at: ticket.updatedAt }
   }
-  const { session: _session, ...execution } = (ticket.execution ?? {}) as Partial<Execution> & { session?: string }
+  const execution: Execution | undefined = ticket.execution && { name: ticket.execution.name, directory: ticket.execution.directory,
+    assignment: ticket.execution.assignment }
   // An open ticket has no `ended` record; a ticket marked `ended` without one defaults to `closed`.
   const closed = { at: ticket.updatedAt, by: 'executor' as const, reason: 'closed', outcome: 'closed' as const }
   const ended = state === 'open' ? undefined : ticket.ended ?? (state === 'ended' ? closed : undefined)
@@ -434,7 +436,7 @@ export function withoutCopies(old: Stored): Ticket {
   const { reason, ...end } = ended ?? {} as NonNullable<Ticket['ended']>
   const once = ended && { ...end, ...reason && reason !== ended.outcome ? { reason } : {} } as NonNullable<Ticket['ended']>
   for (const item of assignments) if (ended && item.endedReason === reason && item.endedAt === ended.at) delete item.endedReason
-  return { ...rest, ...once ? { ended: once } : {}, assignments, ...ticket.execution ? { execution: execution as Execution } : {} }
+  return { ...rest, ...once ? { ended: once } : {}, assignments, ...execution ? { execution } : {} }
 }
 /** Fixed English reason sentences written by versions before schema 11, mapped to their current reason codes. */
 const SENTENCES: Readonly<Record<string, string>> = {

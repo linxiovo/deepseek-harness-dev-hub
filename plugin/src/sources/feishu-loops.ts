@@ -1,12 +1,13 @@
 /** Feishu background loops: live event stream consumer, chat/topic history backfill, chat name refresh, and subscribed thread polling. */
 import { spawn } from 'node:child_process'
+import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
 import { threadKey, type Thread, type Trigger } from '../core/index.ts'
 import { feishuChatLink } from './feishu-channel.ts'
 import type { FeishuBot } from '../deployment.ts'
-import { validItems, type Tally } from '../infra/commands.ts'
+import { batchInvocation, validItems, type Tally } from '../infra/commands.ts'
 import { readFeishu, type FeishuRef } from './feishu-read.ts'
 import { feishuRef, feishuTime, feishuTrigger, HistoricalMessageSchema, historyEvent, HistoryPageSchema, SOURCE, topicEvent }
   from './feishu-trigger.ts'
@@ -68,32 +69,53 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
 export const consumerRetry = (previous: number | undefined, ranMs: number): number =>
   previous === undefined || ranMs >= 60_000 ? 1000 : Math.min(previous * 2, 60_000)
 async function consume(ctx: SourceContext, signal: AbortSignal): Promise<void> {
-  const child = spawn(bot(ctx).cli, ['event', 'consume', 'im.message.receive_v1', '--as', 'bot'],
-    { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1',
-      LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
+  if (signal.aborted) return
+  const cli = bot(ctx).cli
+  const args = ['event', 'consume', 'im.message.receive_v1', '--as', 'bot']
+  const batch = process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(cli)
+  const child = spawn(batch ? process.env.ComSpec ?? 'cmd.exe' : cli,
+    batch ? ['/d', '/e:on', '/v:off', '/s', '/c', batchInvocation(cli, args)] : args,
+    { stdio: ['pipe', 'pipe', 'pipe'], windowsVerbatimArguments: batch,
+      env: { ...process.env, LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
   const stdout = createInterface({ input: child.stdout }); const stderr = createInterface({ input: child.stderr })
-  let chain = Promise.resolve(); let diagnostic = ''; let ready = false
-  const stop = (): void => { child.stdin.end(); child.kill('SIGTERM') }
+  let chain = Promise.resolve(); let diagnostic = ''; let ready = false; let eventFailed = false
+  let stopping = false
+  const stop = (): void => {
+    if (stopping) return
+    stopping = true
+    child.stdin.end()
+    if (batch && child.pid !== undefined) {
+      // Killing cmd.exe alone leaves the CLI it launched running; terminate both processes.
+      const killer = spawn(join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe'),
+        ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+      killer.on('error', () => child.kill('SIGTERM'))
+      killer.on('close', () => { if (child.exitCode === null) child.kill('SIGTERM') })
+    } else child.kill('SIGTERM')
+  }
   signal.addEventListener('abort', stop, { once: true })
+  if (signal.aborted) stop()
   const timeout = setTimeout(() => { diagnostic = 'Feishu event consumer did not become ready within 45 seconds'; stop() }, 45_000)
   stderr.on('line', (line: string) => {
+    if (stopping) return
     diagnostic = line.slice(0, 4000)
     if (line.startsWith('[event] ready')) {
       ready = true; clearTimeout(timeout)
-      ctx.report('feishu', { state: 'ready', detail: 'Listening for bot events', at: new Date().toISOString() })
+      // stdout and stderr are independent: late readiness must not erase an event-processing failure.
+      if (!eventFailed) ctx.report('feishu', { state: 'ready', detail: 'Listening for bot events', at: new Date().toISOString() })
     } else if (/WARN|drop|error/.test(line)) ctx.report('feishu', { state: 'error', detail: diagnostic })
   })
   stdout.on('line', (line: string) => {
     chain = chain.then(async () => {
+      // Events queued before cancellation or a Source toggle must not be read after it.
+      if (stopping || !enabled(ctx)) return
       if (line.length > 1_048_576) throw new Error('Feishu event exceeds 1 MiB')
       const trigger = feishuTrigger(JSON.parse(line), bot(ctx).botId, bot(ctx).appId)
-      // Events already read when the Source is disabled are dropped; the consumer stops shortly after.
-      if (!trigger || !enabled(ctx)) return
+      if (!trigger) return
       const chats = ctx.state.get(KV.feishu.chats) ?? {}
       chats[String(trigger.meta.chatId)] = trigger.meta.direct === true
       ctx.state.set(KV.feishu.chats, chats)
       await receive(ctx, trigger)
-    }).catch(error => { ctx.report('feishu', { state: 'error', detail: String(error) }) })
+    }).catch(error => { eventFailed = true; ctx.report('feishu', { state: 'error', detail: String(error) }) })
   })
   try {
     await new Promise<void>((resolve, reject) => {

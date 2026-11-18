@@ -173,7 +173,18 @@ it('names only the program and how it ended when a command prints no diagnostics
   const commands = new Commands(() => deployment, {}, new AbortController().signal)
   const secret = 'secret reply text'
   await expect(commands.run('sh', ['-c', 'exit 3', secret])).rejects.toMatchObject({ message: 'sh exited with code 3', exitCode: 3 })
-  await expect(commands.run('sh', ['-c', 'kill -9 $$', secret])).rejects.toMatchObject({ message: 'sh was stopped by SIGKILL' })
+  // Unix reports the signal; Git for Windows reports a shell-specific numeric exit status instead.
+  // Both diagnostics name only the program and its ending, never the sensitive argv.
+  expect(commandError({ code: null, killed: true, signal: 'SIGKILL', stderr: '' }, 'sh'))
+    .toMatchObject({ message: 'sh was stopped by SIGKILL' })
+  expect(commandError({ code: 2304, killed: false, signal: null, stderr: '' }, 'sh'))
+    .toMatchObject({ message: 'sh exited with code 2304', exitCode: 2304 })
+  const killed = await commands.run('sh', ['-c', 'kill -9 $$', secret]).catch((error: unknown) => error)
+  expect(killed).toBeInstanceOf(CliError)
+  expect((killed as CliError).message).toEqual(process.platform === 'win32' ? expect.stringMatching(/^sh exited with code \d+$/) : 'sh was stopped by SIGKILL')
+  if (process.platform === 'win32') expect((killed as CliError).exitCode).toEqual(expect.any(Number))
+  else expect((killed as CliError).exitCode).toBeUndefined()
+  expect((killed as CliError).message).not.toContain(secret)
   await expect(commands.run('/no/such/program', ['secret reply text'])).rejects.toMatchObject({ message: 'program could not run: ENOENT' })
   // Timeouts kill the child with SIGTERM; Node's default error message would echo every argument.
   const timedOut = { killed: true, signal: 'SIGTERM', code: null, stderr: '',

@@ -1,8 +1,11 @@
 /** Serves paginated context resources to orchestrator_read so large bodies stay out of model prompts until requested. */
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import { z } from 'zod'
 import { UserError, key, latestReport, reached, runningAssignment, threadKey, type Ticket, type Trigger } from '../core/index.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { readGithub } from '../sources/github-read.ts'
+import { actionsEvidence } from '../sources/actions-evidence.ts'
+import { githubKind } from '../sources/github.ts'
 import { feishuReferences, feishuRead } from '../sources/feishu-read.ts'
 import { feishuRef } from '../sources/feishu.ts'
 import { feishuTriggerId } from '../sources/feishu-trigger.ts'
@@ -13,11 +16,12 @@ import { transcriptEntry } from './context.ts'
 import { builtInParts, defaultPrompts } from './prompts.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Commands } from '../infra/commands.ts'
+import { sameDirectory } from '../infra/environment.ts'
 import type { Handoffs } from './handoffs.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
+import type { SessionMeter } from './session-meter.ts'
 import type { Sessions } from './sessions.ts'
 import type { Settings } from './settings.ts'
-import { KV } from '../kv.ts'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
 
@@ -31,8 +35,9 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'decision/<id>', holds: 'one decision with its audit' },
   { name: 'handoff/<id>', holds: 'the persisted, explicitly confirmed project and product intent, including planner questions and answers' },
   { name: 'spec/<id>', holds: 'the published specification for this handoff, with observable acceptance and test interfaces; pending until publication' },
-  { name: 'ticket/<id>', holds: 'a ticket\'s card, the trigger, decision and threads it is tied to, its latest assignments with the start of each '
-    + 'report, and its inputs, newest first', executor: true },
+  { name: 'ticket/<id>', holds: 'a ticket\'s card, recorded preparation status and rejection reason, verified repository, worktree, '
+    + 'branch, base, worker Session and active writer when available; its trigger, decision and threads, latest assignments with the '
+    + 'start of each report, and inputs, newest first', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
   { name: 'ticket/<id>/assignments', holds: 'its assignments, newest first, with the start of each report', executor: true },
   { name: 'ticket/<id>/inputs', holds: 'its inputs, newest first', executor: true },
@@ -53,8 +58,11 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'prompt-preview/<id>', holds: 'a composed prompt that orchestrator_prompts_save previewed' },
   { name: 'models', holds: 'model providers, the DSH default and each role\'s model' },
   { name: 'models/<provider>', holds: 'one provider\'s models' },
+  { name: 'session/<id>', holds: 'one Session by id: its context snapshot with model, request-plus-response capacity, occupancy, '
+    + 'sampling range and quality, and its cumulative usage by bucket with what is missing or still in flight; never a provider bill' },
   { name: 'feishu/<trigger-id>/…', holds: 'a Feishu original, as the dsh-superagent-feishu skill describes', executor: true },
   { name: 'github/…', holds: 'a GitHub original, as the dsh-superagent-github skill describes', executor: true },
+  { name: 'actions/<ticket|plan>/<id>/commit/<40 lowercase hex SHA>', holds: 'GitHub Actions jobs and artifacts for one owned ticket or handoff at exactly this commit; reports missing required checks, without CI logs' },
 ]
 export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(resource => !executor || resource.executor)
   .map(resource => `${resource.name}: ${resource.holds}`).join('; ')
@@ -66,6 +74,7 @@ export interface ResourceHost {
   readonly commands: Commands
   readonly masterId: string
   readonly context: Context
+  readonly meter: Pick<SessionMeter, 'read'>
   promptVersion(sessionId: string): PromptVersion
   /** Whether a Session may read `revision` (the revision it currently runs under or any revision it ran under previously). */
   mayRead(sessionId: string, revision: number): boolean
@@ -111,6 +120,28 @@ async function sourcePage(read: Read, source: string, fetch: () => Promise<unkno
   if (body === undefined) throw new Error(`Read this ${source === 'feishu' ? 'Feishu' : 'GitHub'} resource from offset 0 first`)
   if (offset === 0) host.pages.set(`${sessionId}:${resource}`, body)
   return text(read, body)
+}
+
+const commitSha = z.string().regex(/^[0-9a-f]{40}$/)
+const pullEvidence = z.looseObject({
+  head: z.looseObject({ sha: commitSha, repo: z.looseObject({ full_name: z.string() }).nullable() }),
+  base: z.looseObject({ sha: commitSha }), merge_commit_sha: commitSha.nullable(),
+})
+/** A local commit belongs to work only when its checkout root and GitHub remote match the configured repository. */
+async function verifyCheckout(commands: Commands, directory: string | undefined, sha: string, kind: 'ticket' | 'plan'): Promise<void> {
+  const refused = `Commit is not verified for this ${kind}`
+  if (!directory?.trim()) throw new Error(refused)
+  try {
+    const root = (await commands.git(['rev-parse', '--show-toplevel'], directory)).trim()
+    if (!sameDirectory(root, directory)) throw new Error(refused)
+    const remote = (await commands.git(['remote', 'get-url', 'origin'], directory)).trim().replace(/\.git\/?$/i, '')
+    const repository = /^(?:https:\/\/(?:[^/@]+@)?github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/?$/i.exec(remote)?.[1]
+    if (repository?.toLowerCase() !== commands.repository.toLowerCase()) throw new Error(refused)
+    if ((await commands.git(['rev-parse', '--verify', 'HEAD'], directory)).trim() !== sha) throw new Error(refused)
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') throw error
+    throw new Error(refused, { cause: error })
+  }
 }
 const THREAD_DECISIONS = 5
 const triggerLine = (trigger: Trigger) => ({ trigger_id: trigger.id, actor: trigger.actor.id, human: trigger.human, at: trigger.at,
@@ -213,12 +244,50 @@ const ROUTES: readonly Route[] = [
     if (!models) throw new Error('Unknown model provider')
     return list(read, (offset, count) => models.slice(offset, offset + count))
   }],
+  // One reading for the Hub and the panel: the meter owns the persistence cursor, so neither entry recomputes usage.
+  ['session/', async read => {
+    const view = await main(read).meter.read(read.rest, read.signal)
+    if (!view) throw new Error('Unknown session')
+    return view
+  }],
   ['feishu/', async read => {
     const source = trigger(read.host, read.rest.split('/')[0]!, read.ticketId)
     const ref = feishuRef(source)
     if (!ref) throw new Error('A Feishu source trigger is required')
     const commands = read.host.commands.withSignal(read.signal)
     return sourcePage(read, 'feishu', () => feishuRead(commands, ref, read.resource, read.host.feishuPageSize()))
+  }],
+  ['actions/', read => {
+    const host = main(read)
+    const match = /^(ticket|plan)\/([^/]+)\/commit\/([0-9a-f]{40})$/.exec(read.rest)
+    if (!match || match[0] !== read.rest) throw new Error('Use actions/<ticket|plan>/<id>/commit/<40 lowercase hex SHA>')
+    const [, kind, id, sha] = match
+    if ((kind !== 'ticket' && kind !== 'plan') || !id || !sha) throw new Error('Use actions/<ticket|plan>/<id>/commit/<40 lowercase hex SHA>')
+    const ticket = kind === 'ticket' ? host.store.tickets.get(id) : undefined
+    const handoff = kind === 'plan' ? host.handoffs.get(id) : undefined
+    if (!ticket && !handoff) throw new Error('Unknown ticket or handoff')
+    const commands = host.commands.withSignal(read.signal)
+    const required = githubKind.schema.parse(host.store.settings().sources.github?.config ?? {}).requiredChecks.map(item => item.id)
+    return sourcePage(read, 'github', async () => {
+      if (ticket) {
+        const ownPull = ticket.follows?.filter(follow => follow.own && follow.thread.startsWith('github:')).at(-1)
+        if (ownPull) {
+          const number = Number(ownPull.thread.slice('github:'.length))
+          if (!Number.isSafeInteger(number) || number <= 0) throw new Error('Ticket has no verifiable own pull request')
+          const pull = await commands.api(pullEvidence, `pulls/${number}`)
+          if (pull.head.sha !== sha || pull.head.repo?.full_name.toLowerCase() !== commands.repository.toLowerCase()) {
+            throw new Error('Commit is not verified for this ticket')
+          }
+          return actionsEvidence(commands, { kind, id }, sha, required,
+            { number, baseSha: pull.base.sha, ...pull.merge_commit_sha ? { mergeSha: pull.merge_commit_sha } : {} })
+        }
+        await verifyCheckout(commands, ticket.execution?.directory, sha, kind)
+      } else if (handoff) {
+        if (handoff.project.repository.toLowerCase() !== commands.repository.toLowerCase()) throw new Error('Handoff repository differs from configured repository')
+        await verifyCheckout(commands, handoff.project.workspace, sha, kind)
+      }
+      return actionsEvidence(commands, { kind, id }, sha, required)
+    })
   }],
   ['github/', read => sourcePage(read, 'github', () => readGithub(read.host.commands.withSignal(read.signal), read.resource))],
   ['trigger/', async read => {

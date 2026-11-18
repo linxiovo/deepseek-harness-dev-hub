@@ -1,9 +1,9 @@
 /** Tickets: their lifecycle from an accept to their end, their Subscriptions and their Inputs. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
-import { latestAssignment, latestReport, liveTicket, readUntil, runningAssignment, settled, threadKey, waitsForPerson } from './model.ts'
-import type { Assignment, ChannelRef, Evaluation, Follow, Mandate, PolicyEffect, ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome,
-  Trigger, TriggerDisposition } from './model.ts'
+import { latestAssignment, liveTicket, readUntil, runningAssignment, settled, threadKey, waitsForPerson } from './model.ts'
+import type { Assignment, ChannelRef, Evaluation, Execution, ExecutionClaim, ExecutionIdentity, ExecutionResult, Follow, Mandate, PolicyEffect,
+  ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome, Trigger, TriggerDisposition } from './model.ts'
 import type { AssessmentOutcome } from './ports.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
@@ -28,6 +28,153 @@ const STATUS_REQUEST = 'Report the current ticket status with orchestrator_repor
  */
 export class Tickets extends EnginePart {
   constructor(options: EngineOptions, private readonly replies: Replies) { super(options) }
+  private sameDirectory(a: string, b: string): boolean {
+    return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b
+  }
+
+  /** Reserve before prepare or Session creation. Only an explicitly released lease can be replaced, even on retry. */
+  reserveExecution(ticketId: string, assignmentId: string, identity: ExecutionIdentity): ExecutionResult<ExecutionClaim> {
+    const ticket = this.require(ticketId)
+    const execution = ticket.execution
+    const assignment = latestAssignment(ticket)
+    if (!execution) return { ok: false, reason: 'The ticket has no execution directory' }
+    const held = ticket.assignments.some(item => item.writer && item.writer.state !== 'idle')
+    const refused = (reason: string): ExecutionResult<ExecutionClaim> => {
+      // Do not overwrite the preparation status of an existing, possibly live, attempt.
+      if (!held && !execution.active_writer) {
+        execution.preparation = { state: 'rejected', reason }
+        ticket.updatedAt = this.now(); this.repo.tickets.save(ticket)
+      }
+      return { ok: false, reason }
+    }
+    if (!liveTicket(ticket) || assignment?.id !== assignmentId || assignment.state === 'ended') {
+      return refused('The ticket ended or a newer Assignment replaced this attempt')
+    }
+    if (held || execution.active_writer) return refused('The previous writer has not been confirmed idle')
+    // A pre-ownership worker cannot be declared idle merely because its Assignment ended or the host restarted.
+    if (ticket.assignments.some(item => item.startedAt && !item.writer)) {
+      return refused('A legacy worker has unverified write ownership; its idle state is unknown')
+    }
+    if (!identity?.base || ![identity.repository, identity.commonDir, identity.worktree, identity.branch, identity.base.ref]
+      .every(value => typeof value === 'string' && !!value.trim() && !value.includes('\0'))
+      || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(identity.base.sha)) {
+      return refused('A canonical repository, common directory, worktree, branch and pinned base are required')
+    }
+    const ownership = execution.ownership
+    if (ownership && (ownership.ticket !== ticketId || !this.sameExecutionIdentity(ownership.identity, identity))) {
+      return refused('The directory, repository, branch or pinned preparation base differs from this ticket ownership')
+    }
+    const foreign = this.repo.tickets.list().find(item => item.id !== ticketId
+      && (item.execution?.ownership?.identity.worktree && this.sameDirectory(item.execution.ownership.identity.worktree, identity.worktree)
+        || item.execution?.worktree && this.sameDirectory(item.execution.worktree, identity.worktree)))
+    if (foreign) return refused(`The worktree directory is owned by ticket ${foreign.id}`)
+    const branchOwner = this.repo.tickets.list().find(item => item.id !== ticketId && item.execution?.ownership
+      && this.sameDirectory(item.execution.ownership.identity.commonDir, identity.commonDir)
+      && item.execution.ownership.identity.branch === identity.branch)
+    if (branchOwner) return refused(`The repository branch is owned by ticket ${branchOwner.id}`)
+    const generation = (ownership?.generation ?? 0) + 1
+    const pinned: ExecutionIdentity = { ...identity, base: { ...identity.base } }
+    const priorActive = execution.active_writer
+    const priorPreparation = execution.preparation
+    const priorWriter = assignment.writer
+    execution.ownership = { ticket: ticketId, generation, identity: pinned, verified: ownership?.verified ?? false }
+    execution.active_writer = null
+    execution.preparation = { state: 'reserved' }
+    assignment.writer = { generation, state: 'preparing' }
+    ticket.updatedAt = this.now()
+    try { this.repo.tickets.save(ticket) }
+    catch (error) {
+      // Persistence is the final authority for canonical paths and unique ownership. A refused save is not a grant.
+      if (ownership) execution.ownership = ownership; else delete execution.ownership
+      if (priorActive === undefined) delete execution.active_writer; else execution.active_writer = priorActive
+      if (priorPreparation === undefined) delete execution.preparation; else execution.preparation = priorPreparation
+      if (priorWriter === undefined) delete assignment.writer; else assignment.writer = priorWriter
+      return refused(error instanceof Error ? error.message : String(error))
+    }
+    return { ok: true, value: { ...pinned, base: { ...pinned.base }, ticket: ticketId, assignment: assignmentId, generation,
+      verified: execution.ownership.verified } }
+  }
+
+  /** Record real Git verification, never an existence check. Retry must reverify the immutable identity and original base. */
+  recordExecutionVerified(claim: ExecutionClaim, identity: ExecutionIdentity): ExecutionResult<Execution> {
+    const current = this.executionAttempt(claim)
+    if (!current || !liveTicket(current.ticket) || latestAssignment(current.ticket)?.id !== claim.assignment
+      || current.assignment.state === 'ended' || current.assignment.writer?.state !== 'preparing') {
+      return { ok: false, reason: 'The execution claim is stale or its writer is stopping' }
+    }
+    if (!this.sameExecutionIdentity(current.execution.ownership!.identity, identity)) {
+      const reason = 'Git verification differs from the reserved repository, worktree, branch or pinned base'
+      this.rejectExecution(claim, reason)
+      return { ok: false, reason }
+    }
+    const { ticket, execution } = current
+    execution.repository = identity.repository; execution.worktree = identity.worktree
+    execution.branch = identity.branch; execution.base = { ...identity.base }
+    execution.ownership!.verified = true
+    execution.preparation = { state: 'verified' }
+    ticket.updatedAt = this.now(); this.repo.tickets.save(ticket)
+    return { ok: true, value: execution }
+  }
+
+  /** Persist a visible reason without dropping ownership or pretending prepare/worker processes have stopped. */
+  rejectExecution(claim: ExecutionClaim, reason: string): boolean {
+    const current = this.executionAttempt(claim)
+    if (!current || current.assignment.writer?.state === 'idle') return false
+    current.execution.preparation = { state: 'rejected', reason }
+    current.assignment.writer!.state = 'stopping'
+    current.ticket.updatedAt = this.now(); this.repo.tickets.save(current.ticket)
+    return true
+  }
+
+  /** Bind the actual Session while the preparation lease is still held; call before creating or prompting that Session. */
+  acquireExecutionWriter(claim: ExecutionClaim, session: string): boolean {
+    const current = this.executionAttempt(claim)
+    if (!current || !session || !liveTicket(current.ticket) || latestAssignment(current.ticket)?.id !== claim.assignment
+      || current.assignment.state === 'ended' || current.execution.preparation?.state !== 'verified') return false
+    const writer = current.assignment.writer!
+    if (writer.state === 'active') return writer.session === session
+    if (writer.state !== 'preparing') return false
+    // A Session cannot write for two tickets, even if their directories differ.
+    if (this.repo.tickets.list().some(ticket => ticket.id !== claim.ticket && ticket.assignments.some(assignment =>
+      assignment.writer?.session === session && assignment.writer.state !== 'idle'))) return false
+    writer.state = 'active'; writer.session = session
+    current.execution.session = session
+    current.execution.active_writer = { assignment: claim.assignment, session }
+    current.ticket.updatedAt = this.now(); this.repo.tickets.save(current.ticket)
+    return true
+  }
+
+  /** Executor confirmation of actual idle, including prepare, shell jobs and subagents; never call just after requesting stop. */
+  releaseExecutionWriter(claim: ExecutionClaim, session?: string): boolean {
+    const current = this.executionAttempt(claim)
+    if (!current) return false
+    const writer = current.assignment.writer!
+    if (writer.session !== session) return false
+    const active = current.execution.active_writer
+    if (active && (active.assignment !== claim.assignment || active.session !== session)) return false
+    if (writer.state === 'idle') return !active
+    writer.state = 'idle'; current.assignment.idleAt = this.now()
+    current.execution.active_writer = null
+    current.ticket.updatedAt = this.now(); this.repo.tickets.save(current.ticket)
+    return true
+  }
+
+  private sameExecutionIdentity(a: ExecutionIdentity, b: ExecutionIdentity): boolean {
+    return this.sameDirectory(a.repository, b.repository) && this.sameDirectory(a.commonDir, b.commonDir)
+      && this.sameDirectory(a.worktree, b.worktree) && a.branch === b.branch
+      && a.base.ref === b.base.ref && a.base.sha.toLowerCase() === b.base.sha.toLowerCase()
+  }
+
+  private executionAttempt(claim: ExecutionClaim): { ticket: Ticket; execution: Execution; assignment: Assignment } | undefined {
+    const ticket = this.repo.tickets.get(claim.ticket)
+    const execution = ticket?.execution
+    const ownership = execution?.ownership
+    const assignment = ticket?.assignments.find(item => item.id === claim.assignment)
+    if (!ticket || !execution || !ownership || ownership.ticket !== claim.ticket || ownership.generation !== claim.generation
+      || !assignment?.writer || assignment.writer.generation !== claim.generation
+      || !this.sameExecutionIdentity(ownership.identity, claim)) return undefined
+    return { ticket, execution, assignment }
+  }
 
   /**
    * Create the ticket an accept decided, under `mandate`, with the Channels and Threads of the Eval's Triggers, its first
@@ -162,7 +309,8 @@ export class Tickets extends EnginePart {
     return this.require(ticketId)
   }
   /**
-   * Ends the stalled assignment of a retryable open ticket (`failed`, `blocked`, or failed input delivery) and starts a new one.
+   * Ends the stalled assignment of a retryable open ticket (`failed`, `blocked`, or failed input delivery) and queues a new one.
+   * The old writer keeps its lease until Executor confirms idle; reservation fences the new attempt until then.
    * @throws UserError when the ticket is unknown or not retryable.
    */
   retry(ticketId: string): Ticket {
@@ -355,7 +503,10 @@ export class Tickets extends EnginePart {
     ticket.ended = { at, by, outcome, ...why }; ticket.undelivered = []; ticket.updatedAt = this.now()
     delete ticket.attention; delete ticket.delivery
     // The Assignments the end stops end with it; the ticket's end says why.
-    for (const assignment of stopping) { assignment.state = 'ended'; assignment.endedAt = at }
+    for (const assignment of stopping) {
+      assignment.state = 'ended'; assignment.endedAt = at
+      if (assignment.writer && assignment.writer.state !== 'idle') assignment.writer.state = 'stopping'
+    }
     this.repo.tickets.save(ticket)
     this.letGo(ticketId, waiting, left)
     this.emit('ticket.ended', { ticketId, by, outcome, ...why })
@@ -386,6 +537,7 @@ export class Tickets extends EnginePart {
   }
   private endAssignment(ticket: Ticket, assignment: Assignment, reason: string): void {
     assignment.state = 'ended'; assignment.endedAt = this.now(); assignment.endedReason = reason
+    if (assignment.writer && assignment.writer.state !== 'idle') assignment.writer.state = 'stopping'
     this.emit('assignment.ended', { ticketId: ticket.id, assignmentId: assignment.id, reason })
   }
   /**

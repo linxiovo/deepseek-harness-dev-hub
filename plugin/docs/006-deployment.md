@@ -16,34 +16,36 @@ The bundle defines `dsh-superagent-worker` for Executors and `dsh-superagent-rou
 
 Opening a blank managed Session in the Web UI can select the profile's default preset. dsh-superagent restores its role-specific preset before the first turn.
 
-Both presets run with `danger-full-access` as the operator's OS user and read messages from subscribed Threads. Account wrappers choose the agent's credentials by default; they do not isolate the process. A worker can execute programs by path and read the operator's home directory. For isolation, use a dedicated OS account containing only the agent's credentials.
+Both presets run with `danger-full-access` as the operator's OS user and read messages from subscribed Threads. Account wrappers choose the agent's credentials, and the worker's command shims refuse the ordinary human-facing send commands by name, but neither isolates the process: a worker can run an installed CLI by absolute path, post over HTTP with another credential, and read the operator's home directory. dsh-superagent provides no container, no network isolation and no separate OS user; workers need the network for dependency installs and for the two read-only Context7 MCP tools they may use. Use a dedicated OS account containing only the agent's credentials if you want process isolation; it is optional operator hardening, not part of the agent boundary.
 
 ## Prerequisites
 
-- Node.js 22.19+ or 24+, pnpm, git 2.32+, Python 3.8+ and tmux
+- Node.js 22.19+ or 24+, pnpm, git 2.32+, plus Python 3.8+ and tmux on POSIX hosts for `scripts/dsh-superagent`
 - GitHub CLI (`gh`) 2.48 or later. Source CLI fields must point to `gh` or `lark-cli` wrappers; the host relies on their subcommands and output formats.
-- A repository on github.com; GitHub Enterprise Server is not supported. To create a checkout per Ticket, keep a local clone from which the prepare command can add worktrees. Install `git-lfs` if that repository uses Git LFS.
+- A repository on github.com; GitHub Enterprise Server is not supported. Keep a local clone of it and name that clone in the Execution settings: the Executor creates one worktree per Ticket there. Install `git-lfs` if that repository uses Git LFS.
 - A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
 - For Feishu: `lark-cli` (tested with 1.0.90) and a Feishu or Lark app with a bot
 
 ### Development checks
 
-From the repository root, use pnpm 11.7.0 with a supported Node.js version. [Plugin CI](../../.github/workflows/plugin-ci.yml) runs on Ubuntu (`check`) and native Windows (`windows`) for pushes and pull requests targeting `main`, with read-only repository access. Linux `check` waits for Windows and explicitly fails if Windows fails; it is not skipped (GitHub treats skipped required jobs as successful). To run the full check locally on Linux (or in WSL):
+Plugin CI (`.github/workflows/plugin-ci.yml`) runs on pushes to `main` and pull requests targeting `main`, uses Node.js 22.19.0 and pnpm 11.7.0, and has read-only repository access. Both jobs are required: native Windows (`windows`) runs `pnpm check` first, and Ubuntu (`check`) waits for it. Unless the workflow itself is cancelled, any Windows result other than `success` makes `check` fail explicitly before checkout, rather than letting GitHub treat a skipped required job as passing.
+
+`pnpm check` runs typechecking, every applicable test, and the build, in that order. Native Windows runs the full Windows-applicable suite: `vitest.config.ts` excludes only `tests/service-script.spec.ts`, which exercises the POSIX service script and requires Python `fcntl`. Linux and WSL run the full suite including those tests. To run the check locally on your platform, use supported Node.js and pnpm 11.7.0 and run from the repository root:
 
 ```sh
 pnpm -C plugin install --frozen-lockfile
 pnpm -C plugin check
 ```
 
-`check` runs typechecking, the full test suite and the build. Some tests require POSIX utilities and fail on native Windows. The Windows job runs typechecking, the handoff tests and the build; use the same commands locally in PowerShell after installing dependencies as above:
+Opt in to local Git hooks with `pnpm -C plugin run hooks:install`. The pre-commit hook typechecks and runs `tests/docs.spec.ts`, `tests/tickets.spec.ts`, and `tests/handoff.spec.ts`; it does not replace CI.
 
-```sh
-pnpm -C plugin typecheck
-pnpm -C plugin exec vitest run tests/handoff.spec.ts
-pnpm -C plugin build
-```
+Set the GitHub Source's `requiredChecks` to `[{"id":"check"},{"id":"windows"}]` for Ticket and plan evidence. Where branch protection is available, require both jobs there too. Those are separate settings; the workflow changes neither, and a job dependency alone does not restrict merging.
 
-Use WSL or Linux for the full suite. After the local hook installer is merged into `main`, run `pnpm -C plugin run hooks:install` in your own checkout to opt into local pre-commit checks. GitHub branch-protection rules and the GitHub Source's `requiredChecks` must be configured separately to require `windows` at merge time or for ticket evidence; the job dependency alone does not restrict merging.
+#### CI build and commit evidence
+
+After both platform checks pass, the Ubuntu job uploads `plugin-check-<github.sha>` from `plugin/lib` and `plugin/ci-evidence`. The evidence directory contains the workflow YAML and `commit.json`, which records `repository`, `sha`, `ref`, `run_id`, `run_attempt`, `workflow`, and, for pull requests, `pull_request_head_sha`. On a push, `sha` is the pushed commit. On a pull request, `sha` and the artifact name identify the synthetic merge commit that CI built, while `pull_request_head_sha` identifies the candidate commit used for the Actions evidence lookup.
+
+When using the build as evidence, match the manifest to the expected repository, commit and run attempt. A successful rerun replaces the artifact; a rerun that fails before upload can leave the previous attempt's artifact available. An artifact alone is not proof that both required jobs passed for the candidate commit.
 
 ## Accounts
 
@@ -64,6 +66,7 @@ Use WSL or Linux for the full suite. After the local hook installer is merged in
    ```
 
    Sign in as the agent account; the last command prints its login. dsh-superagent reads the login the same way.
+   The shell wrapper above is a POSIX example. On Windows, configure the GitHub Source CLI with an absolute path to a native executable or a `.cmd`/`.bat` wrapper, or a command name available on `PATH` via `PATHEXT`.
 
 ### Feishu bot (optional)
 
@@ -86,6 +89,8 @@ Use WSL or Linux for the full suite. After the local hook installer is merged in
    The host refuses a CLI that can act as a user. It reads the app id, Feishu/Lark brand and bot `open_id` from the bot configuration.
 
    Both configurations share the keychain entry for the app secret. To remove only the bot configuration, delete its directory; do not run `lark-cli config remove`, which would affect the shared secret.
+
+   On Windows, the live event consumer also accepts `.cmd` and `.bat` wrappers. Use a path without `cmd.exe` metacharacters; paths containing them are rejected.
 
 ## Install
 
@@ -111,7 +116,7 @@ Copy [examples/profile.cordis.patch.yml](../examples/profile.cordis.patch.yml) t
 
 | Key | Required | Meaning |
 | --- | --- | --- |
-| `stateDir` | yes | Absolute path: the database, the lock, the command shims in `worker-bin`, the agent's git configuration and, by default, the Ticket directories in `work`. Back it up before upgrades |
+| `stateDir` | yes | Absolute path (a drive or UNC path on Windows): the database, the lock, command shims in `worker-bin`, the agent's git configuration and, by default, Ticket directories in `work`. Back it up before upgrades |
 | `promptMaxChars`, `admissionContextMaxPages`, `admissionContextTimeoutMs` | no | The largest saved prompt configuration, and how many Thread pages one assessment reads within what time |
 
 After the first start, edit machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Changes apply without restart. `stateDir` cannot be changed there. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
@@ -123,7 +128,7 @@ scripts/dsh-superagent start
 scripts/dsh-superagent status
 ```
 
-`start` runs `dsh --profile superagent` in tmux session `dsh-superagent`, or `dsh-<profile>` for another profile. It waits up to one minute for the runtime to become ready or report a setup requirement. On a first run it prints the missing setup information. It refuses duplicate instances, including ones started outside this script.
+`scripts/dsh-superagent` is a POSIX-only script (it uses Python `fcntl`, `ps`, and `tmux`). `start` runs `dsh --profile superagent` in tmux session `dsh-superagent`, or `dsh-<profile>` for another profile. It waits up to one minute for the runtime to become ready or report a setup requirement. On a first run it prints the missing setup information. It refuses duplicate instances, including ones started outside this script.
 
 `stop` and `restart` request graceful shutdown and wait up to five minutes for Executors. They never force-kill the process or touch other tmux sessions.
 
@@ -165,14 +170,17 @@ Setup must succeed before polling or work starts. Overview lists missing require
 
 1. **Sources.** Set the GitHub repository (`owner/name`) and agent CLI, for example `/home/me/.local/bin/gh-agent`. Requests normally arrive through the agent account's notifications. A new Issue or comment mentioning the account arrives on the next poll; adding a mention by editing an existing Issue body does not. Post a new comment instead. For Feishu, set the bot CLI, chats, each chat's receive-all or mentions-only mode, and whether to receive direct messages.
 2. **Policy.** The two example rules can be edited or removed. Under **On each Source**, add the GitHub accounts and Feishu users who may ask for work; until a list has someone, no request can become a Ticket. With Feishu, a chat can be chosen to sync the list from, at startup and on **Sync now**.
-3. **Execution.** The directory root and a prepare command. To give each Ticket a checkout of the repository:
+3. **Execution.** The local clone, the base ref each Ticket starts from, the worktree root, an optional prepare command, and blocked commands. Set the clone's absolute path as the local repository (`repository`) and the starting ref, such as `refs/heads/main`, as the base ref (`baseRef`). An empty repository or base ref leaves existing settings readable but prepares no new worktree; it does not fall back to an empty directory. Before a Ticket's first Assignment, the Executor resolves that ref to a pinned commit and exposes `DSH_SUPERAGENT_REPOSITORY`, `DSH_SUPERAGENT_BASE_REF`, the pinned `DSH_SUPERAGENT_BASE_SHA` and the reserved `DSH_SUPERAGENT_BRANCH` to the preparation. With no prepare command, the Executor creates each Ticket's worktree itself with the same `git worktree add` call at the pinned commit. A non-empty prepare command takes over that creation and must use the pinned variables:
 
    ```sh
-   git -C /home/me/src/widgets fetch --no-tags "https://github.com/$DSH_SUPERAGENT_GITHUB_REPOSITORY.git" "${DSH_SUPERAGENT_GITHUB_PR_HEAD:-HEAD}:refs/dsh-superagent/$DSH_SUPERAGENT_TICKET" &&
-   git -C /home/me/src/widgets worktree add -b "agent/$DSH_SUPERAGENT_NAME" "$DSH_SUPERAGENT_DIR" "refs/dsh-superagent/$DSH_SUPERAGENT_TICKET"
+   git -C "$DSH_SUPERAGENT_REPOSITORY" worktree add -b "$DSH_SUPERAGENT_BRANCH" "$DSH_SUPERAGENT_DIR" "$DSH_SUPERAGENT_BASE_SHA"
    ```
 
-   List personal CLIs, such as one signed in to your own account, as blocked commands.
+   The Executor then verifies the created worktree: it must be a linked worktree of that clone, at that path, on that branch, with its first HEAD at the pinned commit. It records those facts on the Ticket. An ordinary directory, another Ticket's worktree, a checkout of another repository, or a wrong branch or base is rejected with the reason on the Ticket; the Executor deletes nothing and starts no Session. A retry reuses only this Ticket's verified worktree, whose current HEAD may already be ahead of its base, and only after the previous writer has stopped. Its recorded repository and base stay pinned even if these settings change; a changed setting selects the base for new Tickets, not for an existing claim.
+
+   The clone's origin must identify the GitHub Source's repository: exactly one `origin` URL, over direct github.com HTTPS, SSH or Git, for that `owner/name`. Keep the worktree root outside the clone's main checkout, every worktree registered in it, and any other Git checkout; a symlink alias counts as its resolved path. A Ticket whose clone origin or destination crosses these boundaries is refused before its prepare command runs, with the reason on the Ticket, and no file is created or changed.
+
+   List personal CLIs, such as one signed in to your own account, as blocked commands. A blocked name fails only when called by that name; an absolute path still runs.
 4. **Prompts.** Set the team sections: the GitHub disclosure line, review bots, the commit author and the auto-merge condition.
 
 ### Management API
@@ -190,6 +198,7 @@ Agents may rely on these routes and fields. The other routes in `src/app/api.ts`
 | `GET state` | What every page reads: `setup`, with `problem` and `feishuProblem`, each `null` or a setup problem with `place`, `code`, `values` and `detail`, and `accounts` once setup resolved them; `health`, an entry per part, below, with `state` (`starting`, `ready`, `paused` or `error`), `detail` and `at`; `load`, the Executor Sessions `running`, the Tickets `queued` and `maxWorkers`; `paused`; and `masterId` |
 | `GET settings` | `blocks`: `policy`, `eval` and `executor`, each with its `value` and its `revision`; `sources`: the Source instances, each with `id`, `kind`, `installed`, its block's `value`, `{"enabled": …, "config": {…}}`, and `revision`, its kind's form, and its setup `problem` when it has one; `policyVersion`; and `environment`, the execution environment's `root` and `variables` |
 | `GET sources` | Each Source's status: `state` (`missing`, `off`, `error`, `setup`, `starting`, `paused` or `ready`), the `health` of its parts, its setup `problem`, the last day's `stats`, the Triggers it `filtered` in that day, and the messages it `dropped` in that day, newest drop first, each with its `channel`, `preview`, `ticket` (`id` and `title`) when it was for one, its `thread` when the store has it, and `dropped.at` and `dropped.reason`, `channelGone` or `channelIgnored` |
+| `GET tickets/<id>` | The Ticket page: stage and actions, Mandate, Inputs, Threads and Assignments, and its `execution` with `name`, `directory`, `repository`, `worktree`, `branch`, `base` (`ref` and `sha`), `session`, `active_writer` and `preparation` with its `reason`. A legacy Ticket omits the facts it never recorded |
 | `PUT settings/<block>` with `{"value": …, "revision": n}` | Saves one block: `saved`, the block's new `revision`, `policy_changed` and `restarting`. `value` is the whole block, as `GET settings` holds it; a missing key takes its default |
 | `POST executor/pause` with `{"paused": true}` or `false` | Pauses or resumes processing: `paused` |
 | `POST setup/check` | Runs setup again by restarting dsh-superagent: `restarting: true`. Refused when setup has nothing to fix |
@@ -218,10 +227,10 @@ A refusal has a status and `error`, its English text:
 
 The blocks:
 
-- `source:github`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository` and `cli`, and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
+- `source:github`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository`, `cli`, `requiredChecks` (`[{"id": "…"}]`, empty by default, naming exact required GitHub Actions jobs), and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
 - `policy`: `{"rules": […], "sources": {"github": {"allowed": [{"id": "<login>"}], "bots": [{"id": "dependabot[bot]"}]}, "feishu": {"allowed": [{"id": "ou_…", "name": "…"}], "syncChat": "oc_…", "admission": {"oc_…": {"unlistedAddressed": "explicit"}}}}}`. `bots` lists the bots whose messages may become inferred candidates. An `admission` row is keyed by chat id, `other` or `direct` for Feishu, and by `issues`, `pulls`, `comments` or `ci` for GitHub; an unset cell takes its default (see [002 Authorization](002-authorization.md)).
 - `eval`: `mode`, `timeoutSeconds` and `model`.
-- `executor`: `model`, `maxWorkers`, `directory`, `prepare` and `blockedCommands`. The processing pause is a setting of its own, `paused`, which `POST executor/pause` sets.
+- `executor`: `model`, `maxWorkers`, `repository`, `baseRef`, `directory`, `prepare` and `blockedCommands`. The processing pause is a setting of its own, `paused`, which `POST executor/pause` sets.
 
 Changing a repository or CLI runs the corresponding setup check first. A failed check returns 400 with details in `setup`. A successful account change, or any save while setup is pending, returns `restarting: true`. The API is temporarily unavailable while the application restarts.
 
@@ -240,14 +249,14 @@ Setup verifies the GitHub repository and the agent's push access, writes the wor
 
 The process environment that setup writes:
 
-- **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's CLI; `lark-cli` runs the bot's CLI; blocked commands fail. A shim removes its own directory from `PATH` before it runs its target.
+- **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's CLI; `lark-cli` runs the bot's CLI; blocked commands fail. The forwarding shim removes its own directory from `PATH` before running its target to avoid wrapper recursion. The CLI policy, platform entry points and limits are specified in `010-session-boundaries.md`.
 - **git configuration** in `<stateDir>/worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
 
 A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
 
 ## Try it
 
-From an allowed GitHub account, open an Issue or post a comment containing `@<agent login> <request>`. Within a polling interval (one minute by default), Overview should show a Ticket. The agent acknowledges the request, works in its own Session and directory, and delivers in the original conversation. For Feishu, mention the bot in a configured chat.
+From an allowed GitHub account, open an Issue or post a comment containing `@<agent login> <request>`. Within a polling interval (one minute by default), Overview should show a Ticket. The agent acknowledges the request, works in its own Session and verified worktree, and delivers in the original conversation. For Feishu, mention the bot in a configured chat.
 
 ## Upgrade
 
@@ -258,11 +267,20 @@ From an allowed GitHub account, open an Issue or post a comment containing `@<ag
 
 A restart ends running Assignments and starts replacements with recovery notes. Team text and overridden prompt parts are retained; parts without overrides follow the new defaults. Review parts marked **Default updated** after upgrading.
 
+Tickets accepted before this version stored only a directory. They keep that directory and its record, but have no verified worktree, branch or base; the Executor does not adopt an existing tree or infer a base from its current HEAD. A legacy Ticket whose earlier worker's idle state cannot be proven refuses a retry with that reason, and an existing directory is never reused. A legacy Ticket that never started can prepare under the new rules when its directory does not already exist.
+
 A database migrated by a newer version cannot be opened by an older one. Rollback therefore requires the pre-upgrade backup. After upgrading DeepSeek Harness itself, restart the running instance so the panel loads matching artifacts.
 
 ### Agent presets
 
-The worker and router presets move shell commands to the background after 5 seconds. A Session cannot load without its preset. Keep the `dsh-superagent-worker` and `dsh-superagent-router` rows in `cordis.patch.yml` while their Sessions are in use; otherwise resume fails with `agent-preset/not-found`.
+The worker preset moves shell commands to the background after 5 seconds; the router preset has no shell, background jobs or write tools. A Session cannot load without its preset. Keep the `dsh-superagent-worker` and `dsh-superagent-router` rows in `cordis.patch.yml` while their Sessions are in use; otherwise resume fails with `agent-preset/not-found`.
+
+## Verification
+
+Run `pnpm -C plugin verify:linux` from the repository root (`pnpm verify:linux` inside `plugin/`, passing script flags after `--`, or `node scripts/verify-linux.mjs --help` for all options) to execute `pnpm install --frozen-lockfile && pnpm check` on a committed Linux snapshot, natively or through WSL from Windows.
+
+- **Committed snapshot and Linux/WSL isolation.** The script resolves `HEAD` from its own checkout, clearing inherited Git location variables. It exports committed `plugin/`, the root `DOCS.md`, and `meta/.scratch/super-agent-implementation/` (read by the offline ticket-link test) into an isolated Linux `mktemp -d` directory. It never reads uncommitted changes, untracked files, or Windows `node_modules`. On Windows it invokes `wsl.exe` directly (`WSL_UTF8=1`) and requires native Linux Node.js and pnpm (or native Corepack / an explicit Linux `--pnpm` path); it rejects a Windows tool instead of falling back silently.
+- **Evidence, failure and cleanup.** Each run writes a separate directory under `plugin/.artifacts/verify/` containing full per-stage logs and `manifest.json` (recording CI identity, environment versions, stage exit status and snapshot cleanup), and prints a concise summary to standard output. Any failed stage stops subsequent stages and exits non-zero while preserving the logs and manifest; cleanup deletes the temporary Linux snapshot after the run and fails non-zero (marking the snapshot uncleaned in the manifest and summary) if removal fails.
 
 ## Troubleshooting
 
@@ -275,13 +293,19 @@ Setup problems appear on the overview with a link to the fix, in the panel's lan
 | `The agent GitHub CLI cannot read its account` | Sign the wrapper in with `auth login` |
 | `@… cannot read …` or `@… cannot push to …` | Give the agent account write access to the repository |
 | `The GitHub Source names no repository.` | Set the repository, `owner/name`, on the GitHub card |
-| A Ticket fails with `The prepare command failed: …` | The output names the cause, such as a wrong clone path; fix the command, then retry the Ticket |
+| A Ticket fails with `The prepare command failed…` | The message names the cause, such as a wrong clone path, and says its files were preserved; fix the command, then retry the Ticket |
+| A Ticket's preparation is rejected because the directory is not this Ticket's verified worktree | The path holds an ordinary directory, another Ticket's worktree, a checkout of another repository, or a worktree of this repository on another branch or base. Nothing was changed. Move that content away or change the directory root, then retry |
+| A Ticket fails with `Configured repository … origin …` | The clone's single `origin` URL must name the GitHub Source's repository. Check `git -C <clone> remote get-url origin`, remove extra origin URLs, and point origin at that `owner/name` over direct HTTPS, SSH or Git |
+| A Ticket fails because its directory or worktree root is inside a checkout | Move `executor.directory` outside the clone's main checkout, every worktree registered in it, and any other Git checkout; a symlink alias counts as its resolved path. Nothing was created or changed |
+| Every new Ticket is rejected while the clone and base ref are set | Check that the base ref resolves in the clone (`git -C <clone> rev-parse <baseRef>`) and that the prepare command creates a linked worktree at `$DSH_SUPERAGENT_DIR` on `$DSH_SUPERAGENT_BRANCH` from `$DSH_SUPERAGENT_BASE_SHA`, not a copy or the clone's own checkout |
+| A Ticket fails naming `executor.repository` or `executor.baseRef` | Both settings are required for a real worktree. Set the local clone and a ref it can resolve; an empty value is not an empty-directory fallback |
 | `git does not read the github.com credential configuration dsh-superagent writes` | Install git 2.32 or later |
 | A Ticket fails with `The git configuration of the repository in … sets …` | Remove the named credential or `http.*.extraheader` settings from the clone's `.git/config` |
 | `… was not written by dsh-superagent` | Move the named file out of `<stateDir>/worker-bin` or `<stateDir>/worker-gitconfig`, or choose another `stateDir` |
 | `The bot lark-cli allows user identities` | Point the Feishu Source at a bot-only configuration, as in Feishu bot above |
 | `The bot lark-cli does not work.` or `The bot identity of app … is …` | Check the configuration's app id and secret |
 | `The Feishu bot is not a member of the chat.` | Add the bot to the chat in the chat's settings; the next attempt succeeds |
+| `Unsafe Feishu bot batch CLI path` | Rename or move the Windows `.cmd`/`.bat` Feishu CLI wrapper so its path contains no `"`, `&`, `\|`, `<`, `>`, `^`, `%`, `!`, or newline characters |
 | `status` exits 2 | A part reports an error, which a restart does not fix: `errors` names each part, as listed under Management API, with its detail; each part clears its own entry once it works again |
 | `status` exits 3 | Setup waits: `setup` says what is missing, and the overview links to the setting that fixes it |
 | `status` exits 1 | The service does not run, runs twice, does not answer, or its runtime reports an error; the output and the newest log say which |

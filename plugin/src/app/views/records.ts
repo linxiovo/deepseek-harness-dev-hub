@@ -15,6 +15,20 @@ export const page = <T>(items: T[], offset: number, limit: number) => ({ items: 
 const DAY = 86_400_000
 export const dayAgo = () => new Date(Date.now() - DAY).toISOString()
 export const newestFirst = (a: Ticket, b: Ticket) => b.updatedAt.localeCompare(a.updatedAt)
+/** Public execution facts: legacy directory-only records have no verified Git identity. */
+export function ticketExecution(ticket: Ticket) {
+  const execution = ticket.execution
+  if (!execution) return undefined
+  const session = execution.session ?? (ticket.assignments.some(item => item.startedAt) ? workerSessionId(ticket.id) : undefined)
+  return { name: execution.name, directory: execution.directory,
+    ...execution.repository ? { repository: execution.repository } : {},
+    ...execution.worktree ? { worktree: execution.worktree } : {},
+    ...execution.branch ? { branch: execution.branch } : {},
+    ...execution.base ? { base: execution.base } : {},
+    ...session ? { session } : {},
+    ...execution.active_writer !== undefined ? { active_writer: execution.active_writer } : {},
+    preparation: execution.preparation ?? { state: 'unverified' as const } }
+}
 
 /** Sender projection for the UI; automated notices have an empty `id` and no `name`. */
 export interface ActorView { source: string; id: string; name?: Localized }
@@ -119,15 +133,16 @@ export function ticketSummary(ticket: Ticket) {
   const stage = ticketStage(ticket)
   const note = ticketNote(ticket, stage)
   const state = liveTicket(ticket) ? 'open' as const : 'ended' as const
+  const execution = ticketExecution(ticket)
   return { id: ticket.id, title: ticket.title, state, ...stage, ...note ? { note } : {},
     actions: { retry: canRetry(ticket), stop: liveTicket(ticket) }, strength: ticket.mandate.strength, ended: ticket.ended,
     attention: ticket.attention && { ...ticket.attention, question: markdown(ticket.attention.question) },
-      assignments: ticket.assignments.length, inputs: ticket.inputs.length, undelivered: ticket.undelivered.length,
-    // Every started Assignment of a Ticket runs in its one shared worker Session.
-    deliveryError: attribute(ticket.delivery?.error), sessionId: ticket.assignments.some(item => item.startedAt)
-      ? workerSessionId(ticket.id) : '',
-    directory: attribute(ticket.execution?.directory), summary: latestReport(ticket)?.summary ?? '', createdAt: ticket.createdAt,
-    updatedAt: ticket.updatedAt }
+    assignments: ticket.assignments.length, inputs: ticket.inputs.length, undelivered: ticket.undelivered.length,
+    // Existing workers used a stable per-ticket Session ID; new executions persist the actual bound Session.
+    deliveryError: attribute(ticket.delivery?.error), sessionId: execution?.session ?? (ticket.assignments.some(item => item.startedAt)
+      ? workerSessionId(ticket.id) : ''),
+    directory: attribute(ticket.execution?.directory), ...execution ? { execution } : {}, summary: latestReport(ticket)?.summary ?? '',
+    createdAt: ticket.createdAt, updatedAt: ticket.updatedAt }
 }
 export type TicketSummaryView = ReturnType<typeof ticketSummary>
 function threadUrl(store: Store, thread: Thread): string | undefined {

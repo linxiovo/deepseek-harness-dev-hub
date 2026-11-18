@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
@@ -20,11 +20,12 @@ import { feishuChannel, feishuTriggerId } from '../src/sources/feishu-trigger.ts
 import { githubLink } from '../src/sources/github-channel.ts'
 import { githubChannel } from '../src/sources/github-trigger.ts'
 import { followupOwners, type ChannelRef } from '../src/core/index.ts'
+import { gitRepository } from './fixtures/git.ts'
 
 let directory: string
 let store: Store
 beforeEach(() => {
-  directory = mkdtempSync(join(tmpdir(), 'dsh-superagent-views-'))
+  directory = mkdtempSync(join(realpathSync.native(tmpdir()), 'dsh-superagent-views-'))
   store = new Store(join(directory, 'orchestrator.sqlite'))
 })
 afterEach(() => { store.close(); rmSync(directory, { recursive: true, force: true }) })
@@ -131,6 +132,40 @@ it('follows the Ticket\'s stage: a blocked Ticket a person answered since is wor
   expect(answered).toMatchObject({ stage: 'working', actions: { retry: false } })
   expect(answered).not.toHaveProperty('note')
   expect(ticketDetail(host, 't1')!.assignments[0]).not.toHaveProperty('turnEndedAt')
+})
+
+it('shows the actual worker Session and verified worktree identity, or a rejected preparation reason, without inventing legacy facts', () => {
+  const host = views()
+  live('verified')
+  const original = store.tickets.get('verified')!
+  const repo = gitRepository(directory)
+  const worktree = join(directory, 'fix-regression'), branch = 'ticket/fix-regression'
+  repo.worktree(worktree, branch)
+  const identity = { repository: repo.repository, commonDir: join(repo.repository, '.git'), worktree, branch, base: repo.base }
+  const session = 'actual-session-19'
+  const execution = { name: 'fix-regression', directory: worktree, assignment: 'Fix regression', repository: identity.repository,
+    worktree, branch, base: repo.base, session, active_writer: { assignment: 'a1', session },
+    preparation: { state: 'verified' as const }, ownership: { ticket: 'verified', generation: 1, identity, verified: true } }
+  store.tickets.save({ ...original, execution, assignments: [{ id: 'a1', state: 'running', createdAt: at, startedAt: at,
+    writer: { generation: 1, state: 'active', session } }] })
+  const { assignment: _assignment, ownership: _ownership, ...shownExecution } = execution
+  expect(ticketDetail(host, 'verified')).toMatchObject({ directory: worktree, sessionId: session, execution: shownExecution })
+  expect(ticketDetail(host, 'verified')?.execution).not.toHaveProperty('ownership')
+
+  live('rejected')
+  const rejected = store.tickets.get('rejected')!
+  const reason = 'Wrong base; existing files were preserved.'
+  store.tickets.save({ ...rejected, execution: { name: 'fix-other', directory: '/srv/worktrees/fix-other', assignment: 'Fix other',
+    active_writer: null, preparation: { state: 'rejected', reason } } })
+  expect(ticketDetail(host, 'rejected')?.execution).toMatchObject({ active_writer: null,
+    preparation: { state: 'rejected', reason } })
+  expect(ticketDetail(host, 'rejected')?.execution).not.toHaveProperty('repository')
+
+  live('legacy')
+  const legacy = store.tickets.get('legacy')!
+  store.tickets.save({ ...legacy, execution: { name: 'old-ticket', directory: '/srv/legacy', assignment: 'Legacy work' } })
+  expect(ticketDetail(host, 'legacy')?.execution).toMatchObject({ preparation: { state: 'unverified' } })
+  expect(ticketDetail(host, 'legacy')?.execution).not.toHaveProperty('repository')
 })
 
 it('does not show a follow-up that reached a ticket as waiting for an Eval, though an older version queued it', () => {

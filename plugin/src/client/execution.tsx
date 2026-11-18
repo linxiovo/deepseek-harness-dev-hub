@@ -1,4 +1,4 @@
-/** Execution status view (active Tickets and pause control) and Execution settings group (Executor capacity and workspace environment). */
+/** Execution status view (active Tickets and pause control) and Execution settings group (Executor capacity, worktree preparation, and workspace environment). */
 import { useRef, useState } from 'react'
 import { TICKET_FILTERS, type TicketFilter } from '../app/api.ts'
 import { LIMITS } from '../limits.ts'
@@ -107,6 +107,15 @@ export function ExecutionSettings() {
             : t('executionDirectoryDefault', { root: environment.root })}>
             <Input className="dt-mono" value={value.directory} placeholder={t('executionDirectoryEmpty')} spellCheck={false} pattern="/.*"
               onChange={event => edit({ directory: event.target.value })} />
+          </Field>
+          {/* Optional until configured: preparation refuses an empty repository or base ref instead of falling back to an empty directory. */}
+          <Field label={t('executionRepository')}>
+            <Input className="dt-mono" value={value.repository ?? ''} spellCheck={false} pattern="/.*"
+              onChange={event => edit({ repository: event.target.value })} />
+          </Field>
+          <Field label={t('executionBaseRef')}>
+            <Input className="dt-mono" value={value.baseRef ?? ''} spellCheck={false} maxLength={256} pattern={String.raw`[^\-\s][^\s]*`}
+              onChange={event => edit({ baseRef: event.target.value })} />
           </Field>
           <Field label={t('prepareCommand')} hint={t('prepareCommandHint')}>
             <textarea ref={prepare} className="dt-textarea dt-mono" rows={3} maxLength={LIMITS.prepareCommand} spellCheck={false}

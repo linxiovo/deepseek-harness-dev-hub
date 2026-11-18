@@ -2,12 +2,15 @@
  * In-memory DSH host fixture (as in tests/runtime.spec.ts) running a configured Runtime with GitHub and Feishu sources,
  * allowed member Alice (`ou_alice`), listened chat `oc_team`, and `auto` eval mode. Stop it with `stop()`.
  */
+import { execFileSync } from 'node:child_process'
 import { Context } from '@deepseek-ai/cordis'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { vi, type Mock } from 'vitest'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
+import type { SessionId } from '@deepseek-ai/dsh-session'
+import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 import { Runtime } from '../../src/app/runtime.ts'
 import { Store } from '../../src/app/store.ts'
 import { SettingsSchema } from '../../src/policy.ts'
@@ -17,9 +20,13 @@ import { Commands } from '../../src/infra/commands.ts'
 import { credentialHelper, workerGitConfig } from '../../src/infra/environment.ts'
 import type { Trigger } from '../../src/core/index.ts'
 import { testMachine } from './deployment.ts'
+import { gitEnv, gitRepository } from './git.ts'
 
 export const MEMBER = 'ou_alice'
 export const CHAT = 'oc_team'
+
+/** Worker prepare command backed by a real local Git repository unless the test opts out. */
+const WORKTREE_PREPARE = 'git -C "$DSH_SUPERAGENT_REPOSITORY" worktree add -b "agent/$DSH_SUPERAGENT_NAME" "$DSH_SUPERAGENT_DIR" "$DSH_SUPERAGENT_BASE_SHA"'
 
 /** Build a Feishu mention trigger from Alice in `oc_team`, using the digits in `id` as the timestamp offset in seconds. */
 export function feishu(id: string, text: string, overrides: Record<string, unknown> = {}): Trigger {
@@ -33,6 +40,7 @@ type FakeAgent = {
   id: string; status: string; inbox: { nextTurn: UserMessage[]; nextStep: UserMessage[] }
   cancel: Mock; inject: Mock<(message: UserMessage) => void>; steer: Mock<(message: UserMessage) => void>; followup: Mock<(message: UserMessage) => void>
   directUserMessage: (text: string) => void
+  session?: { id: string }
 }
 /** A text message, as DSH's job tools and subagents send their notices. */
 const notice = (id: string, text: string) => ({ id, role: 'user', content: [{ type: 'text', text }], source: { kind: 'tool-jobs', form: 'notice' } }) as unknown as UserMessage
@@ -132,14 +140,20 @@ export function subagentRuntime(agents: Map<string, FakeAgent>) {
   return { service, settle, spawn, live: (id: string) => !!children.get(id)?.live }
 }
 
-/** @param seed - writes to the database before the Runtime opens it, such as records an earlier version stored. */
-export async function startRuntime(seed?: (store: Store) => void, options: { withFeishu?: boolean } = {}) {
-  const directory = mkdtempSync(join(tmpdir(), 'orchestrator-host-'))
+/** Seed the database before opening; opt out of real Git or Feishu for unconfigured-executor and source tests. */
+export async function startRuntime(seed?: (store: Store) => void, options: { withFeishu?: boolean; realGit?: boolean } = {}) {
+  const directory = mkdtempSync(join(realpathSync.native(tmpdir()), 'orchestrator-host-'))
+  // Keep the default fixture clone separate from tests that create their own repository under `directory`.
+  const gitRoot = join(directory, 'fixture-git')
+  if (options?.realGit !== false) mkdirSync(gitRoot)
+  const localGit = options?.realGit === false ? undefined : gitRepository(gitRoot)
   const AGENT = join(directory, 'agent-gh'), BOT = join(directory, 'lark-bot')
   const repository = { default_branch: 'master', permissions: { push: true } }
   vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : repository)
   vi.spyOn(Commands.prototype, 'lark').mockResolvedValue({ users: [{ member_id: MEMBER, name: 'Alice' }], has_more: false })
-  vi.spyOn(Commands.prototype, 'git').mockResolvedValue('')
+  const git = vi.spyOn(Commands.prototype, 'git')
+  if (localGit) git.mockImplementation(async (args, cwd) => execFileSync('git', args, { cwd, env: gitEnv(), encoding: 'utf8' }))
+  else git.mockResolvedValue('')
   vi.spyOn(Commands.prototype, 'run').mockResolvedValue('{"ok":true,"data":{}}')
   const scoped = 'git config -z --show-scope --get-regexp ^(credential\\..*|http\\..*extraheader)$'
   const answers: Record<string, string> = {
@@ -153,17 +167,44 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   }
   /** A prepare command (`sh -c`) waits for this while it is set. */
   const hooks: { prepare?: Promise<void> } = {}
-  const subprocess = { spawn: vi.fn((spec: { argv: readonly string[] }) => {
+  const subprocess = { spawn: vi.fn((spec: { argv: readonly string[]; cwd?: string; env?: Record<string, string> }) => {
     const argv = [...spec.argv]
     while (argv[0] === 'env' || /^[A-Z_]+=/.test(argv[0] ?? '')) argv.shift()
-    const reader = (text: string) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
+    const reader = (text: () => string) => ({ readFrom: () => { const value = text(); return { text: value, nextOffset: value.length, lossy: false } } })
     const exited = { exitCode: 0, signal: null }
+    if (localGit && argv[0] === 'sh') {
+      let stderr = ''
+      const done = Promise.resolve().then(async () => {
+        if (hooks.prepare) await hooks.prepare
+        if (argv[1] !== '-c' || argv[2] !== WORKTREE_PREPARE) {
+          stderr = 'Unexpected worker prepare command'
+          return { exitCode: 1, signal: null }
+        }
+        try {
+          execFileSync('git', ['-C', spec.env?.DSH_SUPERAGENT_REPOSITORY ?? '', 'worktree', 'add', '-b',
+            `agent/${spec.env?.DSH_SUPERAGENT_NAME ?? ''}`, spec.env?.DSH_SUPERAGENT_DIR ?? '',
+            spec.env?.DSH_SUPERAGENT_BASE_SHA ?? ''], { cwd: spec.cwd, env: gitEnv(spec.env), encoding: 'utf8' })
+          return exited
+        } catch (error) {
+          const failure = error && typeof error === 'object' ? error : {}
+          stderr = 'stderr' in failure ? String(failure.stderr) : String(error)
+          return { exitCode: 'status' in failure && typeof failure.status === 'number' ? failure.status : 1, signal: null }
+        }
+      })
+      return { done, collected: { stdout: reader(() => ''), stderr: reader(() => stderr) } }
+    }
     const done = argv[0] === 'sh' && hooks.prepare ? hooks.prepare.then(() => exited) : Promise.resolve(exited)
-    return { done, collected: { stdout: reader(answers[argv.join(' ')] ?? ''), stderr: reader('') } }
+    return { done, collected: { stdout: reader(() => answers[argv.join(' ')] ?? ''), stderr: reader(() => '') } }
   }) }
   const agents = new Map<string, FakeAgent>()
-  const sessionHistory = new Map<string, { seq: number; type: string; data: UserMessage }[]>()
+  /** One durable entry of a Session's log; controller-made messages carry no `time`, as their creation time is not an event. */
+  type StoredEvent = { seq: number; time?: number; type: string; data: unknown }
+  const sessionHistory = new Map<string, StoredEvent[]>()
+  /** Fork-inherited prefix lengths, which a real persistence backend stores beside the log. */
+  const inheritedEvents = new Map<string, number>()
   let directMessageSequence = 0
+  // DSH's agents service lists the Sessions still loaded; Sessions install reads it after a service restart.
+  Object.assign(agents, { list: () => [...agents.values()] })
   /** Each Session's next step, which takes the messages that wait for one. */
   const steps = new Map<string, () => void>(), claims = new Map<string, () => void>()
   const tools = new Map<string, Map<string, RegisteredTool>>()
@@ -171,7 +212,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   let http!: HttpHandler
   const resolveDefault = async (id: string) => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }
   const controller = {
-    create: vi.fn(async ({ sessionId }: { sessionId: string }) => {
+    create: vi.fn(async ({ sessionId, workspaceId }: { sessionId: string; workspaceId: string }) => {
       if (agents.has(sessionId)) return
       const agentCtx = new Context()
       const sessionTools = new Map<string, RegisteredTool>()
@@ -198,7 +239,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
           taken.add(message.id)
           ctx.emit('agent/inbox/claimed', { agent, message, turn } as never)
           if (!cut) {
-            const event = { seq: sessionEvents.length, type: 'user/message', data: message }
+            const event = { seq: sessionEvents.length, time: Date.now(), type: 'user/message', data: message }
             sessionEvents.push(event)
             ctx.emit('session/event', session as never, event as never)
           }
@@ -219,7 +260,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
       })
       const sessionEvents = sessionHistory.get(sessionId) ?? []
       sessionHistory.set(sessionId, sessionEvents)
-      const session = { id: sessionId, snapshotEvents: () => sessionEvents, requestHeader: () => undefined, append: vi.fn() }
+      const session = { id: sessionId, header: { cwd: workspaceId }, snapshotEvents: () => sessionEvents, requestHeader: () => undefined, append: vi.fn() }
       let status = 'idle'
       const idle: (() => void)[] = []
       // A cancel drops the inbox unless kept, and the turn it stops ends a moment later, which DSH says.
@@ -235,7 +276,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
       })
       const directUserMessage = (text: string) => {
         const message = { id: `direct-user-${++directMessageSequence}`, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } } as unknown as UserMessage
-        const event = { seq: sessionEvents.length, type: 'user/message', data: message }
+        const event = { seq: sessionEvents.length, time: Date.now(), type: 'user/message', data: message }
         sessionEvents.push(event)
         ctx.emit('session/event', session as never, event as never)
       }
@@ -249,10 +290,20 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     prompt: vi.fn(() => { throw new Error('Plugin delivery must not use user RPC') }),
     inspect: vi.fn(async () => ({ events: [] })),
   }
-  const persistence = { flush: vi.fn(async () => {}), open: vi.fn(async (sessionId: string) => ({
-    read: async (offset = 0, count = 512) => ({ events: (sessionHistory.get(sessionId) ?? []).slice(offset, offset + count) }),
-    [Symbol.asyncDispose]: async () => {},
-  })) }
+  // A real backend knows only created Sessions and keeps the fork cut beside the log; the meter must see the same answers.
+  const persistence = { flush: vi.fn(async () => {}), open: vi.fn(async (sessionId: string) => {
+    const id = sessionId as SessionId
+    const events = sessionHistory.get(sessionId)
+    if (!events) throw new SessionPersistenceNotFoundError(id)
+    const inherited = inheritedEvents.get(sessionId) ?? 0
+    return {
+      id, access: 'read' as const, inheritedEventCount: inherited,
+      header: { id, version: 4, createdAt: 0, isSeeded: inherited > 0 },
+      read: async (offset = 0, count = 512) => ({ eventState: 'detached' as const, events: events.slice(offset, offset + count) }),
+      close: async () => {},
+      [Symbol.asyncDispose]: async () => {},
+    }
+  }) }
   const webServer = { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }
   const jobs = jobRegistry(id => agents.get(id))
   const subagents = subagentRuntime(agents)
@@ -265,7 +316,9 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   const seeded = new Store(join(directory, 'orchestrator.sqlite'))
   const sources = { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT } },
     ...(options.withFeishu === false ? {} : { feishu: { enabled: true, config: { cli: BOT } } }) }
-  seeded.saveSettings(SettingsSchema.parse({ ...seeded.settings(), sources }))
+  const initial = seeded.settings()
+  seeded.saveSettings(SettingsSchema.parse({ ...initial, sources, ...(localGit ? { executor: { ...initial.executor,
+    repository: localGit.repository, baseRef: localGit.base.ref, prepare: WORKTREE_PREPARE } } : {}) }))
   seed?.(seeded)
   seeded.close()
   let runtime = new Runtime(ctx, testMachine({ stateDir: directory }), vi.fn())
@@ -307,6 +360,21 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     if (!agent) throw new Error(`Session ${sessionId} does not exist`)
     agent.directUserMessage(text)
   }
+  /**
+   * Appends durable events to a Session's log, as DSH does at a turn's checkpoint, and announces them as the live Session does.
+   * `inherited` sets the fork prefix stored beside the log, which the meter must not count as the child's own calls.
+   */
+  const record = (sessionId: string, events: readonly (Omit<StoredEvent, 'seq'> & { seq?: number })[], inherited?: number) => {
+    if (inherited !== undefined) inheritedEvents.set(sessionId, inherited)
+    const log = sessionHistory.get(sessionId) ?? []
+    sessionHistory.set(sessionId, log)
+    const session = agents.get(sessionId)?.session
+    for (const event of events) {
+      const stored = { ...event, seq: event.seq ?? log.length, time: event.time ?? Date.now() } as StoredEvent
+      log.push(stored)
+      if (session) ctx.emit('session/event', session as never, stored as never)
+    }
+  }
   const idlePlanning = () => runtime.effects.idle('planning')
   const idleRelay = () => runtime.effects.idle('relay')
   /** Route one decision with the main Session's orchestrator_route, answering its result; a refused one throws its reason. */
@@ -335,7 +403,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   const step = (sessionId: string) => { steps.get(sessionId)!() }
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
-  return { get runtime() { return runtime }, get ctx() { return ctx }, restart, idlePlanning, idleRelay, directory, agents, tools, deliveries, relays, candidates, runTool, sendUserMessage, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
+  return { get runtime() { return runtime }, get ctx() { return ctx }, restart, idlePlanning, idleRelay, directory, localGit, agents, tools, deliveries, relays, candidates, runTool, sendUserMessage, record, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
     jobs, subagents, step, claim }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>

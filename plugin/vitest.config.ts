@@ -3,6 +3,8 @@ import { configDefaults, defineConfig } from 'vitest/config'
 export default defineConfig({
   resolve: { dedupe: ['react', 'react-dom'] },
   test: {
+    // Real Git worktree fixtures take longer under concurrent native Windows processes.
+    ...(process.platform === 'win32' ? { testTimeout: 20_000, hookTimeout: 30_000 } : {}),
     include: ['tests/**/*.spec.{ts,tsx}'],
     exclude: [
       ...configDefaults.exclude,

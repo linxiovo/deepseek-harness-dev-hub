@@ -567,11 +567,16 @@ async function resolveGitTarget(repoRoot, requestedRef) {
     throw new Error(`Unable to read ${sha}:plugin/package.json: ${pkgShow.stderr.trim()}`)
   }
   const pkg = JSON.parse(pkgShow.stdout)
-  const docsCheck = await runBuffered('git', ['-C', repoRoot, 'cat-file', '-e', `${sha}:DOCS.md`], { env })
+  const targets = ['plugin']
+  // The offline docs and ticket tests also read these committed repository paths.
+  for (const path of ['DOCS.md', 'meta/.scratch/super-agent-implementation']) {
+    const present = await runBuffered('git', ['-C', repoRoot, 'cat-file', '-e', `${sha}:${path}`], { env })
+    if (present.code === 0) targets.push(path)
+  }
   return {
     sha,
     ref,
-    hasDocsMd: docsCheck.code === 0,
+    targets,
     nodeRange: typeof pkg.engines?.node === 'string' ? pkg.engines.node : '',
     pnpmSpec: typeof pkg.packageManager === 'string' ? pkg.packageManager : '',
   }
@@ -755,9 +760,8 @@ async function main() {
     const exportStream = createWriteStream(exportLog, { flags: 'a' })
     manifest.stages.export.log = exportLog
     try {
-      const targets = gitInfo.hasDocsMd ? ['DOCS.md', 'plugin'] : ['plugin']
       const [tarCmd, tarArgs, tarEnv] = linuxCommand(['tar', '-xf', '-', '-C', ownedSnapshotDir])
-      const exportRes = await runArchiveExport(options.repo, gitInfo.sha, targets, tarCmd, tarArgs, exportStream, tarEnv)
+      const exportRes = await runArchiveExport(options.repo, gitInfo.sha, gitInfo.targets, tarCmd, tarArgs, exportStream, tarEnv)
       if (exportRes.code !== 0) {
         manifest.stages.export = { status: 'failed', exitCode: exportRes.code, log: exportLog }
         manifest.exitCode = exportRes.code || 1

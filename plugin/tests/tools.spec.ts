@@ -17,7 +17,7 @@ const read = (resource: string, page: { offset?: number; limit?: number } = {}) 
   h.runTool(h.runtime.masterId, 'orchestrator_read', { resource, ...page })
 /** Stand in for the external git CLI, not the resource or Commands adapter, so checkout ownership is exercised. */
 const checkouts = (directories: Record<string, { sha: string; remote?: string; root?: string }>) =>
-  vi.spyOn(Commands.prototype, 'git').mockImplementation(async (args, directory) => {
+  vi.spyOn(Commands.prototype, 'git').mockClear().mockImplementation(async (args, directory) => {
     const entry = directories[directory]
     if (!entry) throw new Error(`No checkout at ${directory}`)
     switch (args.join(' ')) {
@@ -250,7 +250,7 @@ it('accepts only a current own PR head and its matching PR run, never a merge SH
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, github: { ...settings.sources.github!,
     config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build' }] } } } })
-  const git = vi.spyOn(Commands.prototype, 'git').mockRejectedValue(new Error('The PR proves ownership without a local checkout'))
+  const git = vi.spyOn(Commands.prototype, 'git').mockClear().mockRejectedValue(new Error('The PR proves ownership without a local checkout'))
   const gh = vi.spyOn(Commands.prototype, 'gh').mockImplementation(async ([, path]) => {
     if (path === 'repos/acme/widgets/pulls/42') return { head: { sha, repo: { full_name: 'acme/widgets' } },
       base: { sha: base }, merge_commit_sha: merge }

@@ -37,7 +37,7 @@ pnpm -C plugin install --frozen-lockfile
 pnpm -C plugin check
 ```
 
-Opt in to local Git hooks with `pnpm -C plugin run hooks:install`. The pre-commit hook typechecks and runs `tests/docs.spec.ts`, `tests/tickets.spec.ts`, and `tests/handoff.spec.ts`; it does not replace CI.
+Opt in to local Git hooks with `pnpm -C plugin run hooks:install`. The pre-commit hook typechecks and runs `tests/docs.spec.ts`, `tests/tickets.spec.ts`, `tests/handoff.spec.ts`, `tests/plans.spec.ts`, `tests/model-surface.spec.ts`, and `tests/prompts.spec.ts`; together these checks cover the Plan and role-prompt contracts locally. It does not replace CI: CI remains the complete `pnpm check`.
 
 Set the GitHub Source's `requiredChecks` to `[{"id":"check"},{"id":"windows"}]` for Ticket and plan evidence. Where branch protection is available, require both jobs there too. Those are separate settings; the workflow changes neither, and a job dependency alone does not restrict merging.
 
@@ -283,6 +283,20 @@ To run directly inside WSL, use a clone on the distribution's native Linux files
 
 - **Committed snapshot and Linux/WSL isolation.** The script resolves `HEAD` from its own checkout, clearing inherited Git location variables. It exports committed `plugin/`, the root `DOCS.md`, and `meta/.scratch/super-agent-implementation/` (read by the offline ticket-link test) into an isolated Linux `mktemp -d` directory. It never reads uncommitted changes, untracked files, or Windows `node_modules`. On Windows it invokes `wsl.exe` directly (`WSL_UTF8=1`) and requires native Linux Node.js and pnpm (or native Corepack / an explicit Linux `--pnpm` path); it rejects a Windows tool instead of falling back silently.
 - **Evidence, failure and cleanup.** Each run writes a separate directory under `plugin/.artifacts/verify/` containing full per-stage logs and `manifest.json` (recording CI identity, environment versions, stage exit status and snapshot cleanup), and prints a concise summary to standard output. Any failed stage stops subsequent stages and exits non-zero while preserving the logs and manifest; cleanup deletes the temporary Linux snapshot after the run and fails non-zero (marking the snapshot uncleaned in the manifest and summary) if removal fails.
+
+## Manual Plan handoff smoke check
+
+**Manual verification with a real model.** Run this checklist against a real DeepSeek Harness `superagent` profile and model. It is not part of `pnpm check`; neither this flow nor its results are claimed as CI coverage. The automated `tests/plans.spec.ts` path uses a simulated Harness host.
+
+1. Start the `superagent` profile with `scripts/dsh-superagent start` and open its panel.
+2. Confirm setup before creating a handoff: the GitHub Source is ready, the configured agent account can read and push the repository, and the model provider and model are available without a setup or health error.
+3. In the Hub, confirm a new handoff with the required direct approval, then wait for its specification to be published.
+4. Observe `splitter-<handoff-id>` receive its scoped task. Confirm that it can read only the handoff/spec resources and is the Session that invokes `orchestrator_plan_register`.
+5. Before registration, invoke/read `plan/<handoff-id>` from the Hub and verify that it reports the documented pre-registration status, not a registered DAG. Verify there is no Worker Session, Ticket, Assignment or worktree for this handoff.
+6. Restart the `superagent` profile while the splitter task is received but before registration succeeds. Verify that the persisted splitting intent produces exactly one continuation delivery, not a duplicate task or a loop.
+7. Let the splitter register the Plan through `orchestrator_plan_register`. Invoke/read `plan/<handoff-id>` again and verify the registered DAG is visible and the splitting continuation has disappeared. Registration must still leave no Worker Session or Ticket.
+
+This is an operator-run real-model check, separate from automated tests and CI; do not report `pnpm check` or CI as covering it.
 
 ## Troubleshooting
 

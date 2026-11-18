@@ -267,6 +267,10 @@ Each model request binds the Session to the current prompt revision. The revisio
 
 `status` and `promptVersion` serve prompt pages. Saves go through `Prompts.save` and notify the main Session. `modelRetry` exposes model-budget retry state.
 
+### Plan handoff navigation
+
+The implementation path is summarized in the **Plan handoff change map** in `plugin/docs/009-handoff.md`: specification publication → the durable `Planning` splitting effect → a scoped splitter Session and its tools → the `Plans` registry → Hub `orchestrator_read` plan resources → no Worker Session or Ticket. Session restrictions are enforced as described in `plugin/docs/010-session-boundaries.md`; `tests/plans.spec.ts` covers the simulated-host path.
+
 ### Session metering
 
 `SessionMeter` (`src/app/session-meter.ts`) answers two separate questions per Session: what its context looks like now, and what it has spent cumulatively. `read(sessionId, signal?)` flushes `ctx.sessionPersistence`, opens the stored Session read-only, folds its own events into usage and returns one `SessionMeterView`; only route metadata (`provider`, `model`, `capacity_tokens`) comes from a fork's inherited prefix. A Session that does not exist returns `undefined`. A stored log that exists but cannot be read, has non-contiguous sequence numbers, is shorter than its persisted cursor or fork cut, or changed its fork cut throws, so the management API answers 500 rather than calling it missing. When it has read events, it flushes again before persisting its cursor, so a write accepted during the read is not skipped. The read closes its handle, and the lifetime signal cancels it.

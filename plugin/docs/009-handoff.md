@@ -86,6 +86,10 @@ It ensures `planner-<id>` in `project.workspace` and sends the full persisted br
 
 At startup, before effects and passes start, `Planning.resume` enqueues planning for stored handoffs in `confirmed` or `planning`. A missing or disposed Session is retried through `Later`. Shutdown cancels planning Sessions, including ones created while stopping.
 
+## Plan handoff change map
+
+For a published spec, follow this implementation path: **specification publication** (`orchestrator_spec_publish`) → the durable `Planning` **splitting effect** → a scoped splitter Session and its tools (`orchestrator_read`, `orchestrator_plan_register`) → the validated `Plans` registry → Hub `orchestrator_read` resources `plan/<handoff-id>` and `plan/<handoff-id>/node/<node-id>` → **no Worker**: registration creates no executable Ticket, Assignment, Worker Session or worktree. Session tool and preset boundaries are enforced in `plugin/docs/010-session-boundaries.md`; simulated-host coverage is in `tests/plans.spec.ts`.
+
 ## Automatic Plan registration
 
 Publication also persists a `splitting` effect for the exact handoff and spec. The effect starts `splitter-<handoff id>` in the handoff workspace with the read-only planning preset and sends `prompts/splitter-task.md`, the two IDs and scoped resource pointers under `handoff:<id>:plan:<specId>`. The splitter loads `dsh-superagent-to-tickets`, reads only that handoff and its immutable spec, and calls `orchestrator_plan_register`. Stable delivery IDs prevent duplicate queue deliveries on restart. The Hub does not read or write the draft to continue the pipeline, and no user approval is needed.

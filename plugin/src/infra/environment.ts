@@ -34,7 +34,7 @@ const cmdFail = (message: string): readonly string[] => [
 export const credentialHelper = (cli: string): string => `!${shellQuote(cli)} auth git-credential`
 
 export function sameDirectory(a: string, b: string): boolean {
-  const real = (path: string): string => { try { return realpathSync(path) } catch { return resolve(path) } }
+  const real = (path: string): string => { try { return realpathSync.native(path) } catch { return resolve(path) } }
   return WINDOWS ? real(a).toLowerCase() === real(b).toLowerCase() : real(a) === real(b)
 }
 export function withoutDirectory(path: string, dir: string): string {

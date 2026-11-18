@@ -4,7 +4,7 @@
  */
 import { execFileSync } from 'node:child_process'
 import { Context } from '@deepseek-ai/cordis'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { vi, type Mock } from 'vitest'
@@ -142,7 +142,7 @@ export function subagentRuntime(agents: Map<string, FakeAgent>) {
 
 /** Seed the database before opening; opt out of real Git or Feishu for unconfigured-executor and source tests. */
 export async function startRuntime(seed?: (store: Store) => void, options: { withFeishu?: boolean; realGit?: boolean } = {}) {
-  const directory = mkdtempSync(join(tmpdir(), 'orchestrator-host-'))
+  const directory = mkdtempSync(join(realpathSync.native(tmpdir()), 'orchestrator-host-'))
   // Keep the default fixture clone separate from tests that create their own repository under `directory`.
   const gitRoot = join(directory, 'fixture-git')
   if (options?.realGit !== false) mkdirSync(gitRoot)

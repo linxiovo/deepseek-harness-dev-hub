@@ -1,10 +1,11 @@
 /** Read-only Git inspection before a ticket worker is allowed to use a prepared or previously owned worktree. */
 import type { Stats } from 'node:fs'
-import { lstat, realpath, stat } from 'node:fs/promises'
+import { lstat, stat } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import type { ExecutionClaim, ExecutionIdentity } from '../core/index.ts'
 import type { Commands } from '../infra/commands.ts'
 import { CliError } from '../infra/commands.ts'
+import { physicalPath } from '../infra/paths.ts'
 
 export type WorktreeBase = ExecutionIdentity['base']
 
@@ -45,7 +46,7 @@ async function prospectivePath(path: string, role: string): Promise<{ path: stri
   let current = resolve(path)
   for (;;) {
     try {
-      const actual = await realpath(current)
+      const actual = await physicalPath(current)
       if (!(await stat(actual)).isDirectory()) throw new WorktreeRejected('invalid-target', `${role} ${path} crosses a non-directory.`)
       return { path: resolve(actual, ...absent.reverse()), ancestor: actual }
     } catch (error) {
@@ -92,7 +93,7 @@ const within = (candidate: string, checkout: string): boolean => {
 
 async function canonical(directory: string, role: string, code: WorktreeRejectionCode): Promise<string> {
   try {
-    const path = await realpath(directory)
+    const path = await physicalPath(directory)
     if (!(await stat(path)).isDirectory()) throw new Error('not a directory')
     return path
   } catch (error) { throw new WorktreeRejected(code, `${role} ${directory} is unavailable: ${description(error)}`) }
@@ -213,7 +214,7 @@ export async function inspectWorktree(commands: Pick<Commands, 'git'>, input: Wo
   const list = listedWorktrees(await commands.git(['worktree', 'list', '--porcelain', '-z'], main))
   const matches = await Promise.all(list.map(async item => {
     const path = isAbsolute(item.path) ? item.path : resolve(main, item.path)
-    const actual = await realpath(path).catch(() => path)
+    const actual = await physicalPath(path).catch(() => path)
     return samePath(actual, worktree) ? item : undefined
   }))
   const listed = matches.find(item => !!item)

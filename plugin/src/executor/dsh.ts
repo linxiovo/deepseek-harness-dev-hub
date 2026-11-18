@@ -2,13 +2,14 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { lstat, mkdir, realpath } from 'node:fs/promises'
+import { lstat, mkdir } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, ExecutionClaim, ExecutionIdentity, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
 import { runAsWorker, sameDirectory, verifyDirectory } from '../infra/environment.ts'
+import { physicalPath } from '../infra/paths.ts'
 import { worktreePreparationConfig, type Settings } from '../policy.ts'
 import type { Commands } from '../infra/commands.ts'
 import type { Store } from '../app/store.ts'
@@ -61,7 +62,7 @@ async function targetPath(directory: string): Promise<string> {
   const missing: string[] = [basename(target)]
   let parent = dirname(target)
   for (;;) {
-    try { return resolve(await realpath(parent), ...missing.reverse()) }
+    try { return resolve(await physicalPath(parent), ...missing.reverse()) }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || dirname(parent) === parent) throw error
       missing.push(basename(parent)); parent = dirname(parent)

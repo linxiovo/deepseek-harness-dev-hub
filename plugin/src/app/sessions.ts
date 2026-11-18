@@ -4,12 +4,12 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { realpath } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { z } from 'zod'
 import { key, liveTicket, type Ticket } from '../core/index.ts'
 import { mandateInstructions, ticketOfSession, workerSessionId } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
+import { physicalPath } from '../infra/paths.ts'
 import { AgentDelivery, messageId } from './delivery.ts'
 import type { Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
@@ -169,7 +169,7 @@ export class Sessions {
     if (role === 'worker') {
       const createdIn = result.agent.session.header.cwd
       if (!createdIn) throw new Error(`Worker ${id} has no recorded workspace directory`)
-      const [sessionPath, expectedPath] = await Promise.all([realpath(createdIn), realpath(cwd)])
+      const [sessionPath, expectedPath] = await Promise.all([physicalPath(createdIn), physicalPath(cwd)])
       const same = process.platform === 'win32' ? sessionPath.toLowerCase() === expectedPath.toLowerCase() : sessionPath === expectedPath
       if (!same) throw new Error(`Worker ${id} belongs to ${createdIn}, not the verified ticket worktree ${cwd}`)
       if (this.host.workerAuthorized?.(ticketId!, id) === false) throw new Error(`Worker ${id} lost its writer grant before Session setup`)

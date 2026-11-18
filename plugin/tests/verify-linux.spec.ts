@@ -422,6 +422,7 @@ function runCli(
   const env: Record<string, string | undefined> = {
     ...baseEnv,
     PATH: options.pathOverride ?? defaultPath,
+    GITHUB_WORKFLOW: 'verify-linux-fixture',
     ...(windows
       ? {
           DSH_FAKE_WSL_NODE: process.execPath,
@@ -472,7 +473,7 @@ it('exports the committed snapshot rather than dirty working tree files, writes 
   expect(manifest).toMatchObject({
     sha,
     ref: 'refs/heads/feature',
-    workflow: 'verify-linux',
+    workflow: 'verify-linux-fixture',
     status: 'passed',
     exitCode: 0,
     distro: windows ? 'Ubuntu-Test' : null,

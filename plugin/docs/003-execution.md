@@ -50,7 +50,7 @@ Worker subagents at every depth use DeepSeek Harness's `standard` preset with th
 
 A Ticket works in a real Git worktree, not merely in a directory. The Execution settings name the local clone (`executor.repository`) and the ref a Ticket starts from (`executor.baseRef`, such as `refs/heads/main`); `executor.directory` is the root that holds the Ticket's directory, named after its short name. The Ticket's branch is `agent/<short name>`. These facts belong to the Ticket, not to one Session, and they outlive the Ticket's end. Both repository settings must be set before a Ticket can prepare; an empty value fails that Ticket with a reason naming the missing setting and never falls back to an empty directory.
 
-Before the first Assignment, the Executor resolves the configured repository to its canonical main checkout and `baseRef` to a full commit id, then durably reserves the directory and branch for that Ticket. The reservation is written before the prepare command runs and before a Session is created. The Execution record then carries these facts, all optional on records written before they existed:
+Before the first Assignment, the Executor resolves the configured repository to its canonical main checkout and `baseRef` to a full commit id, then durably reserves the directory and branch for that Ticket. Inspection, Session startup and persistence compare native physical paths, so a Windows 8.3 path cannot disagree with its long spelling or claim a second writer. The reservation is written before the prepare command runs and before a Session is created. The Execution record then carries these facts, all optional on records written before they existed:
 
 | Field | Meaning |
 | --- | --- |

@@ -53,7 +53,7 @@ const unregisterWorktrees = async (repositoryPath: string): Promise<void> => {
 
 beforeEach(async () => {
   repositories.length = 0
-  directory = mkdtempSync(join(tmpdir(), 'worktree-inspector-'))
+  directory = mkdtempSync(join(realpathSync.native(tmpdir()), 'worktree-inspector-'))
   commands = new Commands(() => testDeployment(), gitEnv(), new AbortController().signal)
   repository = await createRepository('repository')
   worktree = join(directory, 'ticket-1')

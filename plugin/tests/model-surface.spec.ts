@@ -4,7 +4,7 @@
  */
 import { Context } from '@deepseek-ai/cordis'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, expect, it, vi } from 'vitest'
@@ -70,7 +70,7 @@ const words = (count: number) => Array.from({ length: count }, () => 'word').joi
 
 /** Start a configured Runtime on a fake DSH host (as in tests/runtime.spec.ts) that records registered tools, prompts, skills, and delivered messages per session. */
 async function start() {
-  const directory = mkdtempSync(join(tmpdir(), 'model-surface-'))
+  const directory = mkdtempSync(join(realpathSync.native(tmpdir()), 'model-surface-'))
   const localGit = gitRepository(directory)
   const gitEnvironment = gitEnv({ GIT_CONFIG_GLOBAL: join(directory, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' })
   const AGENT = join(directory, 'agent-gh'), BOT = join(directory, 'lark-bot')

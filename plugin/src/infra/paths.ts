@@ -1,7 +1,11 @@
 /** Resolves packaged asset paths from either the source tree or the compiled lib/ output. */
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, realpath } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
+
+/** Match the Store's native realpath, including expansion of Windows 8.3 path components. */
+export const physicalPath = promisify(realpath.native)
 
 let cached: string | undefined
 export function packageRoot(): string {

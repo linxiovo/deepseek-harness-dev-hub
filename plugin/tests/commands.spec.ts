@@ -173,17 +173,17 @@ it('names only the program and how it ended when a command prints no diagnostics
   const commands = new Commands(() => deployment, {}, new AbortController().signal)
   const secret = 'secret reply text'
   await expect(commands.run('sh', ['-c', 'exit 3', secret])).rejects.toMatchObject({ message: 'sh exited with code 3', exitCode: 3 })
-  // Node reports a child killed by a signal as `signal` on Unix; on Windows a self-killed shell only leaves an exit
-  // status (Git for Windows' sh uses SIGKILL 9 << 8 = 2304). Both diagnostics name only the program and its ending.
+  // Unix reports the signal; Git for Windows reports a shell-specific numeric exit status instead.
+  // Both diagnostics name only the program and its ending, never the sensitive argv.
   expect(commandError({ code: null, killed: true, signal: 'SIGKILL', stderr: '' }, 'sh'))
     .toMatchObject({ message: 'sh was stopped by SIGKILL' })
   expect(commandError({ code: 2304, killed: false, signal: null, stderr: '' }, 'sh'))
     .toMatchObject({ message: 'sh exited with code 2304', exitCode: 2304 })
-  // The real child still proves its sensitive argv never reaches the diagnostic, and keeps the platform's own ending.
   const killed = await commands.run('sh', ['-c', 'kill -9 $$', secret]).catch((error: unknown) => error)
   expect(killed).toBeInstanceOf(CliError)
-  expect((killed as CliError).message).toBe(process.platform === 'win32' ? 'sh exited with code 2304' : 'sh was stopped by SIGKILL')
-  expect((killed as CliError).exitCode).toBe(process.platform === 'win32' ? 2304 : undefined)
+  expect((killed as CliError).message).toEqual(process.platform === 'win32' ? expect.stringMatching(/^sh exited with code \d+$/) : 'sh was stopped by SIGKILL')
+  if (process.platform === 'win32') expect((killed as CliError).exitCode).toEqual(expect.any(Number))
+  else expect((killed as CliError).exitCode).toBeUndefined()
   expect((killed as CliError).message).not.toContain(secret)
   await expect(commands.run('/no/such/program', ['secret reply text'])).rejects.toMatchObject({ message: 'program could not run: ENOENT' })
   // Timeouts kill the child with SIGTERM; Node's default error message would echo every argument.

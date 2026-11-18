@@ -22,14 +22,14 @@ Read the documents through [DOCS.md](DOCS.md), which routes this module's source
 
 ## Development
 
-From the repository root, use Node.js 22.19+ (22.x) or 24+, and pnpm 11.7.0. On Linux, run the same full check as [Plugin CI](../.github/workflows/plugin-ci.yml):
+From the repository root, use Node.js 22.19+ (22.x) or 24+, and pnpm 11.7.0. On native Windows or Linux, run:
 
 ```sh
 pnpm -C plugin install --frozen-lockfile
 pnpm -C plugin check
 ```
 
-`check` typechecks, runs the full tests and builds after the native Windows job succeeds; when Windows fails, `check` explicitly fails rather than being skipped. Windows CI typechecks, runs the handoff tests and builds; the other tests rely on POSIX utilities, so use Linux or WSL for the full suite. After the local hook installer is merged into `main`, opt in with `pnpm -C plugin run hooks:install`; the pre-commit hook is not a substitute for CI. See [deployment checks](docs/006-deployment.md#development-checks).
+`check` typechecks, runs every test applicable to the platform, and builds. CI requires both the native Windows `windows` job and the Ubuntu `check` job. Ubuntu runs the full suite, including the POSIX-only service-script tests, only after Windows succeeds; if Windows does not succeed, the Ubuntu job fails explicitly instead of being skipped. On success Ubuntu uploads the build and exact-commit evidence. See [deployment checks](docs/006-deployment.md#development-checks) for evidence, required job settings, and optional local hooks.
 
 ## License
 

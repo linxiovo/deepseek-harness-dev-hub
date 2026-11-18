@@ -15,6 +15,18 @@ afterEach(async () => { await h.stop() })
 const words = (count: number) => Array.from({ length: count }, () => 'word').join(' ')
 const read = (resource: string, page: { offset?: number; limit?: number } = {}) =>
   h.runTool(h.runtime.masterId, 'orchestrator_read', { resource, ...page })
+/** Stand in for the external git CLI, not the resource or Commands adapter, so checkout ownership is exercised. */
+const checkouts = (directories: Record<string, { sha: string; remote?: string; root?: string }>) =>
+  vi.spyOn(Commands.prototype, 'git').mockImplementation(async (args, directory) => {
+    const entry = directories[directory]
+    if (!entry) throw new Error(`No checkout at ${directory}`)
+    switch (args.join(' ')) {
+      case 'rev-parse --show-toplevel': return `${entry.root ?? directory}\n`
+      case 'remote get-url origin': return `${entry.remote ?? 'https://github.com/acme/widgets.git'}\n`
+      case 'rev-parse --verify HEAD': return `${entry.sha}\n`
+      default: throw new Error(`Unexpected git command: ${args.join(' ')}`)
+    }
+  })
 
 it('reads the lists, a ticket, a decision, the settings, the prompts and the models as resources', async () => {
   const { ticket, trigger } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
@@ -85,6 +97,223 @@ it('reads verified worktree ownership, actual worker Session, active writer, and
   const rejectedPage = (await h.api('GET', `tickets/${ticket.id}`)).body
   expect(rejectedPage).toMatchObject({ execution: shownRejected })
   expect(rejectedPage).not.toHaveProperty('execution.ownership')
+})
+
+it('reads configured GitHub Actions evidence for a ticket at its complete commit SHA', async () => {
+  const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const sha = 'a'.repeat(40)
+  const git = checkouts({ [ticket.execution!.directory]: { sha } })
+  const settings = h.runtime.store.settings()
+  await h.runTool(h.runtime.masterId, 'orchestrator_settings_save', { block: 'source', source: 'github',
+    value: { ...settings.sources.github!, config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build' }] } },
+    revision: h.runtime.store.blockRevision('source:github') })
+  expect(JSON.parse((await read('settings/source:github') as { text: string }).text).value.config.requiredChecks).toEqual([{ id: 'build' }])
+  const gh = vi.spyOn(Commands.prototype, 'gh')
+    .mockResolvedValueOnce({ total_count: 1, workflow_runs: [
+      { id: 21, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success', html_url: 'https://github.com/acme/widgets/actions/runs/21' },
+    ] })
+    .mockResolvedValueOnce({ total_count: 1, jobs: [
+      { id: 37, run_id: 21, run_attempt: 1, head_sha: sha, name: 'build', status: 'completed', conclusion: 'success', html_url: 'https://github.com/acme/widgets/actions/runs/21/job/37' },
+    ] })
+    .mockResolvedValueOnce({ total_count: 0, artifacts: [] })
+  const evidence = JSON.parse((await read(`actions/ticket/${ticket.id}/commit/${sha}`) as { text: string }).text)
+  expect(evidence).toMatchObject({ provider: 'github-actions', repository: 'acme/widgets', work: { kind: 'ticket', id: ticket.id }, sha,
+    required: ['build'], satisfied: true, checks: [{ name: 'build', status: 'completed', conclusion: 'success', passed: true }] })
+  expect(gh.mock.calls[0]![0]).toEqual(['api', `repos/acme/widgets/actions/runs?head_sha=${sha}&per_page=100&page=1`])
+  expect(git.mock.calls.map(([args]) => args)).toEqual([
+    ['rev-parse', '--show-toplevel'], ['remote', 'get-url', 'origin'], ['rev-parse', '--verify', 'HEAD'],
+  ])
+})
+
+it('binds ticket and handoff evidence to their own commit SHA and required job names', async () => {
+  const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const { handoff } = h.runtime.handoffs.confirm({ project: { repository: 'acme/widgets', workspace: 'workspaces/widgets' },
+    goal: 'Verify the release plan', constraints: [], acceptanceScope: ['CI passes'],
+    authorization: { scope: 'Verify CI', release: 'authorized' },
+    confirmedBy: { sessionId: h.runtime.masterId, messageId: 'confirm-1', text: 'Confirmed plan' } })
+  const shaTicket = 'a'.repeat(40), shaPlan = 'b'.repeat(40)
+  checkouts({ [ticket.execution!.directory]: { sha: shaTicket }, [handoff.project.workspace]: { sha: shaPlan } })
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, github: { ...settings.sources.github!,
+    config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'release / build' }] } } } })
+  const gh = vi.spyOn(Commands.prototype, 'gh').mockImplementation(async ([, path]) => {
+    const sha = path?.includes('head_sha=') ? path.split('head_sha=')[1]?.split('&')[0] : path?.includes('/runs/11/') ? shaTicket : shaPlan
+    const run = sha === shaTicket ? 11 : 22
+    if (path?.includes('head_sha=')) return { total_count: 1, workflow_runs: [
+      { id: run, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success', html_url: `https://github.com/acme/widgets/actions/runs/${run}` },
+    ] }
+    if (path?.includes('/jobs?')) return { total_count: 1, jobs: [
+      { id: run + 100, run_id: run, run_attempt: 1, head_sha: sha, name: 'release / build', status: 'completed', conclusion: 'success',
+        html_url: `https://github.com/acme/widgets/actions/runs/${run}/job/${run + 100}` },
+    ] }
+    if (path?.includes('/artifacts?')) return { total_count: 0, artifacts: [] }
+    throw new Error(`Unexpected GitHub API path: ${path}`)
+  })
+  const evidence = async (resource: string) => JSON.parse((await read(resource) as { text: string }).text)
+  const ticketEvidence = await evidence(`actions/ticket/${ticket.id}/commit/${shaTicket}`)
+  const planEvidence = await evidence(`actions/plan/${handoff.id}/commit/${shaPlan}`)
+  expect(ticketEvidence).toMatchObject({ work: { kind: 'ticket', id: ticket.id }, sha: shaTicket, required: ['release / build'], satisfied: true,
+    checks: [{ name: 'release / build', run: { id: 11 } }] })
+  expect(planEvidence).toMatchObject({ work: { kind: 'plan', id: handoff.id }, sha: shaPlan, required: ['release / build'], satisfied: true,
+    checks: [{ name: 'release / build', run: { id: 22 } }] })
+  expect(gh.mock.calls.filter(([args]) => args[1]?.includes('head_sha=')).map(([args]) => args[1])).toEqual([
+    `repos/acme/widgets/actions/runs?head_sha=${shaTicket}&per_page=100&page=1`,
+    `repos/acme/widgets/actions/runs?head_sha=${shaPlan}&per_page=100&page=1`,
+  ])
+})
+
+it('does not count unconfigured or missing required Actions jobs as passing evidence', async () => {
+  const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const sha = 'c'.repeat(40), resource = `actions/ticket/${ticket.id}/commit/${sha}`
+  checkouts({ [ticket.execution!.directory]: { sha } })
+  const gh = vi.spyOn(Commands.prototype, 'gh').mockImplementation(async ([, path]) => {
+    if (path?.includes('head_sha=')) return { total_count: 1, workflow_runs: [
+      { id: 31, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success', html_url: 'https://github.com/acme/widgets/actions/runs/31' },
+    ] }
+    if (path?.includes('/jobs?')) return { total_count: 1, jobs: [
+      { id: 32, run_id: 31, head_sha: sha, name: 'build', status: 'completed', conclusion: 'success',
+        html_url: 'https://github.com/acme/widgets/actions/runs/31/job/32' },
+    ] }
+    if (path?.includes('/artifacts?')) return { total_count: 0, artifacts: [] }
+    throw new Error(`Unexpected GitHub API path: ${path}`)
+  })
+  const unconfigured = JSON.parse((await read(resource) as { text: string }).text)
+  expect(unconfigured).toMatchObject({ required: [], satisfied: false, reason: 'required_checks_unconfigured' })
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, github: { ...settings.sources.github!,
+    config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build' }, { id: 'lint' }] } } } })
+  let text = '', offset: number | null = 0
+  while (offset !== null) {
+    const page = await read(resource, { offset, limit: 70 }) as { text: string; next_offset: number | null }
+    text += page.text; offset = page.next_offset
+  }
+  expect(JSON.parse(text)).toMatchObject({ required: ['build', 'lint'], satisfied: false })
+  expect(gh.mock.calls.every(([args]) => !args[1]?.includes('/logs'))).toBe(true)
+})
+
+it('refuses unowned or malformed Actions resources and never exposes them to worker Sessions', async () => {
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const sha = 'd'.repeat(40)
+  const gh = vi.spyOn(Commands.prototype, 'gh').mockClear()
+  for (const resource of [`actions/ticket/missing/commit/${sha}`, `actions/plan/missing/commit/${sha}`]) {
+    await expect(read(resource)).rejects.toThrow('Unknown ticket or handoff')
+  }
+  for (const invalid of [sha.slice(1), sha.toUpperCase(), `${sha}d`, `${sha}\n`, `../../${sha}`]) {
+    await expect(read(`actions/ticket/${ticket.id}/commit/${invalid}`)).rejects.toThrow('Use actions/')
+  }
+  await expect(read(`actions/other/${ticket.id}/commit/${sha}`)).rejects.toThrow('Use actions/')
+  for (const resource of [`actions/ticket/${ticket.id}/commit/${sha}`, `actions/plan/missing/commit/${sha}`]) {
+    await expect(h.runTool(sessionId, 'orchestrator_read', { resource })).rejects.toThrow('belongs to the main Session')
+  }
+  expect(gh).not.toHaveBeenCalled()
+})
+
+it('refuses unrelated green SHAs for existing tickets and handoffs before asking Actions', async () => {
+  const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const { handoff } = h.runtime.handoffs.confirm({ project: { repository: 'acme/widgets', workspace: 'workspaces/widgets' },
+    goal: 'Verify the release plan', constraints: [], acceptanceScope: ['CI passes'],
+    authorization: { scope: 'Verify CI', release: 'authorized' },
+    confirmedBy: { sessionId: h.runtime.masterId, messageId: 'confirm-1', text: 'Confirmed plan' } })
+  const unrelated = 'e'.repeat(40)
+  checkouts({ [ticket.execution!.directory]: { sha: 'a'.repeat(40) }, [handoff.project.workspace]: { sha: 'b'.repeat(40) } })
+  const gh = vi.spyOn(Commands.prototype, 'gh').mockResolvedValue({ total_count: 1, workflow_runs: [
+    { id: 1, head_sha: unrelated, run_attempt: 1, status: 'completed', conclusion: 'success' },
+  ] })
+  await expect(read(`actions/ticket/${ticket.id}/commit/${unrelated}`)).rejects.toThrow('not verified for this ticket')
+  await expect(read(`actions/plan/${handoff.id}/commit/${unrelated}`)).rejects.toThrow('not verified for this plan')
+  expect(gh).not.toHaveBeenCalled()
+})
+
+it('refuses handoffs for another repository and ticket directories that cannot prove repository ownership', async () => {
+  const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const { handoff } = h.runtime.handoffs.confirm({ project: { repository: 'other/widgets', workspace: 'workspaces/widgets' },
+    goal: 'Verify the release plan', constraints: [], acceptanceScope: ['CI passes'],
+    authorization: { scope: 'Verify CI', release: 'authorized' },
+    confirmedBy: { sessionId: h.runtime.masterId, messageId: 'confirm-1', text: 'Confirmed plan' } })
+  const sha = 'a'.repeat(40)
+  const git = checkouts({ [ticket.execution!.directory]: { sha, remote: 'git@github.com:other/widgets.git' } })
+  const gh = vi.spyOn(Commands.prototype, 'gh').mockResolvedValue({ total_count: 0, workflow_runs: [] })
+  await expect(read(`actions/plan/${handoff.id}/commit/${sha}`)).rejects.toThrow('repository differs')
+  expect(git).not.toHaveBeenCalled()
+  await expect(read(`actions/ticket/${ticket.id}/commit/${sha}`)).rejects.toThrow('not verified for this ticket')
+  git.mockResolvedValueOnce(`${ticket.execution!.directory}-parent\n`)
+  await expect(read(`actions/ticket/${ticket.id}/commit/${sha}`)).rejects.toThrow('not verified for this ticket')
+  git.mockRejectedValue(new Error('Checkout unavailable'))
+  await expect(read(`actions/ticket/${ticket.id}/commit/${sha}`)).rejects.toThrow('not verified for this ticket')
+  expect(gh).not.toHaveBeenCalled()
+})
+
+it('accepts only a current own PR head and its matching PR run, never a merge SHA lookup', async () => {
+  const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  h.runtime.engine.bindThread(ticket.id, { source: 'github', id: '42' }, true)
+  const sha = 'a'.repeat(40), base = 'b'.repeat(40), merge = 'c'.repeat(40)
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, github: { ...settings.sources.github!,
+    config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build' }] } } } })
+  const git = vi.spyOn(Commands.prototype, 'git').mockRejectedValue(new Error('The PR proves ownership without a local checkout'))
+  const gh = vi.spyOn(Commands.prototype, 'gh').mockImplementation(async ([, path]) => {
+    if (path === 'repos/acme/widgets/pulls/42') return { head: { sha, repo: { full_name: 'acme/widgets' } },
+      base: { sha: base }, merge_commit_sha: merge }
+    if (path?.includes('head_sha=')) return { total_count: 1, workflow_runs: [
+      { id: 21, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success',
+        html_url: 'https://github.com/acme/widgets/actions/runs/21', pull_requests: [{ number: 42, head: { sha }, base: { sha: base } }] },
+    ] }
+    if (path?.includes('/jobs?')) return { total_count: 1, jobs: [
+      { id: 37, run_id: 21, run_attempt: 1, head_sha: sha, name: 'build', status: 'completed', conclusion: 'success',
+        html_url: 'https://github.com/acme/widgets/actions/runs/21/job/37' },
+    ] }
+    if (path?.includes('/artifacts?')) return { total_count: 0, artifacts: [] }
+    throw new Error(`Unexpected GitHub API path: ${path}`)
+  })
+  const evidence = JSON.parse((await read(`actions/ticket/${ticket.id}/commit/${sha}`) as { text: string }).text)
+  expect(evidence).toMatchObject({ work: { kind: 'ticket', id: ticket.id }, sha, satisfied: true,
+    checks: [{ name: 'build', run: { id: 21 } }] })
+  expect(gh.mock.calls[0]![0]).toEqual(['api', 'repos/acme/widgets/pulls/42'])
+  expect(gh.mock.calls.find(([args]) => args[1]?.includes('head_sha='))?.[0][1]).toBe(
+    `repos/acme/widgets/actions/runs?head_sha=${sha}&per_page=100&page=1`)
+  expect(git).not.toHaveBeenCalled()
+})
+
+it('does not pass a green PR run associated with an obsolete base commit', async () => {
+  const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  h.runtime.engine.bindThread(ticket.id, { source: 'github', id: '42' }, true)
+  const sha = 'a'.repeat(40), base = 'b'.repeat(40)
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, github: { ...settings.sources.github!,
+    config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build' }] } } } })
+  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async ([, path]) => {
+    if (path === 'repos/acme/widgets/pulls/42') return { head: { sha, repo: { full_name: 'acme/widgets' } },
+      base: { sha: base }, merge_commit_sha: 'd'.repeat(40) }
+    if (path?.includes('head_sha=')) return { total_count: 1, workflow_runs: [
+      { id: 21, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success',
+        html_url: 'https://github.com/acme/widgets/actions/runs/21', pull_requests: [{ number: 42, head: { sha }, base: { sha: 'c'.repeat(40) } }] },
+    ] }
+    if (path?.includes('/jobs?')) return { total_count: 1, jobs: [
+      { id: 37, run_id: 21, run_attempt: 1, head_sha: sha, name: 'build', status: 'completed', conclusion: 'success' },
+    ] }
+    if (path?.includes('/artifacts?')) return { total_count: 0, artifacts: [] }
+    throw new Error(`Unexpected GitHub API path: ${path}`)
+  })
+  const evidence = JSON.parse((await read(`actions/ticket/${ticket.id}/commit/${sha}`) as { text: string }).text)
+  expect(evidence).toMatchObject({ work: { kind: 'ticket', id: ticket.id }, sha, satisfied: false })
+})
+
+it('rejects a stale own PR or a PR whose head comes from another repository', async () => {
+  const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  h.runtime.engine.bindThread(ticket.id, { source: 'github', id: '42' }, true)
+  const sha = 'a'.repeat(40)
+  let head = 'b'.repeat(40), repository = 'acme/widgets'
+  const gh = vi.spyOn(Commands.prototype, 'gh').mockImplementation(async ([, path]) => {
+    if (path === 'repos/acme/widgets/pulls/42') return { head: { sha: head, repo: { full_name: repository } },
+      base: { sha: 'c'.repeat(40) }, merge_commit_sha: 'd'.repeat(40) }
+    throw new Error(`Actions must not be queried for an unowned PR: ${path}`)
+  })
+  await expect(read(`actions/ticket/${ticket.id}/commit/${sha}`)).rejects.toThrow('not verified for this ticket')
+  head = sha; repository = 'other/widgets'
+  await expect(read(`actions/ticket/${ticket.id}/commit/${sha}`)).rejects.toThrow('not verified for this ticket')
+  expect(gh.mock.calls.map(([args]) => args[1])).toEqual([
+    'repos/acme/widgets/pulls/42', 'repos/acme/widgets/pulls/42',
+  ])
 })
 
 it('lists in prompts the built-in parts whose text changed since the team overrode them, and the built-in parts in prompts/defaults', async () => {

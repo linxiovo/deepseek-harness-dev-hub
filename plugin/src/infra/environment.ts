@@ -5,13 +5,15 @@
  */
 import { lstat, mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
-import { delimiter, join, resolve } from 'node:path'
+import { basename, delimiter, join, resolve } from 'node:path'
 import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import type { Deployment } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
-import { CliError } from './commands.ts'
+import { batchInvocation, CliError, windowsBatchRunner } from './commands.ts'
 
 const MARKER = '# Written by dsh-superagent on every start; edits are lost.'
+const WINDOWS = process.platform === 'win32'
+const BATCH_UNSAFE = /["&|<>^%!\r\n]/
 /** Markers of files written under the project's earlier names (`dsh-tag`, `dsh-go`, `dsh-freelancer`), which `dsh-superagent` owns and replaces too. */
 const LEGACY_MARKERS = ['dsh-tag', 'dsh-go', 'dsh-freelancer'].map(name => `# Written by ${name} on every start; edits are lost.`)
 /** Commands workers need, which `blockedCommands` cannot block: the shims and git. */
@@ -33,7 +35,7 @@ export const credentialHelper = (cli: string): string => `!${shellQuote(cli)} au
 
 export function sameDirectory(a: string, b: string): boolean {
   const real = (path: string): string => { try { return realpathSync(path) } catch { return resolve(path) } }
-  return real(a) === real(b)
+  return WINDOWS ? real(a).toLowerCase() === real(b).toLowerCase() : real(a) === real(b)
 }
 export function withoutDirectory(path: string, dir: string): string {
   return path.split(delimiter).filter(entry => !sameDirectory(entry, dir)).join(delimiter)
@@ -71,7 +73,7 @@ async function written(file: string): Promise<boolean> {
   if (!(await lstat(file)).isFile()) return false
   const head = (await readFile(file, 'utf8')).split('\n', 2).map(line => line.replace(/\r$/, ''))
   return head.some(line => [MARKER, ...LEGACY_MARKERS].some(marker =>
-    line === marker || line === `rem ${marker}` || line === `// ${marker}`))
+    line === marker || line === `rem ${marker}` || line === `// ${marker}` || line === `:: ${marker}`))
 }
 async function own(file: string, text: string, mode = 0o644): Promise<void> {
   let foreign = false
@@ -93,7 +95,7 @@ function workerSendGuardScript(): string {
   return String.raw`// ${MARKER}
 import { spawn } from 'node:child_process'
 import { readFileSync, realpathSync } from 'node:fs'
-import { delimiter, dirname, resolve } from 'node:path'
+import { delimiter, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const [program, cli, ...args] = process.argv.slice(2)
@@ -219,10 +221,25 @@ const fold = (value) => process.platform === 'win32' ? value.toLowerCase() : val
 const real = (value) => { try { return realpathSync(value) } catch { return resolve(value) } }
 const env = { ...process.env }
 for (const name of Object.keys(env)) if (name.toLowerCase() === 'path') delete env[name]
-env.PATH = (process.env.PATH ?? '').split(delimiter).filter(entry => entry && fold(real(entry)) !== fold(real(home))).join(delimiter)
+env.PATH = (process.env.PATH ?? process.env.Path ?? '').split(delimiter).filter(entry => entry && fold(real(entry)) !== fold(real(home))).join(delimiter)
+const batch = process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(cli)
+if (batch && (/["&|<>^%!\r\n]/.test(cli) || args.some(arg => /[\r\n\0]/.test(arg)))) {
+  console.error('dsh-superagent: unsafe Windows batch CLI path or argument')
+  process.exit(1)
+}
+// Keep this standalone script's quoting in sync with batchInvocation in commands.ts.
+const batchInvocation = () => {
+  const quote = arg => {
+    if (/^[A-Za-z0-9#$*+./:?@\\_-]+$/.test(arg) && !arg.endsWith('\\')) return arg
+    return '"' + arg.replace(/(\\*)"/g, (_, slash) => slash + slash + '""').replace(/%/g, '%%cd:~,%').replace(/(\\+)$/, '$1$1') + '"'
+  }
+  return '""' + cli + '"' + (args.length ? ' ' + args.map(quote).join(' ') : '') + '"'
+}
 let child
 try {
-  child = spawn(cli, args, { stdio: [inspectedStdin === undefined ? 'inherit' : 'pipe', 'inherit', 'inherit'], env })
+  child = spawn(batch ? process.env.ComSpec ?? 'cmd.exe' : cli,
+    batch ? ['/d', '/e:on', '/v:off', '/s', '/c', batchInvocation()] : args,
+    { stdio: [inspectedStdin === undefined ? 'inherit' : 'pipe', 'inherit', 'inherit'], env, windowsVerbatimArguments: batch })
 } catch (error) {
   console.error('dsh-superagent: could not run ' + program + ': ' + error.message)
   process.exit(127)
@@ -239,7 +256,14 @@ if (inspectedStdin !== undefined && child.stdin) {
   child.stdin.end(inspectedStdin)
 }
 const signals = ['SIGINT', 'SIGTERM', 'SIGHUP']
-const forward = Object.fromEntries(signals.map(signal => [signal, () => { child.kill(signal) }]))
+const forward = Object.fromEntries(signals.map(signal => [signal, () => {
+  if (!batch || child.pid === undefined) { child.kill(signal); return }
+  // A batch CLI runs below cmd.exe: terminate its descendants rather than orphaning the CLI on cancellation.
+  const killer = spawn(join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe'),
+    ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+  killer.on('error', () => child.kill(signal))
+  killer.on('close', code => { if (code !== 0 && child.exitCode === null) child.kill(signal) })
+}]))
 for (const signal of signals) process.on(signal, forward[signal])
 child.on('error', error => {
   console.error('dsh-superagent: could not run ' + program + ': ' + error.message)
@@ -274,6 +298,17 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     await rename(temporary, join(dir, name))
     kept.add(name)
   }
+  if (WINDOWS) {
+    if (!/^[A-Za-z0-9-]+$/.test(github.login) || blockedCommands.some(name =>
+      !/^[A-Za-z0-9._-]+$/.test(name) || name.endsWith('.') || /\.(?:com|exe|cmd|bat)$/i.test(name) ||
+      !WORKER_COMMANDS.includes(name) && WORKER_COMMANDS.some(required => required.toLowerCase() === name.toLowerCase()) ||
+      name !== SEND_GUARD && name.toLowerCase() === SEND_GUARD)) {
+      throw new Error('Unsafe Windows worker command name or account')
+    }
+    for (const path of [dir, process.execPath, github.cli, feishu?.cli ?? '']) {
+      if (BATCH_UNSAFE.test(path)) throw new Error('Unsafe Windows worker CLI path')
+    }
+  }
   const shim = (name: string, body: string): Promise<void> => write(name, `#!/bin/sh\n${MARKER}\n${body}\n`, 0o755)
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
   const guard = join(dir, SEND_GUARD)
@@ -285,10 +320,10 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   await shim('lark-cli', feishu ? guarded('lark-cli', feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
   const blocked = new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name) && name !== SEND_GUARD))
   for (const name of blocked) await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
-  if (process.platform === 'win32') {
+  if (WINDOWS) {
     // cmd.exe and PowerShell ignore extensionless shell scripts; these wrappers hand the same arguments to the guard.
     const cmd = (name: string, lines: readonly string[]): Promise<void> =>
-      write(`${name}.cmd`, `@echo off\r\nrem ${MARKER}\r\n${lines.join('\r\n')}\r\n`)
+      write(`${name}.cmd`, `@echo off\r\nrem ${MARKER}\r\nsetlocal DisableDelayedExpansion\r\n${lines.join('\r\n')}\r\n`)
     const run = (program: 'gh' | 'lark-cli', cli: string): readonly string[] =>
       [`${cmdQuote(process.execPath)} ${cmdQuote(guard)} ${program} ${cmdQuote(cli)} %*`, '@exit /b %errorlevel%']
     await cmd('gh', run('gh', github.cli))
@@ -319,12 +354,22 @@ export function applyEnvironment(variables: Record<string, string | undefined>, 
 
 /** Spawns a command through the DSH subprocess runtime, which strips credential-shaped environment variables. */
 export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[], cwd: string, signal: AbortSignal, env?: Record<string, string>): Promise<string> {
-  const handle = subprocess.spawn({ argv, cwd, graceMs: 2000, signal, ...env ? { env } : {}, stdio: { stdin: 'ignore', stdout: { maxBytes: 1 << 20 }, stderr: { maxBytes: 1 << 16 } } })
-  const { exitCode } = await handle.done
+  let command = argv
+  // DSH has no windowsVerbatimArguments option. Its local provider owns the Node runner and descendants in
+  // a Windows Job (or taskkill fallback), and its abort signal terminates that managed range.
+  const batch = WINDOWS && /\.(?:cmd|bat)$/i.test(command[0] ?? '')
+  if (batch) command = [process.execPath, '-e', windowsBatchRunner, batchInvocation(command[0]!, command.slice(1))]
+  const handle = subprocess.spawn({ argv: command, cwd, graceMs: 2000, signal, ...env ? { env } : {}, stdio: { stdin: 'ignore', stdout: { maxBytes: 1 << 20 }, stderr: { maxBytes: 1 << 16 } } })
+  let exitCode: number | null
+  try { ({ exitCode } = await handle.done) }
+  finally {
+    // done observes the direct Node child; on cancellation wait until the provider proves its range empty.
+    if (batch && signal.aborted && !await handle.waitForExit()) throw new CliError('Windows worker CLI process tree could not be terminated')
+  }
   const read = (reader: SubprocessOutputReader | undefined): string => reader?.readFrom(0).text ?? ''
   if (exitCode === 0) return read(handle.collected.stdout)
   const ended = exitCode === null ? 'was stopped before it finished' : `exited with ${exitCode}`
-  throw new CliError(read(handle.collected.stderr).trim() || `${argv.join(' ')} ${ended}`, undefined, exitCode ?? undefined)
+  throw new CliError(read(handle.collected.stderr).trim() || `${basename(argv[0] ?? 'command')} ${ended}`, undefined, exitCode ?? undefined)
 }
 
 /** Verifies that worker git invocations resolve the deployment's GitHub credential helper. */
@@ -332,7 +377,8 @@ export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 
   const { github, stateDir } = deployment
   // `-z` separates fields with NUL and never quotes paths.
   const helpers = (await runAsWorker(subprocess, ['git', 'config', '-z', '--show-origin', '--get-all', 'credential.https://github.com.helper'], stateDir, AbortSignal.any([signal, AbortSignal.timeout(60_000)])).catch(() => '')).split('\0')
-  if (helpers.join('\0') !== [`file:${workerGitConfig(stateDir)}`, credentialHelper(github.cli), ''].join('\0')) throw new SetupError('gitTooOld')
+  const [origin, helper, ...tail] = helpers
+  if (!origin?.startsWith('file:') || !sameDirectory(origin.slice(5), workerGitConfig(stateDir)) || helper !== credentialHelper(github.cli) || tail.length !== 1 || tail[0] !== '') throw new SetupError('gitTooOld')
 }
 
 /**

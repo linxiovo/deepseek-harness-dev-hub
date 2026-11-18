@@ -40,6 +40,40 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Check plugin
         run: pnpm check
+      - name: Write commit identity manifest
+        working-directory: ${{ github.workspace }}
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PULL_REQUEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p plugin/ci-evidence
+          cp .github/workflows/plugin-ci.yml plugin/ci-evidence/plugin-ci.yml
+          node - <<'NODE'
+          const fs = require('node:fs')
+          const e = process.env
+          fs.writeFileSync('plugin/ci-evidence/commit.json', JSON.stringify({
+            repository: e.REPOSITORY,
+            sha: e.SHA,
+            ref: e.REF,
+            run_id: e.RUN_ID,
+            run_attempt: e.RUN_ATTEMPT,
+            ...(e.PULL_REQUEST_HEAD_SHA ? { pull_request_head_sha: e.PULL_REQUEST_HEAD_SHA } : {}),
+            workflow: '.github/workflows/plugin-ci.yml',
+          }, null, 2) + '\n')
+          NODE
+      - name: Upload plugin build and commit identity
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-check-${{ github.sha }}
+          path: |
+            plugin/lib
+            plugin/ci-evidence
+          if-no-files-found: error
+          overwrite: true
 
   windows:
     name: windows
@@ -63,9 +97,5 @@ jobs:
           package_json_file: plugin/package.json
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-      - name: Typecheck
-        run: pnpm typecheck
-      - name: Test handoff
-        run: pnpm exec vitest run tests/handoff.spec.ts
-      - name: Build
-        run: pnpm build
+      - name: Check plugin
+        run: pnpm check

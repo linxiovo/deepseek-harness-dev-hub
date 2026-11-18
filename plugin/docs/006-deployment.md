@@ -20,7 +20,7 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 
 ## Prerequisites
 
-- Node.js 22.19+ or 24+, pnpm, git 2.32+, Python 3.8+ and tmux
+- Node.js 22.19+ or 24+, pnpm, git 2.32+, plus Python 3.8+ and tmux on POSIX hosts for `scripts/dsh-superagent`
 - GitHub CLI (`gh`) 2.48 or later. Source CLI fields must point to `gh` or `lark-cli` wrappers; the host relies on their subcommands and output formats.
 - A repository on github.com; GitHub Enterprise Server is not supported. Keep a local clone of it and name that clone in the Execution settings: the Executor creates one worktree per Ticket there. Install `git-lfs` if that repository uses Git LFS.
 - A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
@@ -28,22 +28,24 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 
 ### Development checks
 
-From the repository root, use pnpm 11.7.0 with a supported Node.js version. [Plugin CI](../../.github/workflows/plugin-ci.yml) runs on Ubuntu (`check`) and native Windows (`windows`) for pushes and pull requests targeting `main`, with read-only repository access. Linux `check` waits for Windows and explicitly fails if Windows fails; it is not skipped (GitHub treats skipped required jobs as successful). To run the full check locally on Linux (or in WSL):
+Plugin CI (`.github/workflows/plugin-ci.yml`) runs on pushes to `main` and pull requests targeting `main`, uses Node.js 22.19.0 and pnpm 11.7.0, and has read-only repository access. Both jobs are required: native Windows (`windows`) runs `pnpm check` first, and Ubuntu (`check`) waits for it. Unless the workflow itself is cancelled, any Windows result other than `success` makes `check` fail explicitly before checkout, rather than letting GitHub treat a skipped required job as passing.
+
+`pnpm check` runs typechecking, every applicable test, and the build, in that order. Native Windows runs the full Windows-applicable suite: `vitest.config.ts` excludes only `tests/service-script.spec.ts`, which exercises the POSIX service script and requires Python `fcntl`. Linux and WSL run the full suite including those tests. To run the check locally on your platform, use supported Node.js and pnpm 11.7.0 and run from the repository root:
 
 ```sh
 pnpm -C plugin install --frozen-lockfile
 pnpm -C plugin check
 ```
 
-`check` runs typechecking, the full test suite and the build. Some tests require POSIX utilities and fail on native Windows. The Windows job runs typechecking, the handoff tests and the build; use the same commands locally in PowerShell after installing dependencies as above:
+Opt in to local Git hooks with `pnpm -C plugin run hooks:install`. The pre-commit hook typechecks and runs `tests/docs.spec.ts`, `tests/tickets.spec.ts`, and `tests/handoff.spec.ts`; it does not replace CI.
 
-```sh
-pnpm -C plugin typecheck
-pnpm -C plugin exec vitest run tests/handoff.spec.ts
-pnpm -C plugin build
-```
+Set the GitHub Source's `requiredChecks` to `[{"id":"check"},{"id":"windows"}]` for Ticket and plan evidence. Where branch protection is available, require both jobs there too. Those are separate settings; the workflow changes neither, and a job dependency alone does not restrict merging.
 
-Use WSL or Linux for the full suite. After the local hook installer is merged into `main`, run `pnpm -C plugin run hooks:install` in your own checkout to opt into local pre-commit checks. GitHub branch-protection rules and the GitHub Source's `requiredChecks` must be configured separately to require `windows` at merge time or for ticket evidence; the job dependency alone does not restrict merging.
+#### CI build and commit evidence
+
+After both platform checks pass, the Ubuntu job uploads `plugin-check-<github.sha>` from `plugin/lib` and `plugin/ci-evidence`. The evidence directory contains the workflow YAML and `commit.json`, which records `repository`, `sha`, `ref`, `run_id`, `run_attempt`, `workflow`, and, for pull requests, `pull_request_head_sha`. On a push, `sha` is the pushed commit. On a pull request, `sha` and the artifact name identify the synthetic merge commit that CI built, while `pull_request_head_sha` identifies the candidate commit used for the Actions evidence lookup.
+
+When using the build as evidence, match the manifest to the expected repository, commit and run attempt. A successful rerun replaces the artifact; a rerun that fails before upload can leave the previous attempt's artifact available. An artifact alone is not proof that both required jobs passed for the candidate commit.
 
 ## Accounts
 
@@ -64,6 +66,7 @@ Use WSL or Linux for the full suite. After the local hook installer is merged in
    ```
 
    Sign in as the agent account; the last command prints its login. dsh-superagent reads the login the same way.
+   The shell wrapper above is a POSIX example. On Windows, configure the GitHub Source CLI with an absolute path to a native executable or a `.cmd`/`.bat` wrapper, or a command name available on `PATH` via `PATHEXT`.
 
 ### Feishu bot (optional)
 
@@ -86,6 +89,8 @@ Use WSL or Linux for the full suite. After the local hook installer is merged in
    The host refuses a CLI that can act as a user. It reads the app id, Feishu/Lark brand and bot `open_id` from the bot configuration.
 
    Both configurations share the keychain entry for the app secret. To remove only the bot configuration, delete its directory; do not run `lark-cli config remove`, which would affect the shared secret.
+
+   On Windows, the live event consumer also accepts `.cmd` and `.bat` wrappers. Use a path without `cmd.exe` metacharacters; paths containing them are rejected.
 
 ## Install
 
@@ -111,7 +116,7 @@ Copy [examples/profile.cordis.patch.yml](../examples/profile.cordis.patch.yml) t
 
 | Key | Required | Meaning |
 | --- | --- | --- |
-| `stateDir` | yes | Absolute path: the database, the lock, the command shims in `worker-bin`, the agent's git configuration and, by default, the Ticket directories in `work`. Back it up before upgrades |
+| `stateDir` | yes | Absolute path (a drive or UNC path on Windows): the database, the lock, command shims in `worker-bin`, the agent's git configuration and, by default, Ticket directories in `work`. Back it up before upgrades |
 | `promptMaxChars`, `admissionContextMaxPages`, `admissionContextTimeoutMs` | no | The largest saved prompt configuration, and how many Thread pages one assessment reads within what time |
 
 After the first start, edit machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Changes apply without restart. `stateDir` cannot be changed there. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
@@ -123,7 +128,7 @@ scripts/dsh-superagent start
 scripts/dsh-superagent status
 ```
 
-`start` runs `dsh --profile superagent` in tmux session `dsh-superagent`, or `dsh-<profile>` for another profile. It waits up to one minute for the runtime to become ready or report a setup requirement. On a first run it prints the missing setup information. It refuses duplicate instances, including ones started outside this script.
+`scripts/dsh-superagent` is a POSIX-only script (it uses Python `fcntl`, `ps`, and `tmux`). `start` runs `dsh --profile superagent` in tmux session `dsh-superagent`, or `dsh-<profile>` for another profile. It waits up to one minute for the runtime to become ready or report a setup requirement. On a first run it prints the missing setup information. It refuses duplicate instances, including ones started outside this script.
 
 `stop` and `restart` request graceful shutdown and wait up to five minutes for Executors. They never force-kill the process or touch other tmux sessions.
 
@@ -222,7 +227,7 @@ A refusal has a status and `error`, its English text:
 
 The blocks:
 
-- `source:github`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository` and `cli`, and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
+- `source:github`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository`, `cli`, `requiredChecks` (`[{"id": "…"}]`, empty by default, naming exact required GitHub Actions jobs), and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
 - `policy`: `{"rules": […], "sources": {"github": {"allowed": [{"id": "<login>"}], "bots": [{"id": "dependabot[bot]"}]}, "feishu": {"allowed": [{"id": "ou_…", "name": "…"}], "syncChat": "oc_…", "admission": {"oc_…": {"unlistedAddressed": "explicit"}}}}}`. `bots` lists the bots whose messages may become inferred candidates. An `admission` row is keyed by chat id, `other` or `direct` for Feishu, and by `issues`, `pulls`, `comments` or `ci` for GitHub; an unset cell takes its default (see [002 Authorization](002-authorization.md)).
 - `eval`: `mode`, `timeoutSeconds` and `model`.
 - `executor`: `model`, `maxWorkers`, `repository`, `baseRef`, `directory`, `prepare` and `blockedCommands`. The processing pause is a setting of its own, `paused`, which `POST executor/pause` sets.
@@ -300,6 +305,7 @@ Setup problems appear on the overview with a link to the fix, in the panel's lan
 | `The bot lark-cli allows user identities` | Point the Feishu Source at a bot-only configuration, as in Feishu bot above |
 | `The bot lark-cli does not work.` or `The bot identity of app … is …` | Check the configuration's app id and secret |
 | `The Feishu bot is not a member of the chat.` | Add the bot to the chat in the chat's settings; the next attempt succeeds |
+| `Unsafe Feishu bot batch CLI path` | Rename or move the Windows `.cmd`/`.bat` Feishu CLI wrapper so its path contains no `"`, `&`, `\|`, `<`, `>`, `^`, `%`, `!`, or newline characters |
 | `status` exits 2 | A part reports an error, which a restart does not fix: `errors` names each part, as listed under Management API, with its detail; each part clears its own entry once it works again |
 | `status` exits 3 | Setup waits: `setup` says what is missing, and the overview links to the setting that fixes it |
 | `status` exits 1 | The service does not run, runs twice, does not answer, or its runtime reports an error; the output and the newest log say which |

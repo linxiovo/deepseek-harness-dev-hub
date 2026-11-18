@@ -205,6 +205,16 @@ Plugins receive `SourceHost`: the registry and `context(kind)`. The kind itself 
 
 That context supplies deployment and commands, setup readiness (`ready`, `configured`, `problem`), configuration, `receive`, `atomic`, and typed `state`. It also exposes Thread reads and metadata writes, Ticket reads and binding/closure commands, Trigger reads, `notify` through Outbox, and `report` for declared health entries.
 
+### Actions evidence
+
+`src/sources/actions-evidence.ts` is the shared read-only provider for GitHub Actions results, not a second CI poller. `actionsEvidence(commands, work, sha, required, pr?)` queries `actions/runs?head_sha=<sha>` in the configured repository, then reads each matching run's latest-attempt jobs and run-level artifacts. It pages all three collections and never reads CI logs. The candidate SHA must be complete and lowercase. For PR evidence, `sha` is the PR head, not GitHub's synthetic merge commit; a run must match `head_sha` and include the same PR number, head SHA and base SHA in `pull_requests`. This rules out an unrelated push or a stale-base PR run on the same commit.
+
+The result identifies the provider, repository, work item (`ticket` or `plan` and its id), candidate `sha` and required names. Each check reports its name, status, conclusion, `passed`, run metadata when present (`id`, `attempt`, `sha`, optional `mergeSha`, `url`), the job id and URL when available, and artifact download references (`id`, `name`, `url`, `expired`). `run.sha` is the REST `head_sha`; `mergeSha` is contextual PR metadata, not the query key or proof of the checkout. Artifacts are listed for the run, not verified against its latest attempt. See [CI build and commit evidence](006-deployment.md#ci-build-and-commit-evidence) for the manifest that identifies the actual build.
+
+A check passes only when the workflow run and the job both completed with `success`, and the job matches the exact required name, run id, attempt and candidate SHA. The provider considers matching runs in execution order, so a newer attempt of the same workflow that has not scheduled the job takes precedence over an older success. With no job, evidence keeps the applicable run's status (or `pending` if it has none); `not_run` denotes no matching run or a successful run that omitted the job. Missing, pending, failed, cancelled, skipped or timed-out evidence does not pass. API failures propagate instead of reporting success.
+
+`satisfied` requires every configured job to pass. The GitHub Source's explicit `requiredChecks` list supplies the exact names; the provider returns `required_checks_unconfigured` without querying Actions when the list is empty. It does not infer checks from branch protection or PR state and does not replace `pullChecks`, the Source's existing polling for Trigger events. See [development checks](006-deployment.md#development-checks) for this repository's required Windows and Ubuntu jobs.
+
 ### DshExecutor
 
 `DshExecutor` (`src/executor/dsh.ts`) provides one Session and one verified Git worktree per Ticket. `start` and `deliver` enqueue `launch` and `delivery` effects. `stop` cancels the turn through `Store.afterCommit`, so a rolled-back end does not stop the worker.
@@ -321,7 +331,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 
 - Outbox applies the Feishu chat word limit.
 - `src/app/links.ts` resolves Feishu message links and `repliedTo`. It and Runtime read settings with `feishuSettings`.
-- `src/app/resources.ts` reads the `feishu/` and `github/` originals; `src/app/cards.ts` uses `pullOf` for Ticket cards.
+- `src/app/resources.ts` reads the `feishu/` and `github/` originals and the `actions/` evidence; `src/app/cards.ts` uses `pullOf` for Ticket cards.
 - Runtime sends `pullEndNotices` through the Outbox for merged or closed Tickets.
 - Executor tools bind reported pull requests with `readPull` and `claimPull`, using the GitHub context exposed by Runtime.
 - MasterAssessor reads repository files with `readRepositoryPath`.
@@ -403,8 +413,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents` (descendant cleanup per `010-session-boundaries.md`), `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/executor/worktree.ts` | `inspectRepository`, `inspectWorktree` and `validateWorktreeDestination`, read-only Git checks through `Commands.git`: the configured repository must be a clone's main checkout, a Ticket's `worktree` must be its canonical linked secondary worktree with the same common git directory, `--show-toplevel`, branch, pinned base (exact on a fresh path, an ancestor for reuse) and, on reuse, a previously verified `ExecutionClaim` of the same ticket and assignment, and a Ticket destination or worktree root must lie outside the clone's checkouts and any unrelated Git checkout; refusals are `WorktreeRejected` with a `WorktreeRejectionCode`, and it never creates, repairs or deletes |
 | `src/executor/repository-identity.ts` | `validateRepositoryIdentity` reads the clone's local `remote.origin.url` without modifying it or contacting GitHub; it accepts one direct github.com HTTPS, SSH or Git URL for the configured owner/name, case-insensitively and with an optional `.git` suffix, and refuses missing, ambiguous, unsupported or mismatched origins with `WorktreeRejected` |
-| `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
-| `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
+| `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. Supports native Windows batch wrappers and process-tree cancellation. `CliError` carries the code reported by the CLI, such as a GitHub HTTP status; when nothing is printed, the error describes how the command ended without exposing its arguments. `validItems` skips and counts malformed list items |
+| `src/infra/environment.ts` | The agent's process environment: platform-specific command shims, the git configuration and credential helper, `runAsWorker` through the DeepSeek Harness subprocess interface, and the checks of the environment and of a Ticket's directory |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
 | `src/infra/text.ts` | Word counts and the chat message limit, `fill` and `sameName` |
 | `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer |
@@ -417,9 +427,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/github-pull.ts` | The pull request rules: which pull requests a Ticket follows (`claimPull`, `observePull`), the closes it reports to the Engine, and `pullEndNotices`, the chat notice of a Ticket that ended merged or closed |
 | `src/sources/github-channel.ts` | The GitHub Channel: comments and review thread replies, `sent` or `gone` |
 | `src/sources/github-read.ts` | CI snapshots, repository reads, the `github/` resources, and `githubThreadContext`: an Issue's or pull request's conversation by page |
+| `src/sources/actions-evidence.ts` | The shared GitHub Actions evidence provider: `EvidenceWork`, `ActionsEvidence` and `actionsEvidence`, which read one complete candidate commit's workflow runs (with optional PR provenance filtering), latest-attempt jobs and artifacts, and never logs |
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
-| `src/sources/feishu-loops.ts` | The Feishu loops: the event consumer, history recovery, chat names and polling of subscribed topics. Event-processing errors remain visible for that consumer run even if stderr readiness arrives later |
+| `src/sources/feishu-loops.ts` | The Feishu event consumer, including Windows batch-wrapper launch and process-tree cancellation, history recovery, chat names and polling of subscribed topics. Event-processing errors stay visible for that consumer run even if readiness arrives later |
 | `src/sources/feishu-channel.ts` | The Feishu Channel: topic replies, `sent` or `gone` |
 | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
@@ -461,9 +472,10 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
-| `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
+| `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, cross-platform Feishu event consumer launch and cancellation, health |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
+| `tests/actions-evidence.spec.ts` | GitHub Actions evidence at the REST seam: candidate-SHA runs, PR provenance matching (`number`, `head.sha`, `base.sha`) and `mergeSha` context, workflow and job `success` gates, queued/waiting runs without jobs vs `not_run`, run and job URLs, downloadable artifact references, stale SHAs, newer attempts, an empty required set and paginated lists |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, a host that stops, and bounded subagent release |
@@ -482,7 +494,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
-| `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, worktree and writer facts, Hub-only `session/<id>` metering, main tools, and internal Worker take-up without an outbound message |
+| `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
 | `tests/http.spec.ts` | Management request bounds; ticket worktree and writer projections; Session meter success, errors, ID decoding and same-origin protection |
@@ -627,10 +639,19 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 | `models`, `models/<provider>` | Available models |
 | `session/<id>` | The `SessionMeterView` of one Session: its `context` snapshot and cumulative `usage`, with provenance, quality, sampled ranges and missing ranges; main Session only |
 | `feishu/<trigger id>/…`, `github/…` | Original Source records, described in the Source skills |
+| `actions/<ticket\|plan>/<id>/commit/<40 lowercase hex SHA>` | GitHub Actions evidence for one owned commit, main Session only |
 
 Ticket Threads are marked `context` for context-only follows and `bound` for Source bindings. Assignment pages are newest first and include report previews. Continue lists with `next_offset`. `/input/<id>` accepts an Input's name or id. `settings` includes small blocks in full and summarizes Policy and Source blocks.
 
 Source resources include message neighborhoods, `github/pulls/<n>/thread/<comment id>` and `github/commits/<sha>/checks`.
+
+`actions/<ticket|plan>/<id>/commit/<40 lowercase hex SHA>` exposes [Actions evidence](#actions-evidence) to the main Session only. The resource requires a stored Ticket or handoff and an exact commit, not a ref or abbreviated SHA. Before querying Actions, it verifies that the candidate belongs to the work item and the configured repository:
+
+- For a Ticket with its own GitHub pull request, the latest such binding supplies the PR number. The PR's current head SHA and head repository must match the candidate and configured repository. The PR's number, current base SHA, and optional synthetic merge SHA go to the evidence provider.
+- For a Ticket without its own GitHub PR, its recorded execution directory must be the checkout root, with an `origin` matching the configured repository and `HEAD` equal to the candidate SHA.
+- For a plan, the handoff's project repository must match the configured repository, and its workspace must pass the same checkout, `origin` and `HEAD` checks.
+
+A mismatch or unverifiable identity is refused. The read does not change Git or GitHub state, emit a Trigger, or change settings or Ticket state. Read offset 0 first; later offsets page the same snapshot.
 
 An original's messages read in one compact shape, `{id, from, at, text, reply_to?, path?, line?, url?}`, not as GitHub or Feishu records them.
 

@@ -1,19 +1,20 @@
-import { execFile, spawn } from 'node:child_process'
+import { execFile, spawn, type ExecFileOptionsWithStringEncoding } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
+import { setTimeout as delay } from 'node:timers/promises'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { Context } from '@deepseek-ai/cordis'
 import type { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { ToolRuntime, type ToolDefinition } from '@deepseek-ai/dsh-tools'
-import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
+import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, verifyEnvironment, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
   from '../src/infra/environment.ts'
-import { CliError, Commands } from '../src/infra/commands.ts'
+import { batchInvocation, CliError, Commands } from '../src/infra/commands.ts'
 import { sendFeishu } from '../src/sources/feishu-channel.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 import { gitEnv } from './fixtures/git.ts'
@@ -23,7 +24,12 @@ vi.setConfig({ testTimeout: 30_000 })
 const exec = promisify(execFile)
 const windows = process.platform === 'win32'
 let dir: string
-const program = (path: string, body: string): string => { writeFileSync(path, `#!/bin/sh\n${body}\n`); chmodSync(path, 0o755); return path }
+const program = (path: string, body: string, batch?: string): string => {
+  writeFileSync(path, `#!/bin/sh\n${body}\n`)
+  chmodSync(path, 0o755)
+  if (windows && batch !== undefined) writeFileSync(`${path}.cmd`, `@echo off\r\n${batch}\r\n`)
+  return windows && batch !== undefined ? `${path}.cmd` : path
+}
 /** The first executable on PATH with a Windows executable extension; Node cannot run an extensionless POSIX script here. */
 const executable = (name: string): string | undefined => {
   for (const directory of (process.env.PATH ?? '').split(delimiter)) {
@@ -42,6 +48,33 @@ const shell: string = foundShell
 /** The directory links the tests can create without privileges: junctions on Windows, directory symlinks elsewhere. */
 const directoryLink = (target: string, path: string): void => { symlinkSync(target, path, windows ? 'junction' : 'dir') }
 const removeDirectoryLink = (path: string): void => { if (windows) rmdirSync(path); else rmSync(path) }
+const shim = (bin: string, name: string): string => join(bin, `${name}${windows ? '.cmd' : ''}`)
+const invoke = (file: string, args: string[], options: ExecFileOptionsWithStringEncoding = {}) =>
+  windows ? exec(process.env.ComSpec ?? 'cmd.exe', ['/d', '/e:on', '/v:off', '/s', '/c', batchInvocation(file, args)], { ...options, windowsVerbatimArguments: true })
+    : exec(file, args, options)
+const waitForPid = async (file: string): Promise<number> => {
+  for (let i = 0; i < 250; i++) {
+    try {
+      const pid = Number(readFileSync(file, 'utf8'))
+      if (Number.isSafeInteger(pid) && pid > 0) return pid
+    } catch { /* The child has not written its PID yet. */ }
+    await delay(20)
+  }
+  throw new Error('The child did not start')
+}
+const waitForExit = async (pid: number): Promise<void> => {
+  for (let i = 0; i < 250; i++) {
+    try { process.kill(pid, 0) } catch { return }
+    await delay(20)
+  }
+  throw new Error('The child process tree survived cancellation')
+}
+const cleanupPid = async (pid: number | undefined): Promise<void> => {
+  if (pid === undefined) return
+  try { process.kill(pid, 0) } catch { return }
+  if (windows) await exec(join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe'), ['/PID', String(pid), '/T', '/F'], { timeout: 5_000 }).catch(() => {})
+  else try { process.kill(pid, 'SIGKILL') } catch { /* Already exited. */ }
+}
 /** Worker shell environment after DSH strips credential-shaped variables. */
 const workerEnv = (env: Record<string, string | undefined>): Record<string, string> =>
   Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined && !SENSITIVE_ENV_PATTERN.test(entry[0])))
@@ -176,6 +209,7 @@ describe('worker shims', () => {
     expect(parsed.config).toBe(config)
     // The wrapper's `gh` resolves past the shim directory to the caller's other entries.
     expect(parsed.path).not.toContain('worker-bin')
+    // The fake CLI is a POSIX shell script; its PATH variable is colon-separated even in Git Bash.
     expect(parsed.path.split(':')).toEqual(expect.arrayContaining([expect.stringMatching(/venv$/), expect.stringMatching(/real$/)]))
   })
   it('make `lark-cli` fail without a Feishu bot and each blocked command fail with the agent\'s login', async () => {
@@ -184,6 +218,13 @@ describe('worker shims', () => {
       stderr: 'lark-cli is unavailable: this installation has no Feishu bot.\n' })
     await expect(runByName('personal-gh', [], workerShell())).rejects.toMatchObject({ code: 1,
       stderr: 'personal-gh is blocked in this installation; use gh, which acts as agent-bot.\n' })
+    if (windows) {
+      const before = readFileSync(shim(workerBin(dir), 'gh'), 'utf8')
+      await expect(writeEnvironment(testDeployment({ stateDir: dir }), ['GH'])).rejects.toThrow('Unsafe Windows worker command name or account')
+      await expect(writeEnvironment(testDeployment({ stateDir: dir }), ['personal-gh.exe'])).rejects.toThrow('Unsafe Windows worker command name or account')
+      await expect(writeEnvironment(testDeployment({ stateDir: dir }), ['SEND-GUARD.MJS'])).rejects.toThrow('Unsafe Windows worker command name or account')
+      expect(readFileSync(shim(workerBin(dir), 'gh'), 'utf8')).toBe(before)
+    }
   })
   it('keep `gh` and `lark-cli` working, and shim no `git`, when the blocked commands name the commands workers need', async () => {
     const deployment = fakeDeployment()
@@ -486,11 +527,75 @@ describe('worker shims', () => {
       await close()
     }
   })
+  it.skipIf(!windows)('launches a configured batch wrapper without recursive shims or shell injection', async () => {
+    program(join(dir, 'real', 'gh'), 'exit 0',
+      `"${process.execPath}" -e "process.stdout.write(JSON.stringify({login:'agent-bot',config:process.env.GH_CONFIG_DIR,path:process.env.PATH,args:process.argv.slice(1)}))" %*`)
+    const config = join(dir, 'agent-config')
+    const tools = join(dir, 'configured tools'); mkdirSync(tools)
+    const wrapper = program(join(tools, 'gh-agent'), 'exit 0', `set "GH_CONFIG_DIR=${config}"\r\ngh %*`)
+    const deployment = testDeployment({ stateDir: dir, github: { ...testDeployment().github, cli: wrapper }, feishu: undefined })
+    await writeEnvironment(deployment, [])
+    const bin = workerBin(dir)
+    const path = [bin, join(dir, 'venv'), join(dir, 'real'), dirname(process.execPath), ...(process.env.PATH ?? '').split(delimiter)].join(delimiter)
+    const injected = join(dir, 'injected')
+    const args = ['api', 'user', '--raw-field', `body=hello & echo pwned > ${injected}`]
+    const { stdout } = await invoke(shim(bin, 'gh'), args, { env: { ...workerShell(), PATH: path }, timeout: 10_000 })
+    const result = JSON.parse(stdout) as { login: string; config: string; path: string; args: string[] }
+    expect(result).toMatchObject({ login: 'agent-bot', config, args })
+    expect(result.path.split(delimiter)).toEqual(expect.arrayContaining([expect.stringMatching(/venv$/), expect.stringMatching(/real$/)]))
+    expect(result.path.split(delimiter)).not.toContain(bin)
+    expect(() => readFileSync(injected, 'utf8')).toThrow()
+    await expect(invoke(shim(bin, 'gh'), ['issue', 'comment', '1', '--body', 'hello'], { env: { ...workerShell(), PATH: path } }))
+      .rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('direct channel sends are disabled') })
+  })
+  it('forwards configured batch CLIs through Commands and the DSH worker spawn without exposing arguments in failures', async () => {
+    const gh = program(join(dir, 'gh-agent'), `exec "${process.execPath}" -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' "$@"`,
+      `"${process.execPath}" -e "process.stdout.write(JSON.stringify(process.argv.slice(1)))" %*`)
+    const lark = program(join(dir, 'lark-bot'), `exec "${process.execPath}" -e 'process.stdout.write(JSON.stringify({ok:true,data:process.argv.slice(1)}))' "$@"`,
+      `"${process.execPath}" -e "process.stdout.write(JSON.stringify({ok:true,data:process.argv.slice(1)}))" %*`)
+    const base = testDeployment()
+    const deployment = testDeployment({ stateDir: dir, github: { ...base.github, cli: gh }, feishu: { ...base.feishu!, cli: lark } })
+    await writeEnvironment(deployment, [])
+    const commands = new Commands(() => deployment, agentVariables(dir), new AbortController().signal)
+    const injected = join(dir, 'injected')
+    const args = ['api', 'repos/acme/widgets/issues?state=open&per_page=10', '--jq', '{name: .full_name, push: .permissions.push}', '--raw-field', `body=hello & echo pwned > ${injected}`]
+    expect(await commands.gh(args)).toEqual(args)
+    expect(await commands.lark(['api', 'GET', '/open-apis/bot/v3/info'])).toEqual(['api', 'GET', '/open-apis/bot/v3/info', '--as', 'bot', '--format', 'json'])
+    expect(JSON.parse(await runAsWorker(subprocess(join(dir, 'global')), [gh, ...args], dir, new AbortController().signal))).toEqual(args)
+    expect(() => readFileSync(injected, 'utf8')).toThrow()
+    const failing = program(join(dir, 'failing'), 'exit 7', 'exit /b 7')
+    const error = await commands.run(failing, ['private-message']).catch((failure: unknown) => failure)
+    expect(error).toBeInstanceOf(CliError)
+    if (!(error instanceof CliError)) throw error
+    expect(error.message).not.toContain('private-message')
+    if (windows) {
+      const unsafe = join(dir, 'unsafe&cli.cmd')
+      await expect(commands.run(unsafe, [])).rejects.toThrow('Unsafe batch CLI path or argument')
+      await expect(writeEnvironment({ ...deployment, github: { ...deployment.github, cli: unsafe } }, [])).rejects.toThrow('Unsafe Windows worker CLI path')
+    }
+  })
+
+  it('ends a batch CLI child when Commands.run is aborted', async () => {
+    const pidFile = join(dir, 'child.pid')
+    const cli = program(join(dir, 'long-running'), `exec "${process.execPath}" -e 'require("node:fs").writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)' "${pidFile}"`,
+      `"${process.execPath}" -e "require('node:fs').writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)" "${pidFile}"`)
+    const controller = new AbortController()
+    const commands = new Commands(() => testDeployment(), {}, controller.signal)
+    const running = commands.run(cli, [])
+    let pid: number | undefined
+    try {
+      pid = await waitForPid(pidFile)
+      controller.abort()
+      await expect(running).rejects.toMatchObject({ name: 'AbortError' })
+      await waitForExit(pid)
+    } finally { controller.abort(); void running.catch(() => {}); await cleanupPid(pid) }
+  })
+
   it('replace only what dsh-superagent wrote and refuse anything else in its places', async () => {
     await writeEnvironment(testDeployment({ stateDir: dir }), ['old-cli'])
     await writeEnvironment(testDeployment({ stateDir: dir }), [])
     expect(readdirSync(workerBin(dir)).sort()).toEqual(workerFiles().sort())
-    // A file that merely contains the marker on a later line, a directory link to a shim, and a foreign gitconfig are all rejected.
+    // A marker on a later line, a directory link, and a foreign guard or gitconfig are all rejected.
     writeFileSync(join(workerBin(dir), 'notes'), `notes\nmore\n${readFileSync(join(workerBin(dir), 'gh'), 'utf8').split('\n')[1]}\n`)
     await expect(writeEnvironment(testDeployment({ stateDir: dir }), [])).rejects.toThrow(`${join(workerBin(dir), 'notes')} was not written by dsh-superagent`)
     rmSync(join(workerBin(dir), 'notes'))
@@ -498,6 +603,12 @@ describe('worker shims', () => {
     directoryLink(join(dir, 'elsewhere'), join(workerBin(dir), 'link'))
     await expect(writeEnvironment(testDeployment({ stateDir: dir }), [])).rejects.toThrow('link was not written by dsh-superagent')
     removeDirectoryLink(join(workerBin(dir), 'link'))
+    const guard = join(workerBin(dir), 'send-guard.mjs')
+    const original = readFileSync(guard, 'utf8')
+    writeFileSync(guard, 'foreign guard\n')
+    await expect(writeEnvironment(testDeployment({ stateDir: dir }), [])).rejects.toThrow(`${guard} was not written by dsh-superagent`)
+    expect(readFileSync(guard, 'utf8')).toBe('foreign guard\n')
+    writeFileSync(guard, original)
     writeFileSync(workerGitConfig(dir), '[user]\n\tname = someone\n')
     await expect(writeEnvironment(testDeployment({ stateDir: dir }), [])).rejects.toThrow(`${workerGitConfig(dir)} was not written by dsh-superagent`)
     expect(readFileSync(workerGitConfig(dir), 'utf8')).toBe('[user]\n\tname = someone\n')
@@ -505,7 +616,7 @@ describe('worker shims', () => {
   it('replaces the files it wrote under the project\'s earlier names', async () => {
     await writeEnvironment(testDeployment({ stateDir: dir }), ['old-cli', 'older-cli'])
     const legacy = (file: string, name: string) => writeFileSync(file, readFileSync(file, 'utf8').replace('Written by dsh-superagent', `Written by ${name}`))
-    legacy(join(workerBin(dir), 'old-cli'), 'dsh-tag'); legacy(join(workerBin(dir), 'older-cli'), 'dsh-freelancer'); legacy(workerGitConfig(dir), 'dsh-go')
+    legacy(shim(workerBin(dir), 'old-cli'), 'dsh-tag'); legacy(shim(workerBin(dir), 'older-cli'), 'dsh-freelancer'); legacy(workerGitConfig(dir), 'dsh-go')
     await writeEnvironment(testDeployment({ stateDir: dir }), [])
     expect(readdirSync(workerBin(dir)).sort()).toEqual(workerFiles().sort())
     expect(readFileSync(workerGitConfig(dir), 'utf8')).toContain('Written by dsh-superagent')
@@ -563,9 +674,12 @@ describe('agent git configuration', () => {
     await git('init', '-q', 'repo')
     await exec('git', ['-C', 'repo', 'remote', 'add', 'origin', 'git@github.com:acme/widgets.git'], { cwd: dir, env })
     expect(await git('-C', 'repo', 'remote', 'get-url', '--push', 'origin')).toBe('https://github.com/acme/widgets.git')
-    // `-z` is git's machine-readable output: NUL-separated fields, with no quoting of Windows backslashes.
-    expect((await git('config', '-z', '--show-origin', '--get-all', 'credential.https://github.com.helper')).split('\0'))
-      .toEqual([`file:${workerGitConfig(dir)}`, credentialHelper('/opt/agent tools/gh'), ''])
+    // `-z` is NUL-separated; Git may spell the same Windows path with slashes and different casing.
+    const [origin, helper, tail] = (await exec('git', ['config', '-z', '--show-origin', '--get-all', 'credential.https://github.com.helper'], { cwd: dir, env })).stdout.split('\0')
+    expect(origin?.startsWith('file:')).toBe(true)
+    expect(origin?.slice(5).replaceAll('\\', '/').toLowerCase()).toBe(workerGitConfig(dir).replaceAll('\\', '/').toLowerCase())
+    expect([helper, tail]).toEqual([credentialHelper('/opt/agent tools/gh'), ''])
+    await expect(verifyEnvironment(deployment, subprocess(workerGitConfig(dir)), new AbortController().signal)).resolves.toBeUndefined()
     expect(await git('config', '--get-all', 'credential.helper')).toBe('')
     await expect(git('config', 'commit.gpgsign')).rejects.toThrow()
     await expect(git('config', 'core.abbrev')).rejects.toThrow()
@@ -579,8 +693,8 @@ describe('agent git configuration', () => {
 
 it('fails instead of asking the operator\'s askpass helpers when the agent\'s credential helper has no answer', async () => {
   const log = join(dir, 'asked')
-  const askpass = program(join(dir, 'askpass'), `echo asked >> ${log}; echo operator-secret`)
-  const agent = program(join(dir, 'real', 'gh'), 'exit 0')
+  const askpass = program(join(dir, 'askpass'), `echo asked >> ${log}; echo operator-secret`, `echo asked >> "${log}"\r\necho operator-secret`)
+  const agent = program(join(dir, 'real', 'gh'), 'exit 0', 'exit /b 0')
   const deployment = testDeployment({ stateDir: dir, github: { ...testDeployment().github, cli: agent } })
   await writeEnvironment(deployment, [])
   const env = workerEnv({ PATH: process.env.PATH, HOME: dir, GIT_ASKPASS: askpass, SSH_ASKPASS: askpass, ...agentVariables(dir) })
@@ -596,21 +710,30 @@ it('removes every spelling of a directory from PATH and keeps the other entries'
   mkdirSync(join(dir, 'state', 'worker-bin'), { recursive: true })
   directoryLink(join(dir, 'state'), join(dir, 'link'))
   const bin = join(dir, 'state', 'worker-bin')
-  const kept = [join(dir, 'elsewhere'), 'node_modules/.bin']
+  const kept = [join(dir, 'elsewhere'), windows ? 'C:\\Windows' : '/usr/bin', 'node_modules/.bin']
   expect(withoutDirectory([`${bin}/`, join(dir, 'link', 'worker-bin'), ...kept].join(delimiter), bin)).toBe(kept.join(delimiter))
   removeDirectoryLink(join(dir, 'link'))
 })
 
-/** Minimal SubprocessRuntime backed by child_process.spawn with an isolated global git config. */
-const subprocess = (config: string): SubprocessRuntime => ({
-  spawn: ({ argv, cwd }: { argv: readonly string[]; cwd: string }) => {
-    const child = spawn(argv[0]!, argv.slice(1), { cwd, env: gitEnv({ GIT_CONFIG_GLOBAL: config, GIT_CONFIG_NOSYSTEM: '1' }) })
+/** Minimal local subprocess seam: native child execution with signal-driven process-range termination. */
+const subprocess = (config: string, waited?: () => void): SubprocessRuntime => ({
+  spawn: ({ argv, cwd, env, signal }: { argv: readonly string[]; cwd: string; env?: Record<string, string>; signal?: AbortSignal }) => {
+    const child = spawn(argv[0]!, argv.slice(1), { cwd, env: { ...gitEnv({ GIT_CONFIG_GLOBAL: config, GIT_CONFIG_NOSYSTEM: '1' }), ...env } })
     const output = { stdout: '', stderr: '' }
     child.stdout.on('data', chunk => { output.stdout += String(chunk) })
     child.stderr.on('data', chunk => { output.stderr += String(chunk) })
     const reader = (name: 'stdout' | 'stderr') => ({ readFrom: () => ({ text: output[name], nextOffset: 0, lossy: false }) })
-    const done = new Promise(resolve => child.on('close', code => resolve({ exitCode: code, signal: null })))
-    return { done, collected: { stdout: reader('stdout'), stderr: reader('stderr') } }
+    const { promise: done, resolve } = Promise.withResolvers<{ exitCode: number | null; signal: null }>()
+    child.on('close', code => resolve({ exitCode: code, signal: null }))
+    let cancellation: Promise<void> | undefined
+    const stop = (): void => {
+      if (windows && child.pid !== undefined) {
+        cancellation = exec(join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe'), ['/PID', String(child.pid), '/T', '/F'], { timeout: 5_000 }).then(() => {})
+      } else { child.kill('SIGTERM'); cancellation = Promise.resolve() }
+    }
+    signal?.addEventListener('abort', stop, { once: true })
+    if (signal?.aborted) stop()
+    return { done, collected: { stdout: reader('stdout'), stderr: reader('stderr') }, waitForExit: async () => { waited?.(); await cancellation; return true } }
   },
 }) as unknown as SubprocessRuntime
 describe('ticket directory check', () => {
@@ -637,10 +760,26 @@ describe('ticket directory check', () => {
     await expect(check('repo')).rejects.toThrow(/bad config/)
   })
   it('reports a failed command\'s exit status', async () => {
-    const failing = ['sh', '-c', 'echo nope >&2; exit 3']
+    const failing = [program(join(dir, 'worker-fails'), 'echo nope >&2; exit 3', 'echo nope 1>&2\r\nexit /b 3')]
     const error = await runAsWorker(subprocess(join(dir, 'global')), failing, dir, signal).catch((e: unknown) => e)
     expect(error).toBeInstanceOf(CliError)
     expect(error).toMatchObject({ message: 'nope', exitCode: 3 })
+  })
+  it('waits for the worker batch process range to close after cancellation', async () => {
+    const pidFile = join(dir, 'worker-child.pid')
+    const cli = program(join(dir, 'worker-running'), `exec "${process.execPath}" -e 'require("node:fs").writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)' "${pidFile}"`,
+      `"${process.execPath}" -e "require('node:fs').writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)" "${pidFile}"`)
+    const controller = new AbortController()
+    const waited = vi.fn()
+    const running = runAsWorker(subprocess(join(dir, 'global'), waited), [cli], dir, controller.signal)
+    let pid: number | undefined
+    try {
+      pid = await waitForPid(pidFile)
+      controller.abort()
+      await expect(running).rejects.toBeInstanceOf(CliError)
+      expect(waited).toHaveBeenCalledTimes(windows ? 1 : 0)
+      await waitForExit(pid)
+    } finally { controller.abort(); void running.catch(() => {}); await cleanupPid(pid) }
   })
 })
 

@@ -418,6 +418,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents` (descendant cleanup per `010-session-boundaries.md`), `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/executor/worktree.ts` | `inspectRepository`, `inspectWorktree` and `validateWorktreeDestination`, read-only Git checks through `Commands.git`: the configured repository must be a clone's main checkout, a Ticket's `worktree` must be its canonical linked secondary worktree with the same common git directory, `--show-toplevel`, branch, pinned base (exact on a fresh path, an ancestor for reuse) and, on reuse, a previously verified `ExecutionClaim` of the same ticket and assignment, and a Ticket destination or worktree root must lie outside the clone's checkouts and any unrelated Git checkout; refusals are `WorktreeRejected` with a `WorktreeRejectionCode`, and it never creates, repairs or deletes |
 | `src/executor/repository-identity.ts` | `validateRepositoryIdentity` reads the clone's local `remote.origin.url` without modifying it or contacting GitHub; it accepts one direct github.com HTTPS, SSH or Git URL for the configured owner/name, case-insensitively and with an optional `.git` suffix, and refuses missing, ambiguous, unsupported or mismatched origins with `WorktreeRejected` |
+| `src/executor/doc-tree.ts` | Candidate-bound Doc Tree structure and changed-path evidence; see `011-doc-tree-impact.md` |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. Supports native Windows batch wrappers and process-tree cancellation. `CliError` carries the code reported by the CLI, such as a GitHub HTTP status; when nothing is printed, the error describes how the command ended without exposing its arguments. `validItems` skips and counts malformed list items |
 | `src/infra/environment.ts` | The agent's process environment: platform-specific command shims, the git configuration and credential helper, `runAsWorker` through the DeepSeek Harness subprocess interface, and the checks of the environment and of a Ticket's directory |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
@@ -487,6 +488,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, a host that stops, and bounded subagent release |
 | `tests/worktrees.spec.ts` | Real Git worktrees through acceptance and the Ticket query: each Ticket's Session, branch and pinned base, isolated writes, refusal of an ordinary directory, another Ticket's worktree or a wrong base without cleanup, one writer for concurrent claims, and a retry only after the previous writer stops and ownership matches |
 | `tests/worktree-inspector.spec.ts` | `inspectRepository`, `inspectWorktree` and `validateWorktreeDestination` on temporary Git repositories: a canonical clone and linked worktree accepted, while an ordinary folder, a foreign repository or worktree, a wrong branch or base, and an alias path are refused without changing the tree; destination isolation refuses the primary checkout, registered worktrees, symlink aliases and unrelated Git checkouts without creating paths; reuse requires a previously verified claim |
+| `tests/doc-tree.spec.ts` | Doc Tree structure and committed-candidate evidence in real Git repositories |
 | `tests/repository-identity.spec.ts` | Real Git clones: the fixture's matching origin, GitHub HTTPS/SSH/Git variants, and refusals of wrong owner or repository, missing or duplicate origins, and disguised or unsupported URLs without modifying the clone |
 | `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the worker, read-only router and planner presets it defines |
 | `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown |
@@ -595,12 +597,13 @@ New main Sessions use `dsh-superagent-router` (`ROUTER_PRESET`), a read-only pre
 
 ### Executor tools
 
-Each Executor has six application tools:
+Each Executor has seven application tools:
 
 | Tool | Purpose |
 | --- | --- |
 | `orchestrator_read` | Read resources available to its own Ticket |
 | `orchestrator_ack` | Record the worker's internal take-up of a request; no message is queued for a person |
+| `orchestrator_doc_impact` | Collect candidate-bound documentation evidence; input and results are defined in `011-doc-tree-impact.md` |
 | `orchestrator_report` | Report progress or an outcome, binding a pull request under the pull-request rules; it notifies the Hub only and queues no Channel message directly |
 | `orchestrator_thread_unrelated` | Drop an unrelated attached Thread, hand back its owned follow-ups and tell the main Session why |
 | `orchestrator_thread_follow` | Subscribe to a related Thread for context and tell the main Session |

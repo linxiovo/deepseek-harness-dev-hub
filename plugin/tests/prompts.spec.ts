@@ -95,7 +95,7 @@ it('rejects unknown keys, built-in skill names and oversized configuration befor
     const prompts = promptsOf(store)
     expect(() => prompts.save({ ...defaultPrompts(), shared: 'x' }, 0, 'panel')).toThrow()
     expect(() => prompts.save({ communication: '', scope: '' }, 0, 'panel')).toThrow()
-    for (const name of ['github', 'feishu']) expect(() => prompts.save({ ...defaultPrompts(), skills: { [name]: 'mine' } }, 0, 'panel')).toThrow('built-in skill')
+    for (const name of ['github', 'feishu', 'doc-tree']) expect(() => prompts.save({ ...defaultPrompts(), skills: { [name]: 'mine' } }, 0, 'panel')).toThrow('built-in skill')
     expect(() => prompts.save({ ...defaultPrompts(), skills: { 'Bad Name': 'x' } }, 0, 'panel')).toThrow()
     expect(() => promptsOf(store, 1000).save(defaultPrompts(), 0, 'panel')).toThrow('exceeds')
     expect(prompts.current().revision).toBe(0)
@@ -115,11 +115,24 @@ it('lists a ticket\'s execution environment in its prompt, and says setup is inc
 it('registers the built-in Source skills, Feishu only with a Feishu bot, before the team skills', () => {
   withStore(store => {
     const config = { ...defaultPrompts(), skills: { release: 'Tag releases.' } }
-    const skills = promptsOf(store).skills(config)
+    const skills = promptsOf(store).skills(config, 'orchestrator')
     expect(skills.map(([name]) => name)).toEqual(['feishu', 'github', 'release'])
     expect(skills[1]![1]).toContain('## CLI usage')
     expect(skills[2]![1]).toBe('Tag releases.')
-    expect(new Prompts(store, () => 100000, variables, () => false).skills(config).map(([name]) => name)).toEqual(['github', 'release'])
+    expect(new Prompts(store, () => 100000, variables, () => false).skills(config, 'orchestrator').map(([name]) => name)).toEqual(['github', 'release'])
+  })
+})
+
+it('mounts the bundled Doc Tree skill only for workers, even with an older same-name team skill', () => {
+  withStore(store => {
+    const prompts = promptsOf(store), config = defaultPrompts()
+    const docTree = prompts.skills(config, 'worker').filter(([name]) => name === 'doc-tree')
+    expect(docTree).toEqual([['doc-tree', expect.stringMatching(/\S/)]])
+    const older = { ...config, skills: { 'doc-tree': 'Old team text.' } }
+    expect(prompts.skills(older, 'worker').filter(([name]) => name === 'doc-tree')).toEqual(docTree)
+    for (const role of ['orchestrator', 'planner'] as const) {
+      expect(prompts.skills(older, role).map(([name]) => name)).not.toContain('doc-tree')
+    }
   })
 })
 

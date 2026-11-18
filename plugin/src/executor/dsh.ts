@@ -20,6 +20,7 @@ import { WorktreeNameSchema } from '../app/assessment.ts'
 import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
+import { checkDocTree } from './doc-tree.ts'
 import { validateRepositoryIdentity } from './repository-identity.ts'
 import { inspectRepository, inspectWorktree, validateWorktreeDestination, WorktreeRejected } from './worktree.ts'
 
@@ -513,6 +514,32 @@ export class DshExecutor implements Executor {
       && ticket.execution.ownership?.generation === claim.generation
       && ticket.execution.active_writer?.assignment === assignment.id && ticket.execution.active_writer.session === sessionId
       && assignment.writer?.state === 'active' && assignment.writer.session === sessionId
+  }
+  async inspectDocImpact(ticketId: string, sessionId: string, candidate: string, scope: Parameters<typeof checkDocTree>[4], signal: AbortSignal) {
+    const { store, commands, lifetime } = this.host
+    const stopped = AbortSignal.any([signal, lifetime])
+    const active = store.tickets.get(ticketId)?.execution?.active_writer
+    const claim = active && this.claims.get(active.assignment)
+    const authorize = () => {
+      stopped.throwIfAborted()
+      const ownership = store.tickets.get(ticketId)?.execution?.ownership
+      if (!claim || !ownership?.verified || this.claims.get(claim.assignment) !== claim || !this.writerAuthorized(ticketId, sessionId)) {
+        throw new Error('Doc Tree evidence requires the active writer for this ticket worktree')
+      }
+      return { ...ownership.identity, ticket: ownership.ticket, assignment: claim.assignment, generation: ownership.generation, verified: ownership.verified }
+    }
+    const inspect = () => {
+      const previous = authorize()
+      return inspectWorktree(commands, { mode: 'reuse', previous, repository: previous.repository, directory: previous.worktree,
+        branch: previous.branch, base: previous.base, ticket: ticketId, assignment: previous.assignment, session: sessionId })
+    }
+    const { worktree, head, base } = await inspect()
+    if (candidate !== head) throw new Error('Doc Tree candidate must match the ticket worktree HEAD')
+    authorize()
+    const checked = await checkDocTree(commands, worktree, base.sha, head, scope, stopped)
+    if ((await inspect()).head !== head) throw new Error('Doc Tree candidate changed while collecting evidence')
+    authorize()
+    return { candidate: head, base: base.sha, ...checked }
   }
   /** Stop every loaded worker and release only claims this instance can prove fully idle before Store closes. */
   async shutdown(): Promise<void> {

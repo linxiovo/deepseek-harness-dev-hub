@@ -13,7 +13,7 @@ A team can edit three team sections, add skills, and override every built-in sys
 | Delivery requirements | Evidence in pull requests, the auto-merge condition with its line threshold, and the commit author; without one, the Executor commits as the agent account's no-reply address |
 | Team skills | Knowledge the agents load when they need it, such as an `identities` skill that says which Feishu user is which GitHub account |
 
-The built-in text covers the roles, tool usage, host mechanics, authorization rules, Source skills and the planner's unattended to-spec skill. It refers to the team sections by their headings instead of repeating them.
+The built-in text covers the roles, tool usage, host mechanics, authorization rules, Source skills and role-specific workflow skills. It refers to the team sections by their headings instead of repeating them.
 
 ### Built-in parts and templates
 
@@ -26,6 +26,7 @@ Overrides use these keys:
 | Handoff instructions | `runtime/handoff/orchestrator`, `runtime/handoff/worker` |
 | Source skills | `skill/feishu`, `skill/github` |
 | Planner skill | `skill/to-spec` |
+| Worker skill | `skill/doc-tree` |
 | Generated sections | `runtime/environment`, `runtime/policy`, `runtime/policy/none` |
 
 The worker guards load `prompts/worker-ticket-ended.md`, `prompts/worker-writer-required.md`, and `prompts/worker-ancestry-pending.md` as fixed tool responses, not editable system-prompt parts.
@@ -64,6 +65,8 @@ Built-in files under `prompts/` and `skills/` are loaded by `src/app/skill-files
 The environment section gives the main Session deployment-wide values and each Executor its Ticket-specific values. The Policy section is regenerated from settings on every model request. It contains the Policy version, accept mode, the explicit-request exemption, and enabled rules as `- <name> (<id>): <instruction>`, or a statement that none is enabled. It is last so a Policy change leaves the preceding prompt text unchanged.
 
 Executors also read DeepSeek Harness's coding prompt and the repository's `AGENTS.md`; the main Session does not. An inferred Ticket adds a final note limiting its Executor to the matched rules. Assignments and incoming messages arrive inline as Trigger cards, with resource pointers only for truncated content.
+
+Only Worker Sessions mount `dsh-superagent-doc-tree` (`plugin/skills/dsh-superagent-doc-tree/SKILL.md`). `prompts/work.md` directs Workers to load it for documentation impact and committed-candidate evidence before readiness; the skill leaves semantic approval to independent review. The short name `doc-tree` is reserved. A same-name team skill in an older revision is not mounted and must be renamed or removed before saving that configuration.
 
 Executors work unattended. Their tools exclude those that ask a person, present UI to them or change the profile, such as `ask_user_question`, `present` and `plugin_manager`.
 

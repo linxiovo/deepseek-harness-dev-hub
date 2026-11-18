@@ -21,8 +21,10 @@ function load(name: string) {
   if (!match) throw new Error(`Invalid packaged skill: ${path}`)
   return { name: match[1]!, description: match[2]!, content: match[3]!, path }
 }
-/** Packaged skills by name: the two Source skills and the planner's unattended to-spec workflow. */
-export const bundledSkills = { feishu: load('feishu'), github: load('github'), 'to-spec': load('to-spec') }
+/** Packaged skills whose short names are reserved in team configuration. */
+export const bundledSkills = { feishu: load('feishu'), github: load('github'), 'to-spec': load('to-spec'), 'doc-tree': load('doc-tree') }
+
+export const isBundledSkill = (name: string): name is keyof typeof bundledSkills => Object.hasOwn(bundledSkills, name)
 function promptPath(name: string): string {
   const file = `${name}.md`
   if (isAbsolute(name)) return resolve(file)

@@ -73,7 +73,7 @@ The agreed contract for this boundary:
 | `plugin/src/app/sessions.ts` | `ROUTER_PRESET`, `WORKER_PRESET`, `HUB_TOOLS`, `WORK_TOOLS`, `DEV_MCP_TOOLS`, `Sessions.decorate`, `Sessions.workOnly`, `Sessions.owningTicket` and `Sessions.limitSubagent` (role restrictions and Worker/descendant guards) |
 | `plugin/src/executor/background.ts` | `stopSubagents` and `stopBackground`: Worker and descendant tracked-job shutdown and subagent release on Ticket close and hand-off |
 | `plugin/src/app/tools/main.ts` | The Hub's coordination, inspection and evaluation tools |
-| `plugin/src/app/tools/executor.ts` | The Worker's read, take-up, report, Thread and hand-back tools |
+| `plugin/src/app/tools/executor.ts` | The Worker's read, take-up, report, Thread and hand-back tools, and the candidate evidence tool described in `011-doc-tree-impact.md` |
 | `plugin/src/core/replies.ts` | `Replies.takeUpInternally` records a Worker's take-up without sending; `Replies.acknowledgeAccepted` queues the host's accepted-Ticket acknowledgement for a human Trigger |
 | `plugin/src/core/engine.ts` | `Engine.takeUp` (atomic take-up entry) and `Engine.reply` (Hub answer, result and attention messages) |
 | `plugin/src/infra/environment.ts` | Worker command shims: `gh` and `lark-cli`, `blockedCommands`, and the by-name refusal of human-facing CLI sends |

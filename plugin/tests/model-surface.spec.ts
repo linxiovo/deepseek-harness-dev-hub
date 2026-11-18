@@ -296,6 +296,9 @@ function collect(host: Host, { a, b, workerA, workerB, refusal }: Awaited<Return
   for (const { name, description, content } of host.skills.get(runtime.masterId)!) {
     surfaces.push({ where: `skill ${name}`, owner: PROMPTS, role: 'both', text: `${description}\n${content}` })
   }
+  for (const { name, description, content } of host.skills.get(workerA)!) {
+    if (name === 'dsh-superagent-doc-tree') surfaces.push({ where: `skill ${name}`, owner: PROMPTS, role: 'worker', text: `${description}\n${content}` })
+  }
   surfaces.push({ where: 'orchestrator tool orchestrator_reply error', owner: ERRORS, role: 'orchestrator', text: refusal })
   for (const { text } of host.inputs.filter(input => input.sessionId === runtime.masterId)) {
     const value = JSON.parse(text) as Record<string, unknown>
@@ -384,7 +387,7 @@ function failures(): Map<string, string> {
 }
 
 it('collects both roles\' tools, prompts, skills and inputs', () => {
-  expect([...toolsOf('worker').keys()].sort()).toEqual(['orchestrator_ack', 'orchestrator_read', 'orchestrator_report',
+  expect([...toolsOf('worker').keys()].sort()).toEqual(['orchestrator_ack', 'orchestrator_doc_impact', 'orchestrator_read', 'orchestrator_report',
     'orchestrator_thread_follow',
     'orchestrator_thread_unrelated', 'orchestrator_trigger_handback'])
   expect([...toolsOf('orchestrator').keys()]).toEqual(expect.arrayContaining(['orchestrator_route', 'orchestrator_eval_decide', 'orchestrator_reply']))
@@ -393,7 +396,7 @@ it('collects both roles\' tools, prompts, skills and inputs', () => {
     expect(toolsOf('orchestrator').has(name)).toBe(false)
   }
   const wheres = new Set(surfaces.map(surface => surface.where))
-  for (const where of ['orchestrator prompt runtime/dispatch', 'worker prompt runtime/work', 'skill dsh-superagent-github', 'skill dsh-superagent-feishu',
+  for (const where of ['orchestrator prompt runtime/dispatch', 'worker prompt runtime/work', 'skill dsh-superagent-github', 'skill dsh-superagent-feishu', 'skill dsh-superagent-doc-tree',
     'orchestrator prompt runtime/admission', 'orchestrator input candidate', 'orchestrator input worker_attention', 'orchestrator input worker_report',
     'orchestrator input thread_unrelated', 'orchestrator input ticket_ended', 'orchestrator input settings_saved', 'worker input assignment (explicit)',
     'worker input assignment (inferred)', 'worker input policy-changed', 'worker input resumed', 'worker input status',

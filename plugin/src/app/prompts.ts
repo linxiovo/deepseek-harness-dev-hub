@@ -4,7 +4,7 @@ import { UserError, key } from '../core/index.ts'
 import { policyVersion, type Settings, type SettingsOrigin } from '../policy.ts'
 import { masterPrompt, workerPrompt, sharedPrompt, guides, mainAdmissionPolicy, handoffPolicy, teamDefaults, sourceSkills, cliNotes } from './context.ts'
 import { environmentLines, type Variable } from './execution-environment.ts'
-import { bundledSkills, promptFile } from './skill-files.ts'
+import { bundledSkills, isBundledSkill, promptFile } from './skill-files.ts'
 import { promptsNotice } from './notices.ts'
 import type { Sessions } from './sessions.ts'
 import type { Store } from './store.ts'
@@ -19,12 +19,11 @@ const TEAM_HEADINGS: Record<TeamSection, string> = { communication: 'Communicati
 export const SKILL_NAME = /^[a-z][a-z0-9-]*$/
 /** Prefix prepended to skill names when registering them in DSH Sessions. */
 export const SKILL_PREFIX = 'dsh-superagent-'
-const SkillNameSchema = z.string().regex(SKILL_NAME).refine(name => name !== 'to-spec' && !(Object.keys(sourceSkills) as string[]).includes(name),
-  'This name belongs to a built-in skill')
+const SkillNameSchema = z.string().regex(SKILL_NAME).refine(name => !isBundledSkill(name), 'This name belongs to a built-in skill')
 /** The built-in parts a team may override, by key: all roles' parts, bundled skills, and generated templates. */
 const PART_KEYS = ['runtime/shared', 'runtime/orchestrator', 'runtime/worker', 'runtime/planner', 'runtime/subscriptions', 'runtime/replies',
   'runtime/dispatch', 'runtime/work', 'runtime/admission', 'runtime/handoff/orchestrator', 'runtime/handoff/worker', 'runtime/environment',
-  'runtime/policy', 'runtime/policy/none', 'skill/feishu', 'skill/github', 'skill/to-spec'] as const
+  'runtime/policy', 'runtime/policy/none', 'skill/feishu', 'skill/github', 'skill/to-spec', 'skill/doc-tree'] as const
 export type PartKey = typeof PART_KEYS[number]
 /** A team's text for a built-in part, and `base`, the key of the built-in text it was edited from. */
 const OverrideSchema = z.object({ text: z.string(),
@@ -69,6 +68,7 @@ export const builtInParts = (): Readonly<Record<PartKey, BuiltInPart>> => parts 
   'skill/feishu': { roles: BOTH, text: `${sourceSkills.feishu}\n\n## CLI usage\n${cliNotes}` },
   'skill/github': { roles: BOTH, text: `${sourceSkills.github}\n\n## CLI usage\n${cliNotes}` },
   'skill/to-spec': { roles: PLANNER, text: bundledSkills['to-spec'].content },
+  'skill/doc-tree': { roles: WORKER, text: bundledSkills['doc-tree'].content },
 }
 /** The key of a built-in text, which an override's `base` records. */
 export const builtInBase = (text: string): string => key('prompt-built-in', text)
@@ -122,8 +122,7 @@ export function composePrompt(config: PromptConfig, role: Role, environment?: st
   return promptParts(config, role, environment, policy).map(part => part.text).join('\n\n')
 }
 export function composeSkill(config: PromptConfig, name: string): string {
-  return name === 'feishu' || name === 'github' ? builtIn(config, `skill/${name}`)
-    : name === 'to-spec' ? builtIn(config, 'skill/to-spec') : config.skills[name] ?? ''
+  return isBundledSkill(name) ? builtIn(config, `skill/${name}`) : config.skills[name] ?? ''
 }
 
 /** An override whose built-in text changed since its `base`, with that text when kept, or whose part this version no longer has. */
@@ -150,8 +149,10 @@ export class Prompts {
   }
   /** Register only the bundled specification skill for planner; existing Source and team skills remain on other roles. */
   skills(config: PromptConfig, role: Role = 'worker'): [string, string][] {
-    return role === 'planner' ? [['to-spec', composeSkill(config, 'to-spec')]]
-      : [...this.feishu() ? ['feishu'] : [], 'github', ...Object.keys(config.skills)].map(name => [name, composeSkill(config, name)])
+    if (role === 'planner') return [['to-spec', composeSkill(config, 'to-spec')]]
+    const names = [...this.feishu() ? ['feishu'] : [], 'github', ...role === 'worker' ? ['doc-tree'] : []]
+    return names.map((name): [string, string] => [name, composeSkill(config, name)])
+      .concat(Object.entries(config.skills).filter(([name]) => !isBundledSkill(name)))
   }
   current(): PromptVersion {
     const revision = this.versions.revision()

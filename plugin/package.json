@@ -46,7 +46,7 @@
   },
   "scripts": {
     "build": "tsdown",
-    "check:core": "node scripts/check-core-imports.mjs",
+    "check:imports": "node scripts/check-imports.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "check": "node scripts/check.mjs",

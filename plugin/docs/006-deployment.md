@@ -30,7 +30,7 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 
 Plugin CI (`.github/workflows/plugin-ci.yml`) runs on pushes to `main` and pull requests targeting `main`, uses Node.js 22.19.0 and pnpm 11.7.0, and has read-only repository access. Both jobs are required: native Windows (`windows`) runs `pnpm check` first, and Ubuntu (`check`) waits for it. Unless the workflow itself is cancelled, any Windows result other than `success` makes `check` fail explicitly before checkout, rather than letting GitHub treat a skipped required job as passing.
 
-`pnpm check` runs the core import boundary gate (`check:core`), typechecking, every applicable test, and the build, in that order. Native Windows runs the full Windows-applicable suite: `vitest.config.ts` excludes only `tests/service-script.spec.ts`, which exercises the POSIX service script and requires Python `fcntl`. Linux and WSL run the full suite including those tests. To run the check locally on your platform, use supported Node.js and pnpm 11.7.0 and run from the repository root:
+`pnpm check` runs the import boundary gate (`check:imports`), typechecking, every applicable test, and the build, in that order. Native Windows runs the full Windows-applicable suite: `vitest.config.ts` excludes only `tests/service-script.spec.ts`, which exercises the POSIX service script and requires Python `fcntl`. Linux and WSL run the full suite including those tests. To run the check locally on your platform, use supported Node.js and pnpm 11.7.0 and run from the repository root:
 
 ```sh
 pnpm -C plugin install --frozen-lockfile
@@ -39,7 +39,7 @@ pnpm -C plugin check
 
 Enable or refresh the local Git hooks by running `node plugin/scripts/install-hooks.mjs` from the repository root. Install once per clone, including clones with linked worktrees. The shared hooks forward to `plugin/.githooks/` in the worktree where Git is committing. The selected worktree must contain the hook entry points.
 
-Pre-commit runs from the active worktree's `plugin` directory and verifies that pnpm matches the version declared in `package.json`. It then typechecks and runs the six smoke test files listed in `plugin/.githooks/pre-commit`. The full `pnpm check` runs each stage with the pnpm CLI that started the check.
+Pre-commit runs from the active worktree's `plugin` directory and verifies that pnpm matches the version declared in `package.json`. It then runs the import boundary gate, typechecking, and the focused tests listed in `plugin/.githooks/pre-commit`. The full `pnpm check` runs each stage with the pnpm CLI that started the check.
 
 Set the GitHub Source's `requiredChecks` to `[{"id":"check"},{"id":"windows"}]` for Ticket and plan evidence. Where branch protection is available, require both jobs there too. Those are separate settings; the workflow changes neither, and a job dependency alone does not restrict merging.
 

@@ -22,3 +22,14 @@ The Worker records the candidate and base, document diff paths or unchanged rati
 
 - `src/app/tools/executor.ts` defines the Worker tool; `src/executor/dsh.ts` binds it to the active worktree; `src/executor/doc-tree.ts` reads candidate structure.
 - `pnpm test tests/doc-tree.spec.ts tests/tools.spec.ts tests/prompts.spec.ts` exercises Git snapshots, the Worker tool and its role scope. The simulated host does not certify an LLM's traversal or review judgment.
+
+## Real Worker smoke check
+
+Use a separate `superagent` profile with a Harness version supported by `engines.dsh` in `plugin/package.json`, a working model, and a disposable GitHub repository authorized for test issues, branches and pull requests. Follow [deployment](006-deployment.md) and make the test repository the active project. Require [manual merging](003-execution.md#merging), and keep the PR open through the revision check. If a prerequisite is missing, mark the smoke check not run.
+
+1. Seed the repository with a `DOCS.md` route to a small backend API contract leaf, an existing verification test, and a broken local link from the leaf in place of the test link. Record the seed SHA, keep the base branch there, and confirm the Ticket pins that commit as its base.
+2. Through normal Hub intake, authorize a Ticket to find and repair the named API's verification link without supplying the leaf path. Ask the Worker to reproduce the issue via `orchestrator_doc_impact` before editing. With the seed still at the Worker worktree's `HEAD`, the call declares the root and scoped leaf and uses `impact.kind: unchanged` because the documents match the base. Expect `structure: issues` and a `broken-link` issue naming the leaf and missing target.
+3. In the Worker transcript, confirm it used the Doc Tree skill to find the leaf and reran the tool on the committed repair before reporting `ready`. Expect `structure: checked` and `semantic_review: required` with the leaf declared as an updated contract. Check that the report and PR description record the candidate, base, doc changes and structural result, and that the PR head matches the candidate.
+4. While the Ticket and PR are open, send an authorized follow-up on the same Ticket thread requesting a second in-scope correction, such as linking another existing verification case in the leaf. Confirm a fresh tool call and the new report and PR head all refer to the revised SHA. Inspect the final diff and the linked tests: resolving a link does not prove that its target verifies the API contract.
+
+Record the Harness version and model, Ticket or PR reference, base and both candidate SHAs, and references to the tool calls and reports outside the Doc Tree. Mark any unobserved step not run. This check is separate from CI and simulated-host tests.

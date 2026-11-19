@@ -31,6 +31,8 @@ pnpm -C plugin check
 
 `check` typechecks, runs every test applicable to the platform, and builds. CI requires both the native Windows `windows` job and the Ubuntu `check` job. Ubuntu runs the full suite, including the POSIX-only service-script tests, only after Windows succeeds; if Windows does not succeed, the Ubuntu job fails explicitly instead of being skipped. On success Ubuntu uploads the build and exact-commit evidence. See [deployment checks](docs/006-deployment.md#development-checks) for evidence, required job settings, and optional local hooks.
 
+See [development verification](docs/013-development-verification.md) for focused checks and review of a fixed candidate.
+
 ## License
 
 [MIT](LICENSE)

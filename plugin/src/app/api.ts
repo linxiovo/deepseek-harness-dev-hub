@@ -9,9 +9,12 @@ import type { SettingsView } from './views/settings.ts'
 import type { SourceStatusView } from './views/sources.ts'
 import type { DecisionListView, SearchView, ThreadDetailView, ThreadListView } from './views/threads.ts'
 import type { TicketListView } from './views/tickets.ts'
+import type { CreateProjectInput, CreateProjectResult, OnboardingView, ProjectsView, RuntimeView, SelectProjectResult,
+  VerifyGithubInput } from './installation-api.ts'
 
 export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
 export const THREAD_FILTERS = ['subscribed', 'evaluating', 'recent', 'all'] as const
+export const PROJECT_SCOPE_HEADER = 'x-orchestrator-project-id'
 export type TicketFilter = typeof TICKET_FILTERS[number]
 export type ThreadFilter = typeof THREAD_FILTERS[number]
 interface Paged { offset?: number; limit?: number }
@@ -19,6 +22,12 @@ interface Paged { offset?: number; limit?: number }
 type Delivery = 'injected' | 'pending'
 
 export interface Api {
+  'GET runtime': { response: RuntimeView }
+  'GET onboarding': { response: OnboardingView }
+  'POST onboarding/github/verify': { body: VerifyGithubInput; response: OnboardingView }
+  'GET projects': { response: ProjectsView }
+  'POST projects': { body: CreateProjectInput; response: CreateProjectResult }
+  'POST projects/:projectId/select': { response: SelectProjectResult }
   'GET state': { response: StateView }
   'GET overview': { response: OverviewView }
   'GET search': { query: { q: string }; response: SearchView }

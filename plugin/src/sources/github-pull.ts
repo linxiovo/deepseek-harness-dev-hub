@@ -15,6 +15,41 @@ const PullSchema = z.looseObject({
 export type Pull = z.infer<typeof PullSchema> & { number: number }
 export const readPull = async (ctx: SourceContext, number: number, signal?: AbortSignal): Promise<Pull> =>
   ({ ...await ctx.commands.withSignal(signal).api(PullSchema, `pulls/${number}`), number })
+const PullNumber = z.object({ number: z.number().int().positive() })
+export async function recoverPulls(ctx: SourceContext, signal: AbortSignal): Promise<number[]> {
+  const { repository } = ctx.deployment
+  const owner = repository.split('/')[0]!
+  const commands = ctx.commands.withSignal(signal)
+  const observed = new Map<number, Pull>()
+  const merged = new Set<number>()
+  const read = async (number: number) => {
+    let pull = observed.get(number)
+    if (!pull) { pull = await readPull(ctx, number, signal); observed.set(number, pull) }
+    return pull
+  }
+  for (const ticket of ctx.tickets.open()) {
+    const tracked = pullsOf(ticket, true).filter(number => Number.isSafeInteger(number) && number > 0)
+    const identity = ticket.execution?.ownership?.identity
+    if (identity) {
+      const { branch, worktree } = identity
+      const found = await commands.api(z.array(PullNumber), `pulls?state=all&head=${encodeURIComponent(`${owner}:${branch}`)}&per_page=100`)
+      if (found.length === 100) throw new Error('Cannot reconcile a truncated GitHub branch history')
+      const head = found.length ? (await commands.git(['rev-parse', '--verify', 'HEAD'], worktree)).trim() : undefined
+      for (const { number } of found) {
+        const pull = await read(number)
+        if (!agentPull(pull, ctx.deployment) || pull.head.ref !== branch || pull.head.sha !== head || !ticketBranch(ticket, pull.head.ref)) continue
+        if (pull.merged) merged.add(number)
+        if (pull.state === 'closed' || pull.merged) {
+          if (!(ticket.follows ?? []).some(follow => follow.thread === `${SOURCE}:${number}`)) bind(ctx, ticket.id, pull, true)
+        }
+        else claimPull(ctx, ticket.id, pull)
+      }
+    }
+    for (const number of tracked) if ((await read(number)).merged) merged.add(number)
+  }
+  for (const pull of observed.values()) await observePull(ctx, pull)
+  return [...merged]
+}
 const pullNumber = (thread: string): number | undefined => thread.startsWith(`${SOURCE}:`) ? Number(thread.slice(SOURCE.length + 1)) : undefined
 export const pullsOf = (ticket: Pick<Ticket, 'follows'>, open = false): number[] =>
   (ticket.follows ?? []).filter(item => !open || !item.closed).flatMap(item => pullNumber(item.thread) ?? [])

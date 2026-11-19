@@ -6,6 +6,7 @@ import type { Assessor, AssessmentOutcome, DomainEvent, DomainEvents, Executor, 
 
 export interface EngineOptions {
   repo: Repositories
+  projectId?: string
   policy: () => Policy
   /** Decides whether a Source listens to a trigger; one it does not listen to is stored with a `filtered` disposition. */
   scope: SourceScope

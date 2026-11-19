@@ -28,11 +28,11 @@ flowchart TB
 
 ### Runtime
 
-`Runtime` is the composition root; it contains no domain rules. Its constructor locks the state directory, opens the Store and builds each component. If construction fails, it closes the Store and releases the lock. It also builds the one `SessionMeter` and gives the same instance to the management routes and the resource host, so `GET sessions/<id>/meter` and `orchestrator_read` of `session/<id>` answer from the same meter and its persisted cursor rather than recomputing usage.
+`Runtime` is the composition root; it contains no domain rules. Its constructor locks the installation state directory, opens the catalog and the mounted Store, and builds each component. If construction fails, it closes the databases and releases the lock. See `012-project-runtime.md` for selection, binding and recovery. The management routes and the resource host share one `SessionMeter` and its persisted cursor, so `GET sessions/<id>/meter` and `orchestrator_read` of `session/<id>` do not recompute usage separately.
 
-Startup registers management routes and runs Setup. After setup resolves, it installs Session and Executor hooks, ensures the main Session exists, starts Policy syncs, resumes interrupted Assignments, and starts passes and effects. `ready` marks completion of startup.
+Startup registers management routes, initializes the installation binding and runs Setup. After setup resolves, it installs Session and Executor hooks, ensures the main Session exists, syncs Policy, resumes handoffs and interrupted Assignments, and starts passes and effects. `Runtime.ready` marks completion of startup; the installation API can answer before that promise resolves.
 
-Shutdown cancels turns, waits for passes, effects and agents, restores the process environment, closes the Store and releases the lock. Source plugins inject Runtime as the `orchestrator` service through the narrow `SourceHost` interface.
+Source plugins inject Runtime as the `orchestrator` service through the narrow `SourceHost` interface.
 
 | Part | Module | Does |
 | --- | --- | --- |
@@ -382,6 +382,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/memory.ts` | `MemoryRepositories`: the Store's repositories in memory, in the Store's order and with its nested rollback, for domain tests |
 | `src/core/index.ts` | The core's exports, including `TakeUp` |
 | `src/app/runtime.ts` | The Runtime, the composition root, with its start and stop |
+| `src/app/installation-api.ts` | Installation route contract, public views and typed refusals |
+| `src/app/installation.ts` | GitHub onboarding, project registration and selection, and runtime lifecycle view |
+| `src/app/projects.ts` | SQLite project catalog, canonical bindings, selection and suspension records |
 | `src/app/setup.ts` | Setup, and `setupChanged`, whether a save changes a field setup reads |
 | `src/app/passes.ts` | Passes, the pass scheduler |
 | `src/app/outbox.ts` | The Outbox: the `Outbox` port for the Hub's replies, the acceptance acknowledgement, pull-request end notices and Source notices; the receipts and the `reply` effects that send them |
@@ -433,6 +436,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. Supports native Windows batch wrappers and process-tree cancellation. `CliError` carries the code reported by the CLI, such as a GitHub HTTP status; when nothing is printed, the error describes how the command ended without exposing its arguments. `validItems` skips and counts malformed list items |
 | `src/infra/environment.ts` | The agent's process environment: platform-specific command shims, the git configuration and credential helper, `runAsWorker` through the DeepSeek Harness subprocess interface, and the checks of the environment and of a Ticket's directory |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
+| `src/infra/prompt-file.ts` | Loads and normalizes packaged prompt text for the application and Sources |
 | `src/infra/text.ts` | Word counts and the chat message limit, `fill` and `sameName` |
 | `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer |
 | `src/sources/kind.ts` | The `SourceKind` protocol |
@@ -440,6 +444,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/host.ts` | `SourceHost`, `SourceContext`, `Health`, `health` and the fixed health texts |
 | `src/sources/poll.ts` | What GitHub and Feishu polling share: `POLL_HORIZON_MS`, `polled`, `cursorAt`, and `pollThreads`, which keeps a failure on its Thread as `pollError` |
 | `src/sources/github.ts` | The GitHub kind and plugin entry, exported as `./github-watch`: a poll round of notifications, the pull requests of open Tickets with their CI, and subscribed Threads |
+| `src/sources/github-environment.ts` | Projects verified GitHub identity, repository and ticket references into documented Session variables |
 | `src/sources/github-trigger.ts` | GitHub comments, reviews, Issue bodies and CI changes as Triggers, and GitHub addresses |
 | `src/sources/github-pull.ts` | The pull request rules: which pull requests a Ticket follows (`claimPull`, `observePull`), the closes it reports to the Engine, and `pullEndNotices`, the chat notice of a Ticket that ended merged or closed |
 | `src/sources/github-channel.ts` | The GitHub Channel: comments and review thread replies, `sent` or `gone` |
@@ -518,6 +523,9 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/plans.spec.ts` | Automatic spec continuation, idempotent restart and registration, graph and role queries, invalid graph refusal, and root/node message isolation through the public Session tools |
 | `tests/runtime-concurrency.spec.ts` | Overlapping Triggers, deliveries and launches; Worker inbox recovery after restart, checked after the runtime drains launch and delivery effects against real Git worktrees |
 | `tests/http.spec.ts` | Management request bounds; ticket worktree and writer projections; Session meter success, errors, ID decoding and same-origin protection |
+| `tests/projects.spec.ts` | Durable project registration, selection, re-open and workspace collision checks |
+| `tests/project-work.spec.ts` | Bound handoff and Hub work gates, legacy receipt replay and project-scoped Worker IDs |
+| `tests/github-onboarding.spec.ts` | Managed setup only uses the verified account and bound repository |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, the refusals of the pause, a sync and a block, and the required local repository and base ref with their preparation variables |
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |
 | `tests/timeline.spec.ts` | A Thread's pages and a Trigger's neighbours by time and then id, with every received Trigger's time in one form |
@@ -542,7 +550,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 
 ## Persistence
 
-One SQLite file, `<stateDir>/orchestrator.sqlite`, which only the Store opens.
+Each Store owns its project's `orchestrator.sqlite`. See `012-project-runtime.md` for catalog paths and adoption behavior.
 
 | Table | Holds | Written by |
 | --- | --- | --- |
@@ -709,7 +717,7 @@ Most built-in instructions live in `prompts/*.md`, with one sentence per line jo
 
 ## Configuration reload
 
-Every plugin configuration key except `stateDir` is volatile. The panel's Deployment settings and DeepSeek Harness's Plugin Manager edit them through DeepSeek Harness's configuration form; the host writes `cordis.patch.yml` and updates the values in place, and dsh-superagent reads each limit when it uses it, so a change applies without a restart.
+The host writes `cordis.patch.yml` and updates the volatile machine limits in place. dsh-superagent reads each limit when it uses it, so a limit change applies without a restart. Set `stateDir` and `runtimeMode` in the profile configuration. See [006 Deployment](006-deployment.md#machine-configuration).
 
 A settings save that changes a Source field setup reads, such as an account's CLI, and any save while setup waits, restarts dsh-superagent. DeepSeek Harness's settings service does not serve the entry during that restart, so after its own restart dsh-superagent asks it to read the entry again, and an open form becomes editable again.
 

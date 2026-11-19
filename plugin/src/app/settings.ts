@@ -69,6 +69,7 @@ export interface SettingsHost {
   readonly sourceHost: SourceHost
   /** Setup state, account/command checks, and restart trigger when setup-read fields change. */
   readonly setup: Pick<Setup, 'configured' | 'checkAccounts' | 'blockCommands' | 'restart'>
+  validate?(before: SettingsValue, after: SettingsValue): void
   /** Triggers an immediate pass so work newly allowed by a settings save runs right away. */
   requestPass(): void
 }
@@ -157,6 +158,7 @@ export class Settings {
     const parsed = rules.parse(value, sources, id)
     const current = store.settings()
     const candidate = rules.merge(current, parsed, id)
+    this.host.validate?.(current, candidate)
     const model = block === 'eval' ? candidate.eval.model : block === 'executor' ? candidate.executor.model : null
     const previous = block === 'eval' ? current.eval.model : block === 'executor' ? current.executor.model : null
     if (model && JSON.stringify(model) !== JSON.stringify(previous)) {
@@ -169,6 +171,7 @@ export class Settings {
     // Re-read current settings after async checks in case unrelated blocks were saved concurrently.
     const old = store.settings()
     const settings = rules.merge(old, parsed, id)
+    this.host.validate?.(old, settings)
     if (JSON.stringify(SettingsSchema.parse(settings)) === JSON.stringify(old)) {
       const delivery = await sessions.delivery(`settings:${block}`)
       return { saved: true, revision: store.blockRevision(block), policy_changed: false, restarting: false, context_delivery: delivery }

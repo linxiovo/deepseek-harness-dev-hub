@@ -5,7 +5,7 @@ import { basename, delimiter, join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { Config, executable, machineOf, resolveDeployment, resolveFeishuBot, workerProbe, type Machine, type Probe } from '../src/deployment.ts'
+import { Config, executable, machineOf, resolveDeployment, resolveFeishuBot, verifyGithubAccount, verifyGithubRepository, workerProbe, type Machine, type Probe } from '../src/deployment.ts'
 import { gitEnv } from './fixtures/git.ts'
 
 const win32 = process.platform === 'win32'
@@ -87,7 +87,9 @@ describe('configuration schema', () => {
     // Limits are volatile references that the loader updates in place and callers read when used.
     expect({ ...read, promptMaxChars: read.promptMaxChars.get(), admissionContextMaxPages: read.admissionContextMaxPages.get(),
       admissionContextTimeoutMs: read.admissionContextTimeoutMs.get() })
-      .toEqual({ stateDir: join(dir, 'state'), promptMaxChars: 100000, admissionContextMaxPages: 10, admissionContextTimeoutMs: 15000 })
+      .toEqual({ stateDir: join(dir, 'state'), runtimeMode: 'desktop', promptMaxChars: 100000, admissionContextMaxPages: 10, admissionContextTimeoutMs: 15000 })
+    expect(machineOf(Config(minimal({ runtimeMode: 'headless' }))).runtimeMode).toBe('headless')
+    expect(() => Config(minimal({ runtimeMode: 'unknown' }))).toThrow('runtimeMode')
     expect(() => Config(minimal({ stateDir: 'relative/dir' }))).toThrow()
     expect(() => Config(minimal({ stateDir: '~/dir' }))).toThrow()
     if (win32) expect(() => Config(minimal({ stateDir: 'C:relative' }))).toThrow()
@@ -99,6 +101,44 @@ describe('configuration schema', () => {
 })
 
 describe('setup', () => {
+  it('verifies a github.com account without a repository and resolves renamed repositories separately', async () => {
+    const cli = cliPath(join(dir, 'bin', 'gh'))
+    const github = vi.fn<Probe>(async ([command, operation, endpoint, ...flags], env) => {
+      expect(command).toBe(cli)
+      expect(operation).toBe('api')
+      expect(flags).toEqual(expect.arrayContaining(['--hostname', 'github.com']))
+      expect(env).toMatchObject({ GH_PROMPT_DISABLED: '1', GH_TOKEN: '', GITHUB_TOKEN: '' })
+      if (endpoint === 'user') return JSON.stringify({ id: 7, login: 'Agent-Bot', extra: 'not public identity' })
+      expect(endpoint).toBe('repos/acme/gadgets')
+      return JSON.stringify({ name: 'Acme/Widgets', push: true })
+    })
+    const account = await verifyGithubAccount(machine(), 'gh', github, path)
+    expect(account).toEqual({ cli, id: 7, login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' })
+    expect(github).toHaveBeenCalledTimes(1)
+    await expect(verifyGithubRepository(account, 'acme/gadgets', github)).resolves.toBe('Acme/Widgets')
+    github.mockResolvedValueOnce('{"name":"Acme/Widgets","push":false}')
+    await expect(verifyGithubRepository(account, 'acme/gadgets', github)).rejects.toEqual(setupError('github', 'repositoryReadOnly', { account: 'Agent-Bot', repository: 'Acme/Widgets' }))
+  })
+
+  it('rejects unverified identities and unsafe repository inputs without exposing probe diagnostics', async () => {
+    const secret = 'fake-secret-sentinel'
+    const github = vi.fn<Probe>().mockRejectedValue(new Error(secret))
+    const noDiagnostic = (code: string, values: Record<string, string> = {}) => ({ code, values, message: expect.not.stringContaining(secret) })
+    await expect(verifyGithubAccount(machine(), 'gh', github, path)).rejects.toMatchObject(noDiagnostic('agentCliSignedOut'))
+    await expect(verifyGithubAccount(machine(), join(dir, secret), github, path)).rejects.toMatchObject(noDiagnostic('agentCliMissing'))
+    await expect(verifyGithubAccount(machine(), cliPath(join(dir, 'state-link', 'worker-bin', 'gh')), github, path)).rejects.toMatchObject(noDiagnostic('agentCliMissing'))
+    expect(github).toHaveBeenCalledTimes(1)
+    github.mockResolvedValueOnce('{"id":0,"login":"Agent-Bot"}')
+    await expect(verifyGithubAccount(machine(), 'gh', github, path)).rejects.toMatchObject(noDiagnostic('agentCliNoAccount'))
+    github.mockResolvedValueOnce('{"id":7,"login":"Agent-Bot"}')
+    const account = await verifyGithubAccount(machine(), 'gh', github, path)
+    await expect(verifyGithubRepository(account, 'acme/widgets', github)).rejects.toMatchObject(noDiagnostic('repositoryUnreadable', { account: 'Agent-Bot', repository: 'acme/widgets' }))
+    github.mockClear()
+    await expect(verifyGithubRepository(account, `https://${secret}@github.com/acme/widgets`, github)).rejects.toMatchObject(noDiagnostic('repositoryUnset'))
+    await expect(verifyGithubRepository(account, 'acme/..', github)).rejects.toMatchObject(noDiagnostic('repositoryUnset'))
+    expect(github).not.toHaveBeenCalled()
+  })
+
   it('reads the repository from the GitHub Source and the accounts from their CLIs, skipping the worker shims', async () => {
     const deployment = await resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh' }, probe, path)
     expect(deployment).toMatchObject({ repository: 'acme/widgets', github: { cli: cliPath(join(dir, 'bin', 'gh')), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' } })

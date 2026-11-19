@@ -34,6 +34,7 @@ export interface SessionsHost {
   readonly masterId: string
   readonly lifetime: AbortSignal
   closing(): boolean
+  readonly boundWorkspace?: string | undefined
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
   environment(ticket: Ticket): Variable[]
   /** Whether the persisted handoff is in its active planning state; all other statuses deny planner tools. */
@@ -186,6 +187,12 @@ export class Sessions {
       this.host.lifetime.throwIfAborted()
       if (!this.isSplitterSession(result.agent)) throw new Error(`Splitter ${id} is outside its published handoff workspace`)
     }
+    if (plannerId && this.host.boundWorkspace) {
+      const createdIn = result.agent.session.header.cwd
+      if (!createdIn || relative(this.host.boundWorkspace, await physicalPath(createdIn)) !== '') {
+        throw new Error(`Planner ${id} is outside its registered project workspace`)
+      }
+    }
     if (role === 'worker') {
       const createdIn = result.agent.session.header.cwd
       if (!createdIn) throw new Error(`Worker ${id} has no recorded workspace directory`)
@@ -307,6 +314,13 @@ export class Sessions {
     const plannerId = master ? undefined : plannerHandoffId(agent.id)
     const splitterId = master ? undefined : splitterHandoffId(agent.id)
     const ticket = master || plannerId || splitterId ? undefined : this.ticketOf(agent)
+    if (!ticket && agent.session.header.agentPreset === WORKER_PRESET) {
+      const ticketId = ticketOfSession(agent.id)
+      if (ticketId) {
+        this.bindings.set(agent, { disposers: this.workOnly(agent, ticketId) })
+        return
+      }
+    }
     if (!master && !plannerId && !splitterId && !ticket) { await this.limitSubagent(agent); return }
     const handoffRole = plannerId ? 'planner' : splitterId ? 'splitter' : undefined
     const role: PromptRole = handoffRole ?? (master ? 'orchestrator' : 'worker')
@@ -359,7 +373,7 @@ export class Sessions {
   private plannerOnly(agent: Agent, handoffId: string): (() => void)[] {
     const allow = PLANNER_TOOLS.filter(name => agent.ctx.tools.get(name, scopeParentOf(agent)))
     return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(({ name }) => {
-      if (!this.host.plannerActive(handoffId)) return PLANNER_INACTIVE
+      if (this.host.closing() || !this.host.plannerActive(handoffId)) return PLANNER_INACTIVE
       return PLANNER_TOOLS.includes(name) || SHARED_HOST_TOOLS.includes(name) || PLANNER_HOST_TOOLS.includes(name) ? undefined
         : PLANNER_DENIED
     })]

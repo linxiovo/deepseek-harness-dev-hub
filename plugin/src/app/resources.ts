@@ -71,6 +71,7 @@ export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(r
   .map(resource => `${resource.name}: ${resource.holds}`).join('; ')
 
 export interface ResourceHost {
+  ownsSession?(id: string): boolean
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
   readonly pages: TextCache
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'skills' | 'defaultChanged'>
@@ -274,7 +275,9 @@ const ROUTES: readonly Route[] = [
   }],
   // One reading for the Hub and the panel: the meter owns the persistence cursor, so neither entry recomputes usage.
   ['session/', async read => {
-    const view = await main(read).meter.read(read.rest, read.signal)
+    const host = main(read)
+    if (host.ownsSession?.(read.rest) === false) throw new Error('Unknown session')
+    const view = await host.meter.read(read.rest, read.signal)
     if (!view) throw new Error('Unknown session')
     return view
   }],

@@ -151,7 +151,22 @@ export class Commands {
     } catch (error) { throw commandError(error, program) }
   }
   /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
-  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.github.cli, args)) as T }
+  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.githubOutput(args)) as T }
+  private async githubOutput(args: string[]): Promise<string> {
+    const { github, managed } = this.deployment
+    try { return await this.run(github.cli, args) }
+    catch (error) {
+      if (!managed) throw error
+      if (error instanceof Error && error.name === 'AbortError') throw new DOMException('The operation was aborted', 'AbortError')
+      if (!(error instanceof CliError)) throw new CliError('GitHub CLI command failed')
+      const code = Number.isSafeInteger(error.code) ? error.code : undefined
+      const exitCode = Number.isSafeInteger(error.exitCode) ? error.exitCode : undefined
+      const locked = code === 403 && /^gh: Unable to create comment because issue is locked\. \(HTTP 403\)\r?$/m.test(error.message)
+      const status = code === undefined ? exitCode === undefined ? '' : ` (exit ${exitCode})`
+        : code >= 100 && code <= 599 ? ` (HTTP ${code})` : ` (code ${code})`
+      throw new CliError(`${locked ? 'GitHub issue is locked' : 'GitHub CLI command failed'}${status}`, code, exitCode)
+    }
+  }
   /**
    * Calls the GitHub API on a path within the configured repository, validating JSON output when a schema is provided
    * or returning raw CLI output (such as raw files or `--include` headers) when omitted.
@@ -160,7 +175,7 @@ export class Commands {
   async api<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
   async api(path: string, ...flags: string[]): Promise<string>
   async api<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
-    if (typeof schema === 'string') return this.run(this.deployment.github.cli, ['api', this.path(schema), ...rest])
+    if (typeof schema === 'string') return this.githubOutput(['api', this.path(schema), ...rest])
     const [path = '', ...flags] = rest
     return schema.parse(await this.gh(['api', this.path(path), ...flags]))
   }

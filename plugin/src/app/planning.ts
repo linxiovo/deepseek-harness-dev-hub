@@ -1,5 +1,5 @@
 /** Durable delivery of confirmed handoffs and published specs to their dedicated Sessions. */
-import type { Handoff } from '../core/handoff.ts'
+import type { Handoff, ProjectRef } from '../core/handoff.ts'
 import { PLAN_FEATURE_KINDS } from '../core/plan.ts'
 import { Later, Park, type EffectPayloads, type Effects } from './effects.ts'
 import type { Handoffs } from './handoffs.ts'
@@ -14,6 +14,7 @@ interface PlanningHost {
   readonly sessions: Pick<Sessions, 'ensure' | 'prompt' | 'holds'>
   paused(): boolean
   closing(): boolean
+  verifyProjectBinding?(project: ProjectRef): Promise<string | undefined>
 }
 
 /** Pass the complete confirmed brief, not a summary that could lose the requester's constraints or authorization. */
@@ -68,13 +69,13 @@ export class Planning {
     if (this.host.paused()) throw new Later('Processing is paused')
     const current = this.host.handoffs.get(id)
     if (!current || current.status === 'awaiting' || current.status === 'specified') return
-    if (current.status === 'confirmed') this.host.handoffs.begin(id)
-    if (!this.active(id)) return
-    const handoff = this.host.handoffs.get(id)
-    if (!handoff) return
     const planner = sessionId(id)
     try {
-      await this.host.sessions.ensure(planner, handoff.project.workspace, `Specification: ${handoff.goal.slice(0, 72)}`, 'planner')
+      const workspace = await this.host.verifyProjectBinding?.(current.project) ?? current.project.workspace
+      if (this.host.closing() || this.host.paused()) throw new Later('Planning is paused or stopping')
+      const handoff = this.host.handoffs.begin(id)
+      if (!this.active(id)) return
+      await this.host.sessions.ensure(planner, workspace, `Specification: ${handoff.goal.slice(0, 72)}`, 'planner')
       if (!this.active(id)) return
       await this.host.sessions.prompt(planner, `handoff:${id}:task`, JSON.stringify({ ...brief(handoff), task: taskPrompt }),
         'queue', () => { if (!this.active(id)) throw new Later('Planning state changed before delivery') })
@@ -106,7 +107,9 @@ export class Planning {
     if (!handoff) return
     const session = splitterSessionId(id)
     try {
-      const agent = await this.host.sessions.ensure(session, handoff.project.workspace, `Plan: ${handoff.goal.slice(0, 72)}`, 'splitter')
+      const workspace = await this.host.verifyProjectBinding?.(handoff.project) ?? handoff.project.workspace
+      if (!pending()) return
+      const agent = await this.host.sessions.ensure(session, workspace, `Plan: ${handoff.goal.slice(0, 72)}`, 'splitter')
       if (!pending()) return
       const base = `handoff:${id}:plan:${specId}`, request = pass === 0 ? base : `${base}:resume:${pass}`
       if (!this.selectedSplits.has(id)) {

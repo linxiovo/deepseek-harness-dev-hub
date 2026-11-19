@@ -10,17 +10,18 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-skill'
 import type {} from '@deepseek-ai/dsh-subprocess'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
-import { Engine, key, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
-import { settingsPolicy } from '../policy.ts'
+import { Engine, latestAssignment, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
+import { settingsPolicy, SettingsSchema } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
-import type { Deployment, Machine } from '../deployment.ts'
+import { workerProbe, type Deployment, type Machine } from '../deployment.ts'
+import { sameDirectory } from '../infra/environment.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
-import { DshExecutor, sourceTrigger, workerSessionId } from '../executor/dsh.ts'
+import { DshExecutor, sourceTrigger, ticketOfSession, workerSessionId } from '../executor/dsh.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
@@ -28,6 +29,8 @@ import { evalsHealth } from './views/overview.ts'
 import { TextCache } from './cache.ts'
 import { Effects } from './effects.ts'
 import { Handoffs } from './handoffs.ts'
+import { Installation, projectDatabase, projectHubId } from './installation.ts'
+import { InstallationError } from './installation-api.ts'
 import { Planning } from './planning.ts'
 import { Plans } from './plans.ts'
 import { Prompts } from './prompts.ts'
@@ -35,7 +38,7 @@ import { registerHttp, type HttpHost } from './http.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
-import { pullEndNotices } from '../sources/github-pull.ts'
+import { pullEndNotices, pullsOf, recoverPulls } from '../sources/github-pull.ts'
 import { HealthBoard } from '../infra/health.ts'
 import { Outbox } from './outbox.ts'
 import { Passes } from './passes.ts'
@@ -80,43 +83,68 @@ export class Runtime extends Service implements SourceHost {
   readonly engine: Engine
   readonly passes: Passes
   readonly ready: Promise<void>
+  readonly installation: Installation
   private readonly board = new HealthBoard()
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
   readonly masterId: string
   private readonly sourceLinks = new TextCache(200_000)
   private readonly stopped = new AbortController()
-  private readonly disposers: (() => void)[] = []
+  private disposeHttp?: () => Promise<void>
   private releaseLock?: () => Promise<void>
   private closingFlag = false
+  private recoveryPending = false
   private stopping?: Promise<void>
   private readonly sourceDeps: SourceContextDeps
   private readonly toolHost: MainToolsHost & ExecutorToolsHost & PlannerToolsHost & SplitterToolsHost
   /** Non-zero while a main-Session tool is executing an Engine command, suppressing self-triggered domain event notices. */
   private quiet = 0
-  constructor(ctx: Context, readonly machine: Machine, restart: () => void) {
+  readonly machine: Machine
+  constructor(ctx: Context, machine: Machine, restart: () => void) {
     super(ctx, 'orchestrator')
     const runtime = this
     // Lock the state directory before opening the database so another process cannot migrate or write concurrently.
     mkdirSync(machine.stateDir, { recursive: true, mode: 0o700 })
+    machine = { ...machine, stateDir: realpathSync.native(machine.stateDir) }
     const compromised = (error: Error) => { this.runtimeHealth.set({ state: 'error', detail: error.message }); this.stopped.abort() }
     const release = lockSync(machine.stateDir, { stale: 30_000, onCompromised: compromised })
     this.releaseLock = async () => { release() }
     let opened: Store | undefined
+    let catalog: Installation | undefined
     try {
       const report = (error: unknown) => { ctx.logger.warn('dsh-superagent: %s', String(error)) }
-      const store = opened = this.store = new Store(join(machine.stateDir, 'orchestrator.sqlite'), report)
-      const setup = this.setup = new Setup({ context: ctx, machine, lifetime: this.lifetime, restart })
+      const installation = catalog = this.installation = new Installation({ machine, signal: this.lifetime,
+        probe: workerProbe(ctx.subprocess, machine.stateDir, machine.stateDir, this.lifetime),
+        restart: () => { setTimeout(restart, 0) }, configured: () => this.configured(), paused: () => this.store.settings().paused,
+        recoveryPending: () => this.recoveryPending,
+        recoverable: () => this.recoverable(), settings: () => this.store.settings(), legacyHubId: () => this.legacyHubId(machine.stateDir),
+        legacyHandoffsMatch: ({ repository, workspace }) => this.handoffs.list().every(handoff =>
+          handoff.project.repository.toLowerCase() === repository.toLowerCase() && sameDirectory(handoff.project.workspace, workspace)) })
+      const project = installation.project
+      const projectMachine = this.machine = { ...machine, stateDir: installation.stateDir }
+      const store = opened = this.store = new Store(projectDatabase(installation), report)
+      if (project?.initial && store.get(KV.settings.revision) === undefined) {
+        const { baseRef, policy } = project.initial
+        store.saveSettings(SettingsSchema.parse({ policy, sources: { github: { config: { repository: project.repository } } },
+          executor: { repository: project.workspace, baseRef } }))
+      }
+      if (project && store.settings().executor.repository !== project.workspace) {
+        const saved = store.settings()
+        store.saveSettings({ ...saved, executor: { ...saved.executor, repository: project.workspace } })
+      }
+      const setup = this.setup = new Setup({ context: ctx, machine: projectMachine, lifetime: this.lifetime, restart }, project ? {
+        managed: () => installation.github && { repository: project.repository, github: installation.github },
+      } : {})
       const deployed = () => setup.configured()
         ? environmentOf({ deployment: setup.deployment, sources: this.sources, settings: store.settings() }) : undefined
       const feishu = () => setup.configured() && !!setup.deployment.feishu
       const prompts = this.prompts = new Prompts(store, () => machine.promptMaxChars.get(), deployed, feishu)
-      const masterId = this.masterId = store.get(KV.runtime.masterId) ?? `orchestrator-${key(machine.stateDir)}`
+      const masterId = this.masterId = store.get(KV.runtime.masterId) ?? projectHubId(installation.stateDir)
       store.set(KV.runtime.masterId, masterId)
       const commands = this.commands = new Commands(() => setup.deployment, setup.commandEnvironment, this.lifetime)
       const meter = this.meter = new SessionMeter({ context: ctx, store, lifetime: this.lifetime })
       const board = this.board
       const effects = this.effects = new Effects(store, board)
-      const handoffs = this.handoffs = new Handoffs(store, effects)
+      const handoffs = this.handoffs = new Handoffs(store, effects, project, () => installation.assertNewWork())
       const plans = this.plans = new Plans(store, handoffs, effects)
       const sources = this.sources = new SourceRegistry(() => store.settings(), board, kind => {
         // Sync source member lists once startup completes when a source plugin loads dynamically.
@@ -128,25 +156,37 @@ export class Runtime extends Service implements SourceHost {
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
       const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx, meter,
+        ownsSession: id => this.ownsSession(id),
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
       const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
-        lifetime: this.lifetime,
-        closing: () => this.closing(), environment, plannerActive: id => handoffs.isPlanning(id),
+        lifetime: this.lifetime, boundWorkspace: project?.workspace,
+        closing: () => this.closing(), environment, plannerActive: id => this.configured() && handoffs.isPlanning(id),
         splitterWorkspace: id => {
+          if (!this.configured()) return undefined
           const handoff = handoffs.get(id)
-          return handoff?.id === id && handoff.status === 'specified' && handoff.spec?.handoffId === id ? handoff.project.workspace : undefined
+          return handoff?.id === id && handoff.status === 'specified' && handoff.spec?.handoffId === id ? project?.workspace ?? handoff.project.workspace : undefined
         },
-        workerAuthorized: (ticketId, sessionId) => runtime.executor?.writerAuthorized(ticketId, sessionId) === true,
+        workerAuthorized: (ticketId, sessionId) => !this.closing() && this.configured() && runtime.executor?.writerAuthorized(ticketId, sessionId) === true,
         tools: (agent, ticket, role) => role === 'planner' ? plannerTools(this.toolHost, agent)
           : role === 'splitter' ? splitterTools(this.toolHost, agent)
           : ticket ? executorTools(this.toolHost, ticket, agent.id) : mainTools(this.toolHost, agent) })
-      this.planning = new Planning({ handoffs, plans, effects, sessions, paused: () => this.paused(), closing: () => this.closing() })
+      const verifyProjectBinding = installation.validateWorkspace.bind(installation)
+      this.planning = new Planning({ handoffs, plans, effects, sessions, verifyProjectBinding,
+        paused: () => this.paused(), closing: () => this.closing() })
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
-        sourceHost: this, setup, requestPass: () => { this.passes.request() } })
+        sourceHost: this, setup, requestPass: () => { this.passes.request() },
+        validate: (before, after) => {
+          if (this.closing()) throw new InstallationError(409, 'switching')
+          if (project && (before.sources.github?.config.cli !== after.sources.github?.config.cli
+            || before.sources.github?.config.repository !== after.sources.github?.config.repository
+            || before.executor.repository !== after.executor.repository || before.executor.directory !== after.executor.directory)) {
+            throw new InstallationError(409, 'projectBindingImmutable')
+          }
+        } })
       this.executor = new DshExecutor({ context: ctx, commands, get engine() { return runtime.engine }, store, effects,
-        health: board.claim('worker'), machine, lifetime: this.lifetime, sessions, closing: () => this.closing(),
+        health: board.claim('worker'), machine: projectMachine, lifetime: this.lifetime, sessions, closing: () => this.closing(),
         paused: () => this.paused(), environment, sourceLink: link,
         repliedTo: trigger => repliedTo({ store, sources }, trigger) })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
@@ -155,7 +195,7 @@ export class Runtime extends Service implements SourceHost {
       const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused() })
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
-      const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor,
+      const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor, ...(project ? { projectId: project.id } : {}),
         outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
           // Notify the main Session only about domain events it did not initiate itself.
           const notice = this.quiet ? undefined : eventNotice(event, id => store.tickets.get(id))
@@ -176,18 +216,22 @@ export class Runtime extends Service implements SourceHost {
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
       const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
-        health: this.runtimeHealth, lifetime: this.lifetime, configured: () => setup.configured(), closing: () => this.closing() })
+        health: this.runtimeHealth, lifetime: this.lifetime, configured: () => this.configured(), closing: () => this.closing() })
+      const sourceInactive = () => this.closing() || (project !== undefined && !installation.github)
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
-        get deployment() { return setup.deployment }, configured: () => setup.configured(),
-        get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
+        get deployment() { return setup.deployment }, configured: () => this.configured(), closing: sourceInactive,
+        get setupProblem() { return runtime.setupProblem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => {
+          if (sourceInactive()) throw new InstallationError(409, installation.transitioning() ? 'switching' : 'githubSetupRequired')
+          return passes.receive(trigger)
+        } }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, settings: this.settings, assessor, resources, handoffs, plans, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
-        requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
+        requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
-      this.ready = this.initialize()
+      this.ready = this.initialize().then(() => { installation.finishStartup() })
     } catch (error) {
       // Release the database and state lock if initialization fails so an in-process restart can reacquire them.
-      try { opened?.close() } finally { release() }
+      try { opened?.close() } finally { try { catalog?.close() } finally { release() } }
       throw error
     }
   }
@@ -197,8 +241,11 @@ export class Runtime extends Service implements SourceHost {
   context(kind: { kind: string; health: readonly string[] }): SourceContext { return sourceContextOf(this.sourceDeps, kind) }
   /** Resolved deployment; throws while waiting for setup (`!configured()`). */
   get deployment(): Deployment { return this.setup.deployment }
-  configured(): boolean { return this.setup.configured() }
-  get setupProblem(): SetupProblem | undefined { return this.setup.problem }
+  configured(): boolean { return this.setup.configured() && !this.recoveryPending && (!this.installation.project || !!this.installation.github) }
+  get setupProblem(): SetupProblem | undefined {
+    const onboarding = this.installation.onboarding()
+    return this.setup.problem ?? (onboarding.status === 'blocked' ? onboarding.problem : undefined)
+  }
   /** Why the Feishu bot is unavailable even though the Feishu Source configures a CLI. */
   get feishuProblem(): SetupProblem | undefined { return this.setup.feishuProblem }
   links(): LinkTarget {
@@ -211,7 +258,7 @@ export class Runtime extends Service implements SourceHost {
     const { setup: { deployment }, sources } = this
     return ticketEnvironment({ deployment, sources, settings: this.store.settings(), ticket, ...trigger ? { trigger } : {} })
   }
-  checkSetup(): void { this.setup.check() }
+  checkSetup(): void { if (this.recoveryPending) this.setup.restart(); else this.setup.check() }
   receive(trigger: Trigger): ReceiveResult { return this.passes.receive(trigger) }
   async idle(): Promise<void> {
     await this.passes.idle()
@@ -220,19 +267,50 @@ export class Runtime extends Service implements SourceHost {
   }
   pump(): Promise<void> { return this.passes.pump() }
   sendReplies(): Promise<void> { return this.outbox.sent() }
-  private closing(): boolean { return this.closingFlag }
+  private closing(): boolean { return this.closingFlag || this.lifetime.aborted || this.installation.transitioning() }
   /** Hold evaluation, dispatch, and outbound delivery while paused or awaiting setup; sources still record incoming triggers. */
-  private paused(): boolean { return !this.setup.configured() || this.store.settings().paused }
+  private paused(): boolean { return this.closing() || !this.configured() || this.store.settings().paused }
+  private recoverable() {
+    return {
+      assignments: this.store.tickets.open().filter(ticket => latestAssignment(ticket)?.state !== 'ended').length,
+      handoffs: this.handoffs.list().filter(handoff => handoff.status === 'confirmed' || handoff.status === 'planning'
+        || (handoff.status === 'specified' && this.plans.get(handoff.id) === undefined)).length,
+      effects: this.effects.count(),
+    }
+  }
+  private legacyHubId(stateDir: string): string {
+    if (sameDirectory(stateDir, this.machine.stateDir)) return this.masterId
+    const path = join(stateDir, 'orchestrator.sqlite')
+    if (!existsSync(path)) return projectHubId(stateDir)
+    const store = new Store(path)
+    try { return store.get(KV.runtime.masterId) ?? projectHubId(stateDir) }
+    finally { store.close() }
+  }
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
-    this.disposers.push(registerHttp(this.ctx, this.httpHost()))
-    if (!await this.setup.run(this.store.settings())) {
+    this.disposeHttp = registerHttp(this.ctx, this.httpHost())
+    await this.installation.initialize()
+    if (this.closing()) return
+    const project = this.installation.project
+    if (project) this.sessions.install()
+    if (this.installation.project && this.installation.github) {
+      try { await this.installation.validateWorkspace() }
+      catch (error) {
+        if (this.closing()) return
+        if (!(error instanceof InstallationError)) throw error
+        this.runtimeHealth.set({ state: 'error', detail: error.message, at: now() })
+        return
+      }
+    }
+    if ((this.installation.project && !this.installation.github) || !await this.setup.run(this.store.settings())) {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
       return
     }
-    this.sessions.install()
+    if (!project) this.sessions.install()
     this.executor.install()
-    await this.sessions.ensure(this.masterId, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
+    await this.sessions.ensure(this.masterId, project?.initial ? project.workspace : this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
+    if (this.closing()) return
+    if (project && !await this.reconcilePulls()) return
     for (const id of this.settings.syncable()) await this.settings.sync(id).catch(() => { /* sync() records its failure in health. */ })
     // If stop() was called while awaiting setup, session creation, or policy sync, do not start background loops.
     if (this.closing()) return
@@ -242,22 +320,51 @@ export class Runtime extends Service implements SourceHost {
     this.effects.start()
     this.runtimeHealth.set({ state: 'ready', detail: 'Orchestrator is ready', at: now() })
   }
+  private async reconcilePulls(): Promise<boolean> {
+    const source = this.context({ kind: 'github', health: ['github'] })
+    try {
+      for (const number of await recoverPulls(source, this.lifetime)) {
+        if (this.store.tickets.open().some(ticket => pullsOf(ticket).includes(number) &&
+          (latestAssignment(ticket)?.state === 'running' || latestAssignment(ticket)?.state === 'pending'))) {
+          this.recoveryPending = true
+          this.runtimeHealth.set({ state: 'error', detail: `GitHub PR #${number} has merged but its Ticket is still open. Resolve the Ticket before retrying recovery.`, at: now() })
+          return false
+        }
+      }
+      return !this.closing()
+    } catch {
+      if (this.closing()) return false
+      this.recoveryPending = true
+      this.runtimeHealth.set({ state: 'error', detail: 'Could not reconcile tracked GitHub pull requests. Run the setup check to retry recovery.', at: now() })
+      return false
+    }
+  }
   private httpHost(): HttpHost {
     const runtime = this
-    const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, setup, passes,
+    const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, setup, passes, installation,
       meter } = this
-    return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, meter,
+    return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, meter, installation,
+      get ready() { return runtime.ready }, assertNewWork: () => installation.assertNewWork(),
+      ownsSession: id => this.ownsSession(id),
       get deployment() { return setup.deployment },
-      get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem },
-      configured: () => setup.configured(), links: () => runtime.links(), ticketEnvironment: ticket => runtime.ticketEnvironment(ticket),
-      checkSetup: () => { setup.check() }, requestPass: () => { passes.request() }, models: () => this.ctx.sessionController.modelCatalog() }
+      get setupProblem() { return runtime.setupProblem }, get feishuProblem() { return setup.feishuProblem },
+      configured: () => runtime.configured(), links: () => runtime.links(), ticketEnvironment: ticket => runtime.ticketEnvironment(ticket),
+      checkSetup: () => { runtime.checkSetup() }, requestPass: () => { passes.request() }, models: () => this.ctx.sessionController.modelCatalog() }
+  }
+  private ownsSession(id: string): boolean {
+    if (!this.installation.project || id === this.masterId) return true
+    const ticketId = ticketOfSession(id)
+    if (ticketId) return this.store.tickets.get(ticketId) !== undefined
+    return this.handoffs.list().some(handoff => `planner-${handoff.id}` === id || splitterSessionId(handoff.id) === id)
   }
   /** Idempotent stop; concurrent or repeated calls share the same shutdown promise. */
   stop(): Promise<void> { return this.stopping ??= this.shutdown() }
   private async shutdown(): Promise<void> {
     this.closingFlag = true; const passes = this.passes.stop(); this.stopped.abort()
     try {
+      const http = this.disposeHttp?.()
       this.assessor.stop()
+      await this.ready.catch(() => {})
       const handoffSessions = () => this.handoffs.list().flatMap(({ id }) => {
         const splitter = this.ctx.agents.get(splitterSessionId(id) as SessionId)
         return splitter && this.sessions.isSplitterSession(splitter) ? [`planner-${id}`, splitter.id] : [`planner-${id}`]
@@ -265,7 +372,7 @@ export class Runtime extends Service implements SourceHost {
       const live = (ids: string[]) => ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
       const agents = live([this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id)), ...handoffSessions()])
       for (const agent of agents) agent.cancel({ kind: 'user' }, { keepInbox: true })
-      await Promise.allSettled([passes, this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
+      await Promise.allSettled([http, passes, this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
       // An effect may have been creating a planner or splitter when shutdown took the first snapshot.
       const lateHandoffs = live(handoffSessions()).filter(agent => !agents.includes(agent))
       for (const agent of lateHandoffs) agent.cancel({ kind: 'user' }, { keepInbox: true })
@@ -274,12 +381,12 @@ export class Runtime extends Service implements SourceHost {
       await this.executor.shutdown()
       this.executor.dispose()
       this.sessions.dispose()
-      for (const dispose of this.disposers.reverse()) dispose()
       await this.ctx.sessionPersistence.flush()
+      this.installation.stopped()
     } finally {
       // Close the database before releasing the directory lock so another process cannot open the database mid-write; a compromised lock may already be released.
       this.setup.restore()
-      try { this.store.close() } finally {
+      try { try { this.store.close() } finally { this.installation.close() } } finally {
         const unreleased = (error: unknown) => { this.ctx.logger.warn('dsh-superagent could not release its state directory lock: %s',
           String(error)) }
         await this.releaseLock?.().catch(unreleased)

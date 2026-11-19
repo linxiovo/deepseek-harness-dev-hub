@@ -1,5 +1,5 @@
 /** Shared panel React contexts, state polling, restart detection, and action runner hook. */
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Fragment, createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { caller, usePoll, type ApiMessages, type Call, type SetupView, type StateView } from './api.ts'
 import type { Route } from './route.ts'
@@ -79,14 +79,15 @@ export function PanelProvider({ t, interval = 5000, openSession = noSession, nav
   // Read the current translator via ref so locale changes do not recreate `call` and restart polling.
   const copy = useRef(t)
   copy.current = t
-  const call = useMemo(() => caller(() => messages(copy.current)), [])
+  const installationCall = useMemo(() => caller(() => messages(copy.current)), [])
   const [toast, setToast] = useState<{ text: string; id: number }>()
   const notify = useCallback((text: string) => setToast({ text, id: Date.now() }), [])
   // Poll at 1s during a restart until the server goes down and answers again, or time out after 30s if the restart completed between polls.
   const [restarting, setRestarting] = useState<{ down: boolean }>()
   const [restarts, setRestarts] = useState(0)
   const restart = useCallback(() => setRestarting({ down: false }), [])
-  const { data: state, error, reload } = usePoll(() => call('GET state'), [call], restarting ? 1000 : interval)
+  const { data: state, error, reload } = usePoll(() => installationCall('GET state'), [installationCall], restarting ? 1000 : interval)
+  const call = useMemo(() => caller(() => messages(copy.current), state?.projectId), [state?.projectId])
   if (restarting && !!error !== restarting.down) {
     setRestarting(error ? { down: true } : undefined)
     if (!error) setRestarts(restarts + 1)
@@ -102,7 +103,7 @@ export function PanelProvider({ t, interval = 5000, openSession = noSession, nav
     reload, restarts])
   return <Panel.Provider value={context}><PanelState.Provider value={data}>
     <style>{STYLES}</style>
-    {children}
+    <Fragment key={state?.projectId}>{children}</Fragment>
     {toast && <Toast key={toast.id} text={toast.text} onDone={() => setToast(undefined)} />}
   </PanelState.Provider></Panel.Provider>
 }

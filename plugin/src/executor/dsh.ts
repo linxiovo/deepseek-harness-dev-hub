@@ -672,8 +672,7 @@ export class DshExecutor implements Executor {
         ...(batch.length ? { batch } : {}), ...retried })
     const requestId = later ? `assignment:${ticket.id}:${assignment.id}` : first
     await this.host.sessions.prompt(sessionId, requestId, text, 'queue',
-      () => { if (!current() || !this.writerAuthorized(ticket.id, sessionId)) throw new Error('Launch authorization changed before worker delivery') },
-      () => { this.host.engine.assignmentStarted(ticket.id, assignment.id) })
+      () => { if (!current() || !this.writerAuthorized(ticket.id, sessionId)) throw new Error('Launch authorization changed before worker delivery') })
     this.host.engine.assignmentStarted(ticket.id, assignment.id)
   }
   /** Returns the stored ticket for `agent` when it is a worker session, or undefined otherwise. */

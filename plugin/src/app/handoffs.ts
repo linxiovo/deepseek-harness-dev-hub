@@ -1,3 +1,4 @@
+import { realpathSync, statSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { key } from '../core/ids.ts'
 import type { Handoff, HandoffInput, HandoffQuestion, ProjectRef, Spec, SpecInput } from '../core/handoff.ts'
@@ -9,32 +10,60 @@ import { promptFile } from './skill-files.ts'
 
 const relayTemplate = promptFile('handoff-relay')
 
+function matchesBinding(approved: HandoffInput['project'], recorded: ProjectRef): boolean {
+  if (approved.repository.trim().toLowerCase() !== recorded.repository.toLowerCase()) return false
+  try {
+    const workspace = realpathSync.native(approved.workspace.trim())
+    const matches = process.platform === 'win32' ? workspace.toLowerCase() === recorded.workspace.toLowerCase() : workspace === recorded.workspace
+    return matches && statSync(workspace).isDirectory()
+  } catch {
+    return false
+  }
+}
+
 /** Durable lifecycle for confirmed product briefs and their immutable published specifications. */
 export class Handoffs {
-  constructor(private readonly store: Store, private readonly effects: Effects) {}
+  constructor(private readonly store: Store, private readonly effects: Effects, private readonly binding?: ProjectRef,
+    private readonly assertNewWork?: () => void) {}
 
   /** Confirm and persist the original brief once; identical confirmations reuse it without re-enqueuing planning. */
   confirm(input: HandoffInput): { handoff: Handoff; reused: boolean } {
-    const workspace = resolve(input.project.workspace.trim())
-    const repository = input.project.repository.trim()
-    const projectId = key('handoff-project', repository, workspace)
-    const project: ProjectRef = { id: projectId, repository, workspace }
-    const brief = { project: { repository, workspace }, goal: input.goal.trim(),
+    const brief = { goal: input.goal.trim(),
       constraints: input.constraints.map(item => item.trim()), acceptanceScope: input.acceptanceScope.map(item => item.trim()),
       authorization: { scope: input.authorization.scope.trim(), release: input.authorization.release } }
-    const handoffId = key('handoff', projectId, JSON.stringify(brief))
+    const idFor = ({ id, repository, workspace }: ProjectRef) => key('handoff', id, JSON.stringify({ project: { repository, workspace }, ...brief }))
+    const repository = input.project.repository.trim()
+    const workspace = resolve(input.project.workspace.trim())
     const { sessionId, messageId, text } = input.confirmedBy
     if (!sessionId?.trim() || !messageId?.trim() || !text?.trim()) throw new Error('A direct user confirmation requires a session, message, and text')
     const receiptKey = KV.handoffs.confirmationReceipt(sessionId, messageId)
     return this.store.atomic(() => {
       const receipt = this.store.get(receiptKey)
-      if (receipt && receipt.handoffId !== handoffId) throw new Error('This user message already confirmed a different product brief')
-      const prior = this.store.get(KV.handoffs.record(handoffId))
-      if (prior) {
-        if (!receipt) this.store.set(receiptKey, { handoffId })
+      if (receipt) {
+        const prior = this.get(receipt.handoffId)
+        if (!prior) throw new Error(`Confirmation receipt references unavailable handoff ${receipt.handoffId}`)
+        const exact = repository === prior.project.repository && workspace === prior.project.workspace
+        if (idFor(prior.project) !== prior.id || (!exact && !matchesBinding(input.project, prior.project))) {
+          throw new Error('This user message already confirmed a different product brief')
+        }
         return { handoff: prior, reused: true }
       }
-      if (receipt) throw new Error(`Confirmation receipt references unavailable handoff ${handoffId}`)
+      this.assertNewWork?.()
+      let project: ProjectRef
+      if (this.binding) {
+        if (!matchesBinding(input.project, this.binding)) throw new Error('Approved repository or workspace does not match the bound project')
+        const { id, repository, workspace } = this.binding
+        project = { id, repository, workspace }
+      } else {
+        project = { id: key('handoff-project', repository, workspace), repository, workspace }
+      }
+      const projectId = project.id
+      const handoffId = idFor(project)
+      const prior = this.store.get(KV.handoffs.record(handoffId))
+      if (prior) {
+        this.store.set(receiptKey, { handoffId })
+        return { handoff: prior, reused: true }
+      }
       const currentId = this.store.get(KV.handoffs.current(projectId))
       const current = currentId ? this.store.get(KV.handoffs.record(currentId)) : undefined
       if (current && current.status !== 'specified') throw new Error(`Project already has active handoff ${current.id}`)

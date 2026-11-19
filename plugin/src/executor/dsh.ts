@@ -12,6 +12,7 @@ import { runAsWorker, sameDirectory, verifyDirectory } from '../infra/environmen
 import { physicalPath } from '../infra/paths.ts'
 import { worktreePreparationConfig, type Settings } from '../policy.ts'
 import type { Commands } from '../infra/commands.ts'
+import { CliError } from '../infra/commands.ts'
 import type { Store } from '../app/store.ts'
 import { Later, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
@@ -526,7 +527,8 @@ export class DshExecutor implements Executor {
       && ticket.execution.active_writer?.assignment === assignment.id && ticket.execution.active_writer.session === sessionId
       && assignment.writer?.state === 'active' && assignment.writer.session === sessionId
   }
-  async inspectDocImpact(ticketId: string, sessionId: string, candidate: string, scope: Parameters<typeof checkDocTree>[4], signal: AbortSignal) {
+  private async inspectCandidate<T>(ticketId: string, sessionId: string, candidate: string, purpose: string, signal: AbortSignal,
+    collect: (worktree: string, base: string, signal: AbortSignal) => Promise<T>) {
     const { store, commands, lifetime } = this.host
     const stopped = AbortSignal.any([signal, lifetime])
     const active = store.tickets.get(ticketId)?.execution?.active_writer
@@ -535,7 +537,7 @@ export class DshExecutor implements Executor {
       stopped.throwIfAborted()
       const ownership = store.tickets.get(ticketId)?.execution?.ownership
       if (!claim || !ownership?.verified || this.claims.get(claim.assignment) !== claim || !this.writerAuthorized(ticketId, sessionId)) {
-        throw new Error('Doc Tree evidence requires the active writer for this ticket worktree')
+        throw new Error(`${purpose} evidence requires the active writer for this ticket worktree`)
       }
       return { ...ownership.identity, ticket: ownership.ticket, assignment: claim.assignment, generation: ownership.generation, verified: ownership.verified }
     }
@@ -545,12 +547,43 @@ export class DshExecutor implements Executor {
         branch: previous.branch, base: previous.base, ticket: ticketId, assignment: previous.assignment, session: sessionId })
     }
     const { worktree, head, base } = await inspect()
-    if (candidate !== head) throw new Error('Doc Tree candidate must match the ticket worktree HEAD')
+    if (candidate !== head) throw new Error(`${purpose} candidate must match the ticket worktree HEAD`)
     authorize()
-    const checked = await checkDocTree(commands, worktree, base.sha, head, scope, stopped)
-    if ((await inspect()).head !== head) throw new Error('Doc Tree candidate changed while collecting evidence')
+    const checked = await collect(worktree, base.sha, stopped)
+    if ((await inspect()).head !== head) throw new Error(`${purpose} candidate changed while collecting evidence`)
     authorize()
-    return { candidate: head, base: base.sha, ...checked }
+    return { candidate: head, base: base.sha, checked }
+  }
+
+  async inspectDocImpact(ticketId: string, sessionId: string, candidate: string, scope: Parameters<typeof checkDocTree>[4], signal: AbortSignal) {
+    const { checked, ...revision } = await this.inspectCandidate(ticketId, sessionId, candidate, 'Doc Tree', signal,
+      (worktree, base, stopped) => checkDocTree(this.host.commands, worktree, base, candidate, scope, stopped))
+    return { ...revision, ...checked }
+  }
+
+  async inspectTestEvidence(ticketId: string, sessionId: string, candidate: string, red: readonly string[], signal: AbortSignal) {
+    const git = this.host.commands.git.bind(this.host.commands)
+    const { candidate: head, base } = await this.inspectCandidate(ticketId, sessionId, candidate, 'Test', signal,
+      async (worktree, base, stopped) => {
+        for (const revision of new Set(red)) {
+          stopped.throwIfAborted()
+          if (revision === candidate) throw new Error('Red revision must precede the candidate')
+          if ((await git(['rev-parse', '--verify', `${revision}^{commit}`], worktree)).trim() !== revision) {
+            throw new Error('Red revision must name a commit hash')
+          }
+          try {
+            await git(['merge-base', '--is-ancestor', base, revision], worktree)
+            await git(['merge-base', '--is-ancestor', revision, candidate], worktree)
+          } catch (error) {
+            if (error instanceof CliError && error.exitCode === 1) throw new Error('Red revision must be between the pinned base and candidate')
+            throw error
+          }
+        }
+        if (await git(['status', '--porcelain=v1', '--untracked-files=all'], worktree)) {
+          throw new Error('Test evidence requires a clean candidate worktree')
+        }
+      })
+    return { candidate: head, base }
   }
   /** Stop every loaded worker and release only claims this instance can prove fully idle before Store closes. */
   async shutdown(): Promise<void> {

@@ -136,6 +136,20 @@ it('mounts the bundled Doc Tree skill only for workers, even with an older same-
   })
 })
 
+it.each(['implement', 'tdd', 'test-scope'])('mounts the bundled %s skill for workers alongside a same-name team skill', name => {
+  withStore(store => {
+    const prompts = promptsOf(store), config = defaultPrompts()
+    const saved = prompts.save({ ...config, skills: { [name]: 'Team workflow.' } }, 0, 'panel').config
+    expect(prompts.skills(saved, 'worker')).toEqual(expect.arrayContaining([
+      [`worker/${name}`, expect.stringMatching(/\S/)], [name, 'Team workflow.'],
+    ]))
+    expect(prompts.skills(saved, 'orchestrator')).toContainEqual([name, 'Team workflow.'])
+    for (const role of ['orchestrator', 'planner', 'splitter'] as const) {
+      expect(prompts.skills(saved, role).map(([key]) => key)).not.toContain(`worker/${name}`)
+    }
+  })
+})
+
 it('round-trips a team to-tickets skill without replacing the splitter’s bundled skill', () => {
   withStore(store => {
     const prompts = promptsOf(store)

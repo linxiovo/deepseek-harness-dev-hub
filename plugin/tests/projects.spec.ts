@@ -1,12 +1,16 @@
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, expect, it } from 'vitest'
-import { ProjectCatalog, type ProjectSuspension } from '../src/app/projects.ts'
+import { DatabaseSync } from 'node:sqlite'
+import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { Installation } from '../src/app/installation.ts'
+import { ProjectCatalog, ProjectConflict, type ProjectSuspension } from '../src/app/projects.ts'
 import { Store } from '../src/app/store.ts'
 import { key } from '../src/core/ids.ts'
 import { KV } from '../src/kv.ts'
-import { PolicyConfigSchema } from '../src/policy.ts'
+import { PolicyConfigSchema, SettingsSchema } from '../src/policy.ts'
+import { testMachine } from './fixtures/deployment.ts'
+import { gitRepository } from './fixtures/git.ts'
 
 let directory: string
 let stateDir: string
@@ -55,22 +59,19 @@ it('persists registration and the first selection together, then retains an expl
   expect(catalog.get('unknown')).toBeUndefined()
 })
 
-it('remembers one verified CLI reference before project registration and exposes only the public identity', () => {
+it('remembers one verified CLI reference before project registration', () => {
   expect(catalog.account()).toBeUndefined()
-  expect(catalog.publicAccount()).toBeUndefined()
   const identity = { id: 42, login: 'agent', noreply: '42+agent@users.noreply.github.com' }
   const first = { ...identity, cli: join(directory, 'gh-private') }
   catalog.setAccount(first)
   reopen()
   expect(catalog.account()).toEqual(first)
-  expect(catalog.publicAccount()).toEqual(identity)
 
   const project = catalog.register({ repository: 'Owner/First', workspace: workspace('first') })
   const replacement = { ...first, cli: join(directory, 'gh-replacement') }
   catalog.setAccount(replacement)
   reopen()
   expect(catalog.account()).toEqual(replacement)
-  expect(catalog.publicAccount()).toEqual(identity)
   expect(catalog.list()).toEqual([project])
   expect(catalog.list()[0]).not.toHaveProperty('cli')
 })
@@ -127,7 +128,7 @@ it('rejects invalid input and overlapping workspaces without changing the catalo
   expect(() => catalog.register({ repository: 'Owner/Parent', workspace: parent })).toThrow(/workspace overlaps/i)
   expect(() => catalog.register({ repository: 'Owner/Nested', workspace: workspace(join('checkouts', 'first', 'nested')) }))
     .toThrow(/workspace overlaps/i)
-  expect(() => catalog.register({ repository: 'Owner/First', workspace: workspace('elsewhere') })).toThrow(/already registered/i)
+  expect(() => catalog.register({ repository: 'Owner/First', workspace: workspace('elsewhere') })).toThrow(ProjectConflict)
   expect(() => catalog.register({ repository: 'Owner/Relative', workspace: 'relative' })).toThrow(/absolute directory/i)
   expect(() => catalog.register({ repository: 'https://github.com/Owner/First', workspace: parent })).toThrow(/owner\/name/i)
   expect(() => catalog.register({ repository: 'Owner/..', workspace: parent })).toThrow(/owner\/name/i)
@@ -144,6 +145,50 @@ it.runIf(process.platform === 'win32')('rejects a Windows workspace path relativ
   const path = workspace('root-relative')
   expect(() => catalog.register({ repository: 'Owner/Relative', workspace: path.slice(2) })).toThrow(/absolute directory/i)
   expect(catalog.list()).toEqual([])
+})
+
+async function registration() {
+  const checkout = gitRepository(directory)
+  const installation = new Installation({ machine: testMachine({ stateDir }), signal: new AbortController().signal,
+    probe: async argv => argv[2] === 'user' ? JSON.stringify({ id: 17, login: 'agent' }) : JSON.stringify({ name: 'acme/widgets', push: true }),
+    restart: vi.fn(), configured: () => false, paused: () => false, recoveryPending: () => false,
+    recoverable: () => ({ assignments: 0, handoffs: 0, effects: 0 }), settings: () => SettingsSchema.parse({}),
+    legacyHubId: () => 'legacy-hub', legacyHandoffsMatch: () => true })
+  try {
+    await installation.initialize()
+    installation.finishStartup()
+    expect(installation.runtime()).toMatchObject({ status: 'paused', reason: 'githubSetupRequired', projectId: null })
+    expect(() => installation.assertNewWork()).toThrow(/verify github/i)
+    const input = { repository: 'acme/widgets', workspace: checkout.repository, baseRef: checkout.base.ref }
+    await expect(installation.createProject(input)).rejects.toMatchObject({ status: 409, code: 'githubSetupRequired' })
+    expect((await installation.verifyGithub({ cli: process.execPath })).status).toBe('ready')
+    return { installation, input }
+  } catch (error) {
+    installation.close()
+    throw error
+  }
+}
+
+it.runIf(process.platform === 'win32')('rejects a Windows root-relative registration before resolving it', async () => {
+  const { installation, input } = await registration()
+  try {
+    await expect(installation.createProject({ ...input, workspace: input.workspace.slice(2) })).rejects.toMatchObject({
+      status: 400, code: 'invalidProject', message: 'Use an absolute local Git checkout path.',
+    })
+    expect(installation.projects().projects).toEqual([])
+  } finally { installation.close() }
+})
+
+it('does not classify a SQLite write failure as a project conflict', async () => {
+  const { installation, input } = await registration()
+  try {
+    const db = new DatabaseSync(join(stateDir, 'projects.sqlite'))
+    try {
+      db.exec(`CREATE TRIGGER refuse_registration BEFORE INSERT ON project BEGIN SELECT RAISE(ABORT, 'fixture write failure'); END`)
+    } finally { db.close() }
+    await expect(installation.createProject(input)).rejects.toMatchObject({ code: 'ERR_SQLITE_ERROR', message: 'fixture write failure' })
+    expect(installation.projects()).toEqual({ activeProjectId: null, projects: [] })
+  } finally { installation.close() }
 })
 
 it('binds legacy storage only on explicit adoption and does not copy its Store into managed projects', () => {

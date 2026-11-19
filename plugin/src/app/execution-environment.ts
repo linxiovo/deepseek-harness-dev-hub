@@ -44,9 +44,10 @@ export function environmentOf(input: { deployment: Deployment; sources: SourceRe
   const append = (owner: string, variables: readonly VariableSpec[], values: Record<string, string>) => {
     for (const spec of variables) result.push({ key: spec.key, value: values[spec.key] ?? '', description: spec.description, owner })
   }
-  if (deployment.managed) append('github', githubEnvironment.variables, githubEnvironment.values(inputContext))
+  const verifiedGithub = deployment.github.id !== undefined
+  if (verifiedGithub) append('github', githubEnvironment.variables, githubEnvironment.values(inputContext))
   for (const { kind, environment, config } of sources.environments(settings)) {
-    if (deployment.managed && kind.kind === 'github') continue
+    if (verifiedGithub && kind.kind === 'github') continue
     append(kind.kind, environment.variables, environment.values({ ...inputContext, config }))
   }
   return result

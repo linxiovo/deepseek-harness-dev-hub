@@ -47,8 +47,12 @@ function repositoryName(input: string): string {
   return name
 }
 
+/** Windows drive-rooted paths without a drive or UNC share still depend on the process's current drive. */
+export const isAbsoluteWorkspace = (input: string): boolean =>
+  isAbsolute(input) && (process.platform !== 'win32' || parse(input).root.length > 1) && !/[\0\r\n]/.test(input)
+
 function canonicalWorkspace(input: string): string {
-  if (!isAbsolute(input) || (process.platform === 'win32' && parse(input).root.length === 1)) {
+  if (!isAbsoluteWorkspace(input)) {
     throw new Error('Project workspace must be an absolute directory')
   }
   const path = realpathSync.native(input)
@@ -58,10 +62,13 @@ function canonicalWorkspace(input: string): string {
 
 const workspaceKey = (path: string): string => process.platform === 'win32' ? path.toLowerCase() : path
 
-function contains(parent: string, child: string): boolean {
+export function containsWorkspace(parent: string, child: string): boolean {
   const fromParent = relative(parent, child)
   return !isAbsolute(fromParent) && fromParent !== '..' && !fromParent.startsWith(`..${sep}`)
 }
+
+/** A valid registration that conflicts with an existing binding or its initialization. */
+export class ProjectConflict extends Error {}
 
 /** Stores project bindings, the selected mount, and account and suspension records under the installation lock. */
 export class ProjectCatalog {
@@ -115,7 +122,7 @@ export class ProjectCatalog {
       this.db.exec('COMMIT')
       return project
     } catch (error) {
-      this.db.exec('ROLLBACK')
+      if (this.db.isTransaction) this.db.exec('ROLLBACK')
       throw error
     }
   }
@@ -127,10 +134,10 @@ export class ProjectCatalog {
       if (existing.repository.toLowerCase() === binding.repository.toLowerCase()) {
         if (current === target && existing.legacy_storage === binding.legacy_storage
           && isDeepStrictEqual(this.initial(existing), this.initial(binding))) return this.project(existing)
-        throw new Error(`GitHub repository ${existing.repository} is already registered with a different binding or initialization`)
+        throw new ProjectConflict(`GitHub repository ${existing.repository} is already registered with a different binding or initialization`)
       }
-      if (contains(current, target) || contains(target, current)) throw new Error(`Project workspace overlaps ${existing.workspace}`)
-      if (existing.legacy_storage && binding.legacy_storage) throw new Error('Legacy storage is already assigned to another project')
+      if (containsWorkspace(current, target) || containsWorkspace(target, current)) throw new ProjectConflict(`Project workspace overlaps ${existing.workspace}`)
+      if (existing.legacy_storage && binding.legacy_storage) throw new ProjectConflict('Legacy storage is already assigned to another project')
     }
     this.db.prepare('INSERT INTO project (id, repository, workspace, legacy_storage, initial) VALUES (?, ?, ?, ?, ?)')
       .run(binding.id, binding.repository, binding.workspace, binding.legacy_storage, binding.initial)
@@ -165,11 +172,6 @@ export class ProjectCatalog {
 
   setAccount({ cli, id, login, noreply }: VerifiedGithub): void {
     this.db.prepare('UPDATE installation SET github_account = ?').run(JSON.stringify({ cli, id, login, noreply }))
-  }
-
-  publicAccount(): Omit<VerifiedGithub, 'cli'> | undefined {
-    const account = this.account()
-    return account && { id: account.id, login: account.login, noreply: account.noreply }
   }
 
   setSuspension(id: string, snapshot: ProjectSuspension | null): void {

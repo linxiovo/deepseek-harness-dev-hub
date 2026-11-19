@@ -1,8 +1,8 @@
 /** Probes repository and account CLIs, configures the worker execution environment and command shims, and tracks setup readiness. */
 import type { Context } from '@deepseek-ai/cordis'
 import { UserError } from '../core/index.ts'
-import { SETUP_FIELDS, resolveDeployment, resolveFeishuBot, verifyGithubRepository, workerProbe,
-  type Deployment, type Machine, type ManagedGithub, type Probe } from '../deployment.ts'
+import { GithubAccountsSchema, SETUP_FIELDS, resolveFeishuBot, verifyGithubRepository, workerProbe,
+  type Deployment, type Machine, type ManagedGithub, type Probe, type VerifiedGithub } from '../deployment.ts'
 import { agentVariables, applyEnvironment, verifyEnvironment, withoutDirectory, workerBin, writeEnvironment } from '../infra/environment.ts'
 import type { Settings, SettingsBlock } from '../policy.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
@@ -13,7 +13,8 @@ export interface SetupHost {
   readonly lifetime: AbortSignal
   restart(): void
 }
-export interface SetupOptions { managed?: () => ManagedGithub | undefined }
+type SetupOptions = { managed: () => ManagedGithub | undefined; legacy?: never; verifyLegacy?: never }
+  | { managed?: never; legacy: () => VerifiedGithub | undefined; verifyLegacy: (cli: string) => Promise<VerifiedGithub> }
 
 const setupFields = (settings: Settings) =>
   JSON.stringify(Object.entries(SETUP_FIELDS).map(([id, keys]) => keys.map(key => settings.sources[id]?.config[key] ?? '')))
@@ -32,7 +33,7 @@ export class Setup {
   /** Environment variables pointing agent subprocesses at the isolated git config and command shims. */
   private readonly variables: Record<string, string | undefined>
   private restoreEnvironment?: () => void
-  constructor(private readonly host: SetupHost, private readonly options: SetupOptions = {}) {
+  constructor(private readonly host: SetupHost, private readonly options: SetupOptions) {
     this.path = withoutDirectory(process.env.PATH ?? '', workerBin(host.machine.stateDir))
     this.variables = { ...agentVariables(host.machine.stateDir), GH_HOST: 'github.com', GH_PROMPT_DISABLED: '1' }
   }
@@ -63,13 +64,16 @@ export class Setup {
   }
   /** Defer the restart to the next macrotask so the current HTTP or tool caller receives its response first. */
   restart(): void { setTimeout(this.host.restart, 0) }
-  /** Verify account CLIs for a modified source block before saving, ignoring setup errors belonging to other blocks. */
+  /** Verify a changed Source account before saving its configuration. */
   async checkAccounts(block: SettingsBlock, settings: Settings): Promise<void> {
-    if (block === 'source:github' && this.options.managed) return
-    const { machine } = this.host
-    const check = block === 'source:feishu' ? resolveFeishuBot(machine, settings.sources.feishu?.config, this.probe())
-      : resolveDeployment(machine, settings.sources.github?.config, this.probe())
-    await check.catch((error: unknown) => { if (!(error instanceof SetupError) || error.place === block.slice(7)) throw error })
+    const probe = this.probe()
+    if (block === 'source:feishu') {
+      await resolveFeishuBot(this.host.machine, settings.sources.feishu?.config, probe)
+    } else if (block === 'source:github' && this.options.verifyLegacy) {
+      const { repository, cli } = GithubAccountsSchema.parse(settings.sources.github?.config ?? {})
+      if (!repository) throw new SetupError('repositoryUnset')
+      await verifyGithubRepository(await this.options.verifyLegacy(cli), repository, probe)
+    }
   }
   async blockCommands(blocked: readonly string[]): Promise<void> {
     if (this.resolved) await writeEnvironment(this.resolved, blocked)
@@ -82,14 +86,20 @@ export class Setup {
   }
   private async resolveGithub(settings: Settings, probe: Probe): Promise<Deployment> {
     const { machine } = this.host
-    const managed = this.options.managed
-    if (!managed) return resolveDeployment(machine, settings.sources.github?.config, probe)
-    const binding = managed()
+    const options = this.options
+    if (options.legacy) {
+      const { repository } = GithubAccountsSchema.parse(settings.sources.github?.config ?? {})
+      if (!repository) throw new SetupError('repositoryUnset')
+      const github = options.legacy()
+      if (!github) throw new SetupError('agentCliUnset')
+      return { ...machine, github, repository: await verifyGithubRepository(github, repository, probe) }
+    }
+    const binding = options.managed()
     if (!binding) throw new SetupError('agentCliUnset')
     const github = { ...binding.github }
     const target = binding.repository
     const repository = await verifyGithubRepository(github, target, probe)
-    const current = managed()
+    const current = options.managed()
     if (!current || current.github.id !== github.id || current.github.cli !== github.cli) throw new SetupError('agentAccountChanged')
     if (current.repository !== target) throw new SetupError('repositoryUnset')
     return { ...machine, github: { cli: github.cli, id: github.id, login: github.login, noreply: github.noreply }, repository, managed: true }

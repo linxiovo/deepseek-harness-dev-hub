@@ -126,6 +126,8 @@ After the first start, edit volatile machine limits in **Settings → Deployment
 
 Run the native host with `dsh --profile superagent` and stop it through the host's normal shutdown (for a foreground process, Ctrl+C). On a server, set `runtimeMode: headless` on the `dsh-superagent` entry and run the same DSH profile under the server's usual process supervision. DSH handles plugin startup, shutdown and remount on project selection. No separate project daemon is needed. Use a dedicated profile and state directory for each DSH instance.
 
+In desktop mode, closing the DSH host or shutting down or suspending the computer pauses work and Source listening. Start the same profile again to continue from its state. `GET /orchestrator/api/runtime` reports the mode, any pause reason, and the recoverable work recorded at startup. Use headless mode if listening must continue while the operator's computer is off.
+
 The optional POSIX helper supervises this same native DSH process. Run its `scripts/dsh-superagent` commands from `plugin/`:
 
 ```sh
@@ -248,7 +250,7 @@ The blocks:
 - `eval`: `mode`, `timeoutSeconds` and `model`.
 - `executor`: `model`, `maxWorkers`, `repository`, `baseRef`, `directory`, `prepare` and `blockedCommands`. The processing pause is a setting of its own, `paused`, which `POST executor/pause` sets.
 
-Account settings that can still change (Feishu, or legacy GitHub before adoption) run their setup check first. A failed check returns 400 with details in `setup`. A save that needs setup to run again returns `restarting: true`; the API is temporarily unavailable during remount.
+Account settings that can still change (Feishu, or the legacy GitHub Source before adoption) run their setup check first. A legacy GitHub CLI change must verify as the same installation account. A failed check returns 400 with details in `setup`. A save that needs setup to run again returns `restarting: true`; the API is temporarily unavailable during remount.
 
 ```sh
 api=http://127.0.0.1:3082/orchestrator/api
@@ -266,7 +268,7 @@ Setup uses the DeepSeek Harness subprocess service, as worker shells do. It remo
 
 For a managed project, installation onboarding verifies the configured CLI account on `github.com` before project setup. Setup requires that verified binding, rechecks push access to the bound repository, and uses the canonical name GitHub returns. It does not fall back to the GitHub Source's CLI or repository settings. Hub and Worker prompts receive the repository, account login and no-reply email even if GitHub polling is disabled; they do not receive the CLI path or credentials.
 
-For a legacy single-repository deployment, setup verifies the account and the repository configured on the GitHub Source. In either case, setup writes the worker environment and checks that git selects the agent's credential helper for `github.com`. A Feishu setup failure disables only the Feishu Source.
+Before adoption of a legacy single-repository deployment, the installation verifies and pins the GitHub Source account through the same onboarding probe, and setup checks that account's access to the legacy repository. In either case, setup writes the worker environment and checks that git selects the agent's credential helper for `github.com`. A Feishu setup failure disables only the Feishu Source.
 
 The process environment that setup writes:
 

@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { realpath } from 'node:fs/promises'
-import { dirname, isAbsolute, join, relative, sep } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 import { promisify } from 'node:util'
 import { key } from '../core/ids.ts'
 import type { ProjectRef } from '../core/handoff.ts'
@@ -10,14 +10,10 @@ import { agentVariables, sameDirectory } from '../infra/environment.ts'
 import { ExecutorConfigSchema, PolicyConfigSchema, type Settings } from '../policy.ts'
 import { SetupError } from '../setup.ts'
 import { InstallationError, type InstallationApi, type OnboardingView, type ProjectView, type RuntimeView } from './installation-api.ts'
-import { ProjectCatalog, type Project, type ProjectSuspension } from './projects.ts'
+import { containsWorkspace, isAbsoluteWorkspace, ProjectCatalog, ProjectConflict, type Project, type ProjectSuspension } from './projects.ts'
 
 const execute = promisify(execFile)
 const timestamp = () => new Date().toISOString()
-const within = (root: string, child: string): boolean => {
-  const path = relative(root, child)
-  return path === '' || (!isAbsolute(path) && path !== '..' && !path.startsWith(`..${sep}`))
-}
 const hubId = (stateDir: string) => `orchestrator-${key(stateDir)}`
 
 interface InstallationHost {
@@ -39,6 +35,8 @@ export class Installation implements InstallationApi {
   readonly project: Project | undefined
   private readonly catalog: ProjectCatalog
   private onboardingState: OnboardingView = { status: 'unconfigured' }
+  private verifiedAccount?: VerifiedGithub
+  private legacyAccount?: VerifiedGithub
   private resumed: ProjectSuspension | null = null
   private changing = false
   private switching = false
@@ -51,15 +49,21 @@ export class Installation implements InstallationApi {
   }
 
   get stateDir(): string { return this.project?.stateDir ?? this.host.machine.stateDir }
-  get github(): VerifiedGithub | undefined { return this.onboardingState.status === 'ready' ? this.catalog.account() : undefined }
+  get github(): VerifiedGithub | undefined { return this.onboardingState.status === 'ready' ? this.verifiedAccount : undefined }
+  get legacyGithub(): VerifiedGithub | undefined {
+    return this.onboardingState.status === 'ready' ? this.legacyAccount : undefined
+  }
   transitioning(): boolean { return this.switching || this.host.signal.aborted }
   onboarding(): OnboardingView { return this.onboardingState }
 
   async initialize(): Promise<void> {
-    const account = this.catalog.account()
-    if (account) {
+    const saved = this.catalog.account()
+    const sourceCli = this.project ? undefined : this.legacyCli()
+    const cli = saved?.cli ?? sourceCli
+    if (cli) {
       try {
-        const verified = await this.verify(account.cli)
+        const verified = await this.verify(cli)
+        if (sourceCli) this.legacyAccount = sourceCli === cli ? verified : await this.verifyLegacyGithub(sourceCli, verified)
         this.host.signal.throwIfAborted()
         this.publish(verified)
       }
@@ -116,7 +120,7 @@ export class Installation implements InstallationApi {
     const projectId = this.project?.id ?? null
     const state = { mode, projectId, resumedFrom: this.resumed }
     if (!this.started) return { ...state, status: 'starting', reason: null }
-    const reason = this.transitioning() ? 'switching' : !this.github ? 'githubSetupRequired' : !this.project ? 'noProject'
+    const reason = this.transitioning() ? 'switching' : !this.github ? 'githubSetupRequired' : !this.project && !this.legacyRepository() ? 'noProject'
       : this.host.recoveryPending() ? 'recoveryPending'
       : !this.host.configured() ? 'projectSetupRequired' : this.host.paused() ? 'operatorPaused' : null
     return { ...state, status: reason ? 'paused' : 'ready', reason }
@@ -124,16 +128,33 @@ export class Installation implements InstallationApi {
 
   assertNewWork(): void {
     if (this.host.signal.aborted || this.switching) throw new InstallationError(409, 'switching')
-    if (this.project || !this.host.configured()) this.requireGithub()
-    if (!this.project && !this.host.configured()) throw new InstallationError(409, 'noProject')
+    this.requireGithub()
+    if (!this.project && !this.legacyRepository()) throw new InstallationError(409, 'noProject')
     if (!this.host.configured()) throw new InstallationError(409, 'projectSetupRequired', 'Project setup is not ready.')
-    if (this.project && this.host.paused()) throw new InstallationError(409, 'operatorPaused')
+    if (this.host.paused()) throw new InstallationError(409, 'operatorPaused')
   }
 
   private requireGithub(): VerifiedGithub {
     const account = this.github
     if (!account) throw new InstallationError(409, 'githubSetupRequired', 'Connect and verify GitHub before starting work or creating a project.')
     return account
+  }
+
+  private legacyCli(): string | undefined {
+    const cli = this.host.settings().sources.github?.config.cli
+    return typeof cli === 'string' ? cli.trim() || undefined : undefined
+  }
+
+  private legacyRepository(): string | undefined {
+    const repository = this.host.settings().sources.github?.config.repository
+    return typeof repository === 'string' ? repository.trim() || undefined : undefined
+  }
+
+  /** Validate the Source CLI even when its repository cannot run, without changing the installation binding. */
+  async verifyLegacyGithub(cli: string, expected?: VerifiedGithub): Promise<VerifiedGithub> {
+    const verified = await this.verify(cli)
+    if (expected && verified.id !== expected.id) throw new SetupError('agentAccountChanged')
+    return verified
   }
 
   private async verify(cli: string): Promise<VerifiedGithub> {
@@ -158,6 +179,7 @@ export class Installation implements InstallationApi {
 
   private publish(account: VerifiedGithub): OnboardingView {
     this.catalog.setAccount(account)
+    this.verifiedAccount = account
     this.onboardingState = { status: 'ready', identity: { id: account.id, login: account.login, noreply: account.noreply } }
     return this.onboardingState
   }
@@ -181,14 +203,12 @@ export class Installation implements InstallationApi {
       const previous = this.github
       try {
         const verified = await this.verify(cli)
-        this.host.signal.throwIfAborted()
-        if (this.host.configured() && !this.project && this.host.settings().sources.github?.config.cli) {
-          const configured = await verifyGithubAccount(this.host.machine, String(this.host.settings().sources.github!.config.cli), this.host.probe)
-          if (configured.id !== verified.id) throw new SetupError('agentAccountChanged')
-        }
+        const sourceCli = this.project ? undefined : this.legacyCli()
+        const legacy = sourceCli ? sourceCli === cli.trim() ? verified : await this.verifyLegacyGithub(sourceCli, verified) : undefined
         this.host.signal.throwIfAborted()
         const view = this.publish(verified)
         if (this.project && (!this.host.configured() || previous?.cli !== verified.cli || previous.login !== verified.login)) this.restart()
+        else if (legacy && this.legacyRepository() && (!previous || this.legacyAccount?.cli !== legacy.cli || this.legacyAccount.login !== legacy.login)) this.restart()
         return view
       } catch (error) {
         if (!(error instanceof SetupError)) throw error
@@ -211,9 +231,9 @@ export class Installation implements InstallationApi {
       const records = this.catalog.list()
       const existing = records.find(project => project.repository.toLowerCase() === repository.toLowerCase() && sameDirectory(project.workspace, workspace))
       const settings = this.host.settings()
-      const legacyRepo = settings.sources.github?.config.repository
+      const legacyRepo = this.legacyRepository()
       const legacyWorkspace = settings.executor.repository
-      const legacyStorage = records.length === 0 && typeof legacyRepo === 'string' && legacyRepo.toLowerCase() === repository.toLowerCase()
+      const legacyStorage = records.length === 0 && legacyRepo?.toLowerCase() === repository.toLowerCase()
         && !!legacyWorkspace && sameDirectory(legacyWorkspace, workspace)
       if (!records.length && legacyRepo && !legacyStorage) {
         throw new InstallationError(409, 'legacyProjectRequired', 'Register the existing installation repository and workspace before adding another project.')
@@ -221,11 +241,24 @@ export class Installation implements InstallationApi {
       if (legacyStorage && (!this.host.legacyHandoffsMatch({ repository, workspace }) || input.policy !== undefined || baseRef !== settings.executor.baseRef)) {
         throw new InstallationError(409, 'legacyProjectMismatch', 'Existing handoffs, authorization or base reference do not match the legacy project binding.')
       }
+      if (legacyStorage) {
+        try { await this.verifyLegacyGithub(this.legacyCli() ?? '', account) }
+        catch (error) {
+          if (!(error instanceof SetupError)) throw error
+          this.host.signal.throwIfAborted()
+          this.onboardingState = { status: 'blocked', problem: error.problem }
+          throw new InstallationError(409, 'legacyProjectMismatch', 'Cannot verify that the legacy GitHub CLI uses the installation account.')
+        }
+        this.host.signal.throwIfAborted()
+      }
       let project: Project
       try {
         project = existing?.initial === undefined && existing ? existing : this.catalog.register({ repository, workspace,
           ...(legacyStorage ? { legacyStorage } : { initial: { baseRef, policy } }) })
-      } catch { throw new InstallationError(409, 'projectConflict') }
+      } catch (error) {
+        if (error instanceof ProjectConflict) throw new InstallationError(409, 'projectConflict')
+        throw error
+      }
       const restarting = this.catalog.selected()?.id === project.id && this.project?.id !== project.id
       if (restarting) this.restart()
       return { project: this.view(project), reused: !!existing, restarting }
@@ -244,7 +277,7 @@ export class Installation implements InstallationApi {
   }
 
   private async workspace(path: string, repository: string, baseRef: string): Promise<string> {
-    if (!isAbsolute(path) || /[\0\r\n]/.test(path)) throw new InstallationError(400, 'invalidProject', 'Use an absolute local Git checkout path.')
+    if (!isAbsoluteWorkspace(path)) throw new InstallationError(400, 'invalidProject', 'Use an absolute local Git checkout path.')
     const env = { ...process.env }
     for (const [name, value] of Object.entries(agentVariables(this.host.machine.stateDir))) {
       if (value === undefined) delete env[name]
@@ -257,7 +290,7 @@ export class Installation implements InstallationApi {
       const top = (await git(['rev-parse', '--show-toplevel'], root)).trim()
       const common = await realpath((await git(['rev-parse', '--path-format=absolute', '--git-common-dir'], root)).trim())
       const stateDir = await realpath(this.host.machine.stateDir)
-      if (!sameDirectory(root, top) || !sameDirectory(dirname(common), root) || within(root, stateDir) || within(stateDir, root)) {
+      if (!sameDirectory(root, top) || !sameDirectory(dirname(common), root) || containsWorkspace(root, stateDir) || containsWorkspace(stateDir, root)) {
         throw new Error('Workspaces must be independent primary checkouts outside the installation state directory.')
       }
       await validateRepositoryIdentity({ git }, root, repository)

@@ -1,0 +1,1 @@
+The host restarted during this ticket. Inspect the current worktree, Git history and GitHub state before continuing. Do not repeat an already completed external operation. Finish the original assignment and report its status.

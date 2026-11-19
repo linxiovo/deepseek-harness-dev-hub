@@ -82,7 +82,7 @@ A pull request belongs to the Ticket when its branch's last path segment matches
 
 One worktree has at most one writer. `active_writer` names the Assignment and Session allowed to write, and is recorded before that Session starts. A second Ticket, retry or launch that claims the same canonical directory, or a Session that already writes for another Ticket, is refused before it can prepare or start a Session: it records its own rejection and runs no prepare command. The first writer keeps the worktree.
 
-A retry or a restart ends the previous Assignment first, but that does not by itself release write access. The Executor cancels the old turn, waits for its background shell jobs and subagents to stop, and releases `active_writer` only when the worker is truly idle. The new Assignment acquires the worktree only after that release, and only when its Ticket, repository and base match. A release or a report carrying an older Assignment cannot clear or alter a newer writer. If the previous writer cannot be confirmed stopped, `active_writer` stays set and the new attempt waits or fails; elapsed time alone never proves that a writer is gone.
+An explicit retry ends the previous Assignment; a host restart keeps the running Assignment in place. Neither proves the old writer is idle. The Executor cancels the old turn, waits for the shell jobs and subagents to stop, and releases `active_writer` only when the Worker Session is truly idle. Before work continues it reacquires write access to the verified worktree with a new fenced generation. If actual idle cannot be established, the old lease remains held and the worktree is not shared.
 
 The reservation stays with the Ticket after it ends, so no other Ticket may claim its worktree.
 
@@ -182,13 +182,13 @@ A retry ends the current Assignment and starts a new one in the same Executor Se
 The Executor model applies only when a Session is created; an existing Session keeps its model.
 ### Restart
 
-Running Assignments end with "host restarted" and new ones start with a recovery note that tells the Executor to check its worktree, git history and GitHub before repeating any outside action, oldest Ticket first. A restart keeps each Ticket's worktree ownership and active writer; the replacement waits until the interrupted worker is confirmed idle, and an idle state that cannot be established keeps the claim and leaves the Ticket waiting instead of sharing the tree.
+Interrupted work resumes the same running Assignment, Worker Session and verified worktree. The recovery note is a durable Input; a restart before its delivery reuses that pending note. It asks the worker to inspect its worktree, Git history and GitHub before repeating an external operation. See `012-project-runtime.md` for project startup reconciliation.
 
 Assignments that are waiting, ready, blocked or failed stay as they are, unless an Input reached them after that Report, in which case they start again too.
 
 Sessions, worktrees, Subscriptions, pending messages and the stored work below survive a restart, and so does the record of which messages each Executor Session took into its history, which a step does once it claimed them and before its model call: a message taken by a turn the restart cut off counts as read once a Report or the end of a turn follows, while one a step claimed but a cancel or error cut off before the history counts as unread.
 
-A retry or a restart gives the new Assignment again the messages delivered to the Assignment it replaces that its Executor Session did not take, which a cancel or a cut-off step may have dropped; a copy still waiting in the Session, kept by a restart or persisted across a crash, is taken out before the new Assignment's first message, so the new delivery is the only copy.
+A retry returns unread Trigger Inputs to the new Assignment; a restart returns them to the interrupted Assignment after the recovery note. Session delivery uses the same Input ID, so a message still queued or already in Session history is not sent again.
 ### Stored work
 
 What dsh-superagent does after a decision, such as relaying a candidate, a follow-up or a report to the main Session, launching an Assignment or delivering an Input, is stored first and done afterwards.

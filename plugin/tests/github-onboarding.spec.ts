@@ -1,9 +1,10 @@
 import { Context } from '@deepseek-ai/cordis'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
 import { environmentLines, environmentOf, ticketEnvironment } from '../src/app/execution-environment.ts'
+import { Installation } from '../src/app/installation.ts'
 import { Setup } from '../src/app/setup.ts'
 import type { Deployment, VerifiedGithub } from '../src/deployment.ts'
 import { credentialHelper, workerGitConfig } from '../src/infra/environment.ts'
@@ -11,6 +12,7 @@ import { SettingsSchema } from '../src/policy.ts'
 import { githubKind } from '../src/sources/github.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 import { testMachine } from './fixtures/deployment.ts'
+import { gitRepository } from './fixtures/git.ts'
 
 const account: VerifiedGithub = { cli: process.execPath, id: 17, login: 'project-agent', noreply: '17+project-agent@users.noreply.github.com' }
 
@@ -61,8 +63,83 @@ it('waits for the verified binding and only checks its repository, never legacy 
   }
 })
 
-it.each(['uninstalled', 'disabled', 'enabled'])('renders verified GitHub facts in managed Hub and Worker context with the Source %s', source => {
-  const deployment: Deployment = { ...testMachine(), repository: 'Canonical/Widgets', github: { ...account, cli: '/private/not-for-prompts' }, managed: true }
+it('keeps legacy onboarding ready when repository setup fails, but refuses adoption under a different account', async () => {
+  const directory = mkdtempSync(join(realpathSync.native(tmpdir()), 'legacy-onboarding-'))
+  const checkout = gitRepository(directory)
+  const stateDir = join(directory, 'state')
+  const alternate = join(directory, `alternate${process.platform === 'win32' ? '.exe' : ''}`)
+  writeFileSync(alternate, '', { mode: 0o755 })
+  const machine = testMachine({ stateDir })
+  const settings = SettingsSchema.parse({ sources: { github: { enabled: false, config: { cli: process.execPath, repository: 'acme/widgets' } } },
+    executor: { repository: checkout.repository, baseRef: checkout.base.ref } })
+  const context = new Context()
+  let sourceId = account.id
+  let alternateId = 18
+  let push = false
+  let paused = false
+  const githubAnswer = (argv: string[]) => argv[2] === 'user'
+    ? JSON.stringify({ id: argv[0] === alternate ? alternateId : sourceId, login: account.login })
+    : JSON.stringify({ name: 'acme/widgets', push })
+  const spawn = vi.fn(({ argv }: { argv: string[] }) => {
+    const reader = (text: string) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
+    const stdout = argv[0] === 'git' ? `file:${workerGitConfig(stateDir)}\0${credentialHelper(account.cli)}\0` : githubAnswer(argv)
+    return { done: Promise.resolve({ exitCode: 0 }), collected: { stdout: reader(stdout), stderr: reader('') } }
+  })
+  context.reflect.provide('subprocess', { spawn })
+  const restart = vi.fn()
+  const signal = new AbortController().signal
+  const installation = new Installation({ machine, signal, probe: async argv => githubAnswer(argv), restart,
+    configured: () => setup.configured(), paused: () => paused, recoveryPending: () => false,
+    recoverable: () => ({ assignments: 0, handoffs: 0, effects: 0 }), settings: () => settings,
+    legacyHubId: () => 'legacy-hub', legacyHandoffsMatch: () => true })
+  const setup: Setup = new Setup({ context, machine, lifetime: signal, restart }, {
+    legacy: () => installation.legacyGithub, verifyLegacy: cli => installation.verifyLegacyGithub(cli),
+  })
+  const ready = { status: 'ready', identity: { id: account.id, login: account.login, noreply: account.noreply } }
+  try {
+    await installation.initialize()
+    expect(await setup.run(settings)).toBe(false)
+    expect(setup.problem?.code).toBe('repositoryReadOnly')
+    installation.finishStartup()
+    expect(installation.onboarding()).toEqual(ready)
+    expect(installation.runtime()).toMatchObject({ projectId: null, status: 'paused', reason: 'projectSetupRequired' })
+    expect(() => installation.assertNewWork()).toThrow(/project setup/i)
+    expect(await installation.verifyGithub({ cli: alternate })).toMatchObject({ status: 'blocked', problem: { code: 'agentAccountChanged' } })
+    expect(installation.onboarding()).toEqual(ready)
+    const candidate = SettingsSchema.parse({ ...settings, sources: { github: { ...settings.sources.github, config: { ...settings.sources.github!.config, cli: alternate } } } })
+    await expect(setup.checkAccounts('source:github', candidate)).rejects.toMatchObject({ code: 'agentAccountChanged' })
+    alternateId = account.id
+    expect(await installation.verifyGithub({ cli: alternate })).toEqual(ready)
+    expect(restart).not.toHaveBeenCalled()
+
+    push = true
+    expect(await setup.run(settings)).toBe(true)
+    expect(installation.runtime()).toMatchObject({ projectId: null, status: 'ready', reason: null })
+    expect(() => installation.assertNewWork()).not.toThrow()
+    paused = true
+    expect(installation.runtime()).toMatchObject({ projectId: null, status: 'paused', reason: 'operatorPaused' })
+    expect(() => installation.assertNewWork()).toThrow(/resume processing/i)
+
+    push = false
+    expect(await setup.run(settings)).toBe(false)
+    push = true
+    const input = { repository: 'acme/widgets', workspace: checkout.repository, baseRef: checkout.base.ref }
+    sourceId = 18
+    await expect(installation.createProject(input)).rejects.toMatchObject({ status: 409, code: 'legacyProjectMismatch' })
+    expect(installation.projects().projects).toEqual([])
+    expect(installation.onboarding()).toMatchObject({ status: 'blocked', problem: { code: 'agentAccountChanged' } })
+    expect(() => installation.assertNewWork()).toThrow(/verify github/i)
+  } finally {
+    setup.restore()
+    installation.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+it.each((['uninstalled', 'disabled', 'enabled'] as const).flatMap(source =>
+  (['managed', 'legacy'] as const).map(mode => ({ source, mode }))))('renders verified $mode GitHub context for Hub and Worker with the Source $source', ({ source, mode }) => {
+  const deployment: Deployment = { ...testMachine(), repository: 'Canonical/Widgets', github: { ...account, cli: '/private/not-for-prompts' },
+    ...(mode === 'managed' && { managed: true }) }
   const settings = SettingsSchema.parse({ sources: { github: { enabled: source !== 'disabled', config: { repository: 'other/repo' } } } })
   const sources = new SourceRegistry(() => settings)
   const unregister = source === 'uninstalled' ? undefined : sources.register(githubKind)

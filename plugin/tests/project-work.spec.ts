@@ -2,17 +2,26 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
+import type { Fiber } from '@deepseek-ai/cordis'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import { Effects } from '../src/app/effects.ts'
 import { Handoffs } from '../src/app/handoffs.ts'
-import { InstallationError } from '../src/app/installation-api.ts'
+import { InstallationError, type CreateProjectResult, type ProjectView } from '../src/app/installation-api.ts'
 import { Plans } from '../src/app/plans.ts'
+import { Runtime } from '../src/app/runtime.ts'
 import { Store } from '../src/app/store.ts'
 import type { HandoffInput } from '../src/core/handoff.ts'
 import { Engine, MemoryRepositories, key, type Outcome, type Trigger } from '../src/core/index.ts'
+import type { RuntimeMode } from '../src/deployment.ts'
 import { workerSessionId } from '../src/executor/dsh.ts'
+import { Commands } from '../src/infra/commands.ts'
+import { credentialHelper, workerGitConfig } from '../src/infra/environment.ts'
 import { HealthBoard } from '../src/infra/health.ts'
 import { KV } from '../src/kv.ts'
-import { feishu, startRuntime } from './fixtures/host.ts'
+import * as githubSource from '../src/sources/github.ts'
+import { testMachine } from './fixtures/deployment.ts'
+import { gitRepository } from './fixtures/git.ts'
+import { feishu, startRuntime, type Host } from './fixtures/host.ts'
 
 const approval = (project: HandoffInput['project']): HandoffInput => {
   const brief = { project, goal: 'Add saved products', constraints: [], acceptanceScope: ['List saved products'],
@@ -157,4 +166,224 @@ it('gates Hub actions that start work and still accepts stops from a configured 
     expect(host.runtime.store.tickets.list()).toHaveLength(1)
     expect(host.runtime.store.tickets.get(ticket.id)?.ended).toMatchObject({ by: 'human' })
   } finally { await host.stop() }
+})
+
+async function managedHarness(runtimeMode: RuntimeMode = 'desktop') {
+  const host = await startRuntime(undefined, { withFeishu: false })
+  // Keep the host's Sessions alive, but give the managed installation a fresh catalog and scoped plugin lifecycle.
+  const scope = host.ctx.isolate('orchestrator')
+  let mounted: Fiber | undefined
+  let watcher: Fiber | undefined
+  const unwatch = async () => { await watcher?.dispose(); watcher = undefined }
+  const stop = async () => {
+    try { await unwatch() }
+    finally {
+      vi.useRealTimers()
+      try { await mounted?.dispose() } finally { await host.stop() }
+    }
+  }
+  try {
+    await host.runtime.stop()
+    const cli = join(host.directory, 'agent-gh')
+    const secondRoot = join(host.directory, 'second')
+    mkdirSync(secondRoot)
+    const secondGit = gitRepository(secondRoot)
+    secondGit.git('remote', 'set-url', 'origin', 'https://github.com/acme/gadgets.git')
+    const checkouts = [host.localGit!, secondGit]
+    const stateDir = join(host.directory, 'installation')
+    const originalSpawn = host.subprocess.spawn.getMockImplementation()!
+    host.subprocess.spawn.mockImplementation(spec => {
+      const { argv, cwd } = spec
+      const endpoint = argv[0] === cli && argv[1] === 'api' && argv[3] === '--hostname' ? argv[2] : undefined
+      const output = endpoint === 'user' ? JSON.stringify({ login: 'agent-bot', id: 7 })
+        : endpoint === 'repos/acme/widgets' || endpoint === 'repos/acme/gadgets' ? JSON.stringify({ name: endpoint.slice(6), push: true })
+        : argv[0] === 'git' && argv[1] === 'config' && argv.includes('--show-origin') && cwd
+          ? `file:${workerGitConfig(cwd)}\0${credentialHelper(cli)}\0` : undefined
+      if (output === undefined) return originalSpawn(spec)
+      const readFrom = () => ({ text: output, nextOffset: output.length, lossy: false })
+      return { done: Promise.resolve({ exitCode: 0, signal: null }), collected: { stdout: { readFrom }, stderr: { readFrom } } }
+    })
+    const mount = async () => {
+      await unwatch()
+      await mounted?.dispose()
+      let runtime!: Runtime
+      mounted = scope.plugin({ async apply(ctx) {
+        const value = runtime = new Runtime(ctx, testMachine({ stateDir, runtimeMode }), vi.fn())
+        ctx.effect(() => () => value.stop())
+        await value.ready
+      } })
+      await mounted
+      return runtime
+    }
+    const watchGithub = async () => { watcher = scope.plugin(githubSource); await watcher }
+    const create = async (index: 0 | 1, repository: string, allowed: string) => {
+      const { repository: workspace, base } = checkouts[index]!
+      const response = await host.api('POST', 'projects', { repository, workspace, baseRef: base.ref,
+        policy: { sources: { github: { allowed: [{ id: allowed }], admission: { issues: { unlistedAddressed: 'ignore' } } } } } })
+      expect(response).toMatchObject({ status: 200, body: { restarting: index === 0, reused: false } })
+      return (response.body as unknown as CreateProjectResult).project
+    }
+    const select = async (project: ProjectView) => {
+      expect(await host.api('POST', `projects/${project.id}/select`)).toMatchObject({ status: 200, body: { restarting: true } })
+    }
+    await mount()
+    expect(await host.api('POST', 'onboarding/github/verify', { cli })).toMatchObject({ status: 200, body: { status: 'ready' } })
+    const first = await create(0, 'acme/widgets', 'alice')
+    const runtime = await mount()
+    const second = await create(1, 'acme/gadgets', 'bob')
+    return { host, first, second, runtime, mount, select, watchGithub, stop }
+  } catch (error) { await stop(); throw error }
+}
+
+async function publishSpec(host: Host, runtime: Runtime, { id: projectId, repository, workspace }: ProjectView, feature: string) {
+  const { confirmedBy: _, ...base } = approval({ repository, workspace })
+  const goal = `Show ${feature} to signed-in shoppers`
+  const brief = { ...base, goal, acceptanceScope: [goal] }
+  const confirmation = JSON.stringify({ confirmed: true, brief })
+  host.sendUserMessage(runtime.masterId, confirmation)
+  const { id } = await host.runTool(runtime.masterId, 'orchestrator_handoff_confirm', { ...brief, confirmation }) as { id: string }
+  await runtime.effects.idle('planning')
+  const planner = `planner-${id}`
+  expect(host.relays(planner)).toEqual([expect.objectContaining({ handoff_id: id, project: { id: projectId, repository, workspace }, goal })])
+  const { spec: { id: specId } } = await host.runTool(planner, 'orchestrator_spec_publish', {
+    handoffId: id, body: goal, acceptance: [{ statement: goal, observable: `The shopper's ${feature} appear`, delivery: 'cross-end' }],
+    testInterfaces: [{ kind: 'proposed', seam: 'Dashboard and its API', note: `Show only the current account's ${feature}` }], outOfScope: [],
+  }) as { spec: { id: string } }
+  await runtime.idle()
+  const splitter = `splitter-${id}`
+  expect(host.relays(splitter)).toEqual([expect.objectContaining({ handoff_id: id, spec_id: specId })])
+  for (const sessionId of [runtime.masterId, planner, splitter]) {
+    expect(host.controller.create).toHaveBeenCalledWith(expect.objectContaining({ sessionId, workspaceId: workspace }))
+  }
+  const draft = { features: [{ id: 'dashboard', kind: 'cross-end' }], nodes: [
+    { id: 'api', featureId: 'dashboard', role: 'backend', title: `${feature} API`, acceptance: [1], blockedBy: [],
+      demonstration: `Request ${feature} with an authorized session`,
+      interfaceContract: { path: 'docs/dashboard-api.md', requirements: `Describe the ${feature} response and authentication` } },
+    { id: 'page', featureId: 'dashboard', role: 'frontend', title: `${feature} dashboard`, acceptance: [1], blockedBy: ['api'],
+      demonstration: `Open the page and review ${feature}` },
+  ] }
+  return { id, planner, splitter, registration: { handoffId: id, specId, ...draft } }
+}
+
+it('keeps confirmed handoffs, specifications and Plan DAGs isolated across managed Hub remounts', async () => {
+  const { host, first, second, runtime, mount, select, stop } = await managedHarness()
+  try {
+    const read = (project: ProjectView, resource: string) => host.runTool(project.hubSessionId, 'orchestrator_read', { resource })
+    const readWork = async (project: ProjectView, id: string) => Promise.all(['handoff', 'spec', 'plan'].map(kind => read(project, `${kind}/${id}`)))
+    const a = await publishSpec(host, runtime, first, 'saved products')
+    await host.runTool(a.splitter, 'orchestrator_plan_register', a.registration)
+    const savedA = await readWork(first, a.id)
+    expect(savedA[0]).toMatchObject({ project: { id: first.id }, confirmedBy: { sessionId: first.hubSessionId } })
+    expect(savedA[2]).toMatchObject({ status: 'registered', nodes: [
+      { id: 'api', title: 'saved products API', blockedBy: [] }, { id: 'page', title: 'saved products dashboard', blockedBy: ['api'] },
+    ] })
+    const oldPlanner = await host.ctx.sessionController.resolveAgent(a.planner as SessionId)
+    if ('error' in oldPlanner) throw new Error('Expected project A’s planner to remain loaded in Harness')
+    const oldPrompt = vi.spyOn(oldPlanner.agent.ctx.systemPrompt, 'section')
+    const oldSkills = vi.spyOn(oldPlanner.agent.ctx.skills, 'register')
+    vi.mocked(oldPlanner.agent.ctx.tools.guard).mockClear()
+    const oldDeliveries = host.relays(a.planner)
+
+    await select(second)
+    const runtimeB = await mount()
+    expect(runtimeB.masterId).toBe(second.hubSessionId)
+    for (const kind of ['handoff', 'spec', 'plan']) await expect(read(second, `${kind}/${a.id}`)).rejects.toThrow(/unknown/i)
+    expect(vi.mocked(oldPlanner.agent.ctx.tools.guard)).toHaveBeenCalledTimes(1)
+    expect(oldPrompt).not.toHaveBeenCalled()
+    expect(oldSkills).not.toHaveBeenCalled()
+    await expect(host.runTool(a.planner, 'orchestrator_read', { resource: `handoff/${a.id}` })).rejects.toThrow(/not registered/)
+    host.record(a.planner, [{ type: 'llm/retry', data: {
+      retryId: 'foreign-budget-wait', turn: 1, step: 2, provider: 'provider-a', mode: 'always', retry: 1, policyKey: 'opaque', delayMs: 10_000,
+      failure: { code: 'INVALID_REQUEST', message: 'Budget has been exceeded! Current cost: 100, Max budget: 99' },
+    } }])
+    expect(await host.api('GET', 'state')).toMatchObject({ status: 200,
+      body: { projectId: second.id, health: { models: { state: 'ready' } } } })
+    const { confirmedBy: _, ...wrong } = approval({ repository: first.repository, workspace: first.workspace })
+    const confirmation = JSON.stringify({ confirmed: true, brief: wrong })
+    host.sendUserMessage(second.hubSessionId, confirmation)
+    await expect(host.runTool(second.hubSessionId, 'orchestrator_handoff_confirm', { ...wrong, confirmation })).rejects.toThrow(/does not match the bound project/)
+
+    const b = await publishSpec(host, runtimeB, second, 'stock alerts')
+    await expect(host.runTool(b.splitter, 'orchestrator_plan_register', a.registration)).rejects.toThrow(/handoff|session/i)
+    await host.runTool(b.splitter, 'orchestrator_plan_register', b.registration)
+    const savedB = await readWork(second, b.id)
+    expect(savedB[0]).toMatchObject({ project: { id: second.id }, confirmedBy: { sessionId: second.hubSessionId } })
+    expect(savedB[2]).toMatchObject({ status: 'registered', nodes: [
+      { id: 'api', title: 'stock alerts API', blockedBy: [] }, { id: 'page', title: 'stock alerts dashboard', blockedBy: ['api'] },
+    ] })
+
+    await select(first)
+    await mount()
+    expect(await readWork(first, a.id)).toEqual(savedA)
+    for (const kind of ['handoff', 'spec', 'plan']) await expect(read(first, `${kind}/${b.id}`)).rejects.toThrow(/unknown/i)
+    expect(host.relays(a.planner)).toEqual(oldDeliveries)
+    await select(second)
+    await mount()
+    expect(await readWork(second, b.id)).toEqual(savedB)
+  } finally { await stop() }
+})
+
+it('polls authorized GitHub events on the headless timer and exposes only the mounted project to clients', async () => {
+  const { host, first, second, runtime: a, mount, select, watchGithub, stop } = await managedHarness('headless')
+  try {
+    vi.mocked(Commands.prototype.gh).mockRestore()
+    const polls: string[] = []
+    const notification = (repository: string, issue: number) => ({ repository: { full_name: repository },
+      subject: { url: `https://api.github.com/repos/${repository}/issues/${issue}` } })
+    const github = vi.mocked(Commands.prototype.run).mockImplementation(async (_program, args) => {
+      const path = args[1]?.split('?')[0]
+      if (path === 'repos/acme/widgets/notifications' || path === 'repos/acme/gadgets/notifications') {
+        const repository = path === 'repos/acme/widgets/notifications' ? first.repository : second.repository
+        polls.push(repository)
+        const notices = repository === first.repository
+          ? [notification(first.repository, 42), notification(second.repository, 99)]
+          : polls.filter(repo => repo === second.repository).length === 1
+            ? [notification(second.repository, 42), notification(first.repository, 99)]
+            : [notification(second.repository, 43), notification(second.repository, 44)]
+        return `HTTP/2 200 OK\r\n\r\n${JSON.stringify(notices)}`
+      }
+      if (path?.endsWith('/comments')) return '[[]]'
+      const issue = /^repos\/(acme\/(?:widgets|gadgets))\/issues\/(42|43|44)$/.exec(path ?? '')
+      if (!issue) throw new Error(`Unexpected GitHub read: ${path}`)
+      const [, repository, number] = issue
+      return JSON.stringify({ number: Number(number), id: Number(number), title: `${repository} report ${number}`, state: 'open',
+        created_at: new Date(Date.now() + 1000).toISOString(), body: '@agent-bot please fix the regression',
+        html_url: `https://github.com/${repository}/issues/${number}`, user: { login: repository === first.repository || number === '44' ? 'alice' : 'bob' } })
+    })
+    const watchReady = () => vi.waitFor(async () => {
+      expect(await host.api('GET', 'state')).toMatchObject({ status: 200, body: { health: { github: { state: 'ready' } } } })
+    })
+    const thread = (number: number) => host.api('GET', `threads/${encodeURIComponent(`github:${number}`)}`)
+    const candidates = (project: ProjectView) => host.relays(project.hubSessionId).filter(item => item.kind === 'candidate')
+    await watchGithub()
+    await watchReady()
+    await a.idle()
+    expect(await thread(42)).toMatchObject({ status: 200, body: { timeline: [{ url: 'https://github.com/acme/widgets/issues/42' }] } })
+    expect(candidates(first)).toMatchObject([{ trigger_id: key('github-issue', '42'), strength: 'explicit' }])
+
+    await select(second)
+    const b = await mount()
+    expect(await host.api('GET', 'runtime')).toMatchObject({ status: 200, body: { mode: 'headless', status: 'ready', projectId: second.id } })
+    expect(await thread(42)).toMatchObject({ status: 404 })
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    await watchGithub()
+    await watchReady()
+    await b.idle()
+    expect(polls).toEqual([first.repository, second.repository])
+    expect(await thread(42)).toMatchObject({ status: 200, body: { timeline: [{ url: 'https://github.com/acme/gadgets/issues/42' }] } })
+    expect(await thread(43)).toMatchObject({ status: 404 })
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    await b.idle()
+    expect(polls).toEqual([first.repository, second.repository, second.repository])
+    expect(await thread(43)).toMatchObject({ status: 200, body: { timeline: [{ url: 'https://github.com/acme/gadgets/issues/43' }] } })
+    expect(await thread(44)).toMatchObject({ status: 200, body: { timeline: [{ disposition: { decision: {
+      reason: [expect.objectContaining({ code: 'not_a_member' })],
+    } } }] } })
+    expect(candidates(second)).toMatchObject([
+      { trigger_id: key('github-issue', '42'), strength: 'explicit' }, { trigger_id: key('github-issue', '43'), strength: 'explicit' },
+    ])
+    expect(candidates(first)).toHaveLength(1)
+    expect(github.mock.calls.some(([, args]) => args[1]?.endsWith('/issues/99'))).toBe(false)
+  } finally { await stop() }
 })

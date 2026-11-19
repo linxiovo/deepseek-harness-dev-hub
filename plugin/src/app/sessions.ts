@@ -37,6 +37,8 @@ export interface SessionsHost {
   readonly boundWorkspace?: string | undefined
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
   environment(ticket: Ticket): Variable[]
+  /** Whether the mounted project owns this persisted planning handoff, even when it is not active. */
+  ownsPlanner(handoffId: string): boolean
   /** Whether the persisted handoff is in its active planning state; all other statuses deny planner tools. */
   plannerActive(handoffId: string): boolean
   /** Workspace authorized by a persisted published specification, including after registration for idempotent replay. */
@@ -137,7 +139,7 @@ export class Sessions {
     ctx.on('session/event', (session, event) => {
       const agent = ctx.agents.get(session.id)
       const binding = agent && agent.session === session ? this.bindings.get(agent) : undefined
-      if (!agent || !binding || binding.subagent) return
+      if (!agent || !binding?.ready || binding.subagent) return
       this.retryHealth.observe(agent.id, event)
       this.updateModelHealth()
     })
@@ -147,8 +149,10 @@ export class Sessions {
     ctx.inject(['agentPresets'], child => {
       child.on('agent-preset/selected', (sessionId, preset) => {
         const ticketId = ticketOfSession(sessionId), agent = ctx.agents.get(sessionId as SessionId)
+        const plannerId = plannerHandoffId(sessionId)
+        const planner = plannerId !== undefined && this.host.ownsPlanner(plannerId)
         const ours = sessionId === this.host.masterId ? ROUTER_PRESET
-          : plannerHandoffId(sessionId) || (agent && this.isSplitterSession(agent)) ? PLANNER_PRESET
+          : planner || (agent && this.isSplitterSession(agent)) ? PLANNER_PRESET
           : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
         if (!ours || preset === ours || !agent) return
         const presets = child.get('agentPresets') as { select(agent: Agent, preset: string): Promise<string> }
@@ -332,6 +336,7 @@ export class Sessions {
       binding.disposers.push(agent.ctx.tools.restrict({ allow: HUB_TOOLS }))
     } else if (plannerId) {
       binding.disposers.push(...this.plannerOnly(agent, plannerId))
+      if (!host.ownsPlanner(plannerId)) return
     } else if (splitterId) {
       binding.disposers.push(...this.splitterOnly(agent))
       if (!this.isSplitterSession(agent)) return

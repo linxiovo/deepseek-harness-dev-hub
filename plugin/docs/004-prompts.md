@@ -31,6 +31,8 @@ Overrides use these keys:
 
 The worker guards load `prompts/worker-ticket-ended.md`, `prompts/worker-writer-required.md`, and `prompts/worker-ancestry-pending.md` as fixed tool responses, not editable system-prompt parts.
 
+The Executor loads `prompts/worker-recovery.md` as the recovery message sent to the original Worker Session for an interrupted Assignment.
+
 The generated sections are editable templates. They must retain these placeholders:
 
 - `runtime/environment`: `{variables}`, filled with execution environment lines.

@@ -230,6 +230,8 @@ export interface Assignment {
    * into a step before, the worker read.
    */
   idleAt?: string
+  /** Most recent durable recovery message, if a host interruption required resuming this Assignment. */
+  recoveryInputId?: string
   /** Fenced write lease; ending an Assignment requests a stop but does not prove this lease idle. */
   writer?: { generation: number; state: 'preparing' | 'active' | 'stopping' | 'idle'; session?: string }
 }

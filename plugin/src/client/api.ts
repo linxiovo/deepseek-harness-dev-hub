@@ -1,6 +1,6 @@
 /** Same-origin client and polling hook for the orchestrator management API. */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { Api, ApiRequest, ApiResponse } from '../app/api.ts'
+import { PROJECT_SCOPE_HEADER, type Api, type ApiRequest, type ApiResponse } from '../app/api.ts'
 import { USER_ERRORS, type UserErrorCode } from '../core/errors.ts'
 import type { TicketStage } from '../core/stage.ts'
 import type { SetupProblem } from '../setup.ts'
@@ -35,7 +35,7 @@ async function api<T>(messages: ApiMessages, path: string, method: string, body?
   const json = body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }
   try {
     response = await fetch(`/orchestrator/api/${path}`, { method, ...json, headers: { 'x-orchestrator-request': '1', ...json.headers,
-      ...(projectId ? { 'x-orchestrator-project-id': projectId } : {}) } })
+      ...(projectId ? { [PROJECT_SCOPE_HEADER]: projectId } : {}) } })
   } catch {
     throw new ApiError(messages.offline, 0, { unreachable: true })
   }

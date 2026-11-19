@@ -16,12 +16,12 @@ export type Pull = z.infer<typeof PullSchema> & { number: number }
 export const readPull = async (ctx: SourceContext, number: number, signal?: AbortSignal): Promise<Pull> =>
   ({ ...await ctx.commands.withSignal(signal).api(PullSchema, `pulls/${number}`), number })
 const PullNumber = z.object({ number: z.number().int().positive() })
-export async function recoverPulls(ctx: SourceContext, signal: AbortSignal): Promise<number[]> {
+export async function recoverPulls(ctx: SourceContext, signal: AbortSignal): Promise<void> {
   const { repository } = ctx.deployment
   const owner = repository.split('/')[0]!
   const commands = ctx.commands.withSignal(signal)
   const observed = new Map<number, Pull>()
-  const merged = new Set<number>()
+  const reconciled = new Map<number, Pull>()
   const read = async (number: number) => {
     let pull = observed.get(number)
     if (!pull) { pull = await readPull(ctx, number, signal); observed.set(number, pull) }
@@ -38,17 +38,16 @@ export async function recoverPulls(ctx: SourceContext, signal: AbortSignal): Pro
       for (const { number } of found) {
         const pull = await read(number)
         if (!agentPull(pull, ctx.deployment) || pull.head.ref !== branch || pull.head.sha !== head || !ticketBranch(ticket, pull.head.ref)) continue
-        if (pull.merged) merged.add(number)
+        reconciled.set(number, pull)
         if (pull.state === 'closed' || pull.merged) {
           if (!(ticket.follows ?? []).some(follow => follow.thread === `${SOURCE}:${number}`)) bind(ctx, ticket.id, pull, true)
         }
         else claimPull(ctx, ticket.id, pull)
       }
     }
-    for (const number of tracked) if ((await read(number)).merged) merged.add(number)
+    for (const number of tracked) reconciled.set(number, await read(number))
   }
-  for (const pull of observed.values()) await observePull(ctx, pull)
-  return [...merged]
+  for (const pull of reconciled.values()) await observePull(ctx, pull)
 }
 const pullNumber = (thread: string): number | undefined => thread.startsWith(`${SOURCE}:`) ? Number(thread.slice(SOURCE.length + 1)) : undefined
 export const pullsOf = (ticket: Pick<Ticket, 'follows'>, open = false): number[] =>

@@ -5,6 +5,7 @@ import type { Assessor, Assignment, Candidate, EngineOptions, Executor, Outbound
 
 const member = { source: 'chat', id: 'alice' }
 const guest = { source: 'chat', id: 'guest' }
+const recoveryNote = 'The host restarted during this ticket.'
 function trigger(id: string, overrides: Partial<Trigger> = {}): Trigger {
   return { id, source: 'chat', threads: [{ source: 'chat', id: 't1' }], actor: member, human: true, at: `2026-09-23T00:00:${id.padStart(2, '0')}Z`, text: `message ${id}`, channel: { source: 'chat', thread: 't1', address: { message: id } }, meta: {}, ...overrides }
 }
@@ -707,18 +708,16 @@ describe('interrupted assignments', () => {
     h.engine.report(waiting, { state: 'waiting', summary: 'done for now' })
     h.engine.receive(trigger('3', { threads: [{ source: 'chat', id: 't2' }] }))
     vi.mocked(h.executor.start).mockClear(); vi.mocked(h.executor.deliver).mockClear()
-    // The Executor reports each Assignment that was running; a fact about one that no longer runs is dropped.
-    for (const id of [interrupted, waiting]) h.engine.assignmentInterrupted(id, runningAssignment(h.repo.tickets.get(id)!)!.id)
-    h.engine.assignmentInterrupted(interrupted, first.id)
+    for (const id of [interrupted, waiting]) h.engine.assignmentInterrupted(id, runningAssignment(h.repo.tickets.get(id)!)!.id, recoveryNote)
+    h.engine.assignmentInterrupted(interrupted, first.id, recoveryNote)
     const ticket = h.repo.tickets.get(interrupted)!
-    expect(ticket.assignments).toEqual([expect.objectContaining({ id: first.id, state: 'ended', endedReason: 'hostRestarted' }),
-      expect.objectContaining({ state: 'pending' })])
+    expect(ticket.assignments).toEqual([expect.objectContaining({ id: first.id, state: 'running' })])
     expect(ticket.inputs).toEqual([expect.objectContaining({ kind: 'text', text: expect.stringContaining('The host restarted') })])
     expect(ticket.undelivered).toEqual([ticket.inputs[0]!.id])
-    expect(h.executor.start).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: interrupted }), ticket.assignments[1])
+    expect(h.executor.start).not.toHaveBeenCalled()
     // A worker that waits keeps its Session and gets what waits for it.
     expect(h.repo.tickets.get(waiting)!.assignments).toHaveLength(1)
-    expect(h.executor.deliver).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: waiting }), expect.objectContaining({ state: 'running' }))
+    expect(h.executor.deliver).toHaveBeenCalledWith(expect.objectContaining({ id: waiting }), expect.objectContaining({ state: 'running' }))
   })
   it('starts again a worker that reported but then got a person\'s message, which it was working on', () => {
     const h = harness()
@@ -727,8 +726,8 @@ describe('interrupted assignments', () => {
     h.tick(1); h.engine.receive(trigger('3', { actor: guest, threads: [{ source: 'chat', id: 't2' }] })); h.settle()
     const running = runningAssignment(h.repo.tickets.get(other)!)!
     expect(running.deliveredAt! > running.report!.at).toBe(true)
-    h.engine.assignmentInterrupted(other, running.id)
-    expect(h.repo.tickets.get(other)!.assignments.map(item => item.state)).toEqual(['ended', 'pending'])
+    h.engine.assignmentInterrupted(other, running.id, recoveryNote)
+    expect(h.repo.tickets.get(other)!.assignments).toEqual([expect.objectContaining({ id: running.id, state: 'running', recoveryInputId: expect.any(String) })])
   })
 })
 describe('pause', () => {
@@ -1570,7 +1569,7 @@ describe('what a worker read', () => {
       h.engine.report(ticketId, { state: 'progress', summary: 'working' })
       h.tick(1); h.engine.receive(trigger('2')); h.settle(); h.read(ticketId)
       // The Assignment starts again with a recovery note, in the same Session, which holds the message.
-      h.tick(1); h.engine.assignmentInterrupted(ticketId, runningAssignment(h.repo.tickets.get(ticketId)!)!.id); h.settle()
+      h.tick(1); h.engine.assignmentInterrupted(ticketId, runningAssignment(h.repo.tickets.get(ticketId)!)!.id, recoveryNote); h.settle()
       if (reported) { h.tick(1); h.engine.report(ticketId, { state: 'progress', summary: 'Recovered' }) }
       h.tick(1); h.engine.stopTicket(ticketId, 'not needed')
       expect(h.repo.threads.get('chat:t1')!.pending).toEqual(reported ? [] : ['2'])
@@ -1608,15 +1607,15 @@ describe('read claims review: retries', () => {
   })
 })
 describe('read claims review: restarts', () => {
-  it('gives a restart\'s Assignment what the replaced one had delivered and no step took, and a retry of it gets it again', () => {
+  it('returns unread messages to the interrupted Assignment, and to its replacement on an explicit retry', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     const ticket = () => h.repo.tickets.get(ticketId)!
     const inputOf = (triggerId: string) => ticket().inputs.find(input => input.kind === 'trigger' && input.triggerId === triggerId)!.id
     h.tick(1); h.engine.receive(trigger('2')); h.settle()
-    // The host restarts mid-work before a step took the message, which a cancel may have dropped: the new Assignment gets it.
-    h.tick(1); h.engine.assignmentInterrupted(ticketId, runningAssignment(ticket())!.id)
-    expect(ticket().undelivered[0]).toBe(inputOf('2'))
+    // The host restarts before a step took the message; the same Assignment gets it again after the recovery note.
+    h.tick(1); h.engine.assignmentInterrupted(ticketId, runningAssignment(ticket())!.id, recoveryNote)
+    expect(ticket().undelivered).toEqual([runningAssignment(ticket())!.recoveryInputId, inputOf('2')])
     h.settle()
     // That Assignment blocks before a step took it, and a person retries: the retry's Assignment gets it too.
     h.tick(1); h.engine.report(ticketId, { state: 'blocked', summary: 'Which page?' })

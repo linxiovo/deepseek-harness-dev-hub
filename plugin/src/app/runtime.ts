@@ -38,7 +38,7 @@ import { registerHttp, type HttpHost } from './http.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
-import { pullEndNotices, pullsOf, recoverPulls } from '../sources/github-pull.ts'
+import { pullEndNotices, recoverPulls } from '../sources/github-pull.ts'
 import { HealthBoard } from '../infra/health.ts'
 import { Outbox } from './outbox.ts'
 import { Passes } from './passes.ts'
@@ -133,7 +133,7 @@ export class Runtime extends Service implements SourceHost {
       }
       const setup = this.setup = new Setup({ context: ctx, machine: projectMachine, lifetime: this.lifetime, restart }, project ? {
         managed: () => installation.github && { repository: project.repository, github: installation.github },
-      } : {})
+      } : { legacy: () => installation.legacyGithub, verifyLegacy: cli => installation.verifyLegacyGithub(cli) })
       const deployed = () => setup.configured()
         ? environmentOf({ deployment: setup.deployment, sources: this.sources, settings: store.settings() }) : undefined
       const feishu = () => setup.configured() && !!setup.deployment.feishu
@@ -161,7 +161,8 @@ export class Runtime extends Service implements SourceHost {
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
       const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
         lifetime: this.lifetime, boundWorkspace: project?.workspace,
-        closing: () => this.closing(), environment, plannerActive: id => this.configured() && handoffs.isPlanning(id),
+        closing: () => this.closing(), environment, ownsPlanner: id => handoffs.get(id) !== undefined,
+        plannerActive: id => this.configured() && handoffs.isPlanning(id),
         splitterWorkspace: id => {
           if (!this.configured()) return undefined
           const handoff = handoffs.get(id)
@@ -217,7 +218,7 @@ export class Runtime extends Service implements SourceHost {
       const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
         health: this.runtimeHealth, lifetime: this.lifetime, configured: () => this.configured(), closing: () => this.closing() })
-      const sourceInactive = () => this.closing() || (project !== undefined && !installation.github)
+      const sourceInactive = () => this.closing() || !installation.github
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
         get deployment() { return setup.deployment }, configured: () => this.configured(), closing: sourceInactive,
         get setupProblem() { return runtime.setupProblem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => {
@@ -241,10 +242,10 @@ export class Runtime extends Service implements SourceHost {
   context(kind: { kind: string; health: readonly string[] }): SourceContext { return sourceContextOf(this.sourceDeps, kind) }
   /** Resolved deployment; throws while waiting for setup (`!configured()`). */
   get deployment(): Deployment { return this.setup.deployment }
-  configured(): boolean { return this.setup.configured() && !this.recoveryPending && (!this.installation.project || !!this.installation.github) }
+  configured(): boolean { return this.setup.configured() && !this.recoveryPending && !!this.installation.github }
   get setupProblem(): SetupProblem | undefined {
     const onboarding = this.installation.onboarding()
-    return this.setup.problem ?? (onboarding.status === 'blocked' ? onboarding.problem : undefined)
+    return onboarding.status === 'blocked' ? onboarding.problem ?? this.setup.problem : this.setup.problem
   }
   /** Why the Feishu bot is unavailable even though the Feishu Source configures a CLI. */
   get feishuProblem(): SetupProblem | undefined { return this.setup.feishuProblem }
@@ -323,11 +324,16 @@ export class Runtime extends Service implements SourceHost {
   private async reconcilePulls(): Promise<boolean> {
     const source = this.context({ kind: 'github', health: ['github'] })
     try {
-      for (const number of await recoverPulls(source, this.lifetime)) {
-        if (this.store.tickets.open().some(ticket => pullsOf(ticket).includes(number) &&
-          (latestAssignment(ticket)?.state === 'running' || latestAssignment(ticket)?.state === 'pending'))) {
+      await recoverPulls(source, this.lifetime)
+      for (const ticket of this.store.tickets.open()) {
+        const assignment = latestAssignment(ticket)
+        if (assignment?.state !== 'running' && assignment?.state !== 'pending') continue
+        // An observed merge is durable. Another restart must not resume the same Assignment if the PR's head can no longer be found.
+        const merged = ticket.follows?.find(({ thread, closed }) => thread.startsWith('github:')
+          && closed?.outcome === 'merged' && Date.parse(closed.at) >= Date.parse(assignment.createdAt))
+        if (merged) {
           this.recoveryPending = true
-          this.runtimeHealth.set({ state: 'error', detail: `GitHub PR #${number} has merged but its Ticket is still open. Resolve the Ticket before retrying recovery.`, at: now() })
+          this.runtimeHealth.set({ state: 'error', detail: `GitHub PR #${merged.thread.slice('github:'.length)} has merged but its Ticket is still open. Resolve the Ticket before retrying recovery.`, at: now() })
           return false
         }
       }

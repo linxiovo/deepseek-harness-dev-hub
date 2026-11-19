@@ -130,7 +130,7 @@ it('mounts the bundled Doc Tree skill only for workers, even with an older same-
     expect(docTree).toEqual([['doc-tree', expect.stringMatching(/\S/)]])
     const older = { ...config, skills: { 'doc-tree': 'Old team text.' } }
     expect(prompts.skills(older, 'worker').filter(([name]) => name === 'doc-tree')).toEqual(docTree)
-    for (const role of ['orchestrator', 'planner'] as const) {
+    for (const role of ['orchestrator', 'planner', 'splitter'] as const) {
       expect(prompts.skills(older, role).map(([name]) => name)).not.toContain('doc-tree')
     }
   })

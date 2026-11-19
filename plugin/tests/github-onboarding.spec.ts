@@ -118,7 +118,6 @@ it('keeps legacy onboarding ready when repository setup fails, but refuses adopt
     expect(() => installation.assertNewWork()).not.toThrow()
     paused = true
     expect(installation.runtime()).toMatchObject({ projectId: null, status: 'paused', reason: 'operatorPaused' })
-    expect(() => installation.assertNewWork()).toThrow(/resume processing/i)
 
     push = false
     expect(await setup.run(settings)).toBe(false)

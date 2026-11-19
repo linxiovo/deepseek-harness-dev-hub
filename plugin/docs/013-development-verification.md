@@ -13,6 +13,7 @@ Run focused checks from `plugin/` as soon as the change is runnable. Pass the re
 | Session tool or model-facing schema | `tests/tools.spec.ts` for public behavior and role boundaries; `tests/model-surface.spec.ts` for the registered surface and prompt budget |
 | Bundled skill or prompt registration | `tests/prompts.spec.ts`, `tests/model-surface.spec.ts`, `tests/tools.spec.ts` and `tests/panel-prompts.spec.tsx` for role scope, resource inventory and settings labels |
 | Doc Tree routes or committed-candidate inspection | `tests/docs.spec.ts` for this repository's navigation and source/test index; `tests/doc-tree.spec.ts` for Git snapshots and target-repository navigation |
+| Project selection or crash recovery | `pnpm test tests/runtime-crash.spec.ts`; for a deployed headless host, record the [live connection smoke check](006-deployment.md#live-headless-connection-smoke-check) separately. |
 
 ## Pin the candidate and review
 

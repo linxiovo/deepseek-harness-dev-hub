@@ -173,6 +173,17 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3082:127.0.0.1:3082 operator@ser
 
 While the tunnel is open, use `http://127.0.0.1:3082` from the operator machine. If you change the server port, match it at both ends so the HTTP `Host` and browser `Origin` use the configured port. Keep HTTP private to loopback and use SSH for authentication and encryption. Treat local access to either end of the tunnel as privileged.
 
+#### Live headless connection smoke check
+
+Use a dedicated DSH Web profile on a real server with `runtimeMode: headless`, the candidate bundle installed, and a verified GitHub account and test project already selected. Start that profile on the server as described above and leave the SSH tunnel open. From a separate operator machine, check the live API through the forwarded port:
+
+```sh
+curl --fail --silent --show-error --max-time 10 -H 'x-orchestrator-request: 1' http://127.0.0.1:3082/orchestrator/api/runtime
+curl --fail --silent --show-error --max-time 10 -H 'x-orchestrator-request: 1' http://127.0.0.1:3082/orchestrator/api/state
+```
+
+Pass only if both return HTTP 200, `runtime` reports `mode: "headless"`, `status: "ready"` and the expected `projectId`, and `state` reports the same project and its expected repository in `setup.accounts.repository`. Record the actual responses (omitting private paths), candidate and server profile in the verification evidence. Without a reachable server and tunnel, mark the smoke check **not run**; no simulated DSH or GitHub result substitutes for it.
+
 ### Hourly check
 
 Create the hourly check in the DeepSeek Harness profile you normally use, not in `superagent`. It must keep running when the agent service is down. Ask an agent in that profile to create an hourly schedule using this prompt, with the checkout path filled in:

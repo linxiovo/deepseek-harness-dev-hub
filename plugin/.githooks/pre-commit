@@ -1,8 +1,14 @@
 #!/bin/sh
 set -eu
 
-repo_root=$(git rev-parse --show-toplevel)
-cd "$repo_root"
+cd "$(dirname "$0")/.."
 
-pnpm -C plugin typecheck
-pnpm -C plugin exec vitest run tests/docs.spec.ts tests/tickets.spec.ts tests/handoff.spec.ts tests/plans.spec.ts tests/model-surface.spec.ts tests/prompts.spec.ts
+required_pnpm=$(node -p 'require("./package.json").packageManager.replace(/^pnpm@/, "").split("+")[0]')
+actual_pnpm=$(pnpm --version)
+if [ "$actual_pnpm" != "$required_pnpm" ]; then
+  printf 'Pre-commit requires pnpm %s, but found %s.\n' "$required_pnpm" "$actual_pnpm" >&2
+  exit 1
+fi
+
+pnpm run typecheck
+pnpm run test tests/docs.spec.ts tests/tickets.spec.ts tests/handoff.spec.ts tests/plans.spec.ts tests/model-surface.spec.ts tests/prompts.spec.ts

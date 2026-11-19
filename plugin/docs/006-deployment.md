@@ -37,7 +37,9 @@ pnpm -C plugin install --frozen-lockfile
 pnpm -C plugin check
 ```
 
-Opt in to local Git hooks with `pnpm -C plugin run hooks:install`. The pre-commit hook typechecks and runs `tests/docs.spec.ts`, `tests/tickets.spec.ts`, `tests/handoff.spec.ts`, `tests/plans.spec.ts`, `tests/model-surface.spec.ts`, and `tests/prompts.spec.ts`; together these checks cover the Plan and role-prompt contracts locally. It does not replace CI: CI remains the complete `pnpm check`.
+Enable or refresh the local Git hooks by running `node plugin/scripts/install-hooks.mjs` from the repository root. Install once per clone, including clones with linked worktrees. The shared hooks forward to `plugin/.githooks/` in the worktree where Git is committing. The selected worktree must contain the hook entry points.
+
+Pre-commit runs from the active worktree's `plugin` directory and verifies that pnpm matches the version declared in `package.json`. It then typechecks and runs the six smoke test files listed in `plugin/.githooks/pre-commit`. The full `pnpm check` runs each stage with the pnpm CLI that started the check.
 
 Set the GitHub Source's `requiredChecks` to `[{"id":"check"},{"id":"windows"}]` for Ticket and plan evidence. Where branch protection is available, require both jobs there too. Those are separate settings; the workflow changes neither, and a job dependency alone does not restrict merging.
 

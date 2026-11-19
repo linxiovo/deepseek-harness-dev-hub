@@ -5,6 +5,7 @@ import type { SessionMeterView } from '../src/app/session-meter.ts'
 import { PromptConflict } from '../src/app/prompts.ts'
 import { SettingsConflict } from '../src/app/settings.ts'
 import type { HttpHost } from '../src/app/http.ts'
+import { InstallationError, type InstallationApi, type RuntimeView } from '../src/app/installation-api.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { SetupError } from '../src/setup.ts'
 import type { Ticket } from '../src/core/index.ts'
@@ -16,12 +17,15 @@ function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.
   let handler: Handler = async () => {}
   const ctx = { webServer: { host, port: 3082, register: (route: { handler: Handler }) => { handler = route.handler; return () => {} } } }
   registerHttp(ctx as never, { ready: Promise.resolve(), ...runtime } as unknown as HttpHost)
-  return async (method: string, path: string, body?: unknown, headers: Headers = {}) => {
+  return async (method: string, path: string, body?: unknown, headers: Headers = {}, beforeBody?: () => Promise<void>) => {
     let status = 0, text = ''
     const chunks = body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]
     const sent = Object.fromEntries(Object.entries({ host: '127.0.0.1:3082', 'x-orchestrator-request': '1', ...headers }).filter(([,
       value]) => value !== undefined))
-    const req = { method, url: `/orchestrator/api/${path}`, headers: sent, async *[Symbol.asyncIterator]() { yield* chunks } }
+    const req = { method, url: `/orchestrator/api/${path}`, headers: sent, async *[Symbol.asyncIterator]() {
+      if (beforeBody) await beforeBody()
+      yield* chunks
+    } }
     await handler(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
     return { status, body: JSON.parse(text) as Record<string, unknown> }
   }
@@ -162,4 +166,155 @@ it('answers a corrupt Session log with 500 instead of claiming the Session is mi
   const call = serve({ meter: { read } })
   expect(await call('GET', 'sessions/worker-t1/meter'))
     .toEqual({ status: 500, body: { error: 'Session log for worker-t1 is corrupt' } })
+})
+
+it('reports lifecycle status while startup is pending, and recovery once ready', async () => {
+  let finishStartup!: () => void
+  const ready = new Promise<void>(resolve => { finishStartup = resolve })
+  const starting: RuntimeView = { mode: 'desktop', status: 'starting', reason: null, projectId: 'alpha', resumedFrom: null }
+  const running: RuntimeView = { ...starting, status: 'ready', resumedFrom: { reason: 'projectSwitched', at: '2026-11-18T00:00:00.000Z',
+    recoverable: { assignments: 2, handoffs: 1, effects: 3 } } }
+  let view: RuntimeView = starting
+  const call = serve({ ready, installation: { runtime: () => view } })
+  try {
+    const result = await Promise.race([call('GET', 'runtime'), new Promise(resolve => setImmediate(() => resolve('waiting for startup')))])
+    expect(result).toEqual({ status: 200, body: starting })
+  } finally { finishStartup() }
+  view = running
+  expect(await call('GET', 'runtime')).toEqual({ status: 200, body: running })
+  view = { ...running, status: 'paused', reason: 'recoveryPending' }
+  expect(await call('GET', 'runtime')).toEqual({ status: 200, body: view })
+})
+
+const idleRuntime = (): RuntimeView => ({ mode: 'desktop', status: 'paused', reason: 'noProject', projectId: null, resumedFrom: null })
+
+it('lets the panel verify GitHub and create or select projects without returning private service fields', async () => {
+  const identity = { id: 12, login: 'agent', noreply: '12+agent@users.noreply.github.com' }
+  const project = { id: 'repo/local', repository: 'org/repo', workspace: 'D:/repos/repo', hubSessionId: 'hub-1' }
+  const privateProject = { ...project, credential: 'private' }
+  const installation: InstallationApi = {
+    onboarding: () => ({ status: 'unconfigured' }),
+    runtime: idleRuntime,
+    verifyGithub: ({ cli }) => cli === 'gh-agent'
+      ? { status: 'ready', identity: Object.assign({ ...identity }, { cli }) }
+      : { status: 'blocked', problem: new SetupError('agentCliSignedOut', { output: 'token=private' }).problem },
+    projects: () => ({ activeProjectId: null, projects: [privateProject] }),
+    createProject: input => {
+      expect(input).toEqual({ repository: 'org/repo', workspace: 'D:/repos/repo', baseRef: 'main', policy: { rules: [], sources: {} } })
+      return { project: privateProject, reused: false, restarting: true }
+    },
+    selectProject: id => {
+      if (id !== project.id) throw new InstallationError(404, 'projectNotFound')
+      return { project: privateProject, restarting: true }
+    },
+  }
+  const call = serve({ installation })
+  expect(await call('GET', 'onboarding')).toEqual({ status: 200, body: { status: 'unconfigured' } })
+  expect(await call('POST', 'onboarding/github/verify', { cli: 'gh-agent' })).toEqual({ status: 200, body: { status: 'ready', identity } })
+  expect(await call('POST', 'onboarding/github/verify', { cli: 'bad' })).toEqual({ status: 200, body: { status: 'blocked',
+    problem: { place: 'github', code: 'agentCliSignedOut', values: {}, detail: 'The agent GitHub CLI cannot read its account.' } } })
+  expect(await call('GET', 'projects')).toEqual({ status: 200, body: { activeProjectId: null, projects: [project] } })
+  expect(await call('POST', 'projects/other/select')).toMatchObject({ status: 404, body: { code: 'projectNotFound' } })
+  expect(await call('POST', 'projects', { repository: 'org/repo', workspace: 'D:/repos/repo', baseRef: 'main', policy: { rules: [] } }))
+    .toEqual({ status: 200, body: { project, reused: false, restarting: true } })
+  expect(await call('POST', 'projects', { repository: 'org/repo', workspace: 'D:/repos/repo' }))
+    .toMatchObject({ status: 400, body: { code: 'invalidRequest' } })
+  const callNewMount = serve({ installation })
+  expect(await callNewMount('POST', 'projects/repo%2Flocal/select')).toEqual({ status: 200, body: { project, restarting: true } })
+  expect(await call('POST', 'projects/repo%2Flocal/select', undefined, { origin: 'http://evil.example' })).toMatchObject({ status: 403 })
+})
+
+it('hides unexpected onboarding failures and reports an unavailable installation explicitly', async () => {
+  const call = serve({ installation: { runtime: idleRuntime, verifyGithub: () => { throw new Error('token=private') } } })
+  expect(await call('POST', 'onboarding/github/verify', { cli: 'gh' })).toEqual({ status: 500, body: { error: 'Installation operation failed.' } })
+  expect(await serve({})('GET', 'projects')).toMatchObject({ status: 404, body: { code: 'installationUnavailable' } })
+})
+
+const projectHeader = (id: string) => ({ 'x-orchestrator-project-id': id })
+const alpha = { id: 'alpha', repository: 'org/alpha', workspace: 'D:/repos/alpha', hubSessionId: 'hub-alpha' }
+const beta = { id: 'beta', repository: 'org/beta', workspace: 'D:/repos/beta', hubSessionId: 'hub-beta' }
+
+it('fences project writes and blocks new work without blocking a scoped pause change', async () => {
+  let setupReady = false, retries = 0, requeues = 0
+  const call = serve({
+    installation: { projects: () => ({ activeProjectId: alpha.id, projects: [alpha] }), runtime: () => ({ reason: null }) },
+    assertNewWork: () => { if (!setupReady) throw new InstallationError(409, 'projectSetupRequired') },
+    store: { tickets: { get: () => ({}) } },
+    engine: { retryTicket: () => { retries++ }, reevaluate: () => { requeues++; return true } },
+    requestPass: () => {}, settings: { pause: (paused: boolean) => ({ paused }) },
+  })
+  expect(await call('POST', 'tickets/t1/retry')).toMatchObject({ status: 409, body: { code: 'projectScopeRequired' } })
+  expect(await call('POST', 'triggers/e1/requeue', undefined, projectHeader(beta.id))).toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  for (const path of ['tickets/t1/retry', 'triggers/e1/requeue']) {
+    expect(await call('POST', path, undefined, projectHeader(alpha.id))).toMatchObject({ status: 409, body: { code: 'projectSetupRequired' } })
+  }
+  expect([retries, requeues]).toEqual([0, 0])
+  expect(await call('POST', 'executor/pause', { paused: false }, projectHeader(alpha.id))).toEqual({ status: 200, body: { paused: false } })
+
+  setupReady = true
+  expect(await call('POST', 'tickets/t1/retry', undefined, projectHeader(alpha.id))).toEqual({ status: 200, body: { retried: true } })
+  expect(await call('POST', 'triggers/e1/requeue', undefined, projectHeader(alpha.id))).toEqual({ status: 200, body: { queued: true } })
+  expect([retries, requeues]).toEqual([1, 1])
+})
+
+it('rejects a body-bearing project mutation whose mounted runtime starts switching during parsing', async () => {
+  const bodyStarted = Promise.withResolvers<void>(), sendBody = Promise.withResolvers<void>()
+  let switching = false, paused = false
+  const call = serve({
+    installation: { projects: () => ({ activeProjectId: alpha.id, projects: [alpha, beta] }),
+      runtime: () => ({ reason: switching ? 'switching' : null }),
+      selectProject: () => { switching = true; return { project: beta, restarting: true } } },
+    settings: { pause: (value: boolean) => ({ paused: paused = value }) },
+  })
+  expect(await call('POST', 'projects/beta/select', undefined, projectHeader(beta.id)))
+    .toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  const pending = call('POST', 'executor/pause', { paused: true }, projectHeader(alpha.id), () => {
+    bodyStarted.resolve(); return sendBody.promise
+  })
+  await bodyStarted.promise
+  try { expect(await call('POST', 'projects/beta/select')).toEqual({ status: 200, body: { project: beta, restarting: true } }) }
+  finally { sendBody.resolve() }
+  expect(await pending).toMatchObject({ status: 409, body: { code: 'switching' } })
+  expect(paused).toBe(false)
+})
+
+it('does not start a project switch during an asynchronous project write or admit a write during selection', async () => {
+  const writeStarted = Promise.withResolvers<void>(), finishWrite = Promise.withResolvers<void>()
+  const selectStarted = Promise.withResolvers<void>(), finishSelect = Promise.withResolvers<void>()
+  let retries = 0
+  const call = serve({
+    installation: { projects: () => ({ activeProjectId: alpha.id, projects: [alpha, beta] }), runtime: () => ({ reason: null }),
+      selectProject: async () => { selectStarted.resolve(); await finishSelect.promise; return { project: beta, restarting: true } } },
+    store: { tickets: { get: () => ({}) } }, engine: { retryTicket: () => { retries++ } },
+    settings: { pause: async (paused: boolean) => { writeStarted.resolve(); await finishWrite.promise; return { paused } } },
+  })
+  const write = call('POST', 'executor/pause', { paused: true }, projectHeader(alpha.id))
+  await writeStarted.promise
+  const selectionDuringWrite = call('POST', 'projects/beta/select')
+  try {
+    const result = await Promise.race([selectionDuringWrite, new Promise(resolve => setImmediate(() => resolve('waiting for write')))])
+    expect(result).toMatchObject({ status: 409, body: { code: 'projectConflict' } })
+  } finally { finishWrite.resolve() }
+  expect(await write).toEqual({ status: 200, body: { paused: true } })
+
+  const select = call('POST', 'projects/beta/select')
+  await selectStarted.promise
+  try {
+    expect(await call('POST', 'tickets/t1/retry', undefined, projectHeader(alpha.id)))
+      .toMatchObject({ status: 409, body: { code: 'switching' } })
+    expect(retries).toBe(0)
+  } finally { finishSelect.resolve() }
+  expect(await select).toEqual({ status: 200, body: { project: beta, restarting: true } })
+})
+
+it('rejects a stale scoped read and hides meters from outside the mounted project', async () => {
+  const call = serve({
+    installation: { projects: () => ({ activeProjectId: alpha.id, projects: [alpha, beta] }) },
+    ownsSession: (id: string) => id === alpha.hubSessionId,
+    meter: { read: async (id: string) => ({ session_id: id }) },
+  })
+  expect(await call('GET', 'sessions/hub-alpha/meter', undefined, projectHeader(beta.id)))
+    .toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  expect(await call('GET', 'sessions/hub-beta/meter')).toEqual({ status: 404, body: { error: 'Session not found' } })
+  expect(await call('GET', 'sessions/hub-alpha/meter')).toEqual({ status: 200, body: { session_id: alpha.hubSessionId } })
 })

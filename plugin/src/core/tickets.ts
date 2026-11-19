@@ -462,21 +462,23 @@ export class Tickets extends EnginePart {
     this.repo.tickets.save(ticket)
     this.letGo(ticket.id, waiting, left)
   }
-  /** Replace a ticket's running Assignment with a new one that receives `note` first, and queue it for launch. */
-  restart(ticket: Ticket, running: Assignment, reason: string, note: string): void {
-    this.endAssignment(ticket, running, reason)
+  /** Resume the existing Assignment after a host interruption; a durable pending recovery message is reused. */
+  recover(ticket: Ticket, running: Assignment, note: string): void {
     this.requeueUntaken(ticket, running)
-    const assignment = this.newAssignment(ticket)
     const at = this.now()
-    const input: TicketInput = { id: key('input', ticket.id, 'restart', assignment.id), kind: 'text', text: note, at }
-    ticket.inputs.push(input); ticket.undelivered.push(input.id); ticket.updatedAt = at
+    if (!running.recoveryInputId || !ticket.undelivered.includes(running.recoveryInputId)) {
+      const id = key('input', ticket.id, running.id, 'recovery', String(ticket.inputs.length))
+      running.recoveryInputId = id
+      ticket.inputs.push({ id, kind: 'text', text: note, at })
+    } else ticket.undelivered = ticket.undelivered.filter(id => id !== running.recoveryInputId)
+    ticket.undelivered.unshift(running.recoveryInputId)
+    ticket.updatedAt = at
     this.repo.tickets.save(ticket)
-    this.options.executor.start(ticket, assignment)
+    this.options.executor.deliver(ticket, running)
   }
   /**
-   * Put back, ahead of what waits, the Trigger Inputs delivered to `replaced` that no step of its worker took: a cancel may
-   * have dropped them, or a step that claimed them was cut off, and the new Assignment's launch takes a copy still waiting
-   * in the Session out, so its delivery is the only one. An earlier end let go of what earlier Assignments left.
+   * Put back Trigger Inputs already delivered that no step of the worker took: a cancel may have dropped them, or a step
+   * that claimed them was cut off. The Executor removes an inbox copy before replaying them.
    */
   private requeueUntaken(ticket: Ticket, replaced: Assignment): void {
     const untaken = ticket.inputs.filter(input => input.kind === 'trigger' && input.readAt === null && input.deliveredTo === replaced.id
@@ -523,7 +525,8 @@ export class Tickets extends EnginePart {
     const taken = this.triggersOf(ticket, ticket.inputs.flatMap(input => input.kind === 'trigger' && !readBefore(input, until) ? [input.id] : []))
       .some(trigger => this.owners(trigger).includes(ticket.id) && this.takenUp(ticket, trigger))
     const latest = latestAssignment(ticket)
-    if (taken || !(Date.parse(latest?.createdAt ?? '') > Date.parse(at))) return taken
+    const recoveredAt = latest?.recoveryInputId && ticket.inputs.find(input => input.id === latest.recoveryInputId)?.at
+    if (taken || !(Date.parse(recoveredAt || latest?.createdAt || '') > Date.parse(at))) return taken
     const report = latest?.report
     const later = ticket.inputs.some(input => input.kind !== 'policy-changed' && Date.parse(input.at) > Date.parse(report?.at ?? ''))
     return report?.state !== 'ready' || ticket.undelivered.length > 0 || later

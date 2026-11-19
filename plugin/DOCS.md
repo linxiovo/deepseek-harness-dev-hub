@@ -30,3 +30,4 @@
 | 009 交棒 | Harness 交棒确认、只读规格与拆票会话、Plan DAG 登记和查询 | [docs/009-handoff.md](docs/009-handoff.md) |
 | 010 会话边界 | Hub Agent、Worker Session 及任意深度子会话的工具与对外消息边界契约、代码与测试入口 | [docs/010-session-boundaries.md](docs/010-session-boundaries.md) |
 | 011 文档影响 | Worker 候选的 Doc Tree 结构检查、接口契约与独立审查证据 | [docs/011-doc-tree-impact.md](docs/011-doc-tree-impact.md) |
+| 012 项目运行时 | GitHub 身份验证、项目目录与切换恢复、安装 API 和项目作用域 | [docs/012-project-runtime.md](docs/012-project-runtime.md) |

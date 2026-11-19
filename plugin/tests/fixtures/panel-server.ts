@@ -310,8 +310,15 @@ const page = <T>(items: T[]) => ({ items, total: items.length, next_offset: null
 const ticketOf = (id: string) =>
   [...server.tickets.open, ...server.person, ...server.tickets.ended].find(ticket => ticket.id === id) ?? server.ticketDetails[id]
 const SourceSave = z.object({ enabled: z.boolean(), config: z.unknown() })
+const installationUnavailable = () => refuse(404, 'Installation management is not available.', { code: 'installationUnavailable' })
 
 const ROUTES: { [K in keyof Api]: Route<K> } = {
+  'GET runtime': { answer: installationUnavailable },
+  'GET onboarding': { answer: installationUnavailable },
+  'POST onboarding/github/verify': { body: true, answer: installationUnavailable },
+  'GET projects': { answer: installationUnavailable },
+  'POST projects': { body: true, answer: installationUnavailable },
+  'POST projects/:projectId/select': { answer: installationUnavailable },
   'GET state': { answer: stateView },
   'GET overview': { answer: overviewView },
   'GET search': { query: ['q'], answer: async ({ query }) => {

@@ -18,6 +18,7 @@ export interface SourceContextDeps {
   readonly deployment: Deployment
   readonly ready: Promise<void>
   configured(): boolean
+  closing?(): boolean
   /** Setup problem whose `place` matches the Source kind receives it on `context.problem`. */
   readonly setupProblem?: SetupProblem | undefined
   /** Why setup found no Feishu bot even though the Feishu Source names a CLI. */
@@ -33,6 +34,10 @@ export interface SourceContextDeps {
 export function sourceContextOf(deps: SourceContextDeps, kind: { kind: string; health: readonly string[] }): SourceContext {
   const { store } = deps
   const health = deps.sources.healthEntries(kind.health)
+  const active = <Value>(work: () => Value): Value => {
+    if (deps.closing?.()) throw new Error('Source project is stopping or switching')
+    return work()
+  }
   return {
     get deployment() { return deps.deployment },
     commands: deps.commands,
@@ -40,30 +45,31 @@ export function sourceContextOf(deps: SourceContextDeps, kind: { kind: string; h
     configured: () => deps.configured(),
     get problem() { return [deps.feishuProblem, deps.setupProblem].find(problem => problem?.place === kind.kind) },
     config: <C extends Record<string, unknown>>(id: string) => {
+      if (deps.closing?.()) return undefined
       const instance = deps.sources.instance<C>(id)
       return instance?.enabled ? instance.config : undefined
     },
     receive: trigger => deps.receive(trigger),
-    atomic: work => store.atomic(work),
+    atomic: work => active(() => store.atomic(work)),
     state: {
-      get: name => store.get(name),
-      set: (name, value) => { if (value === undefined) store.delete(name); else store.set(name, value) },
-      keys: prefix => store.keys(prefix),
+      get: name => active(() => store.get(name)),
+      set: (name, value) => active(() => { if (value === undefined) store.delete(name); else store.set(name, value) }),
+      keys: prefix => active(() => store.keys(prefix)),
     },
     threads: {
-      get: key => store.threads.get(key),
-      subscribed: source => store.read.subscribedThreads(source),
-      describe: (key, description) => store.threads.describe(key, description),
-      patch: (key, meta) => { store.threads.patchMeta(key, meta) },
+      get: key => active(() => store.threads.get(key)),
+      subscribed: source => active(() => store.read.subscribedThreads(source)),
+      describe: (key, description) => active(() => store.threads.describe(key, description)),
+      patch: (key, meta) => active(() => { store.threads.patchMeta(key, meta) }),
     },
     tickets: {
-      get: id => store.tickets.get(id),
-      open: () => store.tickets.open(),
-      bindThread: (id, thread, own) => { deps.engine.bindThread(id, thread, own) },
-      threadClosed: (thread, outcome, at) => { deps.engine.threadClosed(thread, outcome, at) },
+      get: id => active(() => store.tickets.get(id)),
+      open: () => active(() => store.tickets.open()),
+      bindThread: (id, thread, own) => active(() => { deps.engine.bindThread(id, thread, own) }),
+      threadClosed: (thread, outcome, at) => active(() => { deps.engine.threadClosed(thread, outcome, at) }),
     },
-    triggers: { get: id => store.triggers.get(id), latest: thread => store.read.threadTriggers(thread, 1)[0] },
-    notify: message => { deps.outbox.send(message) },
+    triggers: { get: id => active(() => store.triggers.get(id)), latest: thread => active(() => store.read.threadTriggers(thread, 1)[0]) },
+    notify: message => active(() => { deps.outbox.send(message) }),
     report: (entry, value) => {
       if (!kind.health.includes(entry)) throw new Error(`The ${kind.kind} Source has no health entry ${entry}`)
       health.get(entry)?.set(value)

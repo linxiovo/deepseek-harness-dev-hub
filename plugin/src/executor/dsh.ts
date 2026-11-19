@@ -19,11 +19,13 @@ import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
 import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
+import { promptFile } from '../infra/prompt-file.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
 import { checkDocTree } from './doc-tree.ts'
 import { validateRepositoryIdentity } from './repository-identity.ts'
 import { inspectRepository, inspectWorktree, validateWorktreeDestination, WorktreeRejected } from './worktree.ts'
 
+const recoveryNote = promptFile('worker-recovery')
 const now = (): string => new Date().toISOString()
 /** Returns the worker session ID (`worker-<ticketId>`) for a ticket. */
 export const workerSessionId = (ticketId: string): string => `worker-${ticketId}`
@@ -373,7 +375,7 @@ export class DshExecutor implements Executor {
         const sessionId = workerSessionId(ticketId)
         if (!woken && !this.running(ticket)) {
           // A person's message wakes its worker ahead of new launches, in the slot kept for it.
-          const person = ticket.undelivered.some(id => fromPerson(ticket.inputs.find(item => item.id === id)))
+          const person = ticket.undelivered.some(id => id !== assignment.recoveryInputId && fromPerson(ticket.inputs.find(item => item.id === id)))
           this.slots.reserve(ticketId, person ? 'person' : 'wake')
           woken = true
         }
@@ -388,6 +390,15 @@ export class DshExecutor implements Executor {
           }
           if (!this.host.context.agents.get(sessionId as SessionId)) {
             await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker')
+          }
+          if (inputId === assignment.recoveryInputId) {
+            const agent = this.host.context.agents.get(sessionId as SessionId)
+            // Keep the recovery note ahead of unread Triggers, with exactly one copy available to the Worker.
+            for (const waiting of ticket.inputs) {
+              if (waiting.kind === 'trigger' && waiting.readAt === null && waiting.deliveredTo === assignment.id) {
+                agent?.inbox.remove(this.host.sessions.promptedId(waiting.id))
+              }
+            }
           }
           if (input) await this.deliverInput(ticket, assignment, input)
         } catch (error) {
@@ -417,7 +428,7 @@ export class DshExecutor implements Executor {
     const message = inputMessage(input, trigger)
     if (message === undefined) return
     const text = message.length > ASSIGNMENT_CHARS ? JSON.stringify(capped(message, ASSIGNMENT_CHARS, inputResource(ticket.id, input.id))) : message
-    await this.host.sessions.prompt(workerSessionId(ticket.id), input.id, text, 'steer', live)
+    await this.host.sessions.prompt(workerSessionId(ticket.id), input.id, text, input.id === assignment.recoveryInputId ? 'queue' : 'steer', live)
   }
   /** Formats a trigger on `ticket` for the worker, including a preview of the replied-to message when the worker has not yet seen it. */
   private async triggerCard(ticket: Ticket, triggerId: string, note?: string): Promise<object | undefined> {
@@ -672,8 +683,7 @@ export class DshExecutor implements Executor {
         ...(batch.length ? { batch } : {}), ...retried })
     const requestId = later ? `assignment:${ticket.id}:${assignment.id}` : first
     await this.host.sessions.prompt(sessionId, requestId, text, 'queue',
-      () => { if (!current() || !this.writerAuthorized(ticket.id, sessionId)) throw new Error('Launch authorization changed before worker delivery') },
-      () => { this.host.engine.assignmentStarted(ticket.id, assignment.id) })
+      () => { if (!current() || !this.writerAuthorized(ticket.id, sessionId)) throw new Error('Launch authorization changed before worker delivery') })
     this.host.engine.assignmentStarted(ticket.id, assignment.id)
   }
   /** Returns the stored ticket for `agent` when it is a worker session, or undefined otherwise. */
@@ -746,7 +756,7 @@ export class DshExecutor implements Executor {
         // Input that was handed over but not yet taken.
         this.host.context.agents.get(workerSessionId(ticket.id) as SessionId)?.cancel({ kind: 'user' }, { keepInbox: true })
         this.stopWork(ticket.id, 'dsh-superagent restarted', true, running.id)
-        this.host.engine.assignmentInterrupted(ticket.id, running.id)
+        this.host.engine.assignmentInterrupted(ticket.id, running.id, recoveryNote)
       }
       else if (latest?.state === 'pending' && !waitsForPerson(ticket)) this.start(ticket, latest)
     }

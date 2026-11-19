@@ -5,6 +5,7 @@ import type { Deployment } from '../deployment.ts'
 import type { Settings } from '../policy.ts'
 import type { Localized, VariableSpec } from '../sources/kind.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
+import { githubEnvironment } from '../sources/github-environment.ts'
 
 /** Variables registered by the Executor; ticket entries require a ticket, and identity entries require pinned preparation facts. */
 export const EXECUTOR_VARIABLES: readonly (VariableSpec & { ticket?: true; identity?: true })[] = [
@@ -39,9 +40,15 @@ export function environmentOf(input: { deployment: Deployment; sources: SourceRe
   } : {} }
   const result: Variable[] = EXECUTOR_VARIABLES.filter(spec => (!spec.ticket || !!ticket) && (!spec.identity || !!ticket?.identity))
     .map(spec => ({ key: spec.key, value: executor[spec.key] ?? '', description: spec.description, owner: 'executor' }))
+  const inputContext = { deployment, ...trigger ? { trigger } : {} }
+  const append = (owner: string, variables: readonly VariableSpec[], values: Record<string, string>) => {
+    for (const spec of variables) result.push({ key: spec.key, value: values[spec.key] ?? '', description: spec.description, owner })
+  }
+  const verifiedGithub = deployment.github.id !== undefined
+  if (verifiedGithub) append('github', githubEnvironment.variables, githubEnvironment.values(inputContext))
   for (const { kind, environment, config } of sources.environments(settings)) {
-    const values = environment.values({ deployment, config, ...trigger ? { trigger } : {} })
-    for (const spec of environment.variables) result.push({ key: spec.key, value: values[spec.key] ?? '', description: spec.description, owner: kind.kind })
+    if (verifiedGithub && kind.kind === 'github') continue
+    append(kind.kind, environment.variables, environment.values({ ...inputContext, config }))
   }
   return result
 }

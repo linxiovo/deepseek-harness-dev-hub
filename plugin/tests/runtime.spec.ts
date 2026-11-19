@@ -2,7 +2,7 @@ import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:c
 import { Context } from '@deepseek-ai/cordis'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import { ToolRuntime, type ToolDefinition } from '@deepseek-ai/dsh-tools'
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
 import { delimiter, join } from 'node:path'
@@ -37,6 +37,7 @@ import { overview } from '../src/app/views/overview.ts'
 import { preview, readable } from '../src/app/views/text.ts'
 import { decisionList, search, threadDetail, threadList } from '../src/app/views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from '../src/app/views/tickets.ts'
+import type { CreateProjectResult } from '../src/app/installation-api.ts'
 
 let runtime: Runtime
 const viewsOf = (value: Runtime) => ({ store: value.store, sources: value.sources, links: value.links() })
@@ -50,9 +51,10 @@ type Section = { name: string; text: (context: { signal?: AbortSignal }) => stri
 let sections: Map<string, Section>
 type HttpHandler = (req: unknown, res: unknown) => Promise<void>
 let http: HttpHandler
-async function api(method: string, path: string): Promise<{ status: number; body: unknown }> {
+async function api(method: string, path: string, body?: unknown, projectId?: string): Promise<{ status: number; body: unknown }> {
   let status = 0, text = ''
-  const req = { method, url: `/orchestrator/api/${path}`, headers: { host: '127.0.0.1:3082', 'x-orchestrator-request': '1' } }
+  const req = { method, url: `/orchestrator/api/${path}`, headers: { host: '127.0.0.1:3082', 'x-orchestrator-request': '1',
+    'x-orchestrator-project-id': projectId }, async *[Symbol.asyncIterator]() { if (body !== undefined) yield JSON.stringify(body) } }
   await http(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
   return { status, body: JSON.parse(text) }
 }
@@ -216,7 +218,7 @@ async function acceptedTicket(trigger = feishu('1', '@bot 修一下回归')) {
 beforeEach(async () => {
   directory = mkdtempSync(join(realpathSync.native(tmpdir()), 'orchestrator-runtime-'))
   repository = gitRepository(directory)
-  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : args[1]?.includes('/pulls/') ? { state: 'open', user: { login: 'agent-bot' }, html_url: 'https://github.com/acme/widgets/pull/' + args[1].split('/').at(-1), head: { ref: `agent/${String(runtime.store.tickets.list()[0]?.execution?.name)}`, sha: 'head-1', repo: { full_name: 'acme/widgets' } } } : { default_branch: 'master', permissions: { push: true } })
+  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : args[1]?.includes('/pulls?state=all&head=') ? [] : args[1]?.includes('/pulls/') ? { state: 'open', user: { login: 'agent-bot' }, html_url: 'https://github.com/acme/widgets/pull/' + args[1].split('/').at(-1), head: { ref: `agent/${String(runtime.store.tickets.list()[0]?.execution?.name)}`, sha: 'head-1', repo: { full_name: 'acme/widgets' } } } : { default_branch: 'master', permissions: { push: true } })
   vi.spyOn(Commands.prototype, 'lark').mockResolvedValue({ users: [{ member_id: MEMBER, name: 'Alice' }], has_more: false })
   vi.spyOn(Commands.prototype, 'git').mockImplementation(async (args, cwd) => execFileSync('git', args, { cwd, env: gitEnv(), encoding: 'utf8' }))
   vi.spyOn(Commands.prototype, 'run').mockImplementation(async (program, args, cwd) => program === 'git'
@@ -225,8 +227,8 @@ beforeEach(async () => {
   answers = {
     [`git -C ${directory} rev-parse --show-toplevel`]: `${directory}\n`,
     [`git -C ${directory} remote get-url --push origin`]: 'https://github.com/acme/widgets.git\n',
-    [`${AGENT()} api user`]: '{"login":"agent-bot","id":7}', [`${AGENT()} api repos/acme/widgets --jq {name: .full_name, push: .permissions.push}`]: '{"name":"acme/widgets","push":true}\n',
-    [`${OTHER()} api user`]: '{"login":"agent-bot","id":7}', [`${OTHER()} api repos/acme/widgets --jq {name: .full_name, push: .permissions.push}`]: '{"name":"acme/widgets","push":true}\n',
+    [`${AGENT()} api user --hostname github.com`]: '{"login":"agent-bot","id":7}', [`${AGENT()} api repos/acme/widgets --hostname github.com --jq {name: .full_name, push: .permissions.push}`]: '{"name":"acme/widgets","push":true}\n',
+    [`${OTHER()} api user --hostname github.com`]: '{"login":"agent-bot","id":7}', [`${OTHER()} api repos/acme/widgets --hostname github.com --jq {name: .full_name, push: .permissions.push}`]: '{"name":"acme/widgets","push":true}\n',
     [`${BOT()} auth status`]: JSON.stringify({ appId: 'cli_bot', brand: 'feishu', identities: { bot: { status: 'ready' } } }),
     [`${BOT()} config strict-mode`]: 'strict-mode: bot (source: profile)',
     [`${BOT()} api GET /open-apis/bot/v3/info --as bot --format ndjson`]: '{"bot":{"open_id":"ou_bot"},"code":0,"msg":"ok"}',
@@ -329,6 +331,144 @@ afterEach(async () => {
   rmSync(directory, { recursive: true, force: true })
 })
 vi.setConfig({ testTimeout: 30_000 })
+
+it('keeps project binding, authorization, cursors and Hub sessions separate across desktop and headless restarts', async () => {
+  const stateDir = join(directory, 'installation')
+  const otherRoot = join(directory, 'other-checkout')
+  mkdirSync(otherRoot)
+  const secondRepository = gitRepository(otherRoot)
+  secondRepository.git('remote', 'set-url', 'origin', 'https://github.com/acme/gadgets.git')
+  const mount = async (runtimeMode: Machine['runtimeMode'], projectId?: string) => {
+    await runtime.stop()
+    const ctx = new Context()
+    for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
+    if (projectId) answers[HELPERS] = `file:${workerGitConfig(join(stateDir, 'projects', projectId))}\0${credentialHelper(AGENT())}\0`
+    runtime = new Runtime(ctx, testMachine({ stateDir, runtimeMode }), restarts)
+    runtime.sources.register(githubKind)
+    await runtime.ready
+  }
+  await mount('desktop')
+  const create = (repo: string, workspace: string, allowed: string) => api('POST', 'projects', {
+    repository: repo, workspace, baseRef: 'refs/heads/main', policy: { sources: { github: { allowed: [{ id: allowed }] } } },
+  })
+  expect(await create('acme/widgets', repository.repository, 'alice')).toMatchObject({ status: 409, body: { code: 'githubSetupRequired' } })
+  expect(await api('POST', 'triggers/unknown/requeue')).toMatchObject({ status: 409, body: { code: 'githubSetupRequired' } })
+  expect(await api('POST', 'tickets/unknown/retry')).toMatchObject({ status: 409, body: { code: 'githubSetupRequired' } })
+  expect((await api('GET', 'projects')).body).toEqual({ activeProjectId: null, projects: [] })
+  const userProbe = `${AGENT()} api user --hostname github.com`
+  answers[userProbe] = new Error('private-test-credential')
+  expect(JSON.stringify(await api('POST', 'onboarding/github/verify', { cli: AGENT() }))).not.toContain('private-test-credential')
+  answers[userProbe] = '{"login":"agent-bot","id":7}'
+  for (const slug of ['acme/widgets', 'acme/gadgets']) {
+    answers[`${AGENT()} api repos/${slug} --hostname github.com --jq {name: .full_name, push: .permissions.push}`] = JSON.stringify({ name: slug, push: true })
+  }
+  expect(await api('POST', 'onboarding/github/verify', { cli: AGENT() })).toMatchObject({ status: 200, body: { status: 'ready', identity: { id: 7, login: 'agent-bot' } } })
+  expect(await api('POST', 'triggers/unknown/requeue')).toMatchObject({ status: 409, body: { code: 'noProject' } })
+  expect(await create('acme/gadgets', repository.repository, 'alice')).toMatchObject({ status: 400, body: { code: 'invalidProject' } })
+  const first = await create('acme/widgets', repository.repository, 'alice')
+  expect(first).toMatchObject({ status: 200, body: { restarting: true, reused: false } })
+  const project = (first.body as CreateProjectResult).project
+  await mount('desktop', project.id)
+  expect(runtime.masterId).toBe(project.hubSessionId)
+  expect(sections.get(project.hubSessionId)!.text({})).toContain('acme/widgets')
+  const firstSource = runtime.context(githubKind)
+  firstSource.state.set(KV.github.since, '2026-09-01T00:00:00Z')
+  const mention = (slug: string, login: string) => commentTrigger({ id: 900, body: '@agent-bot please fix the regression', user: { login },
+    html_url: `https://github.com/${slug}/issues/42#issuecomment-900`, created_at: new Date().toISOString() },
+  { number: 42, isPr: false }, 'conversation', 'agent-bot')
+  const firstWork = await acceptedTicket(mention('acme/widgets', 'alice'))
+  expect(firstWork.ticket.execution).toMatchObject({ repository: repository.repository, preparation: { state: 'verified' } })
+  expect(sections.get(firstWork.sessionId)!.text({})).toContain('agent-bot')
+  firstSource.tickets.bindThread(firstWork.ticket.id, { source: 'github', id: '205' }, true)
+  const second = await create('acme/gadgets', secondRepository.repository, 'bob')
+  expect(second).toMatchObject({ status: 200, body: { restarting: false, reused: false } })
+  const other = (second.body as CreateProjectResult).project
+  expect(other.hubSessionId).not.toBe(project.hubSessionId)
+  answers[userProbe] = '{"login":"different-account","id":8}'
+  expect(await api('POST', `projects/${other.id}/select`)).toMatchObject({ status: 409, body: { code: 'githubSetupRequired' } })
+  expect(await api('GET', 'projects')).toMatchObject({ body: { activeProjectId: project.id } })
+  answers[userProbe] = '{"login":"agent-bot","id":7}'
+  expect(await api('POST', 'onboarding/github/verify', { cli: AGENT() })).toMatchObject({ body: { status: 'ready' } })
+  await mount('desktop', project.id)
+  expect(await api('POST', `projects/${other.id}/select`)).toMatchObject({ status: 200, body: { restarting: true } })
+  await mount('headless', other.id)
+  expect(runtime.masterId).toBe(other.hubSessionId)
+  expect(sections.get(other.hubSessionId)!.text({})).toContain('acme/gadgets')
+  expect(runtime.context(githubKind).state.get(KV.github.since)).toBeUndefined()
+  expect(() => firstSource.state.set(KV.github.since, 'late')).toThrow('stopping or switching')
+  expect(await api('GET', 'runtime')).toMatchObject({ status: 200, body: { mode: 'headless', status: 'ready', projectId: other.id } })
+  expect(await api('GET', 'settings', undefined, other.id)).toMatchObject({ body: { blocks: { policy: { value: { sources: { github: { allowed: [{ id: 'bob' }] } } } } } } })
+  expect(await api('POST', 'executor/pause', { paused: true }, project.id)).toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  expect(await api('GET', `sessions/${project.hubSessionId}/meter`, undefined, other.id)).toMatchObject({ status: 404 })
+  expect(await api('GET', `tickets/${firstWork.ticket.id}`, undefined, other.id)).toMatchObject({ status: 404 })
+  const incoming = mention('acme/gadgets', 'bob')
+  const run = vi.mocked(Commands.prototype.run)
+  const runCommand = run.getMockImplementation()!
+  run.mockImplementation(async function (this: Commands, program, args, cwd) {
+    if (args[1]?.startsWith('repos/acme/gadgets/notifications?')) return 'HTTP/2 200 OK\r\n\r\n[]'
+    return runCommand.call(this, program, args, cwd)
+  })
+  await pollRound(runtime.context(githubKind))
+  expect(runtime.health.github?.state).toBe('ready')
+  expect(runtime.context(githubKind).state.get(KV.github.since)).toBeDefined()
+  const secondWork = await acceptedTicket(incoming)
+  expect(secondWork.ticket.execution).toMatchObject({ repository: secondRepository.repository, preparation: { state: 'verified' } })
+  expect(secondWork.ticket.execution?.worktree).not.toBe(firstWork.ticket.execution?.worktree)
+  expect(secondWork.sessionId).not.toBe(firstWork.sessionId)
+  const gh = vi.mocked(Commands.prototype.gh)
+  const originalGithub = gh.getMockImplementation()!
+  gh.mockImplementation(async function (this: Commands, args) {
+    if (args[1]?.startsWith('repos/acme/gadgets/pulls?state=all&head=')) return [{ number: 207 }]
+    if (args[1] === 'repos/acme/gadgets/pulls/207') return { state: 'open', user: { login: 'agent-bot' },
+      html_url: 'https://github.com/acme/gadgets/pull/207', head: { ref: secondWork.ticket.execution!.branch, sha: 'a-different-head', repo: { full_name: 'acme/gadgets' } } }
+    return originalGithub.call(this, args)
+  })
+  await mount('headless', other.id)
+  const secondDetail = await api('GET', `tickets/${secondWork.ticket.id}`, undefined, other.id)
+  expect(secondDetail.status).toBe(200)
+  expect(secondDetail.body).toMatchObject({ threads: expect.not.arrayContaining([expect.objectContaining({ key: 'github:207' })]) })
+  await runtime.idle()
+  await vi.waitFor(() => expect(relays(secondWork.sessionId)).toContainEqual({ text: expect.stringContaining('host restarted') }))
+  const recoveredDetail = await api('GET', `tickets/${secondWork.ticket.id}`, undefined, other.id)
+  expect(recoveredDetail.body).toMatchObject({ assignments: [expect.objectContaining({ id: secondWork.ticket.assignments[0]!.id, state: 'running' })] })
+  expect(relays(secondWork.sessionId).filter(item => item.ticket_id === secondWork.ticket.id)).toHaveLength(1)
+  expect(await runTool(secondWork.sessionId, 'orchestrator_report', { state: 'progress', summary: 'recovered existing work' })).toMatchObject({ reported: true })
+  gh.mockImplementation(originalGithub)
+  expect(await api('POST', `projects/${project.id}/select`)).toMatchObject({ status: 200, body: { restarting: true } })
+  await mount('desktop', project.id)
+  expect(await api('GET', 'runtime')).toMatchObject({ body: { mode: 'desktop', projectId: project.id, resumedFrom: { reason: 'projectSwitched' } } })
+  expect(runtime.context(githubKind).state.get(KV.github.since)).toBe('2026-09-01T00:00:00Z')
+  await mount('desktop', project.id)
+  expect(await api('GET', 'runtime')).toMatchObject({ body: { resumedFrom: { reason: 'hostStopped' } } })
+  expect((await api('GET', 'tickets', undefined, project.id)).body).toMatchObject({ total: 1 })
+  gh.mockImplementation(async function (this: Commands, args) {
+    if (args[1] === 'repos/acme/widgets/pulls/205') throw new Error('GitHub unavailable during recovery')
+    return originalGithub.call(this, args)
+  })
+  const deliveriesBeforeBlockedRecovery = relays(firstWork.sessionId).length
+  await mount('desktop', project.id)
+  expect(await api('GET', 'runtime')).toMatchObject({ body: { status: 'paused', reason: 'recoveryPending' } })
+  expect(relays(firstWork.sessionId)).toHaveLength(deliveriesBeforeBlockedRecovery)
+  gh.mockImplementation(async function (this: Commands, args) {
+    if (args[1]?.startsWith('repos/acme/widgets/pulls?state=all&head=')) return [{ number: 206 }]
+    if (args[1] === 'repos/acme/widgets/pulls/206') return { state: 'closed', merged: true, user: { login: 'agent-bot' },
+      html_url: 'https://github.com/acme/widgets/pull/206', head: { ref: firstWork.ticket.execution!.branch, sha: repository.base.sha, repo: { full_name: 'acme/widgets' } } }
+    return originalGithub.call(this, args)
+  })
+  await mount('desktop', project.id)
+  expect(await api('GET', 'runtime')).toMatchObject({ body: { status: 'paused', reason: 'recoveryPending' } })
+  expect(runtime.store.tickets.get(firstWork.ticket.id)?.follows).toContainEqual(expect.objectContaining({ thread: 'github:206', closed: expect.objectContaining({ outcome: 'merged' }) }))
+  expect(relays(firstWork.sessionId)).toHaveLength(deliveriesBeforeBlockedRecovery)
+  gh.mockImplementation(originalGithub)
+  // The first recovery persisted the merge. A later restart must not depend on finding the old head again.
+  await mount('desktop', project.id)
+  expect(await api('GET', 'runtime')).toMatchObject({ body: { status: 'paused', reason: 'recoveryPending' } })
+  expect(relays(firstWork.sessionId)).toHaveLength(deliveriesBeforeBlockedRecovery)
+  repository.git('remote', 'set-url', 'origin', 'https://github.com/acme/changed.git')
+  await mount('desktop', project.id)
+  expect(await api('GET', 'runtime')).toMatchObject({ body: { status: 'paused', reason: 'projectSetupRequired' } })
+  expect(await api('POST', `tickets/${firstWork.ticket.id}/retry`, undefined, project.id)).toMatchObject({ status: 409, body: { code: 'projectSetupRequired' } })
+})
 
 it('relays an explicit member mention as a candidate and creates the ticket, acknowledgement, subscription and worker on accept', async () => {
   const { trigger, ticket, sessionId } = await acceptedTicket()
@@ -640,19 +780,17 @@ it('keeps Issue Triggers stored before Issues arrived through notifications read
   expect(thread).toMatchObject({ timeline: [expect.objectContaining({ id: stored.id, source: 'github-issue' })] })
 })
 
-it('relaunches running assignments after a restart with a recovery note', async () => {
+it('resumes a running Assignment with a recovery note instead of dispatching it again', async () => {
   const { ticket } = await acceptedTicket()
   runtime.executor.resume()
   const recovered = runtime.store.tickets.get(ticket.id)!
-  expect(recovered.assignments.map(item => item.state)).toEqual(['ended', 'pending'])
+  expect(recovered.assignments).toEqual([expect.objectContaining({ id: ticket.assignments[0]!.id, state: 'running' })])
   expect(recovered.inputs).toEqual([expect.objectContaining({ kind: 'text', text: expect.stringContaining('host restarted') })])
   deliveries.mockClear()
   await runtime.pump()
   await runtime.idle()
-  expect(runtime.store.tickets.get(ticket.id)!.assignments[1]).toMatchObject({ state: 'running' })
-  // The new Assignment's message says only what is new, as the Session holds the first; the launch's own pass delivers the
-  // recovery note as it reads.
-  expect(relays(`worker-${ticket.id}`)).toEqual([{ ticket_id: ticket.id, assignment: 2 }, { text: expect.stringContaining('host restarted') }])
+  expect(runtime.store.tickets.get(ticket.id)!.assignments).toEqual([expect.objectContaining({ id: ticket.assignments[0]!.id, state: 'running' })])
+  expect(relays(`worker-${ticket.id}`)).toEqual([{ text: expect.stringContaining('host restarted') }])
 })
 
 it('projects read models for the management page and removes thread subscriptions from the Web surface', async () => {
@@ -951,7 +1089,9 @@ it('leaves waiting and blocked assignments alone after a restart and keeps block
   const other = await acceptedTicket(feishu('12', '@bot 另一个', { root_id: undefined }))
   await runTool(other.sessionId, 'orchestrator_report', { state: 'progress', summary: 'midway' })
   runtime.executor.resume()
-  expect(runtime.store.tickets.get(other.ticket.id)!.assignments.map(item => item.state)).toEqual(['ended', 'pending'])
+  expect(runtime.store.tickets.get(other.ticket.id)!.assignments).toEqual([
+    expect.objectContaining({ id: other.ticket.assignments[0]!.id, state: 'running', recoveryInputId: expect.any(String) }),
+  ])
 })
 
 it('waits for setup without the agent\'s GitHub CLI: the panel works, and nothing is polled, assessed or dispatched', async () => {
@@ -990,9 +1130,9 @@ it('reports each setup problem where the operator fixes it, and checks the agent
     await next.ready
     expect(next.setupProblem).toMatchObject({ place, code, values })
   }
-  answers[`${AGENT()} api repos/acme/widgets --jq {name: .full_name, push: .permissions.push}`] = '{"name":"acme/widgets","push":false}\n'
+  answers[`${AGENT()} api repos/acme/widgets --hostname github.com --jq {name: .full_name, push: .permissions.push}`] = '{"name":"acme/widgets","push":false}\n'
   await needs('github', 'repositoryReadOnly', { account: 'agent-bot', repository: 'acme/widgets' })
-  answers[`${AGENT()} api repos/acme/widgets --jq {name: .full_name, push: .permissions.push}`] = '{"name":"acme/widgets","push":true}\n'
+  answers[`${AGENT()} api repos/acme/widgets --hostname github.com --jq {name: .full_name, push: .permissions.push}`] = '{"name":"acme/widgets","push":true}\n'
   // The agent CLI runs in the workers' environment: without the shims on PATH.
   const check = subprocess.spawn.mock.calls.map(([spec]) => spec).find(spec => spec.argv.includes(AGENT()))!
   expect(check.argv[0]).toBe(AGENT())
@@ -1030,7 +1170,6 @@ it('checks only the account a Source save changes, so a problem setup has elsewh
   await next.ready
   expect(next.feishuProblem).toMatchObject({ code: 'feishuUserIdentity' })
   next.sources.register(feishuKind); next.sources.register(githubKind)
-  answers[`${OTHER()} api repos/acme/widgets --jq {name: .full_name, push: .permissions.push}`] = '{"name":"acme/widgets","push":true}\n'
   const github = next.settings.block('source:github')
   const value = github.value as { enabled: boolean; config: Record<string, unknown> }
   expect(await next.settings.save('source:github', { ...value, config: { ...value.config, cli: OTHER() } }, github.revision, 'panel'))
@@ -1053,10 +1192,10 @@ it('checks a changed account CLI before saving it, restarts after the save, and 
   const save = (config: Record<string, unknown>, origin: SettingsOrigin = 'panel') => runtime.settings.save('source:github',
     { enabled: true, config: { ...runtime.store.settings().sources.github!.config, ...config } }, runtime.store.blockRevision('source:github'), origin)
   await expect(save({ cli: OTHER() }, 'tool')).rejects.toThrow('can only be changed in the management panel')
-  answers[`${OTHER()} api repos/acme/widgets --jq {name: .full_name, push: .permissions.push}`] = '{"name":"acme/widgets","push":false}\n'
+  answers[`${OTHER()} api repos/acme/widgets --hostname github.com --jq {name: .full_name, push: .permissions.push}`] = '{"name":"acme/widgets","push":false}\n'
   await expect(save({ cli: OTHER() })).rejects.toMatchObject({ code: 'repositoryReadOnly', values: { account: 'agent-bot' } })
   expect(restarts).not.toHaveBeenCalled()
-  answers[`${OTHER()} api repos/acme/widgets --jq {name: .full_name, push: .permissions.push}`] = '{"name":"acme/widgets","push":true}\n'
+  answers[`${OTHER()} api repos/acme/widgets --hostname github.com --jq {name: .full_name, push: .permissions.push}`] = '{"name":"acme/widgets","push":true}\n'
   expect(await save({ cli: OTHER() })).toMatchObject({ saved: true, restarting: true })
   await vi.waitFor(() => expect(restarts).toHaveBeenCalledTimes(1))
   // Other fields of the Source take effect without a restart.
@@ -1624,9 +1763,9 @@ it('tells the conversation that the PR merged when work a restart recovered ends
   await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', pr_number: 42 })
   // The host restarted with the worker mid-work: its Assignment starts again with a recovery note.
   const before = runtime.store.tickets.get(ticket.id)!
-  runtime.engine.assignmentInterrupted(ticket.id, runningAssignment(before)!.id)
+  runtime.engine.assignmentInterrupted(ticket.id, runningAssignment(before)!.id, 'The host restarted during this ticket.')
   await runtime.idle()
-  expect(runtime.store.tickets.get(ticket.id)!.assignments).toHaveLength(2)
+  expect(runtime.store.tickets.get(ticket.id)!.assignments).toHaveLength(1)
   // The PR merged before the restart; the recovered work goes on, and nothing is said yet.
   const merged = { number: 42, state: 'closed', merged: true, merged_at: before.assignments[0]!.createdAt, html_url: 'https://github.com/acme/widgets/pull/42',
     user: { login: 'agent-bot' }, head: { sha: 'abc', ref: 'agent/x', repo: { full_name: 'acme/widgets' } } }
@@ -1656,7 +1795,7 @@ it('restarts a worker that was mid-work when the host stopped with the recovery 
   const next = await restart()
   await next.ready
   const recovered = next.store.tickets.get(ticket.id)!
-  expect(recovered.assignments.map(item => item.state)).toEqual(['ended', expect.stringMatching(/^(pending|running)$/)])
+  expect(recovered.assignments).toEqual([expect.objectContaining({ id: ticket.assignments[0]!.id, state: 'running' })])
   expect(recovered.assignments[0]!.report).toMatchObject({ state: 'progress', summary: 'halfway' })
   expect(recovered.assignments.flatMap(item => item.report ? [item.report.state] : [])).toEqual(['progress'])
   expect(recovered.inputs).toEqual([expect.objectContaining({ kind: 'text', text: expect.stringContaining('host restarted') })])
@@ -2261,7 +2400,7 @@ it('restarts a worker whose shell job the host stop ended with the recovery note
   const next = await restart()
   await next.ready
   const recovered = next.store.tickets.get(ticket.id)!
-  expect(recovered.assignments.map(item => item.state)).toEqual(['ended', expect.stringMatching(/^(pending|running)$/)])
+  expect(recovered.assignments).toEqual([expect.objectContaining({ id: ticket.assignments[0]!.id, state: 'running' })])
   expect(recovered.inputs).toEqual([expect.objectContaining({ kind: 'text', text: expect.stringContaining('host restarted') })])
 })
 
@@ -2358,7 +2497,7 @@ it('lets a worker and its subagent use the Context7 docs MCP tools, not a messag
   }
 })
 
-it('gives the Assignment a restart starts the messages the replaced one had delivered but no step took, once', async () => {
+it('returns unread follow-ups to the original Assignment once after restart', async () => {
   const { ticket, sessionId } = await acceptedTicket()
   // A follow-up reaches the worker mid-turn, and the process stops before a step took it: DSH disposes the worker's agent
   // with its inbox.
@@ -2369,7 +2508,7 @@ it('gives the Assignment a restart starts the messages the replaced one had deli
   inbox.nextTurn.length = 0; inbox.nextStep.length = 0
   const next = await restart()
   await next.ready; await next.idle()
-  expect(next.store.tickets.get(ticket.id)!.assignments.map(item => item.state)).toEqual(['ended', 'running'])
+  expect(next.store.tickets.get(ticket.id)!.assignments).toEqual([expect.objectContaining({ id: ticket.assignments[0]!.id, state: 'running' })])
   expect(sent()).toBe(2)
 })
 

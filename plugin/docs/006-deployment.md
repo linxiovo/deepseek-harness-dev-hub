@@ -8,7 +8,7 @@ Use this guide to install, configure and operate dsh-superagent. It covers accou
 - **An agent GitHub account.** The agent comments, pushes branches and opens pull requests as this account, through a GitHub CLI signed in only as that account.
 - **Optional:** a Feishu bot for chat requests.
 
-Plugin configuration holds the state directory and machine limits. Use the panel for everything else: Sources for the repository and accounts, Policy for allowed lists, and Execution for worker directories and commands.
+Plugin configuration holds the installation state directory, runtime mode and machine limits. Use the panel for project settings such as Source intake, Policy, and Executor commands. The installation API handles GitHub verification, registration and selection. See `012-project-runtime.md`.
 
 ### Permissions and isolation
 
@@ -66,7 +66,7 @@ When using the build as evidence, match the manifest to the expected repository,
    ```
 
    Sign in as the agent account; the last command prints its login. dsh-superagent reads the login the same way.
-   The shell wrapper above is a POSIX example. On Windows, configure the GitHub Source CLI with an absolute path to a native executable or a `.cmd`/`.bat` wrapper, or a command name available on `PATH` via `PATHEXT`.
+   The shell wrapper above is a POSIX example. On Windows, use an absolute path to a native executable or a `.cmd`/`.bat` wrapper, or a command name available on `PATH` via `PATHEXT`. Give onboarding the executable reference only, not a token or the contents of the GitHub CLI configuration.
 
 ### Feishu bot (optional)
 
@@ -99,9 +99,9 @@ Run this block once, on a machine that has no `superagent` profile yet:
 ```sh
 npm install -g @deepseek-ai/dsh@0.2.1-rc.3
 git clone <this repository> dsh-superagent && cd dsh-superagent
-pnpm install && pnpm build
+pnpm -C plugin install --frozen-lockfile && pnpm -C plugin build
 dsh superagent --from-default-profile web --dump-config > /dev/null
-dsh plugin --profile superagent add "link:$PWD"
+dsh plugin --profile superagent add "link:$PWD/plugin"
 ```
 
 The pinned version above is public; other versions must satisfy `engines.dsh` in `package.json`.
@@ -116,12 +116,19 @@ Copy [examples/profile.cordis.patch.yml](../examples/profile.cordis.patch.yml) t
 
 | Key | Required | Meaning |
 | --- | --- | --- |
-| `stateDir` | yes | Absolute path (a drive or UNC path on Windows): the database, the lock, command shims in `worker-bin`, the agent's git configuration and, by default, Ticket directories in `work`. Back it up before upgrades |
+| `stateDir` | yes | Absolute installation path (a drive or UNC path on Windows). Holds the lock, project catalog and project state; keep it outside project checkouts and back it up before upgrades |
+| `runtimeMode` | no | `desktop` (default) or `headless`. Reports how the DSH instance is deployed; both modes mount at most one active project and use the same loopback management API |
 | `promptMaxChars`, `admissionContextMaxPages`, `admissionContextTimeoutMs` | no | The largest saved prompt configuration, and how many Thread pages one assessment reads within what time |
 
-After the first start, edit machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Changes apply without restart. `stateDir` cannot be changed there. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
+After the first start, edit volatile machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Limits apply without restart. Set `stateDir` and `runtimeMode` in the profile configuration; they are not volatile. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
 
 ## Start and stop
+
+Run the native host with `dsh --profile superagent` and stop it through the host's normal shutdown (for a foreground process, Ctrl+C). On a server, set `runtimeMode: headless` on the `dsh-superagent` entry and run the same DSH profile under the server's usual process supervision. DSH handles plugin startup, shutdown and remount on project selection. No separate project daemon is needed. Use a dedicated profile and state directory for each DSH instance.
+
+In desktop mode, closing the DSH host or shutting down or suspending the computer pauses work and Source listening. Start the same profile again to continue from its state. `GET /orchestrator/api/runtime` reports the mode, any pause reason, and the recoverable work recorded at startup. Use headless mode if listening must continue while the operator's computer is off.
+
+The optional POSIX helper supervises this same native DSH process. Run its `scripts/dsh-superagent` commands from `plugin/`:
 
 ```sh
 scripts/dsh-superagent start
@@ -154,6 +161,16 @@ Each profile stores logs and control files under `.artifacts/`:
 
 Open the URL printed in the log, then choose **Superagent** in the sidebar.
 
+### Headless access over SSH
+
+Keep the server profile's `webserver.host` at `127.0.0.1`. From the operator machine, forward the same port on local loopback to server loopback through an authenticated SSH connection:
+
+```sh
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3082:127.0.0.1:3082 operator@server
+```
+
+While the tunnel is open, use `http://127.0.0.1:3082` from the operator machine. If you change the server port, match it at both ends so the HTTP `Host` and browser `Origin` use the configured port. Keep HTTP private to loopback and use SSH for authentication and encryption. Treat local access to either end of the tunnel as privileged.
+
 ### Hourly check
 
 Create the hourly check in the DeepSeek Harness profile you normally use, not in `superagent`. It must keep running when the agent service is down. Ask an agent in that profile to create an hourly schedule using this prompt, with the checkout path filled in:
@@ -168,9 +185,10 @@ Check dsh-superagent: run `scripts/dsh-superagent --profile superagent status` i
 
 Setup must succeed before polling or work starts. Overview lists missing requirements and links to their settings. A settings change runs setup again. If you fix something outside the application, such as CLI authentication, choose **Check again**.
 
-1. **Sources.** Set the GitHub repository (`owner/name`) and agent CLI, for example `/home/me/.local/bin/gh-agent`. Requests normally arrive through the agent account's notifications. A new Issue or comment mentioning the account arrives on the next poll; adding a mention by editing an existing Issue body does not. Post a new comment instead. For Feishu, set the bot CLI, chats, each chat's receive-all or mentions-only mode, and whether to receive direct messages.
-2. **Policy.** The two example rules can be edited or removed. Under **On each Source**, add the GitHub accounts and Feishu users who may ask for work; until a list has someone, no request can become a Ticket. With Feishu, a chat can be chosen to sync the list from, at startup and on **Sync now**.
-3. **Execution.** The local clone, the base ref each Ticket starts from, the worktree root, an optional prepare command, and blocked commands. Set the clone's absolute path as the local repository (`repository`) and the starting ref, such as `refs/heads/main`, as the base ref (`baseRef`). An empty repository or base ref leaves existing settings readable but prepares no new worktree; it does not fall back to an empty directory. Before a Ticket's first Assignment, the Executor resolves that ref to a pinned commit and exposes `DSH_SUPERAGENT_REPOSITORY`, `DSH_SUPERAGENT_BASE_REF`, the pinned `DSH_SUPERAGENT_BASE_SHA` and the reserved `DSH_SUPERAGENT_BRANCH` to the preparation. With no prepare command, the Executor creates each Ticket's worktree itself with the same `git worktree add` call at the pinned commit. A non-empty prepare command takes over that creation and must use the pinned variables:
+1. **GitHub onboarding and project.** Verify the dedicated `gh` executable via `POST /orchestrator/api/onboarding/github/verify`, then register the server-local checkout, `owner/name` and explicit base ref via `POST /orchestrator/api/projects`. On an existing installation, adopt its original binding first (see Upgrade). Register additional projects without moving the active mount; explicitly select when switching. Check `GET /orchestrator/api/runtime` for the intended `projectId` and setup status before operating on a project.
+2. **Sources.** Set intake for the active project. GitHub requests normally arrive through the agent account's notifications. A new Issue or comment mentioning the account arrives on the next poll; adding a mention by editing an existing Issue body does not. Post a new comment instead. For Feishu, set the bot CLI, chats, each chat's receive-all or mentions-only mode, and whether to receive direct messages.
+3. **Policy.** The two example rules can be edited or removed. Under **On each Source**, add the GitHub accounts and Feishu users who may ask for work; until a list has someone, no request can become a Ticket. With Feishu, a chat can be chosen to sync the list from, at startup and on **Sync now**.
+4. **Execution.** Registration supplies the local clone and starting ref, such as `refs/heads/main`. Review the base for new work, optional prepare command and blocked commands. An empty repository or base ref leaves existing settings readable but prepares no new worktree; it does not fall back to an empty directory. Before a Ticket's first Assignment, the Executor resolves the ref to a pinned commit and exposes `DSH_SUPERAGENT_REPOSITORY`, `DSH_SUPERAGENT_BASE_REF`, the pinned `DSH_SUPERAGENT_BASE_SHA` and the reserved `DSH_SUPERAGENT_BRANCH` to the preparation. With no prepare command, the Executor creates each Ticket's worktree itself with the same `git worktree add` call at the pinned commit. A non-empty prepare command takes over that creation and must use the pinned variables:
 
    ```sh
    git -C "$DSH_SUPERAGENT_REPOSITORY" worktree add -b "$DSH_SUPERAGENT_BRANCH" "$DSH_SUPERAGENT_DIR" "$DSH_SUPERAGENT_BASE_SHA"
@@ -181,27 +199,27 @@ Setup must succeed before polling or work starts. Overview lists missing require
    The clone's origin must identify the GitHub Source's repository: exactly one `origin` URL, over direct github.com HTTPS, SSH or Git, for that `owner/name`. Keep the worktree root outside the clone's main checkout, every worktree registered in it, and any other Git checkout; a symlink alias counts as its resolved path. A Ticket whose clone origin or destination crosses these boundaries is refused before its prepare command runs, with the reason on the Ticket, and no file is created or changed.
 
    List personal CLIs, such as one signed in to your own account, as blocked commands. A blocked name fails only when called by that name; an absolute path still runs.
-4. **Prompts.** Set the team sections: the GitHub disclosure line, review bots, the commit author and the auto-merge condition.
+5. **Prompts.** Set the team sections: the GitHub disclosure line, review bots, the commit author and the auto-merge condition.
 
 ### Management API
 
-The panel uses a local HTTP API that agents can also call. `SETUP.md` uses it to save settings, and the service script reads `GET state`.
+The panel uses a local HTTP API that agents can also call. The service script reads `GET state`.
 
-Send requests to `http://127.0.0.1:<port>/orchestrator/api/` with `x-orchestrator-request: 1`. The host must be `127.0.0.1:<port>` or `localhost:<port>`. Missing headers or an `Origin` from another site receive 403.
+Send requests to `http://127.0.0.1:<port>/orchestrator/api/` with `x-orchestrator-request: 1`. `Host` must be exactly `127.0.0.1:<port>` or `localhost:<port>`. If `Origin` is supplied, it must be exactly `http://<Host>`. A mismatch or missing required header receives `403 {error: "Same-origin management request required"}`. The server itself must bind to `127.0.0.1`. Use the SSH tunnel on a remote host.
 
-API saves have the panel's permissions. They can change execution environment and setup account fields, unlike saves made through the main Session's tools.
+API saves have the panel's permissions, including execution settings the main Session cannot edit. Managed GitHub identity and project binding are not editable through settings saves. See `012-project-runtime.md` for the installation routes, project-scope contract, and error shapes.
 
 Agents may rely on these routes and fields. The other routes in `src/app/api.ts` serve the panel and change with it.
 
 | Request | Answer |
 | --- | --- |
-| `GET state` | What every page reads: `setup`, with `problem` and `feishuProblem`, each `null` or a setup problem with `place`, `code`, `values` and `detail`, and `accounts` once setup resolved them; `health`, an entry per part, below, with `state` (`starting`, `ready`, `paused` or `error`), `detail` and `at`; `load`, the Executor Sessions `running`, the Tickets `queued` and `maxWorkers`; `paused`; and `masterId` |
+| `GET state` | Host startup and mounted-project health: `setup`, with `problem` and `feishuProblem`, each `null` or a setup problem with `place`, `code`, `values` and `detail`, and `accounts` once setup resolved them; `health`, an entry per part, below, with `state` (`starting`, `ready`, `paused` or `error`), `detail` and `at`; `load`, the Executor Sessions `running`, the Tickets `queued` and `maxWorkers`; `paused`; and `masterId` |
 | `GET settings` | `blocks`: `policy`, `eval` and `executor`, each with its `value` and its `revision`; `sources`: the Source instances, each with `id`, `kind`, `installed`, its block's `value`, `{"enabled": …, "config": {…}}`, and `revision`, its kind's form, and its setup `problem` when it has one; `policyVersion`; and `environment`, the execution environment's `root` and `variables` |
 | `GET sources` | Each Source's status: `state` (`missing`, `off`, `error`, `setup`, `starting`, `paused` or `ready`), the `health` of its parts, its setup `problem`, the last day's `stats`, the Triggers it `filtered` in that day, and the messages it `dropped` in that day, newest drop first, each with its `channel`, `preview`, `ticket` (`id` and `title`) when it was for one, its `thread` when the store has it, and `dropped.at` and `dropped.reason`, `channelGone` or `channelIgnored` |
 | `GET tickets/<id>` | The Ticket page: stage and actions, Mandate, Inputs, Threads and Assignments, and its `execution` with `name`, `directory`, `repository`, `worktree`, `branch`, `base` (`ref` and `sha`), `session`, `active_writer` and `preparation` with its `reason`. A legacy Ticket omits the facts it never recorded |
 | `PUT settings/<block>` with `{"value": …, "revision": n}` | Saves one block: `saved`, the block's new `revision`, `policy_changed` and `restarting`. `value` is the whole block, as `GET settings` holds it; a missing key takes its default |
 | `POST executor/pause` with `{"paused": true}` or `false` | Pauses or resumes processing: `paused` |
-| `POST setup/check` | Runs setup again by restarting dsh-superagent: `restarting: true`. Refused when setup has nothing to fix |
+| `POST setup/check` | Retries setup or pending project recovery by restarting dsh-superagent: `{restarting: true}`. Refused when there is nothing to fix |
 | `POST policy-sync/<source id>` | Syncs that Source's allowed list now: `policy`, the Source's part as saved |
 | `GET prompts`, `PUT prompts` with `{"config", "baseRevision"}` | Reads the prompt configuration: `current`, with its `revision` and `config`, `defaults`, `sections`, the team sections in the order Sessions read them, `skillName`, the pattern of a team skill's name, `builtin`, the names a team skill cannot take, and `skillPrefix`, which Sessions load a skill's name under. Or saves it: the new `revision` |
 | `POST tickets/<id>/retry`, `POST tickets/<id>/stop` | Retries or stops a Ticket, as the panel does |
@@ -222,7 +240,7 @@ A refusal has a status and `error`, its English text:
 
 - 400: an invalid value (`issues`, each with its `path`), a failed account check (`setup`), a fixed refusal (`code` and `values`), or a body that is not JSON or is too large.
 - 404: something that does not exist.
-- 409: a stale revision.
+- 409: a stale revision or a project/transition refusal (`code`); see `012-project-runtime.md`.
 - 500: anything else.
 
 The blocks:
@@ -232,25 +250,30 @@ The blocks:
 - `eval`: `mode`, `timeoutSeconds` and `model`.
 - `executor`: `model`, `maxWorkers`, `repository`, `baseRef`, `directory`, `prepare` and `blockedCommands`. The processing pause is a setting of its own, `paused`, which `POST executor/pause` sets.
 
-Changing a repository or CLI runs the corresponding setup check first. A failed check returns 400 with details in `setup`. A successful account change, or any save while setup is pending, returns `restarting: true`. The API is temporarily unavailable while the application restarts.
+Account settings that can still change (Feishu, or the legacy GitHub Source before adoption) run their setup check first. A legacy GitHub CLI change must verify as the same installation account. A failed check returns 400 with details in `setup`. A save that needs setup to run again returns `restarting: true`; the API is temporarily unavailable during remount.
 
 ```sh
 api=http://127.0.0.1:3082/orchestrator/api
-rev=$(curl -s -H 'x-orchestrator-request: 1' $api/settings | jq '.sources[] | select(.id == "github") | .revision')
-curl -s -X PUT -H 'x-orchestrator-request: 1' -H 'content-type: application/json' $api/settings/source:github \
-  -d "{\"value\": {\"enabled\": true, \"config\": {\"repository\": \"acme/widgets\", \"cli\": \"$HOME/.local/bin/gh-agent\"}}, \"revision\": $rev}"
+curl -sS -H 'x-orchestrator-request: 1' -H 'content-type: application/json' "$api/onboarding/github/verify" \
+  -d '{"cli":"/home/operator/.local/bin/gh-agent"}'
+# Continue only when onboarding returns status "ready". The workspace is on the DSH host.
+curl -sS -H 'x-orchestrator-request: 1' -H 'content-type: application/json' "$api/projects" \
+  -d '{"repository":"acme/widgets","workspace":"/srv/checkouts/widgets","baseRef":"refs/heads/main"}'
+curl -sS -H 'x-orchestrator-request: 1' "$api/runtime"
 ```
 
 ## Setup checks
 
 Setup uses the DeepSeek Harness subprocess service, as worker shells do. It removes environment variables whose names contain KEY, PASSWORD, SECRET or TOKEN.
 
-Setup verifies the GitHub repository and the agent's push access, writes the worker environment, and checks that git uses only the agent credentials for github.com. A Feishu setup failure disables only the Feishu Source.
+For a managed project, installation onboarding verifies the configured CLI account on `github.com` before project setup. Setup requires that verified binding, rechecks push access to the bound repository, and uses the canonical name GitHub returns. It does not fall back to the GitHub Source's CLI or repository settings. Hub and Worker prompts receive the repository, account login and no-reply email even if GitHub polling is disabled; they do not receive the CLI path or credentials.
+
+Before adoption of a legacy single-repository deployment, the installation verifies and pins the GitHub Source account through the same onboarding probe, and setup checks that account's access to the legacy repository. In either case, setup writes the worker environment and checks that git selects the agent's credential helper for `github.com`. A Feishu setup failure disables only the Feishu Source.
 
 The process environment that setup writes:
 
-- **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's CLI; `lark-cli` runs the bot's CLI; blocked commands fail. The forwarding shim removes its own directory from `PATH` before running its target to avoid wrapper recursion. The CLI policy, platform entry points and limits are specified in `010-session-boundaries.md`.
-- **git configuration** in `<stateDir>/worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
+- **Command shims** in the mounted state directory's `worker-bin`, first on `PATH`: `gh` runs the agent's CLI with `github.com` as the default host; `lark-cli` runs the bot's CLI; blocked commands fail. The forwarding shim removes its own directory from `PATH` before running its target to avoid wrapper recursion. The CLI policy, platform entry points and limits are specified in `010-session-boundaries.md`.
+- **git configuration** in the mounted state directory's `worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
 
 A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
 
@@ -260,10 +283,12 @@ From an allowed GitHub account, open an Issue or post a comment containing `@<ag
 
 ## Upgrade
 
-1. Wait until no Executor is in the middle of a turn.
-2. Back up `<stateDir>/orchestrator.sqlite`.
-3. Run `git pull && pnpm install && pnpm build`.
-4. Run `scripts/dsh-superagent restart` and inspect its status.
+1. Wait until no Executor is in the middle of a turn, then stop the DSH profile cleanly.
+2. Back up the installation `stateDir` (catalog, root Store if present, and all project directories), the DSH profile configuration and Session persistence, and any worktrees outside the state directory. Take the backup while stopped, not from a live SQLite file alone.
+3. From the repository root, update the checkout with `git pull`, then run `pnpm -C plugin install --frozen-lockfile` and `pnpm -C plugin build`.
+4. Start the profile again (for example, `scripts/dsh-superagent start`) and inspect its status.
+
+To adopt an existing deployment, keep `stateDir` at its original path. Verify its dedicated agent CLI, then register its current repository, workspace and base ref with `policy` omitted. After remount, confirm the original Hub ID, settings and Tickets before registering other projects. See `012-project-runtime.md` for the exact adoption checks and errors.
 
 A restart ends running Assignments and starts replacements with recovery notes. Team text and overridden prompt parts are retained; parts without overrides follow the new defaults. Review parts marked **Default updated** after upgrading.
 
@@ -304,11 +329,11 @@ Setup problems appear on the overview with a link to the fix, in the panel's lan
 
 | Symptom | Cause and fix |
 | --- | --- |
-| `The agent GitHub CLI is not set.` | Set the agent's CLI on the GitHub card |
+| `The agent GitHub CLI is not set.` | Verify the dedicated CLI through onboarding; for a legacy deployment before adoption, check the GitHub Source's CLI setting |
 | `The agent GitHub CLI was not found.` | Set the wrapper's absolute path, or a command name on `PATH` |
 | `The agent GitHub CLI cannot read its account` | Sign the wrapper in with `auth login` |
 | `@… cannot read …` or `@… cannot push to …` | Give the agent account write access to the repository |
-| `The GitHub Source names no repository.` | Set the repository, `owner/name`, on the GitHub card |
+| `Set a GitHub repository as owner/name.` | Check the registration input or, before adoption, the legacy GitHub Source's repository |
 | A Ticket fails with `The prepare command failed…` | The message names the cause, such as a wrong clone path, and says its files were preserved; fix the command, then retry the Ticket |
 | A Ticket's preparation is rejected because the directory is not this Ticket's verified worktree | The path holds an ordinary directory, another Ticket's worktree, a checkout of another repository, or a worktree of this repository on another branch or base. Nothing was changed. Move that content away or change the directory root, then retry |
 | A Ticket fails with `Configured repository … origin …` | The clone's single `origin` URL must name the GitHub Source's repository. Check `git -C <clone> remote get-url origin`, remove extra origin URLs, and point origin at that `owner/name` over direct HTTPS, SSH or Git |

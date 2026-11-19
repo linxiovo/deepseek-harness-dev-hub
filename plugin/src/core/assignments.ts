@@ -18,7 +18,6 @@ export interface WorkerReport {
   /** The person's question this report answers, which the worker thereby takes up; authorizes the main Session to send an answer reply. */
   answers?: string
 }
-const RECOVERY_NOTE = 'The host restarted during this ticket. Inspect the current worktree, git history and GitHub state before continuing. Do not repeat an already completed external operation. Finish the original assignment and report its status.'
 
 /**
  * Assignments records what the Executor and its workers report about the Assignments that run tickets: one started, Inputs
@@ -80,14 +79,14 @@ export class Assignments extends EnginePart {
    * `waiting`, `ready`, `blocked`, or `failed` and no input was delivered after that report, in which case it keeps its
    * session and flushes any waiting undelivered inputs.
    */
-  interrupted(ticketId: string, assignmentId: string): void {
+  interrupted(ticketId: string, assignmentId: string, recoveryNote: string): void {
     const ticket = this.running(ticketId, assignmentId)
     const running = ticket && runningAssignment(ticket)
     if (!ticket || !running) return
     const report = running.report
     const busy = !!running.deliveredAt && !!report && running.deliveredAt >= report.at
     const settled = !!report && ['waiting', 'ready', 'blocked', 'failed'].includes(report.state) && !busy
-    if (!settled) this.tickets.restart(ticket, running, 'hostRestarted', RECOVERY_NOTE)
+    if (!settled) this.tickets.recover(ticket, running, recoveryNote)
     else if (ticket.undelivered.length) this.options.executor.deliver(ticket, running)
   }
   /**

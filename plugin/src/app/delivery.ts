@@ -80,7 +80,7 @@ export class AgentDelivery {
       else if (mode === 'steer') agent.steer(message)
       else agent.followup(message)
     }
-    accepted?.()
     await this.ctx.sessionPersistence.flush()
+    accepted?.()
   }
 }

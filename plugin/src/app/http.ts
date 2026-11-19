@@ -3,12 +3,14 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
-import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
+import { PROJECT_SCOPE_HEADER, THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
+import { InstallationError, type GithubIdentity, type InstallationApi, type OnboardingView, type ProjectView, type RuntimeView }
+  from './installation-api.ts'
 import { sourceSkills } from './context.ts'
 import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
 import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInParts, defaultPrompts, savePrompts, type Prompts }
   from './prompts.ts'
-import { policyVersion } from '../policy.ts'
+import { PolicyConfigSchema, policyVersion } from '../policy.ts'
 import { SettingsConflict, type Settings } from './settings.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
 import { UserError, type EngineForPeople, type Ticket } from '../core/index.ts'
@@ -30,6 +32,9 @@ import { decisionList, search, threadDetail, threadList } from './views/threads.
 import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
 
 export interface HttpHost {
+  readonly installation?: InstallationApi
+  assertNewWork?(): void
+  ownsSession?(id: string): boolean
   readonly store: Store
   /** Feishu message links resolved since startup, used by search to match AppLink URLs. */
   readonly sourceLinks: Pick<TextCache, 'entries'>
@@ -82,6 +87,7 @@ export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number):
 }
 /** Maps errors to HTTP status codes and structured payloads that the panel localizes in the interface language. */
 function failure(error: unknown): [number, Record<string, unknown>] {
+  if (error instanceof InstallationError) return [error.status, { error: error.message, code: error.code }]
   if (error instanceof z.ZodError) {
     const issues = error.issues.map(issue => ({ path: issue.path.join('.'), message: issue.message }))
     return [400, { error: `Invalid settings: ${issues.map(issue => issue.path).join(', ')}`, issues }]
@@ -107,9 +113,10 @@ function setupView(runtime: HttpHost) {
 /** Build the `/orchestrator/api/state` response consumed by the management panel and `scripts/dsh-superagent status` (`docs/006-deployment.md`). */
 export function stateView(runtime: HttpHost) {
   const settings = runtime.store.settings()
+  const projectId = runtime.installation?.projects().activeProjectId
   return { setup: setupView(runtime), load: { ...executorLoad(runtime.store, runtime.executor.activeCount()),
     maxWorkers: settings.executor.maxWorkers },
-    masterId: runtime.masterId, paused: settings.paused, health: runtime.health }
+    masterId: runtime.masterId, paused: settings.paused, health: runtime.health, ...(projectId ? { projectId } : {}) }
 }
 const views = (runtime: HttpHost): ViewHost => ({ store: runtime.store, sources: runtime.sources, links: runtime.links() })
 const setupState = (runtime: HttpHost): SetupState => ({ deployment: runtime.configured() ? runtime.deployment : undefined,
@@ -136,6 +143,7 @@ export type PromptsView = ReturnType<typeof promptsView>
 
 interface Input<K extends keyof Api> {
   params: RouteParams<K>; query: Record<string, string>; body: (maxBytes?: number) => Promise<unknown>
+  write<T>(operation: () => T | Promise<T>): T | Promise<T>
 }
 type Routes = { [K in keyof Api]: (input: Input<K>) => ApiResponse<K> | Promise<ApiResponse<K>> }
 const offset = z.coerce.number().int().nonnegative().catch(0)
@@ -150,19 +158,101 @@ const PromptsQuery = z.object({ revision: count.optional(), offset: count.defaul
 const SourceBlock = z.templateLiteral(['source:', z.string().regex(/^[a-z][a-z0-9-]*$/)])
 const SettingsBlockSchema = z.union([z.enum(['policy', 'eval', 'executor']), SourceBlock])
 const SaveRequest = z.object({ value: z.unknown(), revision: z.number().int().nonnegative() })
+const nonBlank = z.string().refine(value => value.trim().length > 0 && !/[\u0000\r\n]/.test(value))
+const VerifyRequest = z.strictObject({ cli: nonBlank })
+const CreateProjectRequest = z.strictObject({ repository: nonBlank, workspace: nonBlank, baseRef: nonBlank,
+  policy: PolicyConfigSchema.optional() })
+
+function installationInput<T>(schema: z.ZodType<T>, value: unknown): T {
+  const result = schema.safeParse(value)
+  if (!result.success) throw new InstallationError(400, 'invalidRequest')
+  return result.data
+}
+
+function installationOf(runtime: HttpHost): InstallationApi {
+  if (!runtime.installation) throw new InstallationError(404, 'installationUnavailable')
+  return runtime.installation
+}
+
+function publicSetupProblem({ code, values }: SetupProblem): SetupProblem {
+  const safe: Record<string, string> = {}
+  for (const [key, pattern] of Object.entries({ account: /^[\w-]+$/, repository: /^[\w.-]+\/[\w.-]+$/ })) {
+    const value = values[key]
+    if (value && value.length <= 200 && pattern.test(value)) safe[key] = value
+  }
+  return new SetupError(code, safe).problem
+}
+
+function identityView({ id, login, noreply }: GithubIdentity): GithubIdentity { return { id, login, noreply } }
+
+function onboardingView(view: OnboardingView): OnboardingView {
+  if (view.status === 'unconfigured') return { status: view.status }
+  if (view.status === 'ready') return { status: view.status, identity: identityView(view.identity) }
+  return { status: view.status, ...(view.identity && { identity: identityView(view.identity) }),
+    ...(view.problem && { problem: publicSetupProblem(view.problem) }) }
+}
+
+function projectView({ id, repository, workspace, hubSessionId }: ProjectView): ProjectView {
+  return { id, repository, workspace, hubSessionId }
+}
+
+function installationFailure(error: unknown): [number, Record<string, unknown>] {
+  if (error instanceof InstallationError || error instanceof RouteError) return failure(error)
+  if (error instanceof z.ZodError) return failure(new InstallationError(400, 'invalidRequest'))
+  if (error instanceof SetupError) {
+    const setup = publicSetupProblem(error.problem)
+    return [400, { error: setup.detail, setup }]
+  }
+  return [500, { error: 'Installation operation failed.' }]
+}
+
+function runtimeView({ mode, status, reason, projectId, resumedFrom }: RuntimeView): RuntimeView {
+  if (!resumedFrom) return { mode, status, reason, projectId, resumedFrom: null }
+  const { reason: via, at, recoverable: { assignments, handoffs, effects } } = resumedFrom
+  return { mode, status, reason, projectId, resumedFrom: { reason: via, at, recoverable: { assignments, handoffs, effects } } }
+}
+
+const installationRoutes: ReadonlySet<keyof Api> = new Set(['GET runtime', 'GET onboarding', 'POST onboarding/github/verify',
+  'GET projects', 'POST projects', 'POST projects/:projectId/select'])
+
+function assertProjectScope(active: string | null, requested: string | string[] | undefined, required: boolean): void {
+  if (requested !== undefined && requested !== active) throw new InstallationError(409, 'staleProject')
+  if (required && active !== null && requested === undefined) throw new InstallationError(409, 'projectScopeRequired')
+}
 
 function routes(runtime: HttpHost): Routes {
   const { store } = runtime
   const ticket = (id: string) => { if (!store.tickets.get(id)) throw new RouteError(404, 'Ticket not found'); return id }
   const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
   return {
+    'GET runtime': () => runtimeView(installationOf(runtime).runtime()),
+    'GET onboarding': () => onboardingView(installationOf(runtime).onboarding()),
+    'POST onboarding/github/verify': async ({ body, write }) => {
+      const request = installationInput(VerifyRequest, await body())
+      return write(async () => onboardingView(await installationOf(runtime).verifyGithub(request)))
+    },
+    'GET projects': () => {
+      const { activeProjectId, projects } = installationOf(runtime).projects()
+      return { activeProjectId, projects: projects.map(projectView) }
+    },
+    'POST projects': async ({ body, write }) => {
+      const request = installationInput(CreateProjectRequest, await body())
+      return write(async () => {
+        const { project, reused, restarting } = await installationOf(runtime).createProject(request)
+        return { project: projectView(project), reused, restarting }
+      })
+    },
+    'POST projects/:projectId/select': ({ params, write }) => write(async () => {
+      const { project, restarting } = await installationOf(runtime).selectProject(params.projectId)
+      return { project: projectView(project), restarting }
+    }),
     'GET state': () => stateView(runtime),
     'GET overview': () => overview(views(runtime), runtime.health, policyVersion(store.settings()),
       executorLoad(store, runtime.executor.activeCount()), runtime.setupProblem ?? runtime.feishuProblem),
     'GET search': ({ query }) => search(views(runtime), query.q ?? '', runtime.sourceLinks),
     'GET sources': () => sourcesStatus(views(runtime), runtime.health, setupState(runtime)),
     'GET settings': () => settingsView(store, runtime.sources, runtime.health, setupState(runtime), runtime.machine.stateDir),
-    'POST sources/:id/labels': ({ params }) => runtime.settings.refreshLabels(params.id),
+    'POST sources/:id/labels': ({ params, write }) => write(() => runtime.settings.refreshLabels(params.id)),
     'GET threads': ({ query }) => {
       const { filter, offset, limit } = ThreadsQuery.parse(query)
       return threadList(views(runtime), filter, offset, limit)
@@ -173,42 +263,58 @@ function routes(runtime: HttpHost): Routes {
       if (!detail) throw new RouteError(404, 'Thread not found')
       return detail
     },
-    'POST threads/:key/unsubscribe': async ({ params }) => {
+    'POST threads/:key/unsubscribe': ({ params, write }) => write(async () => {
       const removed = runtime.engine.unsubscribe(params.key)
       return { removed, thread: params.key, context_delivery: await runtime.sessions.delivery(`subscription:${params.key}`) }
-    },
-    'POST triggers/:id/requeue': ({ params }) => {
+    }),
+    'POST triggers/:id/requeue': ({ params, write }) => write(() => {
+      runtime.assertNewWork?.()
       const queued = runtime.engine.reevaluate(params.id)
       runtime.requestPass()
       return { queued }
-    },
+    }),
     'GET decisions': ({ query }) => {
       const { kind, window, offset, limit } = DecisionsQuery.parse(query)
       const since = window ? new Date(Date.now() - 86_400_000).toISOString() : ''
       return decisionList(views(runtime), kind.split(',').filter(Boolean), offset, limit, since)
     },
-    'POST decisions/:id/dismiss': ({ params }) => { runtime.engine.dismiss(params.id); return { dismissed: true } },
+    'POST decisions/:id/dismiss': ({ params, write }) => write(() => { runtime.engine.dismiss(params.id); return { dismissed: true } }),
     'GET tickets': ({ query }) => {
       const { state, offset, limit } = TicketsQuery.parse(query)
       return ticketList(views(runtime), state, offset, limit)
     },
     'GET tickets/:id': ({ params }) => ticketPage(runtime, params.id),
-    'POST tickets/:id/retry': ({ params }) => { const id = ticket(params.id); runtime.engine.retryTicket(id); return { retried: true } },
-    'POST tickets/:id/stop': ({ params }) => { const id = ticket(params.id); runtime.engine.stopTicket(id); return { stopped: true } },
-    'POST executor/pause': async ({ body }) => runtime.settings.pause(z.object({ paused: z.boolean() }).parse(await body()).paused, 'panel'),
-    'PUT settings/:block': async ({ params, body }) => {
+    'POST tickets/:id/retry': ({ params, write }) => write(() => {
+      runtime.assertNewWork?.()
+      const id = ticket(params.id)
+      runtime.engine.retryTicket(id)
+      return { retried: true }
+    }),
+    'POST tickets/:id/stop': ({ params, write }) => write(() => {
+      const id = ticket(params.id)
+      runtime.engine.stopTicket(id)
+      return { stopped: true }
+    }),
+    'POST executor/pause': async ({ body, write }) => {
+      const { paused } = z.object({ paused: z.boolean() }).parse(await body())
+      return write(() => runtime.settings.pause(paused, 'panel'))
+    },
+    'PUT settings/:block': async ({ params, body, write }) => {
       const block = SettingsBlockSchema.parse(params.block)
-      const known = !block.startsWith('source:') || runtime.sources.instances().some(instance => `source:${instance.id}` === block)
-      if (!known) throw new RouteError(404, 'Source not found')
       const request = SaveRequest.parse(await body())
-      return runtime.settings.save(block, request.value, request.revision, 'panel')
+      return write(() => {
+        const known = !block.startsWith('source:') || runtime.sources.instances().some(instance => `source:${instance.id}` === block)
+        if (!known) throw new RouteError(404, 'Source not found')
+        return runtime.settings.save(block, request.value, request.revision, 'panel')
+      })
     },
     'GET policy/history': () => policyHistory(store, runtime.sources, policyVersion(store.settings())),
-    'POST policy-sync/:id': async ({ params }) => ({ policy: await runtime.settings.sync(params.id) }),
-    'POST setup/check': () => { runtime.checkSetup(); return { restarting: true } },
+    'POST policy-sync/:id': ({ params, write }) => write(async () => ({ policy: await runtime.settings.sync(params.id) })),
+    'POST setup/check': ({ write }) => write(() => { runtime.checkSetup(); return { restarting: true } }),
     'GET models': () => runtime.models(),
     'GET sessions/:id/meter': async ({ params }) => {
       // The Hub reads the same view; a corrupt Session log is not a missing Session and keeps its 500.
+      if (runtime.installation?.projects().activeProjectId && !runtime.ownsSession?.(params.id)) throw new RouteError(404, 'Session not found')
       const view = await runtime.meter.read(params.id)
       if (!view) throw new RouteError(404, 'Session not found')
       return view
@@ -216,7 +322,7 @@ function routes(runtime: HttpHost): Routes {
     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
     'PUT prompts': async input => {
       const request = z.object({ config: z.unknown(), baseRevision: z.number().int().nonnegative() }).parse(await promptBody(input))
-      return savePrompts(runtime, request.config, request.baseRevision, 'panel')
+      return input.write(() => savePrompts(runtime, request.config, request.baseRevision, 'panel'))
     },
     'POST prompts/preview': async input => runtime.prompts.preview(await promptBody(input)),
   }
@@ -232,25 +338,63 @@ function match(table: Routes, method: string, segments: string[]) {
     if (verb !== method || !fits) continue
     const params: Record<string, string> = {}
     pattern.forEach((part, index) => { if (part.startsWith(':')) params[part.slice(1)] = decoded(segments[index]!) })
-    return { run: run as (input: Input<keyof Api>) => unknown, params }
+    return { key: route as keyof Api, run: run as (input: Input<keyof Api>) => unknown, params }
   }
   return undefined
 }
-export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
+export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<void> {
   if (ctx.webServer.host !== '127.0.0.1') throw new Error('Orchestrator management requires a loopback Web server')
   const table = routes(runtime)
+  let writing: 'installation' | 'project' | undefined
+  let activeWrite: Promise<unknown> | undefined
+  let retiring = false
+  let closed = false
+  async function write<T>(installationRoute: boolean, scope: string | string[] | undefined, operation: () => T | Promise<T>): Promise<T> {
+    if (retiring) throw new InstallationError(409, 'switching')
+    const { installation } = runtime
+    if (!installationRoute || scope !== undefined) {
+      assertProjectScope(installation?.projects().activeProjectId ?? null, scope, !installationRoute)
+    }
+    if (!installation) return operation()
+    if (writing === 'installation' || installation.runtime().reason === 'switching') throw new InstallationError(409, 'switching')
+    if (writing) throw new InstallationError(409, 'projectConflict')
+    writing = installationRoute ? 'installation' : 'project'
+    try {
+      const pending = Promise.resolve(operation())
+      activeWrite = pending
+      const result = await pending
+      if (result && typeof result === 'object' && 'restarting' in result && result.restarting === true) retiring = true
+      return result
+    } finally { writing = undefined; activeWrite = undefined }
+  }
   const disposers = [
     ctx.webServer.register({ kind: 'prefix', path: '/orchestrator', handler: async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://localhost')
       if (!url.pathname.startsWith('/orchestrator/api/')) { res.writeHead(404); res.end(); return }
       if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
+      let installationRoute = false
       try {
-        await runtime.ready
         const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
         if (!route) throw new RouteError(404, 'Unknown operation')
+        installationRoute = installationRoutes.has(route.key)
+        if (!installationRoute) await runtime.ready
+        const scope = req.headers[PROJECT_SCOPE_HEADER]
+        if (!installationRoute && scope !== undefined && (route.key.startsWith('GET ') || route.key === 'POST prompts/preview')) {
+          assertProjectScope(runtime.installation?.projects().activeProjectId ?? null, scope, false)
+        }
         const query = Object.fromEntries(url.searchParams)
-        json(res, 200, await route.run({ params: route.params as never, query, body: maxBytes => readBody(req, maxBytes) }))
-      } catch (error) { json(res, ...failure(error)) }
+        json(res, 200, await route.run({ params: route.params as never, query, body: async maxBytes => {
+          const body = await readBody(req, maxBytes)
+          if (closed) throw new InstallationError(409, 'switching')
+          return body
+        },
+          write: operation => write(installationRoute, scope, operation) }))
+      } catch (error) { json(res, ...(installationRoute ? installationFailure(error) : failure(error))) }
     } })]
-  return () => { for (const dispose of disposers) dispose() }
+  return async () => {
+    retiring = true
+    closed = true
+    for (const dispose of disposers) dispose()
+    if (activeWrite) await Promise.allSettled([activeWrite])
+  }
 }

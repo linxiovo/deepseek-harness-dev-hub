@@ -82,8 +82,8 @@ async function start() {
     execFileSync('git', args, { cwd, env: gitEnvironment, encoding: 'utf8' }))
   vi.spyOn(Commands.prototype, 'run').mockResolvedValue('{"ok":true,"data":{}}')
   const answers: Record<string, string> = {
-    [`${AGENT} api user`]: '{"login":"agent-bot","id":7}',
-    [`${AGENT} api repos/acme/widgets --jq {name: .full_name, push: .permissions.push}`]: '{"name":"acme/widgets","push":true}\n',
+    [`${AGENT} api user --hostname github.com`]: '{"login":"agent-bot","id":7}',
+    [`${AGENT} api repos/acme/widgets --hostname github.com --jq {name: .full_name, push: .permissions.push}`]: '{"name":"acme/widgets","push":true}\n',
     [`${BOT} auth status`]: JSON.stringify({ appId: 'cli_bot', brand: 'feishu', identities: { bot: { status: 'ready' } } }),
     [`${BOT} config strict-mode`]: 'strict-mode: bot (source: profile)',
     [`${BOT} api GET /open-apis/bot/v3/info --as bot --format ndjson`]: '{"bot":{"open_id":"ou_bot"},"code":0,"msg":"ok"}',

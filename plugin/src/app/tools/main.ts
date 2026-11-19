@@ -7,6 +7,7 @@ import { UserError, followupOwners, key, reasonText, type Decision, type Decisio
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
 import type { Handoffs } from '../handoffs.ts'
+import { InstallationError } from '../installation-api.ts'
 import { PlanTargetSchema, type Plans } from '../plans.ts'
 import { ticketCard } from '../cards.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
@@ -71,6 +72,8 @@ export interface MainToolsHost {
   readonly resources: ResourceHost
   readonly handoffs: Pick<Handoffs, 'confirm' | 'answer' | 'get' | 'spec'>
   readonly plans: Pick<Plans, 'view' | 'node' | 'append'>
+  assertNewWork?(): void
+  verifyProjectBinding?(): Promise<string | undefined>
   /** Schedules a pass to carry out work queued by an Engine command (such as an Eval or ticket resume). */
   requestPass(): void
   sendReplies(): Promise<void>
@@ -138,6 +141,7 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
   if (earlier && item.kind === 'ignore') return { refused: `Decided in this call with ${earlier}, whose Decision took its batch` }
   switch (item.kind) {
     case 'accept': {
+      host.assertNewWork?.()
       const before = host.store.triggers.disposition(item.trigger_id)?.decisionId
       const decision = host.engine.decide(item.trigger_id, { kind: 'accept', title: item.title!, scope: item.title!, reason: { code: 'explicitRouted' },
         acknowledgement: item.acknowledgement!, name: item.worktree_name!, ...note })
@@ -149,6 +153,7 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
       return { ...fromDecision(decision), triggerIds: decision.triggerIds }
     }
     case 'attach': {
+      host.assertNewWork?.()
       const ticket = host.quietly(() => host.engine.attach(item.ticket_id!, item.trigger_id, item.note ?? undefined))
       return { reason: 'Attached: the ticket follows the trigger\'s thread and receives the trigger', ticketId: ticket.id }
     }
@@ -186,12 +191,12 @@ function routeTool(host: MainToolsHost): Tool {
           return { ...head, ...(result.decision ? { decision: result.decision } : {}), reason: result.reason,
             ...(ticket ? { ticket: ticketCard(ticket) } : {}) }
         } catch (error) {
-          if (error instanceof UserError) return { ...head, refused: error.message }
+          if (error instanceof UserError || error instanceof InstallationError) return { ...head, refused: error.message }
           host.context.logger.warn('dsh-superagent could not route trigger %s: %s', item.trigger_id, String(error))
           return { ...head, refused: `Not recorded: ${error instanceof Error ? error.message : String(error)}; retry this item` }
         }
       })
-      host.requestPass()
+      if (results.some(result => !('refused' in result))) host.requestPass()
       return { results }
     },
   })
@@ -226,6 +231,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
           || brief.authorization.release !== approvedBrief.authorization.release) {
           throw new Error(handoffErrors.mismatchedBrief)
         }
+        await host.verifyProjectBinding?.()
         const { handoff, reused } = host.handoffs.confirm({ ...approvedBrief,
           confirmedBy: { sessionId: agent.id, messageId, text: confirmation } })
         return { id: handoff.id, reused, handoff, spec: handoff.spec ?? null,
@@ -264,7 +270,10 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       name: 'orchestrator_ticket_retry',
       description: 'Start a new assignment on an explicit human request to retry a ticket whose worker reported failed or blocked, or whose input was not delivered; the stalled one ends.',
       schema: z.object({ ticket_id: z.string() }).strict(),
-      execute: async args => routed(host, { reason: 'Started a new assignment', ticketId: host.engine.retryTicket(args.ticket_id).id }),
+      execute: async args => {
+        host.assertNewWork?.()
+        return routed(host, { reason: 'Started a new assignment', ticketId: host.engine.retryTicket(args.ticket_id).id })
+      },
     }),
     tool({
       name: 'orchestrator_ticket_request_status',
@@ -292,6 +301,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       description: 'Queue a trigger for a fresh assessment, such as after its Source\'s access changed; a follow-up that reached a ticket comes back only from its worker.',
       schema: z.object({ trigger_id: z.string() }).strict(),
       execute: async args => {
+        host.assertNewWork?.()
         // A follow-up that reached a ticket is its worker's to judge, which hands back what is not its own; a person may still requeue it.
         const trigger = host.store.triggers.get(args.trigger_id)
         const owners = trigger ? followupOwners(trigger, host.store) : []
@@ -318,7 +328,9 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       description: 'Record the decision of an assessment, as admission describes it, after orchestrator_eval with the same trigger_id.',
       schema: z.object({ trigger_id: z.string().min(1), ...AssessmentSchema.shape }).strict(),
       execute: async ({ trigger_id, ...result }, signal) => {
-        const decided = await host.assessor.decide(trigger_id, AssessmentSchema.parse(result), signal)
+        const assessment = AssessmentSchema.parse(result)
+        if (assessment.decision === 'accept') host.assertNewWork?.()
+        const decided = await host.assessor.decide(trigger_id, assessment, signal)
         return routed(host, { decision: decided.state as DecisionKind, reason: decided.reason, ticketId: decided.ticket_id })
       },
     }),

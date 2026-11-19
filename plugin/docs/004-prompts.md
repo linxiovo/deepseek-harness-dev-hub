@@ -31,6 +31,8 @@ Overrides use these keys:
 
 The worker guards load `prompts/worker-ticket-ended.md`, `prompts/worker-writer-required.md`, and `prompts/worker-ancestry-pending.md` as fixed tool responses, not editable system-prompt parts.
 
+The Executor loads `prompts/worker-recovery.md` as the recovery message sent to the original Worker Session for an interrupted Assignment.
+
 The generated sections are editable templates. They must retain these placeholders:
 
 - `runtime/environment`: `{variables}`, filled with execution environment lines.
@@ -60,7 +62,7 @@ The system prompt is assembled in this order:
 
 Admission instructions come from `prompts/admission.md`. They describe proactive assessment and when an irrelevant candidate can be ignored from its card. `orchestrator_eval` returns context rather than repeating these instructions.
 
-Built-in files under `prompts/` and `skills/` are loaded by `src/app/skill-files.ts`: `promptFile` normalizes line endings, joins lines within each paragraph with spaces (so source files stay one sentence per line without changing rendered prompt length), and preserves blank-line paragraph breaks; `bundledSkills` parses the frontmatter and body of each built-in `SKILL.md`. Two test suites enforce prompt budgets: `tests/cards.spec.ts` caps each role's own instructions (`masterPrompt` and `workerPrompt`), and `tests/model-surface.spec.ts` caps each role's combined composed system prompt and registered tool schemas.
+The shared `promptFile` loader in `src/infra/prompt-file.ts` normalizes line endings, joins lines within each paragraph with spaces, and preserves blank-line paragraph breaks. `src/app/skill-files.ts` parses and registers the bundled `SKILL.md` definitions. `prompts/github-environment.md` supplies the localized GitHub context descriptions used by the Hub, Workers and settings views. Two test suites enforce prompt budgets: `tests/cards.spec.ts` caps each role's own instructions (`masterPrompt` and `workerPrompt`), and `tests/model-surface.spec.ts` caps each role's combined composed system prompt and registered tool schemas.
 
 The environment section gives the main Session deployment-wide values and each Executor its Ticket-specific values. The Policy section is regenerated from settings on every model request. It contains the Policy version, accept mode, the explicit-request exemption, and enabled rules as `- <name> (<id>): <instruction>`, or a statement that none is enabled. It is last so a Policy change leaves the preceding prompt text unchanged.
 

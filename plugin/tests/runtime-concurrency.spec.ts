@@ -682,7 +682,7 @@ describe('what a worker read', () => {
     h.claim(one.sessionId); await h.runtime.idle(); await later()
     expect(input().readAt).toBe(null)
   })
-  it('keeps a note waiting in a worker\'s Session across an in-process restart, for the next Assignment\'s first step', async () => {
+  it('keeps a note waiting in a worker\'s Session across an in-process restart, for the first resumed step', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
     h.runtime.engine.note(one.ticket.id, 'Ticket B changes the same page.'); await h.runtime.idle()
     const copies = () => h.deliveries.mock.calls.filter(([call]) => call.sessionId === one.sessionId && call.text.includes('Ticket B changes the same page.'))
@@ -691,18 +691,17 @@ describe('what a worker read', () => {
     h.ctx.on('agent/inbox/claimed', ({ message }) => { claimed.push(message.id) })
     // The restart cancels the worker's turn and keeps its inbox, where the note waits.
     h.runtime.executor.resume()
-    // Relaunch revalidates the real Git worktree. Wait for launch and delivery effects, not a polling deadline.
+    // Recovery revalidates the real Git worktree. Wait for delivery rather than a polling deadline.
     await h.runtime.idle()
     expect(claimed).toContain(copies()[0]![0].id)
     expect(copies()).toHaveLength(1)
   })
-  it('delivers once a message a crash left waiting in a worker\'s Session, which the restart puts back for the next Assignment', async () => {
+  it('replays a message left in a worker\'s inbox only after removing its pending copy at restart', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
     h.runtime.receive(feishu('2', '再改一下', { mentions: [], root_id: 'om_1' })); await h.runtime.idle()
     const copies = () => h.deliveries.mock.calls.filter(([call]) => call.sessionId === one.sessionId && call.text.includes('再改一下'))
     expect(copies()).toHaveLength(1)
-    // The process dies: the worker's agent is not loaded when the restart runs, and its inbox, which holds the message,
-    // persists for the launch that loads it.
+    // The worker's Agent is not loaded when the restart runs, but the inbox containing the message is restored with it.
     const agent = h.agents.get(one.sessionId)!
     h.agents.delete(one.sessionId); agent.status = 'idle'
     h.controller.resolveAgent.mockImplementation(async (id: string) => { if (id === one.sessionId) h.agents.set(id, agent); return h.resolveDefault(id) })
@@ -711,10 +710,10 @@ describe('what a worker read', () => {
     h.runtime.executor.resume()
     await h.runtime.idle()
     expect(copies()).toHaveLength(2)
-    // The launch's message found no copy of it waiting, which its step would take beside the copy delivered after.
+    // The recovery note finds no pending copy of the unread message; it will be sent once after the note.
     expect(waiting[0]).not.toContain(copies()[0]![0].id)
   })
-  it('gives the Assignment an in-process restart starts a message a cut-off step had claimed, once', async () => {
+  it('redelivers a message a cut-off step claimed but did not take into Session history', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
     h.runtime.receive(feishu('2', '再改一下', { mentions: [], root_id: 'om_1' })); await h.runtime.idle()
     const sent = () => h.deliveries.mock.calls.filter(([call]) => call.sessionId === one.sessionId && call.text.includes('再改一下')).length

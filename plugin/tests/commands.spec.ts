@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { CliError, Commands, commandError } from '../src/infra/commands.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { feishuChannel } from '../src/sources/feishu-trigger.ts'
-import { githubKind } from '../src/sources/github.ts'
+import { githubKind, pollFailure } from '../src/sources/github.ts'
 import { githubChannel } from '../src/sources/github-trigger.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 import { SettingsSchema } from '../src/policy.ts'
@@ -160,6 +160,66 @@ describe('GitHub calls', () => {
     await expect(value.pages(z.looseObject({ id: z.number() }), 'issues/12/comments')).rejects.toThrow()
   })
 })
+
+describe('managed GitHub diagnostics', () => {
+  const sentinel = 'SENTINEL_locked_TOKEN'
+  const stderr = `gh: Forbidden (HTTP 403)\nAuthorization: ${sentinel}`
+  const commands = () => new Commands(() => ({ ...deployment, managed: true }), {}, new AbortController().signal)
+
+  it('keeps the status for raw polls without exposing CLI diagnostics to health', async () => {
+    const value = commands()
+    vi.spyOn(value, 'run').mockRejectedValueOnce(commandError({ stderr, code: 1 }))
+      .mockRejectedValueOnce(commandError({ stderr: 'gh: HTTP 304', code: 1 }))
+    const error = await value.api('notifications', '--include').catch((error: unknown) => error)
+    expect(error).toBeInstanceOf(CliError)
+    expect(error).toMatchObject({ code: 403, exitCode: 1 })
+    expect(String(error).includes(sentinel)).toBe(false)
+    expect(JSON.stringify(pollFailure(1, 1, error)).includes(sentinel)).toBe(false)
+    await expect(value.api('issues', '--include')).rejects.toMatchObject({ code: 304, exitCode: 1 })
+  })
+
+  it('does not drop unauthorized sends or expose their diagnostics, but still drops locked issues', async () => {
+    const value = commands()
+    vi.spyOn(value, 'run').mockResolvedValueOnce('[[]]')
+      .mockRejectedValueOnce(commandError({ stderr, code: 1 }))
+      .mockResolvedValueOnce('[[]]')
+      .mockRejectedValueOnce(commandError({ stderr: `gh: Unable to create comment because issue is locked. (HTTP 403)\n${sentinel}`, code: 1 }))
+    const error = await send(value, reply).catch((error: unknown) => error)
+    expect(error).toBeInstanceOf(CliError)
+    expect(error).toMatchObject({ code: 403, exitCode: 1 })
+    expect(String(error).includes(sentinel)).toBe(false)
+    await expect(send(value, reply)).resolves.toBe('gone')
+  })
+
+  it('does not propagate text in a structured error code', async () => {
+    const value = commands()
+    vi.spyOn(value, 'run').mockRejectedValueOnce(commandError({ stderr: JSON.stringify({ error: { code: sentinel, message: sentinel } }), code: 1 }))
+    const error = await value.pages(z.unknown(), 'issues').catch((error: unknown) => error)
+    expect(error).toBeInstanceOf(CliError)
+    expect(error).toMatchObject({ code: undefined, exitCode: 1 })
+    expect(JSON.stringify(error).includes(sentinel)).toBe(false)
+  })
+
+  it('rejects an interrupted poll as an AbortError even with a partial 304 diagnostic', async () => {
+    const value = commands()
+    const error = Object.assign(new Error('The operation was aborted', { cause: sentinel }), {
+      name: 'AbortError', stderr: `gh: HTTP 304\n${sentinel}`, stdout: sentinel,
+    })
+    vi.spyOn(value, 'run').mockRejectedValueOnce(commandError(error))
+    const result = await value.api('issues', '--include').catch((error: unknown) => error)
+    expect(result).toMatchObject({ name: 'AbortError' })
+    expect(result).not.toBeInstanceOf(CliError)
+    expect(JSON.stringify(result).includes(sentinel)).toBe(false)
+    expect(result).not.toHaveProperty('cause')
+  })
+
+  it('retains legacy GitHub diagnostics', async () => {
+    const value = new Commands(() => deployment, {}, new AbortController().signal)
+    vi.spyOn(value, 'run').mockRejectedValueOnce(commandError({ stderr, code: 1 }))
+    await expect(value.api('notifications', '--include')).rejects.toMatchObject({ message: stderr, code: 403, exitCode: 1 })
+  })
+})
+
 it('says how to add the bot to a chat when Feishu answers that it is not a member, and keeps the code', async () => {
   const commands = new Commands(() => deployment, {}, new AbortController().signal)
   const membership = JSON.stringify({ error: { code: 232011, message: 'operator is not in the chat' } })

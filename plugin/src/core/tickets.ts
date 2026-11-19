@@ -478,7 +478,7 @@ export class Tickets extends EnginePart {
   }
   /**
    * Put back Trigger Inputs already delivered that no step of the worker took: a cancel may have dropped them, or a step
-   * that claimed them was cut off. Session delivery recognizes a copy still in the inbox and does not enqueue it again.
+   * that claimed them was cut off. The Executor removes an inbox copy before replaying them.
    */
   private requeueUntaken(ticket: Ticket, replaced: Assignment): void {
     const untaken = ticket.inputs.filter(input => input.kind === 'trigger' && input.readAt === null && input.deliveredTo === replaced.id

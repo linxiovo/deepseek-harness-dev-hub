@@ -131,7 +131,7 @@ export class Installation implements InstallationApi {
     this.requireGithub()
     if (!this.project && !this.legacyRepository()) throw new InstallationError(409, 'noProject')
     if (!this.host.configured()) throw new InstallationError(409, 'projectSetupRequired', 'Project setup is not ready.')
-    if (this.host.paused()) throw new InstallationError(409, 'operatorPaused')
+    if (this.project && this.host.paused()) throw new InstallationError(409, 'operatorPaused')
   }
 
   private requireGithub(): VerifiedGithub {

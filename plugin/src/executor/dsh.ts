@@ -391,6 +391,15 @@ export class DshExecutor implements Executor {
           if (!this.host.context.agents.get(sessionId as SessionId)) {
             await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker')
           }
+          if (inputId === assignment.recoveryInputId) {
+            const agent = this.host.context.agents.get(sessionId as SessionId)
+            // Keep the recovery note ahead of unread Triggers, with exactly one copy available to the Worker.
+            for (const waiting of ticket.inputs) {
+              if (waiting.kind === 'trigger' && waiting.readAt === null && waiting.deliveredTo === assignment.id) {
+                agent?.inbox.remove(this.host.sessions.promptedId(waiting.id))
+              }
+            }
+          }
           if (input) await this.deliverInput(ticket, assignment, input)
         } catch (error) {
           if (this.host.closing() || error instanceof Later) throw error
@@ -419,7 +428,7 @@ export class DshExecutor implements Executor {
     const message = inputMessage(input, trigger)
     if (message === undefined) return
     const text = message.length > ASSIGNMENT_CHARS ? JSON.stringify(capped(message, ASSIGNMENT_CHARS, inputResource(ticket.id, input.id))) : message
-    await this.host.sessions.prompt(workerSessionId(ticket.id), input.id, text, 'steer', live)
+    await this.host.sessions.prompt(workerSessionId(ticket.id), input.id, text, input.id === assignment.recoveryInputId ? 'queue' : 'steer', live)
   }
   /** Formats a trigger on `ticket` for the worker, including a preview of the replied-to message when the worker has not yet seen it. */
   private async triggerCard(ticket: Ticket, triggerId: string, note?: string): Promise<object | undefined> {

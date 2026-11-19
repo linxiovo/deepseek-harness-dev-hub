@@ -70,6 +70,8 @@ Under `/orchestrator/api/`, scoped writes are `PUT settings/:block` and `PUT pro
 
 The write check runs after body parsing and before applying the mutation. An installation write or ongoing remount blocks concurrent writes with `409 switching`. An active project write blocks another write, including selection, with `409 projectConflict`. Retrying a Ticket or requeueing a Trigger also checks GitHub, project setup and operator pause (`githubSetupRequired`, `noProject`, `projectSetupRequired` or `operatorPaused` as applicable). A correctly scoped pause change remains available when setup is pending. After a switch, refresh the mounted ID and confirm the operator's intent before resubmitting a refused mutation.
 
+The verified legacy runtime may still accept an operation into its queue during operator pause, but does not start queued work until processing resumes. Managed projects reject new-work requests while paused.
+
 Registering A with B's checkout returns `400 invalidProject` before registration or selection changes. A request with A's project header after switching to B returns `409 staleProject` without mutating B, even if the record ID is valid there.
 
 ## Code and verification

@@ -188,7 +188,7 @@ Assignments that are waiting, ready, blocked or failed stay as they are, unless 
 
 Sessions, worktrees, Subscriptions, pending messages and the stored work below survive a restart, and so does the record of which messages each Executor Session took into its history, which a step does once it claimed them and before its model call: a message taken by a turn the restart cut off counts as read once a Report or the end of a turn follows, while one a step claimed but a cancel or error cut off before the history counts as unread.
 
-A retry returns unread Trigger Inputs to the new Assignment; a restart returns them to the interrupted Assignment after the recovery note. Session delivery uses the same Input ID, so a message still queued or already in Session history is not sent again.
+A retry returns unread Trigger Inputs to the new Assignment; a restart returns them to the interrupted Assignment after the recovery note. Recovery removes any pending inbox copy before replaying the same Input ID. Session delivery does not replay a copy already in history.
 ### Stored work
 
 What dsh-superagent does after a decision, such as relaying a candidate, a follow-up or a report to the main Session, launching an Assignment or delivering an Input, is stored first and done afterwards.

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, it } from 'vitest'
+import { z } from 'zod'
 import { resolve } from 'node:path'
 import { startRuntime, type Host } from './fixtures/host.ts'
 
@@ -199,4 +200,123 @@ it('keeps direct root background and single-node instructions separate across a 
   expect(page).toMatchObject({ instructions: [expect.objectContaining({ text: instruction })], blockedBy: ['saved-api'] })
   expect(page).not.toHaveProperty('context')
   expect([...h.agents.keys()].filter(key => key.startsWith('worker-'))).toEqual([])
+})
+
+
+const fanInSpec = {
+  ...spec,
+  body: 'Build independent catalog and account backends followed by a dashboard.',
+  acceptance: [
+    { statement: 'Search the catalog.', observable: 'Search returns matching products.', delivery: 'backend' as const },
+    { statement: 'Retrieve the profile.', observable: 'Account lookup returns the profile.', delivery: 'backend' as const },
+    { statement: 'Display both in the dashboard.', observable: 'The dashboard shows both results.', delivery: 'frontend' as const },
+  ],
+}
+const PlanDispatchClaimSchema = z.object({ planId: z.string(), nodeId: z.string(), ticketId: z.string(), assignmentId: z.string(), session: z.string(),
+  role: z.enum(['backend', 'frontend']), pendingAction: z.enum(['launch', 'resume']).nullable(), claimedAt: z.string(), startedAt: z.string().optional() }).strict()
+const PlanDispatchSchema = z.object({ planId: z.string(), nodeId: z.string(), role: z.enum(['backend', 'frontend']), status: z.string(), reused: z.boolean(),
+  claim: PlanDispatchClaimSchema.optional(), waitingOn: z.array(z.string()).optional(), reason: z.string().optional() }).strict()
+type PlanDispatch = z.infer<typeof PlanDispatchSchema>
+const dispatchPlan = async (planId: string, nodeId: string): Promise<PlanDispatch> => PlanDispatchSchema.parse(
+  await h.runTool(h.runtime.masterId, 'orchestrator_plan_dispatch', { planId, nodeId }))
+
+async function registeredFanIn() {
+  const published = await publish({ ...brief, goal: fanInSpec.body }, fanInSpec)
+  await h.runtime.idle()
+  await published.register(fanInDraft)
+  return published
+}
+
+it('claims only frontier nodes, records role/session/action before start, and deduplicates a node claim', async () => {
+  const { id } = await registeredFanIn()
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, maxWorkers: 2 } })
+  const prepare = Promise.withResolvers<void>()
+  h.hooks.prepare = prepare.promise
+  try {
+    const [catalog, replay, accounts, dashboard] = await Promise.all([
+      dispatchPlan(id, 'catalog'), dispatchPlan(id, 'catalog'), dispatchPlan(id, 'accounts'), dispatchPlan(id, 'dashboard'),
+    ] as const)
+    const catalogClaim = catalog.claim, accountsClaim = accounts.claim
+    if (!catalogClaim || !accountsClaim) throw new Error('Independent frontier nodes must have claims')
+    expect(catalog).toMatchObject({ status: 'claimed', reused: false, claim: { role: 'backend', pendingAction: 'launch' } })
+    expect(replay).toMatchObject({ status: 'claimed', reused: true, claim: catalogClaim })
+    expect(accounts).toMatchObject({ status: 'claimed', reused: false, claim: { role: 'backend', pendingAction: 'launch' } })
+    expect(dashboard).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'] })
+    expect((await read(`plan/${id}`)).nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'catalog', status: 'claimed', claim: catalogClaim }),
+      expect.objectContaining({ id: 'accounts', status: 'claimed', claim: accountsClaim }),
+      expect.objectContaining({ id: 'dashboard', status: 'blocked', waiting_on: ['catalog', 'accounts'] }),
+    ]))
+    expect(await read(`ticket/${catalogClaim.ticketId}`)).toMatchObject({ plan: { plan_id: id, node_id: 'catalog', role: 'backend', pending_action: 'launch' } })
+    expect(h.agents.has(catalogClaim.session)).toBe(false)
+  } finally { prepare.resolve() }
+  await h.runtime.idle()
+  expect(h.deliveries.mock.calls.map(([delivery]) => delivery).filter(delivery => delivery.sessionId.startsWith('worker-'))).toHaveLength(2)
+  expect((await read(`plan/${id}`)).nodes).toEqual(expect.arrayContaining([
+    expect.objectContaining({ id: 'catalog', status: 'running', claim: expect.objectContaining({ pendingAction: null }) }),
+    expect.objectContaining({ id: 'accounts', status: 'running', claim: expect.objectContaining({ pendingAction: null }) }),
+  ]))
+})
+
+it('leaves the other frontier node waiting when the last worker slot is already claimed', async () => {
+  const { id } = await registeredFanIn()
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, maxWorkers: 1 } })
+  const prepare = Promise.withResolvers<void>()
+  h.hooks.prepare = prepare.promise
+  try {
+    const [first, second] = await Promise.all([dispatchPlan(id, 'catalog'), dispatchPlan(id, 'accounts')] as const)
+    expect(first).toMatchObject({ status: 'claimed' })
+    expect(second).toMatchObject({ status: 'waiting-for-slot', reused: false })
+    expect((await read(`plan/${id}`)).nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'catalog', status: 'claimed' }),
+      expect.objectContaining({ id: 'accounts', status: 'waiting-for-slot' }),
+    ]))
+  } finally { prepare.resolve() }
+  await h.runtime.idle()
+})
+
+it('does not unlock a successor from ready alone, but accepts one exact formal delivery receipt', async () => {
+  const { id } = await registeredFanIn()
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, maxWorkers: 2 } })
+  const [catalog, accounts] = await Promise.all([dispatchPlan(id, 'catalog'), dispatchPlan(id, 'accounts')] as const)
+  const catalogClaim = catalog.claim, accountsClaim = accounts.claim
+  if (!catalogClaim || !accountsClaim) throw new Error('Independent frontier nodes must have claims')
+  await h.runtime.idle()
+  for (const claim of [catalogClaim, accountsClaim]) {
+    await h.runTool(claim.session, 'orchestrator_report', { state: 'ready', summary: 'Worker finished its local implementation.' })
+  }
+  await h.runtime.idle()
+  expect((await read(`plan/${id}/node/dashboard`)).status).toBe('blocked')
+  expect((await read(`plan/${id}/node/catalog`)).status).toBe('awaiting-delivery')
+  for (const [nodeId, claim] of [['catalog', catalogClaim], ['accounts', accountsClaim]] as const) {
+    await h.runTool(h.runtime.masterId, 'orchestrator_plan_deliver', { planId: id, nodeId, receipt: { ticketId: claim.ticketId, assignmentId: claim.assignmentId,
+      receiptId: `delivery-${nodeId}`, candidate: `commit-${nodeId}`, verifiedAt: new Date().toISOString() } })
+  }
+  expect((await read(`plan/${id}/node/dashboard`)).status).toBe('waiting-for-slot')
+  expect(await read(`plan/${id}`)).toMatchObject({ nodes: expect.arrayContaining([
+    expect.objectContaining({ id: 'catalog', status: 'delivered' }), expect.objectContaining({ id: 'accounts', status: 'delivered' }),
+  ]) })
+  expect((await read(`plan/${id}`)).frontier).toContain('dashboard')
+})
+
+it('replays a durable claim after restart without creating a second Worker delivery', async () => {
+  const published = await publish()
+  await h.runtime.idle()
+  await published.register(splitDraft)
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, paused: true, executor: { ...settings.executor, maxWorkers: 1 } })
+  const before = h.runtime.planDispatcher.dispatch(published.id, 'saved-api')
+  const beforeClaim = before.claim
+  if (!beforeClaim) throw new Error('A dispatched node must have a durable claim')
+  expect(before).toMatchObject({ status: 'claimed', claim: { pendingAction: 'launch' } })
+  await h.restart()
+  expect((await read(`plan/${published.id}/node/saved-api`)).claim).toEqual(beforeClaim)
+  await h.runtime.settings.pause(false, 'panel')
+  await h.runtime.idle()
+  const deliveries = h.deliveries.mock.calls.map(([delivery]) => delivery).filter(delivery => delivery.sessionId === beforeClaim.session)
+  expect(deliveries).toHaveLength(1)
+  expect((await read(`plan/${published.id}/node/saved-api`)).status).toBe('running')
 })

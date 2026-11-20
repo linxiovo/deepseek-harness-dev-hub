@@ -317,10 +317,24 @@ export class DshExecutor implements Executor {
       throw error
     }
   }
+  /** Reconstitute a Plan worker's verified durable claim after a process restart; no new generation is issued. */
+  private persistedPlanClaim(ticket: Ticket, assignment: Assignment): ExecutionClaim | undefined {
+    if (!ticket.plan) return undefined
+    const execution = ticket.execution, ownership = execution?.ownership, writer = assignment.writer
+    if (!execution || !ownership || !writer || ownership.ticket !== ticket.id || writer.generation !== ownership.generation) return undefined
+    return { ...ownership.identity, ticket: ticket.id, assignment: assignment.id, generation: ownership.generation, verified: ownership.verified }
+  }
   /** Enqueues a `launch` effect for an accepted or resumed assignment; launches start in queue order as worker slots free up. */
   start(ticket: Ticket, assignment: Assignment): void {
     this.host.effects.enqueue('launch', assignment.id, { ticketId: ticket.id, assignmentId: assignment.id })
   }
+  /** Reserve a launch slot synchronously before a Plan claim is committed; the effect handler reuses this reservation. */
+  reserveLaunch(ticketId: string): boolean {
+    try { this.slots.reserve(ticketId, 'launch'); return true }
+    catch (error) { if (error instanceof Later) return false; throw error }
+  }
+  /** Roll back a pre-claim launch reservation when the durable claim transaction fails. */
+  releaseLaunch(ticketId: string): void { this.slots.free(ticketId) }
   /** Enqueues a `delivery` effect to steer pending inputs into `ticket`'s running worker session. */
   deliver(ticket: Ticket, _assignment: Assignment): void { this.host.effects.enqueue('delivery', ticket.id, { ticketId: ticket.id }) }
   /** Launch only a current pending assignment; each claim is released only after its preparation and worker are idle. */
@@ -650,15 +664,20 @@ export class DshExecutor implements Executor {
     if (!workspace) throw new PrepareFailed('The ticket has no execution directory')
     if (!isAbsolute(workspace)) throw new PrepareFailed(`Ticket execution directory ${workspace} must be absolute`)
     const previous = ticket.execution?.ownership?.identity
+    const persisted = this.claims.get(assignment.id) ?? this.persistedPlanClaim(ticket, assignment)
     const configured = await inspectRepository(this.host.commands, config.repository)
     const repository = previous ? await inspectRepository(this.host.commands, previous.repository) : configured
     const base = previous?.base ?? { ref: config.baseRef,
       sha: (await this.host.commands.git(['rev-parse', '--verify', `${config.baseRef}^{commit}`], repository.repository)).trim() }
     const identity: ExecutionIdentity = { ...repository, worktree: previous?.worktree ?? resolve(workspace),
       branch: previous?.branch ?? `agent/${ticket.execution!.name}`, base }
-    const reserved = this.host.engine.reserveExecution(ticket.id, assignment.id, identity)
-    if (!reserved.ok) throw new PrepareFailed(reserved.reason)
-    const claim = reserved.value
+    let claim: ExecutionClaim
+    if (persisted) claim = persisted
+    else {
+      const reserved = this.host.engine.reserveExecution(ticket.id, assignment.id, identity)
+      if (!reserved.ok) throw new PrepareFailed(reserved.reason)
+      claim = reserved.value
+    }
     this.claims.set(assignment.id, claim)
     // A saved ownership claim does not authorize a newly configured clone, or excuse a changed origin on reuse.
     const expectedSlug = this.host.commands.repository
@@ -674,24 +693,32 @@ export class DshExecutor implements Executor {
     let fresh: boolean
     try { await lstat(workspace); fresh = false }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; fresh = true }
+    if (fresh && persisted?.verified) throw new PrepareFailed('The previously verified Plan worktree no longer exists; refusing to create a replacement')
     if (fresh) {
       await validateWorktreeDestination(this.host.commands, claim.repository, workspace)
       if (!current()) throw new PrepareFailed('The ticket ended before its directory was prepared')
       await this.prepareDirectory(ticket, claim)
     }
-    // Existing paths, including retries, must pass Git inspection; never infer ownership from directory existence.
+    // Existing paths, including retries and recovered Plan claims, must pass Git inspection; never infer ownership from a directory.
     const inspected = await inspectWorktree(this.host.commands, { repository: claim.repository, directory: workspace,
       branch: claim.branch, base: claim.base, ticket: ticket.id, assignment: assignment.id, session: workerSessionId(ticket.id),
       ...fresh ? { mode: 'fresh' as const } : { mode: 'reuse' as const, previous: claim } })
     await verifyDirectory(workspace, this.host.context.subprocess, this.host.lifetime)
-    const verified = this.host.engine.recordExecutionVerified(claim, inspected)
-    if (!verified.ok) throw new PrepareFailed(verified.reason)
-    if (!current()) throw new PrepareFailed('The ticket ended while its worktree was verified')
-    const sessionId = workerSessionId(ticket.id)
-    if (!this.host.engine.acquireExecutionWriter(claim, sessionId)) {
-      throw new PrepareFailed('The worker writer grant was refused; the Session was not started')
+    const writer = this.host.store.tickets.get(ticket.id)?.assignments.find(item => item.id === assignment.id)?.writer
+    const active = writer?.state === 'active' && writer.session === workerSessionId(ticket.id)
+    if (active) {
+      if (!claim.verified || ticket.execution?.preparation?.state !== 'verified') throw new PrepareFailed('The recovered Plan writer is not verified')
+    } else {
+      const verified = this.host.engine.recordExecutionVerified(claim, inspected)
+      if (!verified.ok) throw new PrepareFailed(verified.reason)
+      if (!current()) throw new PrepareFailed('The ticket ended while its worktree was verified')
+      const sessionId = workerSessionId(ticket.id)
+      if (!this.host.engine.acquireExecutionWriter(claim, sessionId)) {
+        throw new PrepareFailed('The worker writer grant was refused; the Session was not started')
+      }
     }
     if (!current()) throw new PrepareFailed('The ticket ended before its worker Session was created')
+    const sessionId = workerSessionId(ticket.id)
     const source = sourceTrigger(this.host, ticket)
     const agent = await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker')
     if (!current()) throw new PrepareFailed('The ticket ended while its worker Session was created')
@@ -784,6 +811,10 @@ export class DshExecutor implements Executor {
     // Launch pending tickets oldest first (in acceptance order).
     for (const ticket of this.host.store.tickets.open().sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
       const running = runningAssignment(ticket), latest = latestAssignment(ticket)
+      if (latest) {
+        const persisted = this.persistedPlanClaim(ticket, latest)
+        if (persisted) this.claims.set(latest.id, persisted)
+      }
       if (running) {
         // A restart within this process left DSH's Sessions, jobs and subagents running: they stop first. The inbox keeps an
         // Input that was handed over but not yet taken.

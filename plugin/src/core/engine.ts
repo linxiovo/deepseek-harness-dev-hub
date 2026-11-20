@@ -1,7 +1,9 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
+import { key } from './ids.ts'
 import { isoTime, liveTicket } from './model.ts'
-import type { Decision, Execution, ExecutionClaim, ExecutionIdentity, ExecutionResult, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { Decision, Execution, ExecutionClaim, ExecutionIdentity, ExecutionResult, PlanTicket, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { PlanNode } from './plan.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
@@ -98,6 +100,29 @@ export class Engine {
    * mode or without enabled matching rules.
    */
   decide(triggerId: string, outcome: Outcome): Decision { return this.repo.atomic(() => this.evals.decide(triggerId, outcome)) }
+  /** Create one authorized Plan Ticket with a stable identity; it has no Source Trigger or human acknowledgement. */
+  createPlanTicket(planId: string, node: PlanNode, at = new Date().toISOString()): Ticket {
+    const id = key('plan-ticket', planId, node.id)
+    return this.repo.atomic(() => {
+      const existing = this.repo.tickets.get(id)
+      if (existing) {
+        if (existing.plan?.planId !== planId || existing.plan.nodeId !== node.id || existing.plan.role !== node.role) {
+          throw new UserError('invalidPlan', { detail: `Ticket ${id} is bound to a different Plan node` })
+        }
+        return existing
+      }
+      const plan: PlanTicket = { planId, nodeId: node.id, role: node.role }
+      const mandate = { strength: 'explicit' as const, policyVersion: `plan:${planId}`,
+        basis: { via: 'addressed' as const, addressed: 'direct' as const, source: 'plan', scope: { planId, nodeId: node.id }, row: 'registered' },
+        actor: { source: 'plan', id: 'hub' }, scope: `Plan ${planId} node ${node.id}` }
+      const note = `Plan node ${node.id}; execution role ${node.role}. Read plan/${planId}/node/${node.id} before working. `
+        + `Demonstrate: ${node.demonstration}`
+        + (node.interfaceContract ? ` Interface contract: ${node.interfaceContract.path}; ${node.interfaceContract.requirements}` : '')
+      this.tickets.create(id, key('plan-decision', planId, node.id), mandate, { triggerIds: [key('plan-trigger', planId, node.id)] },
+        { kind: 'accept', title: node.title, scope: mandate.scope, reason: 'Plan dispatch', name: 'plan-node', note }, isoTime(at), plan)
+      return this.repo.tickets.get(id)!
+    })
+  }
   /**
    * Attach a Trigger to a ticket that the message points at: the ticket follows the Trigger's Threads and receives it as an
    * Input with the routing note, and the Eval that holds the Trigger ends, since the ticket has it now; the other Triggers of

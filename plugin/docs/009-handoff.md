@@ -100,9 +100,17 @@ The registration takes `handoffId`, `specId`, `features[]` and `nodes[]`. A feat
 Every backend predecessor explicitly referenced by a frontend node needs an interface contract, including when the two nodes belong to different features.
 The registry compares each acceptance reference with its immutable delivery classification. A `cross-end` criterion must be referenced by both an interface-contract backend node and a frontend node explicitly blocked by that node, even if the draft labels the feature as single-end. Role labels in a draft cannot weaken a specification.
 
-Only `blockedBy` creates an edge. A node without predecessors is `waiting-for-slot`; a node with predecessors is `blocked`. Registration creates no executable Ticket, Worker Session, Assignment, or worktree. `stats` reports registered and delivered counts separately for `backend` and `frontend`; none are delivered at this stage.
+Only `blockedBy` creates an edge. Before dispatch, a node without predecessors is `waiting-for-slot` and a node with predecessors is `blocked` with `waiting_for: predecessors`; registration creates no executable Ticket, Worker Session, Assignment or worktree. `stats` reports registered and formally delivered counts separately for `backend` and `frontend`; no node is delivered at registration.
 
 For an already registered plan, `orchestrator_plan_context` takes the verbatim latest direct Hub user message as `message`. That message is JSON with `planId`, `target: {"kind":"background"}` or `target: {"kind":"node","nodeId":"…"}`, and `text`. The tool parses the plan and target from the message itself, records the event once, and stores root background separately from the addressed node's instructions. Neither record, message visibility nor Thread subscription creates authorization, alters the graph, or starts work.
+
+## Frontier dispatch and claims
+
+The Hub starts one node with `orchestrator_plan_dispatch {planId, nodeId}`. After the separate delivery-check process has produced an exact receipt, the Hub records it with `orchestrator_plan_deliver {planId, nodeId, receipt}` through the Runtime-issued delivery writer; the tool does not turn a Worker `ready` report into delivery. The registered node role is authoritative: neither tool accepts a caller-supplied role or an unregistered Plan. A node is in the Frontier only when every `blockedBy` node has a persisted formal delivery receipt. A Worker `ready`, `failed`, `stopped`, cancelled or closed result remains `awaiting-delivery`, `failed` or `stopped`; it does not unlock a successor.
+
+The dispatch transaction reserves the existing `DshExecutor` launch slot synchronously, creates one stable Plan Ticket/Assignment, and writes the node claim before the launch effect can run. The claim records `planId`, `nodeId`, `ticketId`, `assignmentId`, Worker Session, execution role, and `pendingAction`. Same-node replays return that claim; a competing request that cannot reserve the last slot returns `waiting-for-slot` without a second claim. The Plan read and Ticket detail expose these facts before a Session or directory exists. The Ticket uses the normal verified worktree and single-writer checks; an ordinary directory or chat message is never a lock.
+
+`plan/<id>` and `plan/<id>/node/<node-id>` join the immutable graph with the durable node state: `claimed`, `running`, `awaiting-delivery`, `delivered`, `failed` or `stopped`. A formal delivery receipt must name the exact claimed Ticket and Assignment plus its receipt, candidate and verification timestamp. On restart, the dispatcher rearms the same pending Assignment and the Executor adopts a persisted Plan writer claim without issuing a new generation. Stable `assignment:<ticket>` delivery IDs prevent a second Worker message; a missing start receipt is completed when the existing Session is found and the Assignment start is recorded.
 
 ## Optional Feishu entry
 
@@ -120,7 +128,7 @@ An allowed participant can send `status` or `状态` in the bound conversation f
 
 Run `pnpm test tests/handoff.spec.ts tests/topic-binding.spec.ts tests/http.spec.ts` for the Harness flow, Feishu channel contract and project-scoped management routes.
 
-`pnpm test tests/plans.spec.ts` exercises automatic delegation, restart deduplication, graph validation and reads, and message isolation through the Hub and splitter tools using a simulated Harness host.
+`pnpm test tests/plans.spec.ts` exercises automatic delegation, restart deduplication, graph validation and reads, message isolation, Frontier claims, role/session/action visibility, slot races, formal delivery gating and claim replay through the Hub and splitter tools using a simulated Harness host.
 
 ## Limitations
 

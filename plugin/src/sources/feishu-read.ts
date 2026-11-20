@@ -51,7 +51,7 @@ export function feishuResource(resource: string) {
   }
   return { triggerId: match[1]!, section: match[2]!, cursor: match[3] ? decodeURIComponent(match[3]) : undefined }
 }
-async function sourceOf(commands: Commands, ref: FeishuRef) {
+async function sourceOf(commands: Commands, ref: Pick<FeishuRef, 'chatId' | 'messageId'>) {
   const id = messageId.parse(ref.messageId)
   // Use the raw mget endpoint to read parent/root IDs without triggering CLI thread expansion.
   const params = JSON.stringify({ message_ids: [id] })
@@ -61,6 +61,14 @@ async function sourceOf(commands: Commands, ref: FeishuRef) {
   if (!source || source.deleted) throw new Error('The source Feishu message is unavailable or deleted; retained trigger text is still readable')
   if (source.chat_id !== ref.chatId) throw new Error('Feishu source chat does not match the accepted trigger')
   return source
+}
+
+/** Resolve a bound group root to its server-provided thread ID without reading other topics or rendering message content. */
+export async function feishuBoundThread(commands: Commands, chatId: string, rootId: string): Promise<string | undefined> {
+  const source = await sourceOf(commands, { chatId, messageId: rootId })
+  if ((source.root_id && source.root_id !== rootId) || (source.parent_id && source.parent_id !== rootId))
+    throw new Error('The bound group message is not a thread root')
+  return source.thread_id
 }
 
 export interface FeishuPage<M> { status: string; thread_id?: string; messages: M[]; next_resource: string | null; skipped?: number }

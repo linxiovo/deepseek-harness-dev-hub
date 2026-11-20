@@ -7,6 +7,7 @@ import type { Plan, PlanMessage } from './core/plan.ts'
 import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { SessionMeterState } from './app/session-meter.ts'
+import type { TopicBindingRecord } from './app/topic-binding.ts'
 import type { SettingsSave } from './policy.ts'
 import type { Retry } from './sources/github.ts'
 
@@ -60,6 +61,8 @@ export const KV = {
   feishu: { chats: record<Record<string, boolean>>('feishu-chats'), history: family<string, [chat: string]>('feishu-history:'),
     topics: family<Record<string, string>, [chat: string]>('feishu-history-threads:'),
     seen: family<string[], [thread: string]>('thread-seen:'), initialized: family<boolean, [thread: string]>('thread-initialized:') },
+  /** Mounted project: one active binding and text-free consumption receipts that survive unbind/rebind. */
+  topicBinding: { active: record<TopicBindingRecord>('topic-binding'), received: family<true>('topic-binding-received:') },
   /** Handoffs: current record by project; immutable full records and specs; direct confirmation receipts. */
   handoffs: { current: family<string, [projectId: string]>('handoff-current:'),
     record: family<Handoff, [id: string]>('handoff:'),

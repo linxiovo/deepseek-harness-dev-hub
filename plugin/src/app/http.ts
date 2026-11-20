@@ -22,6 +22,7 @@ import type { Sessions } from './sessions.ts'
 import type { SessionMeter } from './session-meter.ts'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
+import { actorIdPattern, TopicBindingError, type TopicBinding } from './topic-binding.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
 import type { Variable } from './execution-environment.ts'
 import { policyHistory } from './settings-history.ts'
@@ -33,6 +34,9 @@ import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
 
 export interface HttpHost {
   readonly installation?: InstallationApi
+  readonly topicBinding?: Pick<TopicBinding, 'view' | 'bind' | 'unbind'> | undefined
+  /** Verify the workspace under the write lock, before the final scope check and bind. */
+  readonly verifyTopicBinding?: (() => Promise<void>) | undefined
   assertNewWork?(): void
   ownsSession?(id: string): boolean
   readonly store: Store
@@ -93,7 +97,7 @@ function failure(error: unknown): [number, Record<string, unknown>] {
     return [400, { error: `Invalid settings: ${issues.map(issue => issue.path).join(', ')}`, issues }]
   }
   if (error instanceof SetupError) return [400, { error: error.message, setup: error.problem }]
-  if (error instanceof RouteError) return [error.status, { error: error.message }]
+  if (error instanceof RouteError || error instanceof TopicBindingError) return [error.status, { error: error.message }]
   if (error instanceof UserError) return [error.missing ? 404 : 400, { error: error.message, code: error.code, values: error.values }]
   if (error instanceof SettingsConflict || error instanceof PromptConflict) return [409, { error: error.message }]
   return [500, { error: error instanceof Error ? error.message : String(error) }]
@@ -144,7 +148,7 @@ export type PromptsView = ReturnType<typeof promptsView>
 
 interface Input<K extends keyof Api> {
   params: RouteParams<K>; query: Record<string, string>; body: (maxBytes?: number) => Promise<unknown>
-  write<T>(operation: () => T | Promise<T>): T | Promise<T>
+  write<T>(operation: () => T | Promise<T>, verify?: () => Promise<void>): T | Promise<T>
 }
 type Routes = { [K in keyof Api]: (input: Input<K>) => ApiResponse<K> | Promise<ApiResponse<K>> }
 const offset = z.coerce.number().int().nonnegative().catch(0)
@@ -163,6 +167,7 @@ const nonBlank = z.string().refine(value => value.trim().length > 0 && !/[\u0000
 const VerifyRequest = z.strictObject({ cli: nonBlank })
 const CreateProjectRequest = z.strictObject({ repository: nonBlank, workspace: nonBlank, baseRef: nonBlank,
   policy: PolicyConfigSchema.optional() })
+const TopicBindingRequest = z.strictObject({ triggerId: nonBlank, allowedActors: z.array(z.string().regex(actorIdPattern)) })
 
 function installationInput<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value)
@@ -173,6 +178,11 @@ function installationInput<T>(schema: z.ZodType<T>, value: unknown): T {
 function installationOf(runtime: HttpHost): InstallationApi {
   if (!runtime.installation) throw new InstallationError(404, 'installationUnavailable')
   return runtime.installation
+}
+
+function topicBindingOf(runtime: HttpHost): NonNullable<HttpHost['topicBinding']> {
+  if (!runtime.topicBinding) throw new RouteError(404, 'Topic binding is not available')
+  return runtime.topicBinding
 }
 
 function publicSetupProblem({ code, values }: SetupProblem): SetupProblem {
@@ -216,13 +226,20 @@ function runtimeView({ mode, status, reason, projectId, resumedFrom }: RuntimeVi
 const installationRoutes: ReadonlySet<keyof Api> = new Set(['GET runtime', 'GET onboarding', 'POST onboarding/github/verify',
   'GET projects', 'POST projects', 'POST projects/:projectId/select'])
 
-function assertProjectScope(active: string | null, requested: string | string[] | undefined, required: boolean): void {
+const topicBindingRoutes: Partial<Record<keyof Api, true>> = {
+  'GET topic-binding': true, 'POST topic-binding': true, 'POST topic-binding/unbind': true,
+}
+
+function assertProjectScope(active: string | null, requested: string | string[] | undefined,
+  requirement: 'optional' | 'when-active' | 'required'): void {
   if (requested !== undefined && requested !== active) throw new InstallationError(409, 'staleProject')
-  if (required && active !== null && requested === undefined) throw new InstallationError(409, 'projectScopeRequired')
+  if (active === null && requirement === 'required') throw new InstallationError(409, 'noProject')
+  if (active !== null && requirement !== 'optional' && requested === undefined) throw new InstallationError(409, 'projectScopeRequired')
 }
 
 function routes(runtime: HttpHost): Routes {
   const { store } = runtime
+  const verifyBinding = runtime.verifyTopicBinding?.bind(runtime)
   const ticket = (id: string) => { if (!store.tickets.get(id)) throw new RouteError(404, 'Ticket not found'); return id }
   const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
   return {
@@ -247,6 +264,14 @@ function routes(runtime: HttpHost): Routes {
       const { project, restarting } = await installationOf(runtime).selectProject(params.projectId)
       return { project: projectView(project), restarting }
     }),
+    'GET topic-binding': () => topicBindingOf(runtime).view(),
+    'POST topic-binding': async ({ body, write }) => {
+      const request = TopicBindingRequest.safeParse(await body())
+      if (!request.success) throw new RouteError(400, 'Invalid topic binding request')
+      const { triggerId, allowedActors } = request.data
+      return write(() => topicBindingOf(runtime).bind(triggerId, allowedActors), verifyBinding)
+    },
+    'POST topic-binding/unbind': ({ write }) => write(() => topicBindingOf(runtime).unbind()),
     'GET state': () => stateView(runtime),
     'GET overview': () => overview(views(runtime), runtime.health, policyVersion(store.settings()),
       executorLoad(store, runtime.executor.activeCount()), runtime.setupProblem ?? runtime.feishuProblem),
@@ -350,18 +375,26 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
   let activeWrite: Promise<unknown> | undefined
   let retiring = false
   let closed = false
-  async function write<T>(installationRoute: boolean, scope: string | string[] | undefined, operation: () => T | Promise<T>): Promise<T> {
+  async function write<T>(route: keyof Api, scope: string | string[] | undefined, operation: () => T | Promise<T>,
+    verify?: () => Promise<void>): Promise<T> {
     if (retiring) throw new InstallationError(409, 'switching')
+    const installationRoute = installationRoutes.has(route)
+    const requirement = topicBindingRoutes[route] ? 'required' : 'when-active'
     const { installation } = runtime
     if (!installationRoute || scope !== undefined) {
-      assertProjectScope(installation?.projects().activeProjectId ?? null, scope, !installationRoute)
+      assertProjectScope(installation?.projects().activeProjectId ?? null, scope, requirement)
     }
     if (!installation) return operation()
     if (writing === 'installation' || installation.runtime().reason === 'switching') throw new InstallationError(409, 'switching')
     if (writing) throw new InstallationError(409, 'projectConflict')
     writing = installationRoute ? 'installation' : 'project'
     try {
-      const pending = Promise.resolve(operation())
+      const pending = verify ? verify().then(() => {
+        // Workspace verification may suspend; recheck the mounted scope at the mutation itself.
+        if (retiring || installation.runtime().reason === 'switching') throw new InstallationError(409, 'switching')
+        assertProjectScope(installation.projects().activeProjectId, scope, requirement)
+        return operation()
+      }) : Promise.resolve(operation())
       activeWrite = pending
       const result = await pending
       if (result && typeof result === 'object' && 'restarting' in result && result.restarting === true) retiring = true
@@ -380,8 +413,13 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         installationRoute = installationRoutes.has(route.key)
         if (!installationRoute) await runtime.ready
         const scope = req.headers[PROJECT_SCOPE_HEADER]
-        if (!installationRoute && scope !== undefined && (route.key.startsWith('GET ') || route.key === 'POST prompts/preview')) {
-          assertProjectScope(runtime.installation?.projects().activeProjectId ?? null, scope, false)
+        if (route.key === 'GET topic-binding') {
+          if (retiring || writing === 'installation' || runtime.installation?.runtime().reason === 'switching') {
+            throw new InstallationError(409, 'switching')
+          }
+          assertProjectScope(runtime.installation?.projects().activeProjectId ?? null, scope, 'required')
+        } else if (!installationRoute && scope !== undefined && (route.key.startsWith('GET ') || route.key === 'POST prompts/preview')) {
+          assertProjectScope(runtime.installation?.projects().activeProjectId ?? null, scope, 'optional')
         }
         const query = Object.fromEntries(url.searchParams)
         json(res, 200, await route.run({ params: route.params as never, query, body: async maxBytes => {
@@ -389,7 +427,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
           if (closed) throw new InstallationError(409, 'switching')
           return body
         },
-          write: operation => write(installationRoute, scope, operation) }))
+          write: (operation, verify) => write(route.key, scope, operation, verify) }))
       } catch (error) { json(res, ...(installationRoute ? installationFailure(error) : failure(error))) }
     } })]
   return async () => {

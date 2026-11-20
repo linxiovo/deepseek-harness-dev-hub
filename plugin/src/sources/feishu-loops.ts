@@ -8,16 +8,19 @@ import { threadKey, type Thread, type Trigger } from '../core/index.ts'
 import { feishuChatLink } from './feishu-channel.ts'
 import type { FeishuBot } from '../deployment.ts'
 import { batchInvocation, validItems, type Tally } from '../infra/commands.ts'
-import { readFeishu, type FeishuRef } from './feishu-read.ts'
+import { feishuBoundThread, readFeishu, type FeishuRef } from './feishu-read.ts'
 import { feishuRef, feishuTime, feishuTrigger, HistoricalMessageSchema, historyEvent, HistoryPageSchema, SOURCE, topicEvent }
   from './feishu-trigger.ts'
-import { health, type SourceContext } from './host.ts'
+import { health, type FeishuTopic, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
 import { cursorAt, POLL_HORIZON_MS, polled, pollThreads as pollEach } from './poll.ts'
 import type { FeishuConfig } from './feishu.ts'
+const TimedHistoricalMessageSchema = HistoricalMessageSchema.extend({ create_time: z.string().refine(value => {
+  try { feishuTime(value); return true } catch { return false }
+}) })
 
 export const runFeishu = (ctx: SourceContext, signal: AbortSignal): Promise<unknown> =>
-  Promise.allSettled([watch, backfillLoop, chatNamesLoop].map(loop => loop(ctx, signal)))
+  Promise.allSettled([watch, backfillLoop, chatNamesLoop, ...(ctx.feishuTopic ? [boundTopicLoop] : [])].map(loop => loop(ctx, signal)))
 const enabled = (ctx: SourceContext): FeishuConfig | undefined => ctx.config<FeishuConfig>(SOURCE)
 const bot = (ctx: SourceContext): FeishuBot => {
   const resolved = ctx.deployment.feishu
@@ -200,14 +203,14 @@ export async function backfillChat(ctx: SourceContext, chatId: string, direct: b
         sort_type: 'ByCreateTimeAsc', page_size: 50, ...(page ? { page_token: page } : {}) }
       const request = ['api', 'GET', '/open-apis/im/v1/messages', '--params', JSON.stringify(parameters)]
       const result = HistoryPageSchema.parse(await commands.lark(request))
-      for (const message of validItems(HistoricalMessageSchema, result.items, tally)) {
+      for (const message of validItems(TimedHistoricalMessageSchema, result.items, tally)) {
         const outside = message.chat_id !== chatId || (kind === 'thread' && message.thread_id !== id)
         if (outside) throw new Error('Feishu history returned a message outside the requested chat or thread')
         if (message.deleted) continue
         const at = feishuTime(message.create_time)
         if (message.thread_id && !(Date.parse(topics[message.thread_id] ?? '') >= Date.parse(at))) topics[message.thread_id] = at
         const trigger = feishuTrigger(historyEvent(message, chatId, direct), bot(ctx).botId, bot(ctx).appId)
-        if (trigger) await receive(ctx, trigger)
+        if (trigger && !ctx.feishuTopic?.claims(trigger)) await receive(ctx, trigger)
       }
       const stuck = result.has_more && (!result.page_token || pages.has(result.page_token))
       if (stuck) throw new Error('Feishu history pagination did not advance')
@@ -225,6 +228,104 @@ export async function backfillChat(ctx: SourceContext, chatId: string, direct: b
   ctx.state.set(topicsKey, topics)
   for (const id of Object.keys(topics)) await scan('thread', id)
   ctx.state.set(topicsKey, topics)
+}
+
+/** Binding polls independently of chat filters and the Ticket subscription horizon. */
+async function boundTopicLoop(ctx: SourceContext, signal: AbortSignal): Promise<void> {
+  const connection = ctx.feishuTopic
+  if (!connection) return
+  await ctx.ready
+  let cursor: { epoch: string; at: string } | undefined
+  let reported = false
+  while (!signal.aborted) {
+    const topic = connection.target()
+    if (topic) {
+      const until = new Date().toISOString()
+      const since = cursor?.epoch === topic.epoch ? cursor.at : topic.since
+      try {
+        if (await pollBoundTopic(ctx, topic, signal, since, until)) {
+          cursor = { epoch: topic.epoch, at: cursorAt(until) }
+          if (reported) connection.report({ state: 'ready', detail: 'Bound Feishu conversation recovered', at: until })
+          reported = false
+        }
+      } catch (error) {
+        if (!signal.aborted && connection.target()?.epoch === topic.epoch) {
+          connection.report({ state: 'error', detail: `Could not poll the bound Feishu conversation: ${String(error)}` })
+          reported = true
+        }
+      }
+    }
+    await delay(30_000, undefined, { signal }).catch(() => {})
+  }
+}
+
+/** The fetched messages are pinned to this epoch; they can never be rerouted to a Ticket. */
+export async function pollBoundTopic(ctx: Pick<SourceContext, 'commands' | 'deployment' | 'feishuTopic'>, topic: FeishuTopic,
+  signal: AbortSignal, since = topic.since, until = new Date().toISOString()): Promise<boolean> {
+  const connection = ctx.feishuTopic
+  const sameBinding = () => {
+    if (signal.aborted) return false
+    const current = connection?.target()
+    return current?.epoch === topic.epoch && current.sourceRevision === topic.sourceRevision
+  }
+  if (!connection || !sameBinding()) return false
+  const commands = ctx.commands.withSignal(signal)
+  const account = ctx.deployment.feishu
+  if (!account) return false
+  const { botId, appId } = account
+  const active = () => {
+    if (!sameBinding()) return false
+    const current = ctx.deployment.feishu
+    return current?.botId === botId && current.appId === appId
+  }
+  const rootId = topic.rootId
+  if (!topic.direct && !rootId) throw new Error('The bound Feishu group topic has no root message')
+  const threadId = rootId ? await feishuBoundThread(commands, topic.chatId, rootId) : undefined
+  // Keep the initial cursor while the group root has no thread, so the first reply cannot be lost.
+  const tally = { skipped: 0 }
+  if (!topic.direct && !threadId) return false
+  const from = Date.parse(since), to = Date.parse(until)
+  const pages = new Set<string>()
+  // Chats stream oldest-first. For threads, scan newest-first to stop at the cursor, but decide answers in creation order.
+  const backlog: Trigger[] | undefined = threadId ? [] : undefined
+  let page: string | undefined
+  do {
+    if (!active()) return false
+    const params = { container_id_type: threadId ? 'thread' : 'chat', container_id: threadId ?? topic.chatId,
+      sort_type: threadId ? 'ByCreateTimeDesc' : 'ByCreateTimeAsc', page_size: 50,
+      // Feishu supports time bounds on chat pages, not on thread pages.
+      ...(!threadId ? { start_time: String(Math.floor(from / 1000)), end_time: String(Math.ceil(to / 1000)) } : {}),
+      ...(page ? { page_token: page } : {}) }
+    const result = HistoryPageSchema.parse(await commands.lark(['api', 'GET', '/open-apis/im/v1/messages', '--params', JSON.stringify(params)]))
+    let older = false
+    for (const message of validItems(TimedHistoricalMessageSchema, result.items, tally)) {
+      if (!active()) return false
+      if (message.chat_id !== topic.chatId || (threadId && ((message.thread_id && message.thread_id !== threadId)
+        || (message.root_id && message.root_id !== rootId)))) throw new Error('Feishu returned a message outside the bound conversation')
+      if (message.deleted || message.message_id === rootId) continue
+      const at = Date.parse(feishuTime(message.create_time))
+      if (at < from) { older = true; continue }
+      if (at > to) continue
+      // The exact thread endpoint may omit the root on replies. It is safe to supply the verified ID here only.
+      const event = historyEvent(rootId ? { ...message, root_id: rootId } : message, topic.chatId, topic.direct)
+      const trigger = feishuTrigger(event, botId, appId)
+      if (trigger) {
+        if (backlog) backlog.push(trigger)
+        else await connection.receive(trigger, topic.epoch)
+      }
+    }
+    if (threadId && older) break
+    if (result.has_more && (!result.page_token || pages.has(result.page_token))) throw new Error('Feishu pagination did not advance')
+    page = result.has_more ? result.page_token : undefined
+    if (page) pages.add(page)
+  } while (page)
+  while (backlog?.length) {
+    if (!active()) return false
+    await connection.receive(backlog.pop()!, topic.epoch)
+  }
+  connection.report(tally.skipped ? { state: 'error', detail: `${tally.skipped} unreadable bound-topic messages skipped` }
+    : { state: 'ready', detail: 'Bound Feishu conversation recovered', at: new Date().toISOString() })
+  return active()
 }
 
 /** Resolves the retained source message reference for polling a subscribed thread. */
@@ -277,7 +378,7 @@ async function pollThread(ctx: SourceContext, thread: Thread, signal?: AbortSign
       if (signal?.aborted) return
       const trigger = feishuTrigger(topicEvent(message, ref.chatId, direct, root), botId, appId)
       // Ignore messages older than the thread subscription on initial poll.
-      if (!trigger || (!initialized && Date.parse(trigger.at) < since)) continue
+      if (!trigger || (!initialized && Date.parse(trigger.at) < since) || ctx.feishuTopic?.claims(trigger)) continue
       await receive(ctx, trigger)
     }
     result.messages.forEach(message => known.add(message.message_id))

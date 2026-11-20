@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { CliError, Commands, commandError } from '../src/infra/commands.ts'
@@ -58,6 +61,39 @@ describe('account-isolated operations', () => {
     await send(commands, { ...reply, channel: feishuChannel('oc_1', 'om_1') })
     expect(run.mock.calls[0]![1]).toEqual(expect.arrayContaining(['--as','bot','--idempotency-key','stable-operation','--message-id','om_1']))
   })
+  it('passes multiline Feishu Markdown to the CLI as UTF-8 data, separate from the command line', async () => {
+    const commands = new Commands(() => deployment, {}, new AbortController().signal)
+    const run = vi.spyOn(commands, 'run').mockResolvedValue('{"ok":true,"data":{}}')
+    const text = '项目已绑定。\n[Settings](http://localhost:3082/?project=A&view=settings)'
+    await send(commands, { ...reply, channel: feishuChannel('oc_1', 'om_1'), text })
+    expect(run).toHaveBeenCalledWith(deployment.feishu!.cli, expect.arrayContaining(['--markdown', '-']), undefined, text)
+    expect(run.mock.calls[0]![1]).not.toContain(text)
+  })
+  it.skipIf(process.platform !== 'win32')('forwards Feishu Markdown through a real Windows batch CLI as exact UTF-8 stdin', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'commands-batch-'))
+    const cli = join(directory, 'capture.cmd')
+    const capture = join(directory, 'capture.mjs')
+    const body = '第一行 — café\nsecond & third | %PATH% ! ^ <tag>\n最後の行 🧪'
+    try {
+      writeFileSync(capture, [
+        'let input = ""',
+        'process.stdin.setEncoding("utf8")',
+        'process.stdin.on("data", chunk => { input += chunk })',
+        'process.stdin.on("end", () => process.stdout.write(JSON.stringify({ ok: true, data: { args: process.argv.slice(2), stdin: input } })))',
+        '',
+      ].join('\n'))
+      writeFileSync(cli, `@echo off\r\n"${process.execPath}" "%~dp0capture.mjs" %*\r\n`)
+
+      const commands = new Commands(() => testDeployment({ feishu: { ...testDeployment().feishu!, cli } }), {}, new AbortController().signal)
+      const result = await commands.lark<{ args: string[]; stdin: string }>(['im', '+messages-send', '--markdown', body])
+      const expectedArgs = ['im', '+messages-send', '--markdown', '-', '--as', 'bot', '--format', 'json']
+      expect(result.args.length === expectedArgs.length && result.args.every((arg, index) => arg === expectedArgs[index]) && result.stdin === body,
+        'Windows batch CLI received unexpected argv or stdin').toBe(true)
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
 })
 
 it('reports Feishu failures with their code and without command arguments', () => {

@@ -15,13 +15,20 @@ export const feishuChatLink = (brand: 'feishu' | 'lark', chatId: string): string
  */
 const gone = (error: unknown): boolean => error instanceof CliError && error.code !== undefined && (error.code === 230011
   || /withdrawn/i.test(error.message) || (Math.floor(error.code / 100) === 2300 && /not found/i.test(error.message)))
-/** Replies in the topic of the target message; Feishu keeps at most one reply per idempotency key (the outgoing message's `message.id`). */
+/** Sends a bound DM to its chat, or replies in the exact topic of a message. Both operations use a stable idempotency key. */
 export async function sendFeishu(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
-  const messageId = message.channel.address.messageId
-  if (!messageId) throw new Error('Missing Feishu reply target')
+  const { chatId, messageId, delivery, bindingEpoch, direct } = message.channel.address
   const text = checkedImText(message.text)
-  const reply = ['im', '+messages-reply', '--message-id', messageId, '--markdown', text, '--reply-in-thread', '--idempotency-key', message.id]
-  try { await host.commands.lark(reply) }
+  const directChat = delivery === 'direct-chat'
+  if (bindingEpoch !== undefined && (directChat !== (direct === 'true')
+    || !/^oc_[A-Za-z0-9_-]+$/.test(chatId ?? '')
+    || (!directChat && (delivery !== 'group-topic' || !/^om_[A-Za-z0-9_-]+$/.test(messageId ?? ''))))) {
+    throw new Error('Invalid bound Feishu delivery target')
+  }
+  if (directChat && !bindingEpoch) throw new Error('A direct chat send requires a binding')
+  if (!directChat && !messageId) throw new Error('Missing Feishu reply target')
+  const target = directChat ? ['+messages-send', '--chat-id', chatId!] : ['+messages-reply', '--message-id', messageId!, '--reply-in-thread']
+  try { await host.commands.lark(['im', ...target, '--markdown', text, '--idempotency-key', message.id]) }
   catch (error) {
     if (gone(error)) return 'gone'
     throw error

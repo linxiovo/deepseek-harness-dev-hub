@@ -11,6 +11,7 @@ import type { DecisionListView, SearchView, ThreadDetailView, ThreadListView } f
 import type { TicketListView } from './views/tickets.ts'
 import type { CreateProjectInput, CreateProjectResult, OnboardingView, ProjectsView, RuntimeView, SelectProjectResult,
   VerifyGithubInput } from './installation-api.ts'
+import type { TopicBindingView } from './topic-binding.ts'
 
 export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
 export const THREAD_FILTERS = ['subscribed', 'evaluating', 'recent', 'all'] as const
@@ -28,6 +29,9 @@ export interface Api {
   'GET projects': { response: ProjectsView }
   'POST projects': { body: CreateProjectInput; response: CreateProjectResult }
   'POST projects/:projectId/select': { response: SelectProjectResult }
+  'GET topic-binding': { response: TopicBindingView }
+  'POST topic-binding': { body: { triggerId: string; allowedActors: string[] }; response: NonNullable<TopicBindingView> }
+  'POST topic-binding/unbind': { response: null }
   'GET state': { response: StateView }
   'GET overview': { response: OverviewView }
   'GET search': { query: { q: string }; response: SearchView }

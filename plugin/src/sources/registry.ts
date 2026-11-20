@@ -78,6 +78,12 @@ export class SourceRegistry implements SourceScope {
     const instance = this.resolve(kind, settings.sources[channel.source])
     return instance.enabled && (kind.channel?.allowed?.(channel.address, instance.config) ?? true)
   }
+  /** Render a non-mutating notice using the host-supplied settings link, even without a declared capability. */
+  confirmationNotice(source: string, { summary, settingsLink }: { summary: string; settingsLink: string }): string {
+    const guidance = this.kinds.get(source)?.channel?.confirmation === 'text-only'
+      ? 'Replies in this channel cannot grant approval.' : 'Approve only in Harness.'
+    return `${summary}\n${guidance} [Settings](${settingsLink})`
+  }
   /** Environment variable declarations for every installed kind, whether enabled or disabled. */
   declarations(): { kind: string; variables: readonly VariableSpec[] }[] {
     return [...this.kinds.values()].sort((a, b) => a.kind.localeCompare(b.kind)).flatMap(kind => kind.environment ? [{ kind: kind.kind, variables: kind.environment.variables }] : [])

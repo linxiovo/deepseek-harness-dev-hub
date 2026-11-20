@@ -10,7 +10,7 @@ A handoff is one product brief a person confirmed in the main Session ("the Hub"
 | --- | --- | --- |
 | Project | `id`, `repository`, `workspace` | `workspace` is resolved to an absolute path. `id` derives from the repository and that path, so one checkout keeps one identity |
 | Handoff | `id`, `project`, `goal`, `constraints`, `acceptanceScope`, `authorization {scope, release}`, `confirmedBy {sessionId, messageId, text}`, `status`, `question?`, `spec?` | The brief is written once. A confirmation receipt binds one direct user message to one brief; a project has at most one handoff that is not `specified`. Earlier records stay readable |
-| Question | `id`, `text`, `why`, `affectedAcceptance`, `status`, `answer?` | At most one per handoff. Its status is `awaiting` or `answered`; every `affectedAcceptance` item is one of the handoff's `acceptanceScope` items |
+| Question | `id`, `text`, `why`, `affectedAcceptance`, `status`, `answer?`, `answeredBy?` | At most one per handoff. Its status is `awaiting` or `answered`; every affected item belongs to `acceptanceScope`. Feishu answers retain the sender's open ID and the originating Trigger ID. |
 | Spec | `id`, `handoffId`, `revision`, `body`, `acceptance`, `testInterfaces`, `outOfScope` | Stored once with revision `1`; never updated in place. `outOfScope` is required and may be empty: `[]` explicitly means there are no confirmed exclusions, while every entry is an actual excluded item; the field is neither omitted nor filled with invented items |
 
 Statuses:
@@ -59,7 +59,7 @@ Its host tools are limited to the same handoff:
 
 `orchestrator_spec_question` requires `handoffId`, `text`, `why` and `affectedAcceptance[]`. The handoff must be `planning` and have no earlier question, and each affected criterion must already be in `acceptanceScope`. The tool refuses known technical-boundary and file-organization formulations; the planner prompt forbids those questions altogether. The question becomes `awaiting`, and the planner stops until an answer resumes it.
 
-The same state transaction queues a relay to the Hub naming the project, question, reason and affected acceptance; no Outbox reply is written. Its text comes from the `prompts/handoff-relay.md` template, which fills the project, kind, content, resource and handoff id; the publication relay uses the same template. The Hub presents the question in Harness and calls `orchestrator_handoff_answer` (`handoffId`, `questionId`, `answer`) only with the exact latest direct user's answer. `Handoffs.answer` accepts the matching first answer, repeats that answer idempotently and rejects a changed answer, unknown question or handoff not awaiting an answer. The first answer resumes `planning` and enqueues a planning effect for the same Session.
+The same state transaction queues a relay to the Hub naming the project, question, reason and affected acceptance. Its text comes from `prompts/handoff-relay.md`; publication uses the same template. A Harness answer via `orchestrator_handoff_answer` (`handoffId`, `questionId`, `answer`) must equal the latest direct user's answer. The [optional Feishu entry](#optional-feishu-entry) verifies answers at the Source instead. Both paths use `Handoffs.answer`: it accepts the matching first answer, repeats that answer idempotently and rejects a changed answer or unknown question. The first answer resumes `planning` and enqueues a planning effect for the same Session.
 
 `orchestrator_spec_publish` requires `handoffId`, a non-empty `body`, observable `acceptance` entries, at least one selected public `testInterfaces` entry of kind `existing` or `proposed`, and a required `outOfScope` list. `outOfScope: []` is accepted only as the explicit statement that there are no confirmed exclusions; each non-empty entry names an actual excluded item, and a caller neither omits the field nor fabricates entries. Only a `planning` handoff may publish. The immutable revision `1` and `specified` status are stored together with a Hub relay containing the `spec/<id>` read resource; the requester sees that result in Harness without IM. A second publication is refused.
 
@@ -104,15 +104,25 @@ Only `blockedBy` creates an edge. A node without predecessors is `waiting-for-sl
 
 For an already registered plan, `orchestrator_plan_context` takes the verbatim latest direct Hub user message as `message`. That message is JSON with `planId`, `target: {"kind":"background"}` or `target: {"kind":"node","nodeId":"…"}`, and `text`. The tool parses the plan and target from the message itself, records the event once, and stores root background separately from the addressed node's instructions. Neither record, message visibility nor Thread subscription creates authorization, alters the graph, or starts work.
 
+## Optional Feishu entry
+
+A selected, registered project can use one Feishu private chat or group topic as a second entrance. This does not create a second Hub or change a Worker's tools. Harness confirmation, questions, and specification reads do not require a binding.
+
+Use the existing loopback management API under `/orchestrator/api/`, with `x-orchestrator-request: 1` and `x-orchestrator-project-id` set to the selected project ID. `POST topic-binding` accepts `{ "triggerId": "…", "allowedActors": ["ou_…"] }`. Select a message observed by the project's Feishu Source, not a caller-supplied chat address. The operator grants those open IDs permission to answer product questions in that destination; group membership and the Source admission list do not confer that permission. `GET topic-binding` reads the binding; `POST topic-binding/unbind` removes it. Unbind before changing destination or participants.
+
+The Hub sends a binding confirmation once. Question and result notices link back to the selected project; they do not copy conversation history, answers or specification text into a group. To answer a pending product question, use the reply format in its notice. The Hub verifies the question reference and the sender reported by Feishu before recording an answer on the same handoff that Harness reads. Plain assent such as `同意` is not an approval. Settings links open Harness; they do not apply a change by themselves.
+
+An allowed participant can send `status` or `状态` in the bound conversation for a text summary of the current handoff. An answer uses `answer <code>: <answer>` with the 24-character code from the current question's notice. The reply format is reserved even if a code is stale; ordinary follow-ups such as `Answer export: use CSV.` continue through normal Ticket intake. A forwarded link or code is not a grant. Links use the Harness loopback port: open them on the Harness machine or through an authorized tunnel to that port. If another project is active, the link asks the operator to select the named project instead of opening the wrong settings.
+
 ## Tests
 
 `tests/handoff.spec.ts` drives a running Runtime through public Hub and planner tools. In GitHub-only projects it covers a confirmed brief surviving restart with one delivered planner task, an observable specification with a selected public test interface, one missing product-intent question with the exact direct user answer delivered once to the same planner, and a completed-spec relay to the Hub. It rejects bare assent, a Hub tool brief that differs from the direct JSON approval, old confirmations reused for changed briefs, invented answers, incomplete specifications, technical or repeated questions, and non-planner publication.
 
-Run it with `pnpm test tests/handoff.spec.ts`.
+Run `pnpm test tests/handoff.spec.ts tests/topic-binding.spec.ts tests/http.spec.ts` for the Harness flow, Feishu channel contract and project-scoped management routes.
 
 `pnpm test tests/plans.spec.ts` exercises automatic delegation, restart deduplication, graph validation and reads, and message isolation through the Hub and splitter tools using a simulated Harness host.
 
 ## Limitations
 
-- No IM or Feishu: the question, answer and publication notice travel only through the Harness Sessions. No Feishu binding, chat message or Outbox reply is created.
+- The Feishu entry answers product questions; it does not accept configuration approvals. Other IM connectors and interactive confirmation cards are not part of this contract.
 - One immutable specification: revision `1` is the only revision and publication is one-way. A changed brief is a new handoff after the prior one is `specified`.

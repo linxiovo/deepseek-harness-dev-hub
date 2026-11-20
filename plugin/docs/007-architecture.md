@@ -201,6 +201,8 @@ Sources extend the host through `SourceKind`, defined in `src/sources/kind.ts`. 
 
 Registry configuration methods include `kind`, `instances`, `instance`, `validate`, `validatePolicy`, `policyPart`, `channelAllowed`, `declarations`, `environments`, `find` and `scope`. `find` asks each kind that supports search.
 
+`confirmationNotice` formats a text summary and a project-scoped Harness settings link. A channel can declare `confirmation: 'text-only'`; lack of a declaration or removal of an adapter never grants approval authority.
+
 Generic code accesses Source behavior through the registry. `send(message, commands)` calls the kind's Channel and returns `sent`, `gone` or `waiting` if the kind is not installed. `link` resolves its Channel link. `threadContext` pairs a kind's reader with its configuration, or returns nothing when the kind has no reader. Invalid stored configuration disables the instance.
 
 Plugins receive `SourceHost`: the registry and `context(kind)`. The kind itself uses a narrower `SourceContext`, built by `sourceContextOf` in `src/app/source-context.ts`.
@@ -394,6 +396,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/migration.ts` | The schema 11 migration: one step from schema 10 that writes every stored record in its current shape |
 | `src/app/effects.ts` | Effects |
 | `src/app/handoffs.ts` | `Handoffs`: the durable project and handoff records, their single question, answer and immutable specification |
+| `src/app/topic-binding.ts` | Binds one observed Feishu destination to the selected project and accepts correlated answers from explicitly authorized senders; see `009-handoff.md` |
 | `src/app/planning.ts` | `Planning`: durable `planning` and `splitting` effects for the specification planner and the Plan DAG splitter |
 | `src/app/plans.ts` | `Plans`: validates and atomically registers authorized Plan DAGs; keeps plan background separate from node instructions |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
@@ -451,9 +454,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/github-read.ts` | CI snapshots, repository reads, the `github/` resources, and `githubThreadContext`: an Issue's or pull request's conversation by page |
 | `src/sources/actions-evidence.ts` | The shared GitHub Actions evidence provider: `EvidenceWork`, `ActionsEvidence` and `actionsEvidence`, which read one complete candidate commit's workflow runs (with optional PR provenance filtering), latest-attempt jobs and artifacts, and never logs |
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
-| `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
+| `src/sources/feishu-trigger.ts` | Feishu messages as Triggers: live `reply_to` and history/topic `parent_id` identify the direct parent, not the topic root (`root_id`) |
 | `src/sources/feishu-loops.ts` | The Feishu event consumer, including Windows batch-wrapper launch and process-tree cancellation, history recovery, chat names and polling of subscribed topics. Event-processing errors stay visible for that consumer run even if readiness arrives later |
-| `src/sources/feishu-channel.ts` | The Feishu Channel: topic replies, `sent` or `gone` |
+| `src/sources/feishu-channel.ts` | The Feishu Channel: private-chat sends and topic replies, `sent` or `gone`. The CLI transport sends Markdown via UTF-8 stdin (`--markdown -`), not as a shell argument. |
 | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
@@ -521,6 +524,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
 | `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
+| `tests/topic-binding.spec.ts` | Uses a mounted project and normalized Feishu events to verify topic isolation, answer provenance and idempotent outbound delivery |
 | `tests/plans.spec.ts` | Automatic spec continuation, idempotent restart and registration, graph and role queries, invalid graph refusal, and root/node message isolation through the public Session tools |
 | `tests/runtime-concurrency.spec.ts` | Overlapping Triggers, deliveries and launches; Worker inbox recovery after restart, checked after the runtime drains launch and delivery effects against real Git worktrees |
 | `tests/http.spec.ts` | Management request bounds; ticket worktree and writer projections; Session meter success, errors, ID decoding and same-origin protection |
@@ -547,7 +551,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/docs.spec.ts` | Numbered documents are consecutive, indexed in `plugin/DOCS.md` with `plugin/README.md` linking to that index, link only to earlier ones with inline-code guidance on violations, every local link resolves including root `DOCS.md` and `plugin/DOCS.md`, no document has merge conflict markers, `010` explicit file paths exist, and this document's tables list every module and every test |
 | `tests/tickets.spec.ts` | Offline local ticket filename/title, declared GitHub issue URL/number, dependency links, and local relative paths/anchors |
 
-`tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.
+`tests/fixtures/` holds shared test inputs: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; `async.ts`; and `feishu-live-reply-lark-cli-1.0.100.json`, the minimal published live-event field shape that distinguishes `reply_to` from history `parent_id`.
 
 ## Persistence
 

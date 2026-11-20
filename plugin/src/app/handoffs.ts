@@ -24,7 +24,7 @@ function matchesBinding(approved: HandoffInput['project'], recorded: ProjectRef)
 /** Durable lifecycle for confirmed product briefs and their immutable published specifications. */
 export class Handoffs {
   constructor(private readonly store: Store, private readonly effects: Effects, private readonly binding?: ProjectRef,
-    private readonly assertNewWork?: () => void) {}
+    private readonly assertNewWork?: () => void, private readonly changed?: (handoff: Handoff) => void) {}
 
   /** Confirm and persist the original brief once; identical confirmations reuse it without re-enqueuing planning. */
   confirm(input: HandoffInput): { handoff: Handoff; reused: boolean } {
@@ -74,11 +74,19 @@ export class Handoffs {
       this.store.set(KV.handoffs.record(handoffId), handoff)
       this.store.set(KV.handoffs.current(projectId), handoffId)
       this.effects.enqueue('planning', handoffId, { handoffId })
+      this.changed?.(handoff)
       return { handoff, reused: false }
     })
   }
 
   get(id: string): Handoff | undefined { return this.store.get(KV.handoffs.record(id)) }
+
+  /** The project's canonical head, not a guessed latest record from history. */
+  current(projectId: string): Handoff | undefined {
+    const id = this.store.get(KV.handoffs.current(projectId))
+    const handoff = id && this.get(id)
+    return handoff && handoff.project.id === projectId ? handoff : undefined
+  }
 
   /** Only a persisted planning record authorizes planner operations; malformed/missing state fails closed. */
   isPlanning(id: string): boolean {
@@ -117,12 +125,13 @@ export class Handoffs {
           `${question.text}\nWhy: ${question.why}\nAffected acceptance: ${question.affectedAcceptance.join('; ')}`,
           'orchestrator_handoff_answer'),
       })
+      this.changed?.(awaiting)
       return awaiting
     })
   }
 
   /** Record a single user answer; an identical retry is idempotent and a conflicting answer is rejected. */
-  answer(id: string, questionId: string, answer: string): Handoff {
+  answer(id: string, questionId: string, answer: string, answeredBy?: HandoffQuestion['answeredBy']): Handoff {
     return this.store.atomic(() => {
       const handoff = this.require(id), question = handoff.question
       if (!question || question.id !== questionId) throw new Error(`Unknown question ${questionId} for handoff ${id}`)
@@ -131,9 +140,11 @@ export class Handoffs {
         return handoff
       }
       if (handoff.status !== 'awaiting') throw new Error(`Handoff ${id} is not awaiting an answer`)
-      const resumed: Handoff = { ...handoff, status: 'planning', question: { ...question, status: 'answered', answer } }
+      const resumed: Handoff = { ...handoff, status: 'planning', question: { ...question, status: 'answered', answer,
+        ...(answeredBy ? { answeredBy } : {}) } }
       this.store.set(KV.handoffs.record(id), resumed)
       this.effects.enqueue('planning', id, { handoffId: id })
+      this.changed?.(resumed)
       return resumed
     })
   }
@@ -159,6 +170,7 @@ export class Handoffs {
         text: this.relay(handoff, 'published specification', `Goal: ${handoff.goal}`, `spec/${id} (revision ${spec.revision})`),
       })
       this.effects.enqueue('splitting', id, { handoffId: id, specId: spec.id })
+      this.changed?.(specified)
       return specified
     })
   }

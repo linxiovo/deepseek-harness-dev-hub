@@ -43,6 +43,21 @@ Pre-commit runs from the active worktree's `plugin` directory and verifies that 
 
 Set the GitHub Source's `requiredChecks` to `[{"id":"check"},{"id":"windows"}]` for Ticket and plan evidence. Where branch protection is available, require both jobs there too. Those are separate settings; the workflow changes neither, and a job dependency alone does not restrict merging.
 
+#### Verify a committed candidate on Windows
+
+From the repository root in native Windows PowerShell, use supported Windows Node.js, Git for Windows, the Windows `tar.exe`, and native pnpm matching the candidate's `packageManager` (11.7.0 for this checkout). Pin the candidate before running:
+
+```powershell
+$sha = git rev-parse --verify HEAD
+node plugin/scripts/verify-windows.mjs --ref $sha --output plugin/.artifacts/verify
+```
+
+The same entry point is available as `pnpm -C plugin verify:windows --ref $sha`. Without `--ref`, the script resolves `HEAD` in its worktree once; an invalid ref fails without falling back. Use `--repo DIR` to select another local Git worktree root. `--output DIR` is relative to the invocation's working directory and defaults to `plugin/.artifacts/verify` in the selected worktree.
+
+The verifier exports the pinned commit's tracked files, including repository-level offline test inputs, into a fresh Windows temporary directory. It does not copy the checkout, its `node_modules`, or the contents of submodules. It runs `pnpm install --frozen-lockfile` and then `pnpm check` there without WSL. The install may use the normal pnpm store and network. Only verify commits whose scripts you trust; the snapshot is not a sandbox.
+
+Each run gets a new evidence directory with `manifest.json` and logs for the stages that started. Accept a result only if `sha` matches the expected full commit ID, `status` is `passed`, `exitCode` is `0`, and `snapshotCleaned` is `true`. A forced termination may leave an incomplete manifest and a disposable snapshot; neither is reused by a later run. Use [the CI evidence](#ci-build-and-commit-evidence) separately for required jobs.
+
 #### CI build and commit evidence
 
 After both platform checks pass, the Ubuntu job uploads `plugin-check-<github.sha>` from `plugin/lib` and `plugin/ci-evidence`. The evidence directory contains the workflow YAML and `commit.json`, which records `repository`, `sha`, `ref`, `run_id`, `run_attempt`, `workflow`, and, for pull requests, `pull_request_head_sha`. On a push, `sha` is the pushed commit. On a pull request, `sha` and the artifact name identify the synthetic merge commit that CI built, while `pull_request_head_sha` identifies the candidate commit used for the Actions evidence lookup.

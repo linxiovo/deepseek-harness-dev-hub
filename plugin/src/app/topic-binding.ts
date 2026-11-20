@@ -41,7 +41,6 @@ const chatIdPattern = /^oc_[A-Za-z0-9]+$/
 const messageIdPattern = /^om_[A-Za-z0-9_-]+$/
 export const actorIdPattern = /^ou_[A-Za-z0-9]+$/
 const replyPrefix = /^answer ([0-9a-f]{24}):/u
-const answerCommand = /^answer[ \t]+[^:\s]+[ \t]*:/iu
 const statusCommand = /^(?:status|状态)$/iu
 const STATUS = Symbol('status command')
 const approvalOnly = /^(?:同意|批准|确认批准|approve[d]?|i approve|agree[d]?|i agree)[.!。！]?$/iu
@@ -152,7 +151,7 @@ export class TopicBinding {
     if (!targetOf(trigger)) return false
     const text = trigger.text.trim()
     return this.options.store.get(KV.topicBinding.received(trigger.id)) === true || replyPrefix.test(text)
-      || ((answerCommand.test(text) || statusCommand.test(text) || approvalOnly.test(text)) && this.matches(trigger))
+      || ((statusCommand.test(text) || approvalOnly.test(text)) && this.matches(trigger))
   }
 
   /** A claimed protocol message rejected before intake (e.g. unbind across an await) must not replay as general work. */

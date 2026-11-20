@@ -112,7 +112,7 @@ Use the existing loopback management API under `/orchestrator/api/`, with `x-orc
 
 The Hub sends a binding confirmation once. Question and result notices link back to the selected project; they do not copy conversation history, answers or specification text into a group. To answer a pending product question, use the reply format in its notice. The Hub verifies the question reference and the sender reported by Feishu before recording an answer on the same handoff that Harness reads. Plain assent such as `同意` is not an approval. Settings links open Harness; they do not apply a change by themselves.
 
-Send `status` or `状态` in the bound conversation for a text summary of the current handoff. An answer uses `answer <code>: <answer>` with the code from the current question's notice. A forwarded link or code is not a grant. Links use the Harness loopback port: open them on the Harness machine or through an authorized tunnel to that port. If another project is active, the link asks the operator to select the named project instead of opening the wrong settings.
+An allowed participant can send `status` or `状态` in the bound conversation for a text summary of the current handoff. An answer uses `answer <code>: <answer>` with the 24-character code from the current question's notice. The reply format is reserved even if a code is stale; ordinary follow-ups such as `Answer export: use CSV.` continue through normal Ticket intake. A forwarded link or code is not a grant. Links use the Harness loopback port: open them on the Harness machine or through an authorized tunnel to that port. If another project is active, the link asks the operator to select the named project instead of opening the wrong settings.
 
 ## Tests
 

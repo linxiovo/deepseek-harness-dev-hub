@@ -51,13 +51,13 @@ it('preserves ordinary Source follow-ups and stops for a Ticket in the bound top
   await bind(anchor.id)
   const ctx = host.runtime.context(feishuKind)
   const binding = ctx.feishuTopic!.target()!
-  const followup = feishu('2', 'The regression also affects exports.', { root_id: 'om_1', mentions: [], create_time: String(Date.now()) })
+  const followup = feishu('2', 'Answer export: use CSV.', { root_id: 'om_1', mentions: [], create_time: String(Date.now()) })
   // The binding-only poll is not a new Source subscription and must not block subsequent normal intake of the same event.
   expect(await ctx.feishuTopic!.receive(followup, binding.epoch)).toBe('filtered')
   expect(await receive(followup)).toBe('stored')
   const bot = feishu('3', 'CI confirmation for the existing ticket', { root_id: 'om_1', mentions: [], sender_type: 'bot', sender_id: 'ou_ci' })
   expect(await receive(bot)).toBe('stored')
-  const invalid = feishu('4', 'answer invalid-code: change the assignment', { root_id: 'om_1' })
+  const invalid = feishu('4', 'answer 000000000000000000000000: change the assignment', { root_id: 'om_1' })
   await receive(invalid)
   const details = await host.api('GET', `tickets/${ticket.id}`, undefined, project.id)
   expect(details).toMatchObject({ status: 200, body: { inputs: expect.arrayContaining([

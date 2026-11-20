@@ -58,6 +58,14 @@ describe('account-isolated operations', () => {
     await send(commands, { ...reply, channel: feishuChannel('oc_1', 'om_1') })
     expect(run.mock.calls[0]![1]).toEqual(expect.arrayContaining(['--as','bot','--idempotency-key','stable-operation','--message-id','om_1']))
   })
+  it('passes multiline Feishu Markdown to the CLI as UTF-8 data, separate from the command line', async () => {
+    const commands = new Commands(() => deployment, {}, new AbortController().signal)
+    const run = vi.spyOn(commands, 'run').mockResolvedValue('{"ok":true,"data":{}}')
+    const text = '项目已绑定。\n[Settings](http://localhost:3082/?project=A&view=settings)'
+    await send(commands, { ...reply, channel: feishuChannel('oc_1', 'om_1'), text })
+    expect(run).toHaveBeenCalledWith(deployment.feishu!.cli, expect.arrayContaining(['--markdown', '-']), undefined, text)
+    expect(run.mock.calls[0]![1]).not.toContain(text)
+  })
 })
 
 it('reports Feishu failures with their code and without command arguments', () => {

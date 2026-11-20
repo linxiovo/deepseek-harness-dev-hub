@@ -1,6 +1,8 @@
 /** Subprocess wrapper for running gh, lark-cli, and git commands under the deployment's configured accounts. */
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { basename, join } from 'node:path'
+import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { Deployment } from '../deployment.ts'
@@ -46,11 +48,16 @@ async function terminateWindowsTree(child: ChildProcess): Promise<CliError | und
   return new CliError('Windows CLI process tree could not be terminated')
 }
 
+/** Deliver literal UTF-8 input. Prefer a failed CLI's own diagnostic to a secondary broken pipe. */
+function feedInput(child: ChildProcess, input: string) {
+  return pipeline(Readable.from([Buffer.from(input, 'utf8')]), child.stdin!).then(() => true, () => false)
+}
 /** Execute a batch CLI through a rooted Node child, collecting bounded output while owning abort and timeout teardown. */
-async function runWindowsBatch(program: string, args: string[], cwd: string | undefined, signal: AbortSignal, env: NodeJS.ProcessEnv): Promise<string> {
+async function runWindowsBatch(program: string, args: string[], cwd: string | undefined, signal: AbortSignal, env: NodeJS.ProcessEnv, input?: string): Promise<string> {
   const command = batchInvocation(program, args)
   if (signal.aborted) throw new DOMException('The operation was aborted', 'AbortError')
-  const child = spawn(process.execPath, ['-e', windowsBatchRunner, command], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+  const child = spawn(process.execPath, ['-e', windowsBatchRunner, command], { cwd, env, stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'], windowsHide: true })
+  const fed = input === undefined ? true : feedInput(child, input)
   const streams = { stdout: { chunks: [] as Buffer[], size: 0 }, stderr: { chunks: [] as Buffer[], size: 0 } }
   let stopped: 'abort' | 'timeout' | 'maxBuffer' | undefined
   let cleanup: Promise<CliError | undefined> | undefined
@@ -82,6 +89,7 @@ async function runWindowsBatch(program: string, args: string[], cwd: string | un
     if (stopped === 'timeout') throw new CliError(`${basename(program)} timed out after ${TIMEOUT_MS / 1000} s`)
     if (stopped === 'maxBuffer') throw new CliError(`${basename(program)} printed more output than it may`)
     if (code !== 0) throw commandError({ code, signal: endedBy, stderr: Buffer.concat(streams.stderr.chunks).toString() }, program)
+    if (!await fed) throw new CliError('Could not deliver CLI input')
     return Buffer.concat(streams.stdout.chunks).toString()
   } finally {
     signal.removeEventListener('abort', abort)
@@ -139,16 +147,19 @@ export class Commands {
   get deployment(): Deployment { return this.resolved() }
   get repository(): string { return this.deployment.repository }
   withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
-  async run(program: string, args: string[], cwd?: string): Promise<string> {
+  async run(program: string, args: string[], cwd?: string, input?: string): Promise<string> {
     const environment = { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' }
     if (process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(program)) {
-      try { return await runWindowsBatch(program, args, cwd, this.signal, environment) }
+      try { return await runWindowsBatch(program, args, cwd, this.signal, environment, input) }
       catch (error) { if (error instanceof CliError || error instanceof Error && error.name === 'AbortError') throw error; throw commandError(error, program) }
     }
     try {
-      const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: MAX_OUTPUT, env: environment })
+      const running = exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: MAX_OUTPUT, env: environment })
+      const fed = input === undefined ? true : feedInput(running.child, input)
+      const { stdout } = await running
+      if (!await fed) throw new CliError('Could not deliver CLI input')
       return stdout
-    } catch (error) { throw commandError(error, program) }
+    } catch (error) { throw error instanceof CliError ? error : commandError(error, program) }
   }
   /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
   async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.githubOutput(args)) as T }
@@ -196,7 +207,11 @@ export class Commands {
   async lark<T>(args: string[], cwd?: string): Promise<T> {
     const bot = this.deployment.feishu
     if (!bot) throw new Error('The Feishu Source has no working bot CLI')
-    const output = await this.run(bot.cli, [...args, '--as', 'bot', '--format', 'json'], cwd)
+    const argv = [...args, '--as', 'bot', '--format', 'json']
+    const markdown = args[0] === 'im' && (args[1] === '+messages-send' || args[1] === '+messages-reply') ? args.indexOf('--markdown') : -1
+    const input = markdown < 0 ? undefined : args[markdown + 1]
+    if (input !== undefined) argv[markdown + 1] = '-'
+    const output = await this.run(bot.cli, argv, cwd, input)
       .catch((error: unknown) => { throw membership(error) })
     const result = JSON.parse(output) as { ok: boolean; data: T; error?: { code?: number; message?: string } }
     const code = result.error?.code

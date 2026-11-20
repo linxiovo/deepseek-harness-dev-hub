@@ -456,7 +456,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers: live `reply_to` and history/topic `parent_id` identify the direct parent, not the topic root (`root_id`) |
 | `src/sources/feishu-loops.ts` | The Feishu event consumer, including Windows batch-wrapper launch and process-tree cancellation, history recovery, chat names and polling of subscribed topics. Event-processing errors stay visible for that consumer run even if readiness arrives later |
-| `src/sources/feishu-channel.ts` | The Feishu Channel: topic replies, `sent` or `gone` |
+| `src/sources/feishu-channel.ts` | The Feishu Channel: private-chat sends and topic replies, `sent` or `gone`. The CLI transport sends Markdown via UTF-8 stdin (`--markdown -`), not as a shell argument. |
 | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |

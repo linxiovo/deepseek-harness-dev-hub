@@ -5,6 +5,7 @@ import { backfillChat, consumerRetry, feishuKind, feishuTriggerId, feishuRef, fe
 import { KV } from '../src/kv.ts'
 import { apply as applyFeishu, pollThreads as pollFeishuThreads } from '../src/sources/feishu.ts'
 import { runFeishu } from '../src/sources/feishu-loops.ts'
+import { feishuParent } from '../src/sources/feishu-trigger.ts'
 import { commentTrigger, githubAddress, githubChannel, issueTrigger, type GithubComment, type GithubIssue } from '../src/sources/github-trigger.ts'
 import { claimPull, observePull, pullEndNotices, pullOf, ticketBranch, type Pull } from '../src/sources/github-pull.ts'
 import { ciCounts, ciFact, ciSummary } from '../src/sources/github-read.ts'
@@ -121,6 +122,12 @@ describe('feishu source', () => {
     expect(feishuRef(trigger)).toEqual({ triggerId: trigger.id, chatId: 'oc_1', messageId: 'om_2', at: trigger.at })
     expect(feishuTrigger({ message_id: 'om_3', chat_id: 'oc_1', chat_type: 'p2p', sender_id: 'ou_bot', sender_type: 'bot', content: 'me', create_time: '1' }, 'ou_bot', 'cli_bot')).toBeUndefined()
     expect(feishuTrigger(historyEvent({ message_id: 'om_4', chat_id: 'oc_1', create_time: '2', sender: { id: 'ou_x', sender_type: 'app' }, body: { content: '{"text":"from app"}' } }, 'oc_1', false), 'ou_bot', 'cli_bot')).toMatchObject({ human: false, text: 'from app', threads: [{ id: 'oc_1:om_4' }] })
+  })
+  it('resolves the parent of a live reply without treating it as a topic root', () => {
+    const reply = feishuTrigger({ message_id: 'om_reply', chat_id: 'oc_team', chat_type: 'group', sender_id: MEMBER,
+      sender_type: 'user', content: 'reply', create_time: '1', reply_to: 'om_parent' }, 'ou_bot', 'cli_bot')!
+    expect(feishuParent(reply)).toBe(feishuTriggerId('om_parent'))
+    expect(reply.meta).not.toHaveProperty('rootId')
   })
   it('polls subscribed threads and stores unseen replies as triggers on that thread', async () => {
     const h = host()

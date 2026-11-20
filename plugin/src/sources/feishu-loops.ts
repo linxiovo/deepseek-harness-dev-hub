@@ -25,7 +25,7 @@ const bot = (ctx: SourceContext): FeishuBot => {
   return resolved
 }
 async function receive(ctx: SourceContext, trigger: Trigger): Promise<void> {
-  if (await ctx.receive(trigger) === 'filtered') return
+  await ctx.receive(trigger)
   const chatId = String(trigger.meta.chatId ?? '')
   if (!chatId) return
   const name = ctx.state.get(KV.sources.labels(SOURCE))?.[chatId] ?? chatId
@@ -257,17 +257,24 @@ async function boundTopicLoop(ctx: SourceContext, signal: AbortSignal): Promise<
 }
 
 /** The fetched messages are pinned to this epoch; they can never be rerouted to a Ticket. */
-export async function pollBoundTopic(ctx: SourceContext, topic: FeishuTopic, signal: AbortSignal, since = topic.since,
-  until = new Date().toISOString()): Promise<boolean> {
+export async function pollBoundTopic(ctx: Pick<SourceContext, 'commands' | 'deployment' | 'feishuTopic'>, topic: FeishuTopic,
+  signal: AbortSignal, since = topic.since, until = new Date().toISOString()): Promise<boolean> {
   const connection = ctx.feishuTopic
-  const active = () => {
+  const sameBinding = () => {
     if (signal.aborted) return false
     const current = connection?.target()
     return current?.epoch === topic.epoch && current.sourceRevision === topic.sourceRevision
   }
-  if (!connection || !active()) return false
+  if (!connection || !sameBinding()) return false
   const commands = ctx.commands.withSignal(signal)
-  const { botId, appId } = bot(ctx)
+  const account = ctx.deployment.feishu
+  if (!account) return false
+  const { botId, appId } = account
+  const active = () => {
+    if (!sameBinding()) return false
+    const current = ctx.deployment.feishu
+    return current?.botId === botId && current.appId === appId
+  }
   const rootId = topic.rootId
   if (!topic.direct && !rootId) throw new Error('The bound Feishu group topic has no root message')
   const threadId = rootId ? await feishuBoundThread(commands, topic.chatId, rootId) : undefined
@@ -275,6 +282,8 @@ export async function pollBoundTopic(ctx: SourceContext, topic: FeishuTopic, sig
   if (!topic.direct && !threadId) return false
   const from = Date.parse(since), to = Date.parse(until)
   const pages = new Set<string>()
+  // Chats stream oldest-first. For threads, scan newest-first to stop at the cursor, but decide answers in creation order.
+  const backlog: Trigger[] | undefined = threadId ? [] : undefined
   let page: string | undefined
   do {
     if (!active()) return false
@@ -296,13 +305,20 @@ export async function pollBoundTopic(ctx: SourceContext, topic: FeishuTopic, sig
       // The exact thread endpoint may omit the root on replies. It is safe to supply the verified ID here only.
       const event = historyEvent(rootId ? { ...message, root_id: rootId } : message, topic.chatId, topic.direct)
       const trigger = feishuTrigger(event, botId, appId)
-      if (trigger) await connection.receive(trigger, topic.epoch)
+      if (trigger) {
+        if (backlog) backlog.push(trigger)
+        else await connection.receive(trigger, topic.epoch)
+      }
     }
     if (threadId && older) break
     if (result.has_more && (!result.page_token || pages.has(result.page_token))) throw new Error('Feishu pagination did not advance')
     page = result.has_more ? result.page_token : undefined
     if (page) pages.add(page)
   } while (page)
+  while (backlog?.length) {
+    if (!active()) return false
+    await connection.receive(backlog.pop()!, topic.epoch)
+  }
   return active()
 }
 

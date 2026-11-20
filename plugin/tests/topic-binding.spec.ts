@@ -44,7 +44,31 @@ it('confirms only the selected topic once, including after a restart and retry',
   expect(messages()).toEqual([{ to: 'om_1', text: expect.stringContaining(project.id) }])
 })
 
-it.each(['group', 'p2p'] as const)('answers the existing Harness question as the Feishu sender, only in the bound %s', async chatType => {
+it('preserves ordinary Source follow-ups and stops for a Ticket in the bound topic', async () => {
+  const { trigger: anchor, ticket } = await host.acceptedTicket(feishu('1', '@bot Fix the regression'))
+  await bind(anchor.id)
+  const ctx = host.runtime.context(feishuKind)
+  const binding = ctx.feishuTopic!.target()!
+  const followup = feishu('2', 'The regression also affects exports.', { root_id: 'om_1', mentions: [], create_time: String(Date.now()) })
+  // The binding-only poll is not a new Source subscription and must not block subsequent normal intake of the same event.
+  expect(await ctx.feishuTopic!.receive(followup, binding.epoch)).toBe('filtered')
+  expect(await receive(followup)).toBe('stored')
+  const bot = feishu('3', 'CI confirmation for the existing ticket', { root_id: 'om_1', mentions: [], sender_type: 'bot', sender_id: 'ou_ci' })
+  expect(await receive(bot)).toBe('stored')
+  const invalid = feishu('4', 'answer invalid-code: change the assignment', { root_id: 'om_1' })
+  await receive(invalid)
+  const details = await host.api('GET', `tickets/${ticket.id}`, undefined, project.id)
+  expect(details).toMatchObject({ status: 200, body: { inputs: expect.arrayContaining([
+    expect.objectContaining({ triggerId: bot.id }), expect.objectContaining({ triggerId: followup.id }),
+  ]) } })
+  expect(details.body.inputs).not.toContainEqual(expect.objectContaining({ triggerId: invalid.id }))
+  const stop = feishu('5', '@bot Stop this ticket.', { root_id: 'om_1' })
+  await receive(stop)
+  expect(await host.route({ kind: 'stop', ticket_id: ticket.id, trigger_id: stop.id }))
+    .toMatchObject({ decision: 'stop', ticket: { ticket_id: ticket.id, state: 'stopped' } })
+})
+
+async function startPlanner() {
   const brief = { project: { repository: project.repository, workspace: project.workspace }, goal: 'Save a customer list.',
     constraints: [], acceptanceScope: ['Users can view a saved list.'], authorization: { scope: 'Implement and test.', release: 'not-authorized' } }
   const confirmation = JSON.stringify({ confirmed: true, brief })
@@ -53,6 +77,31 @@ it.each(['group', 'p2p'] as const)('answers the existing Harness question as the
   const { id } = await host.runTool(hub, 'orchestrator_handoff_confirm', { ...brief, confirmation })
   await host.idlePlanning()
   const planner = `planner-${id}`
+  return { hub, id, planner, brief }
+}
+
+it('does not send a question answered in Harness while Feishu delivery was validating the checkout', async () => {
+  const { id, brief } = await startPlanner()
+  const anchor = feishu('1', 'group topic')
+  await receive(anchor)
+  await bind(anchor.id)
+  await host.runtime.sendReplies()
+  const validating = Promise.withResolvers<void>(), resume = Promise.withResolvers<void>()
+  vi.spyOn(host.runtime.installation, 'validateWorkspace').mockImplementationOnce(async () => {
+    validating.resolve(); await resume.promise; return project.workspace
+  })
+  const handoffs = host.runtime.handoffs
+  const awaiting = handoffs.question(String(id), { text: 'Who may see a list?', why: 'Visibility is unspecified.', affectedAcceptance: brief.acceptanceScope })
+  const sending = host.runtime.sendReplies()
+  try {
+    await validating.promise
+    handoffs.answer(awaiting.id, awaiting.question!.id, 'Only the owner.')
+  } finally { resume.resolve(); await sending }
+  expect(messages().map(item => item.text).join('\n')).not.toMatch(/answer [\w-]+:/i)
+})
+
+it.each(['group', 'p2p'] as const)('answers the existing Harness question as the Feishu sender, only in the bound %s', async chatType => {
+  const { hub, id, planner, brief } = await startPlanner()
   await host.runTool(planner, 'orchestrator_spec_question', { handoffId: id, text: 'Who may see a saved list?',
     why: 'Visibility changes who can use a list.', affectedAcceptance: brief.acceptanceScope })
   const readHandoff = () => host.runTool(hub, 'orchestrator_read', { resource: `handoff/${id}` })
@@ -79,6 +128,10 @@ it.each(['group', 'p2p'] as const)('answers the existing Harness question as the
 
   const accepted = reply('15', `${prefix} ${answer}`)
   if (chatType === 'p2p') {
+    expect(await host.api('POST', 'executor/pause', { paused: true }, project.id)).toMatchObject({ status: 200 })
+    expect(await receive(accepted)).toBe('filtered')
+    expect(await readHandoff()).toMatchObject({ question: { status: 'awaiting' } })
+    expect(await host.api('POST', 'executor/pause', { paused: false }, project.id)).toMatchObject({ status: 200 })
     // An offline DM arrives via Feishu history, without a mention or a Ticket subscription.
     const ctx = host.runtime.context(feishuKind)
     const target = ctx.feishuTopic!.target()!

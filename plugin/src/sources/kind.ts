@@ -44,6 +44,8 @@ export interface ChannelLink { url: string; label: Localized; triggerId?: string
 export type ChannelLinks = Partial<Pick<Deployment, 'repository' | 'feishu'>>
 /** Outbound messaging adapter for a source kind's threads. */
 export interface SourceChannel<C> {
+  /** Declares text-only confirmation presentation. No channel can grant approval through this interface. */
+  readonly confirmation?: 'text-only'
   /** Whether a reply may still go to `address`; without it, every address may receive replies. */
   allowed?(address: Record<string, string>, config: C): boolean
   /**

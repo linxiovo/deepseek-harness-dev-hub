@@ -3,6 +3,8 @@ import { Commands } from '../src/infra/commands.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 import { feishuRead, readFeishu, readFeishuLink } from '../src/sources/feishu-read.ts'
 import type { FeishuRef } from '../src/sources/feishu-read.ts'
+import { pollBoundTopic } from '../src/sources/feishu.ts'
+import type { FeishuTopic, SourceContext } from '../src/sources/host.ts'
 const commands = new Commands(() => testDeployment(), {}, new AbortController().signal)
 const event: FeishuRef = { triggerId: 'source', chatId: 'oc_chat', messageId: 'om_source' }
 const source = { message_id: 'om_source', chat_id: 'oc_chat', parent_id: 'om_parent', root_id: 'om_root', thread_id: 'omt_thread' }
@@ -90,3 +92,34 @@ it('reads the chat around a message by time: five before it, the message and fiv
   expect('messages' in earlier && earlier.messages.map(message => message.id)).toEqual(['om_-7', 'om_-6'])
   expect(params(4)).toMatchObject({ page_token: 'older', page_size: 10 })
 })
+
+it.each(['bound', 'unbound while fetching', 'wrong root', 'aborted during replay', 'bot replaced during replay'] as const)(
+  'recovers competing group answers oldest first across pages: %s', async scenario => {
+    const topic: FeishuTopic = { epoch: 'epoch-1', sourceRevision: 1, since: new Date(1000).toISOString(),
+      chatId: 'oc_chat', direct: false, rootId: 'om_root' }
+    const deployment = testDeployment(), controller = new AbortController(), delivered: string[] = []
+    let bound = true
+    const ctx: Pick<SourceContext, 'commands' | 'deployment' | 'feishuTopic'> = { commands, deployment, feishuTopic: {
+      target: () => bound ? topic : undefined, report: vi.fn(), receive: async trigger => {
+        delivered.push(trigger.text)
+        if (scenario === 'aborted during replay') controller.abort()
+        if (scenario === 'bot replaced during replay') deployment.feishu!.botId = 'ou_replacement'
+        return 'stored'
+      },
+    } }
+    const item = (n: number, root = topic.rootId) => ({ message_id: `om_${n}`, chat_id: topic.chatId, thread_id: 'omt_thread', root_id: root,
+      sender: { id: 'ou_user', sender_type: 'user' }, create_time: String(n * 1000), body: { content: JSON.stringify({ text: `answer abcdefabcdefabcdefabcdef: ${n}` }) } })
+    const lark = vi.spyOn(Commands.prototype, 'lark').mockResolvedValueOnce({ items: [{ message_id: topic.rootId, chat_id: topic.chatId, thread_id: 'omt_thread' }] })
+      .mockResolvedValueOnce({ items: [item(3), item(2)], has_more: true, page_token: 'older' })
+      .mockImplementationOnce(async () => {
+        if (scenario === 'unbound while fetching') bound = false
+        return { items: [item(1, scenario === 'wrong root' ? 'om_elsewhere' : topic.rootId), item(0)], has_more: true, page_token: 'too-old' }
+      })
+    const recovered = pollBoundTopic(ctx, topic, controller.signal, topic.since, new Date(4000).toISOString())
+    if (scenario === 'wrong root') await expect(recovered).rejects.toThrow('outside the bound conversation')
+    else await expect(recovered).resolves.toBe(scenario === 'bound')
+    const expected = scenario === 'bound' ? [1, 2, 3] : scenario.endsWith('during replay') ? [1] : []
+    expect(delivered).toEqual(expected.map(n => `answer abcdefabcdefabcdefabcdef: ${n}`))
+    expect(lark).toHaveBeenCalledTimes(3) // The pre-cursor item on page two ends the descending scan.
+    expect(JSON.parse(lark.mock.calls[2]![0].at(-1)!)).toMatchObject({ page_token: 'older', sort_type: 'ByCreateTimeDesc' })
+  })

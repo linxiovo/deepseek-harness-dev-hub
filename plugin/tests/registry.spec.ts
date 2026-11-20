@@ -73,6 +73,23 @@ describe('Source registry', () => {
     expect(await sources.send(message('quiet'), commands)).toBe('gone')
     expect(sources.threadContext({ ...trigger, source: 'quiet' })).toBeUndefined()
   })
+  it('presents confirmation as a text summary and settings link for text-only or undeclared channels', () => {
+    const sources = new SourceRegistry(() => SettingsSchema.parse({}))
+    const channel = { send: async () => 'sent' as const, link: () => ({ url: '', label: probe.title }) }
+    const attrs = { summary: 'The project specification has been published.',
+      settingsLink: 'http://127.0.0.1:3082/?superagentProject=alpha&superagentView=settings' }
+    const link = '[Settings](http://127.0.0.1:3082/?superagentProject=alpha&superagentView=settings)'
+    const unregister = sources.register({ ...probe, channel: { ...channel, confirmation: 'text-only' } })
+    const textOnly = `The project specification has been published.\nReplies in this channel cannot grant approval. ${link}`
+    expect(sources.confirmationNotice(probe.kind, attrs)).toBe(textOnly)
+    sources.register(feishuKind)
+    expect(sources.confirmationNotice('feishu', attrs)).toBe(textOnly)
+    unregister()
+    sources.register({ ...probe, channel })
+    const fallback = `The project specification has been published.\nApprove only in Harness. ${link}`
+    expect(sources.confirmationNotice(probe.kind, attrs)).toBe(fallback)
+    expect(sources.confirmationNotice('uninstalled', attrs)).toBe(fallback)
+  })
   it('refuses a kind that declares a health entry another kind or dsh-superagent itself reports, and gives up its entries at unregister', () => {
     const board = new HealthBoard()
     // Pre-claim built-in health entries; sync:* entries are reserved for settings sync.

@@ -206,6 +206,8 @@ export class Runtime extends Service implements SourceHost {
             if (!this.topicBinding?.allows(message.channel)) return 'waiting'
             const revision = store.get(KV.settings.revision)
             await installation.validateWorkspace()
+            // Answering in Harness can withdraw the question while the checkout is being verified.
+            if (store.receipts.get(message.id)?.status !== 'pending') return 'waiting'
             if (!this.topicBinding.allows(message.channel) || revision !== store.get(KV.settings.revision)) return 'waiting'
           }
           return sources.send(message, deliveryCommands)
@@ -213,7 +215,7 @@ export class Runtime extends Service implements SourceHost {
       } })
       if (project) {
         const link = (view: 'project' | 'settings') => projectNavigationLink(`http://127.0.0.1:${ctx.webServer.port}`, project.id, view)
-        this.topicBinding = new TopicBinding({ store, handoffs, outbox, projectId: project.id,
+        this.topicBinding = new TopicBinding({ store, handoffs, outbox, sources, projectId: project.id,
           get projectLink() { return link('project') }, get settingsLink() { return link('settings') },
           available: () => this.topicBindingAvailable(), botIdentity: () => {
             const bot = setup.configured() ? setup.deployment.feishu : undefined
@@ -254,11 +256,7 @@ export class Runtime extends Service implements SourceHost {
           receive: (trigger, epoch) => this.receiveBoundFeishu(trigger, epoch), report: value => topicHealth.set(value) } } : {}),
         receive: (trigger, kind) => {
           if (sourceInactive()) throw new InstallationError(409, installation.transitioning() ? 'switching' : 'githubSetupRequired')
-          if (kind === FEISHU && trigger.source === FEISHU && this.topicBinding) {
-            if (this.topicBinding.matches(trigger)) return this.receiveBoundFeishu(trigger)
-            // A replay of a consumed message after unbinding is still not a generic request.
-            if (this.topicBinding.receive(trigger)) return 'filtered'
-          }
+          if (kind === FEISHU && this.topicBinding?.claims(trigger)) return this.receiveBoundFeishu(trigger)
           return passes.receive(trigger)
         } }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, settings: this.settings, assessor, resources, handoffs, plans, lifetime: this.lifetime,
@@ -332,13 +330,16 @@ export class Runtime extends Service implements SourceHost {
   }
   private async receiveBoundFeishu(trigger: Trigger, expectedEpoch?: string): Promise<ReceiveResult> {
     const binding = this.topicBinding
+    // Normal ingress has already classified protocol traffic. Exact polling gets no generic fallback.
+    if (this.closing() || !binding || (expectedEpoch !== undefined && !binding.claims(trigger))) return 'filtered'
     const target = this.feishuTopic()
-    if (!binding || (expectedEpoch !== undefined && target?.epoch !== expectedEpoch) || !binding.matches(trigger)) return 'filtered'
-    if (!target || trigger.human !== true || trigger.actor.source !== FEISHU
-      || !binding.view()?.allowedActors.includes(trigger.actor.id) || !(Date.parse(trigger.at) >= Date.parse(target.since))) {
+    if ((expectedEpoch !== undefined && target?.epoch !== expectedEpoch) || !binding.matches(trigger)) return 'filtered'
+    if (!binding.eligible(trigger)) {
       binding.discard(trigger)
       return 'filtered'
     }
+    // Pause or setup can recover on the same binding: don't mark the authorized message as consumed while unavailable.
+    if (!target) return 'filtered'
     await this.verifyTopicBinding()
     const current = this.feishuTopic()
     if (current?.epoch !== target.epoch || current.sourceRevision !== target.sourceRevision) {

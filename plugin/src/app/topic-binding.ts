@@ -5,6 +5,7 @@ import { KV } from '../kv.ts'
 import { feishuThreadId, feishuTriggerId, SOURCE } from '../sources/feishu-trigger.ts'
 import type { Handoffs } from './handoffs.ts'
 import type { Store } from './store.ts'
+import type { SourceRegistry } from '../sources/registry.ts'
 
 interface Target { chatId: string; direct: boolean; rootId?: string }
 interface Binding extends Target {
@@ -27,6 +28,7 @@ interface Options {
   projectId: string
   projectLink: string
   settingsLink: string
+  sources: Pick<SourceRegistry, 'confirmationNotice'>
   available: () => boolean
   botIdentity: () => string | undefined
 }
@@ -37,8 +39,11 @@ export class TopicBindingError extends Error {
 
 const chatIdPattern = /^oc_[A-Za-z0-9]+$/
 const messageIdPattern = /^om_[A-Za-z0-9_-]+$/
-const actorIdPattern = /^ou_[A-Za-z0-9]+$/
+export const actorIdPattern = /^ou_[A-Za-z0-9]+$/
 const replyPrefix = /^answer ([0-9a-f]{24}):/u
+const answerCommand = /^answer[ \t]+[^:\s]+[ \t]*:/iu
+const statusCommand = /^(?:status|状态)$/iu
+const STATUS = Symbol('status command')
 const approvalOnly = /^(?:同意|批准|确认批准|approve[d]?|i approve|agree[d]?|i agree)[.!。！]?$/iu
 
 function sameTarget(a: Target, b: Target): boolean {
@@ -117,7 +122,7 @@ export class TopicBinding {
       const record = { binding, botIdentity }
       store.set(KV.topicBinding.active, record)
       const current = handoffs.current(projectId)
-      this.notice(binding, 'binding', `Project topic bound. ${summary(current)} Use Harness settings for approvals.`)
+      this.notice(binding, 'binding', `Project topic bound. ${summary(current)}`)
       if (current?.status === 'awaiting') this.projectQuestion(record, current)
       return binding
     })
@@ -142,10 +147,39 @@ export class TopicBinding {
     return !!target && !!binding && sameTarget(binding, target)
   }
 
-  /** A read pinned to this binding was rejected before intake (e.g. unbind across an await). Its replay is not general work. */
+  /** Reserve reply syntax even across project switches; status and assent are reserved only in the bound conversation. */
+  claims(trigger: Trigger): boolean {
+    if (!targetOf(trigger)) return false
+    const text = trigger.text.trim()
+    return this.options.store.get(KV.topicBinding.received(trigger.id)) === true || answerCommand.test(text)
+      || ((statusCommand.test(text) || approvalOnly.test(text)) && this.matches(trigger))
+  }
+
+  /** A claimed protocol message rejected before intake (e.g. unbind across an await) must not replay as general work. */
   discard(trigger: Trigger): void {
     const target = targetOf(trigger)
     if (target && normalized(trigger, target)) this.options.store.set(KV.topicBinding.received(trigger.id), true)
+  }
+
+  /** Check identity and protocol without requiring availability, so a valid paused message remains recoverable. */
+  eligible(trigger: Trigger): boolean {
+    const record = this.active(), target = targetOf(trigger)
+    return !!record && !!target && this.command(trigger, target, record) !== undefined
+  }
+
+  private command(trigger: Trigger, target: Target, record: TopicBindingRecord): typeof STATUS | string | undefined {
+    const { store } = this.options, { binding, pending } = record
+    const botIdentity = this.options.botIdentity()
+    if (!sameTarget(target, binding) || !normalized(trigger, target) || trigger.human !== true || !binding.allowedActors.includes(trigger.actor.id)
+      || trigger.meta.botIdentity !== record.botIdentity || (botIdentity !== undefined && record.botIdentity !== botIdentity)
+      || !(Date.parse(trigger.at) >= Date.parse(binding.boundAt)) || store.triggers.get(trigger.id)
+      || store.get(KV.topicBinding.received(trigger.id))) return undefined
+    const text = trigger.text.trim()
+    if (statusCommand.test(text)) return STATUS
+    const reply = replyPrefix.exec(text)
+    if (!reply || !pending || reply[1] !== pending.token) return undefined
+    const answer = text.slice(reply[0].length).trim()
+    return answer && !approvalOnly.test(answer) ? answer : undefined
   }
 
   /** Separate from generic chat scope. Outbox rechecks this immediately before sending an epoch-tagged receipt. */
@@ -185,43 +219,37 @@ export class TopicBinding {
   /** True means consumed (including rejection). Only an explicit participant's fresh, correlated clarification reaches Handoffs.answer. */
   receive(trigger: Trigger): boolean {
     const target = targetOf(trigger)
-    if (!target) return false
+    if (!target || !this.claims(trigger)) return false
     const { store, handoffs, projectId } = this.options
     return store.atomic(() => {
       const receipt = KV.topicBinding.received(trigger.id)
       if (store.get(receipt)) return true
       const record = this.active()
-      if (!record || !sameTarget(target, record.binding)) {
-        // Protocol traffic for a retired or differently mounted binding must never become a general request.
-        return replyPrefix.test(trigger.text.trimStart())
-      }
+      if (!record || !sameTarget(target, record.binding)) return true
+      const command = this.command(trigger, target, record)
+      if (command && !this.available(record)) return true // Leave eligible replies for the next exact poll.
       store.set(receipt, true) // Do not store rejected message text in the general Trigger timeline.
-      if (!normalized(trigger, target) || trigger.human !== true || !record.binding.allowedActors.includes(trigger.actor.id) ||
-          !this.available(record) || trigger.meta.botIdentity !== record.botIdentity || store.triggers.get(trigger.id)) return true
-      const text = trigger.text.trim()
-      if (/^(?:status|状态)$/iu.test(text)) {
-        if (Date.parse(trigger.at) >= Date.parse(record.binding.boundAt)) this.notice(record.binding, `status:${trigger.id}`, summary(handoffs.current(projectId)))
+      if (!command) return true
+      if (command === STATUS) {
+        this.notice(record.binding, `status:${trigger.id}`, summary(handoffs.current(projectId)))
         return true
       }
-      const reply = replyPrefix.exec(text), pending = record.pending
-      if (!reply || !pending || reply[1] !== pending.token) return true
-      const answer = text.slice(reply[0].length).trim()
-      if (!answer || approvalOnly.test(answer)) return true
+      const pending = record.pending! // A valid answer identified this pending question's token.
       const current = handoffs.current(projectId)
       if (current?.id === pending.handoffId && current.status === 'awaiting' && current.question?.id === pending.questionId && current.question.status === 'awaiting') {
-        handoffs.answer(current.id, pending.questionId, answer, { source: SOURCE, actorId: trigger.actor.id, triggerId: trigger.id })
+        handoffs.answer(current.id, pending.questionId, command, { source: SOURCE, actorId: trigger.actor.id, triggerId: trigger.id })
       }
       return true
     })
   }
 
   private notice(binding: Binding, event: string, text: string): string {
-    const { outbox, projectLink, settingsLink } = this.options
+    const { outbox, projectLink, settingsLink, sources } = this.options
     const id = key('topic-binding', binding.epoch, event)
     const address = { chatId: binding.chatId, bindingEpoch: binding.epoch, ...(binding.direct ? { direct: 'true', delivery: 'direct-chat' }
       : { messageId: binding.rootId!, delivery: 'group-topic' }) }
     outbox.send({ id, kind: 'notice', channel: { source: SOURCE, thread: `feishu:${binding.chatId}`, address },
-      text: `${text}\n[Project](${projectLink}) · [Settings](${settingsLink})` })
+      text: `${sources.confirmationNotice(SOURCE, { summary: text, settingsLink })} · [Project](${projectLink})` })
     return id
   }
 }

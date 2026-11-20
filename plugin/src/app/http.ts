@@ -22,7 +22,7 @@ import type { Sessions } from './sessions.ts'
 import type { SessionMeter } from './session-meter.ts'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
-import { TopicBindingError, type TopicBinding } from './topic-binding.ts'
+import { actorIdPattern, TopicBindingError, type TopicBinding } from './topic-binding.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
 import type { Variable } from './execution-environment.ts'
 import { policyHistory } from './settings-history.ts'
@@ -166,7 +166,7 @@ const nonBlank = z.string().refine(value => value.trim().length > 0 && !/[\u0000
 const VerifyRequest = z.strictObject({ cli: nonBlank })
 const CreateProjectRequest = z.strictObject({ repository: nonBlank, workspace: nonBlank, baseRef: nonBlank,
   policy: PolicyConfigSchema.optional() })
-const TopicBindingRequest = z.strictObject({ triggerId: nonBlank, allowedActors: z.array(z.string().regex(/^ou_[A-Za-z0-9]+$/)) })
+const TopicBindingRequest = z.strictObject({ triggerId: nonBlank, allowedActors: z.array(z.string().regex(actorIdPattern)) })
 
 function installationInput<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value)

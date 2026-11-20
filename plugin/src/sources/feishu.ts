@@ -59,6 +59,7 @@ export const feishuKind: SourceKind<FeishuConfig> = {
   },
   // A reply goes only to a chat the Source still receives.
   channel: {
+    confirmation: 'text-only',
     allowed: (address, config) =>
       feishuKind.scope!({ meta: { chatId: address.chatId ?? '', direct: address.direct === 'true' } }, config).listened,
     send: sendFeishu, link: feishuLink,

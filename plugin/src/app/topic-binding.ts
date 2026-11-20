@@ -147,12 +147,12 @@ export class TopicBinding {
     return !!target && !!binding && sameTarget(binding, target)
   }
 
-  /** Reserve reply syntax even across project switches; status and assent are reserved only in the bound conversation. */
+  /** Issued answer codes must not become Ticket work after unbinding. Reserve other commands only at the bound target. */
   claims(trigger: Trigger): boolean {
     if (!targetOf(trigger)) return false
     const text = trigger.text.trim()
-    return this.options.store.get(KV.topicBinding.received(trigger.id)) === true || answerCommand.test(text)
-      || ((statusCommand.test(text) || approvalOnly.test(text)) && this.matches(trigger))
+    return this.options.store.get(KV.topicBinding.received(trigger.id)) === true || replyPrefix.test(text)
+      || ((answerCommand.test(text) || statusCommand.test(text) || approvalOnly.test(text)) && this.matches(trigger))
   }
 
   /** A claimed protocol message rejected before intake (e.g. unbind across an await) must not replay as general work. */

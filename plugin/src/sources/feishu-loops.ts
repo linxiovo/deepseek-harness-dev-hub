@@ -207,7 +207,7 @@ export async function backfillChat(ctx: SourceContext, chatId: string, direct: b
         const at = feishuTime(message.create_time)
         if (message.thread_id && !(Date.parse(topics[message.thread_id] ?? '') >= Date.parse(at))) topics[message.thread_id] = at
         const trigger = feishuTrigger(historyEvent(message, chatId, direct), bot(ctx).botId, bot(ctx).appId)
-        if (trigger) await receive(ctx, trigger)
+        if (trigger && !ctx.feishuTopic?.claims(trigger)) await receive(ctx, trigger)
       }
       const stuck = result.has_more && (!result.page_token || pages.has(result.page_token))
       if (stuck) throw new Error('Feishu history pagination did not advance')
@@ -372,7 +372,7 @@ async function pollThread(ctx: SourceContext, thread: Thread, signal?: AbortSign
       if (signal?.aborted) return
       const trigger = feishuTrigger(topicEvent(message, ref.chatId, direct, root), botId, appId)
       // Ignore messages older than the thread subscription on initial poll.
-      if (!trigger || (!initialized && Date.parse(trigger.at) < since)) continue
+      if (!trigger || (!initialized && Date.parse(trigger.at) < since) || ctx.feishuTopic?.claims(trigger)) continue
       await receive(ctx, trigger)
     }
     result.messages.forEach(message => known.add(message.message_id))

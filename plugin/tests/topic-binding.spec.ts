@@ -46,6 +46,8 @@ it('confirms only the selected topic once, including after a restart and retry',
 
 it('preserves ordinary Source follow-ups and stops for a Ticket in the bound topic', async () => {
   const { trigger: anchor, ticket } = await host.acceptedTicket(feishu('1', '@bot Fix the regression'))
+  const beforeBinding = feishu('6', 'Answer export: use CSV.', { root_id: 'om_1', mentions: [] })
+  await receive(beforeBinding)
   await bind(anchor.id)
   const ctx = host.runtime.context(feishuKind)
   const binding = ctx.feishuTopic!.target()!
@@ -59,6 +61,7 @@ it('preserves ordinary Source follow-ups and stops for a Ticket in the bound top
   await receive(invalid)
   const details = await host.api('GET', `tickets/${ticket.id}`, undefined, project.id)
   expect(details).toMatchObject({ status: 200, body: { inputs: expect.arrayContaining([
+    expect.objectContaining({ triggerId: beforeBinding.id }),
     expect.objectContaining({ triggerId: bot.id }), expect.objectContaining({ triggerId: followup.id }),
   ]) } })
   expect(details.body.inputs).not.toContainEqual(expect.objectContaining({ triggerId: invalid.id }))

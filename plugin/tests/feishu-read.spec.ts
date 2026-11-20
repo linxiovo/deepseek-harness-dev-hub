@@ -100,6 +100,7 @@ it.each(['bound', 'unbound while fetching', 'wrong root', 'aborted during replay
     const deployment = testDeployment(), controller = new AbortController(), delivered: string[] = []
     let bound = true
     const ctx: Pick<SourceContext, 'commands' | 'deployment' | 'feishuTopic'> = { commands, deployment, feishuTopic: {
+      claims: () => true,
       target: () => bound ? topic : undefined, report: vi.fn(), receive: async trigger => {
         delivered.push(trigger.text)
         if (scenario === 'aborted during replay') controller.abort()

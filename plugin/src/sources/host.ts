@@ -52,6 +52,8 @@ export interface SourceContext {
   /** Independent of generic chat subscriptions. A fetch pinned to an epoch must never fall through to Engine intake. */
   feishuTopic?: {
     target(): FeishuTopic | undefined
+    /** Historical protocol messages belong to the ordered binding poll, not a subscribed Ticket's paged reader. */
+    claims(trigger: Trigger): boolean
     receive(trigger: Trigger, epoch: string): Promise<ReceiveResult>
     report(health: Health): void
   }

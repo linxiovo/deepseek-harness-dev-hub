@@ -253,6 +253,7 @@ export class Runtime extends Service implements SourceHost {
         get deployment() { return setup.deployment }, configured: () => this.configured(), closing: sourceInactive,
         get setupProblem() { return runtime.setupProblem }, get feishuProblem() { return setup.feishuProblem },
         ...(topicHealth ? { feishuTopic: { target: () => this.feishuTopic(),
+          claims: trigger => this.topicBinding?.claims(trigger) === true,
           receive: (trigger, epoch) => this.receiveBoundFeishu(trigger, epoch), report: value => topicHealth.set(value) } } : {}),
         receive: (trigger, kind) => {
           if (sourceInactive()) throw new InstallationError(409, installation.transitioning() ? 'switching' : 'githubSetupRequired')

@@ -131,11 +131,14 @@ describe('feishu source', () => {
       lastAt: new Date().toISOString() })
     const reply = { message_id: 'om_reply', chat_id: 'oc_1', msg_type: 'text', content: 'more details', sender: { id: 'ou_guest', sender_type: 'user' }, create_time: '1757376000000', thread_id: 'omt_1', root_id: 'om_root', mentions: [] }
     const mine = { ...reply, message_id: 'om_mine', sender: { id: 'ou_bot', sender_type: 'app', open_bot_id: 'ou_bot' } }
+    const pendingAnswer = { ...reply, message_id: 'om_answer', content: 'answer abcdefabcdefabcdefabcdef: later answer' }
+    // The exact binding poll orders answers across history pages; a Ticket subscription must not race that replay.
+    Object.assign(h, { feishuTopic: { claims: (item: Trigger) => item.text === pendingAnswer.content } })
     const earlier = { ...reply, message_id: 'om_old', create_time: '1700000000000' }
     const lark = vi.spyOn(h.commands, 'lark').mockImplementation(async args => {
       if (args[0] === 'api') return { items: [{ message_id: 'om_root', chat_id: 'oc_1', thread_id: 'omt_1' }] }
       if (args[1] === '+messages-mget') return { messages: [] }
-      return { thread_id: 'omt_1', has_more: false, messages: [mine, reply, earlier] }
+      return { thread_id: 'omt_1', has_more: false, messages: [pendingAnswer, mine, reply, earlier] }
     })
     await pollFeishuThreads(h)
     expect(h.receive).toHaveBeenCalledTimes(1)

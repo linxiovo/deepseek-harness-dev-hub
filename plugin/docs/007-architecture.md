@@ -317,7 +317,7 @@ Validation: `tests/session-meter.spec.ts` covers the read seam (absent vs corrup
 - **Explicit, narrow dependencies.** Each class receives an interface that names what it uses, mostly as `Pick` types of other classes: `ExecutorHost`, `AssessorHost`, `SessionsHost`, `SettingsHost`, `SetupHost`, `PassesHost` and `OutboxHost` for the core classes, and `HttpHost`, `MainToolsHost`, `ExecutorToolsHost`, `ResourceHost`, `LinkHost` and `SourceContextDeps` for the glue, with the Engine as the `Pick` of the role that calls it. The Runtime passes itself only behind such an interface. A Source plugin injects the `orchestrator` service, which its type names as a `SourceHost`: the registry and `context(kind)`; its kind's code sees only its `SourceContext`.
 - **What may import what.** `src/core` imports nothing outside itself apart from Node's hashing, and does no I/O. `src/sources` imports nothing from `src/app`. The panel imports only types from the host side, and the plain values of `src/admission.ts`, `src/limits.ts`, `src/setup.ts`, `src/navigation.ts`, `src/sources/host.ts`, `src/core/errors.ts`, `src/core/reasons.ts` and the filter lists of `src/app/api.ts`.
 
-  `scripts/check-core-imports.mjs` runs first in `pnpm check` as `check:core`. It parses TypeScript module references and allows only relative paths that stay inside `src/core` and the `node:crypto` hashing exception. Runtime `import()` is disallowed even for those targets. See `tests/core-imports.spec.ts` for the command's boundary cases.
+  `scripts/check-imports.mjs` parses TypeScript module references in `src/core` and `src/sources`. In core, only relative paths within core and the `node:crypto` hashing exception are allowed; runtime `import()` is always rejected. In Sources, direct paths into `src/app` are rejected after path normalization, including in type-only imports, re-exports, `import()` and `require`. Computed module references are rejected because the gate cannot resolve their targets.
 
 - **One writer per state.** Each kind of state has one writer, and the others read it or ask that writer.
 
@@ -491,7 +491,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | Test | Covers |
 | --- | --- |
 | `tests/core-engine.spec.ts` | Domain rules on in-memory repositories: receiving, Eval, fan-out, resume and stop, interrupted Assignments, the pause, Policy changes, reports and outcomes, attaching, replies, take-up, failed deliveries and dismissed problems |
-| `tests/core-imports.spec.ts` | The core boundary command: internal paths and `node:crypto` pass; paths escaping core, other built-ins, packages, and dynamic `import()` fail; type imports, re-exports and `require` are also checked |
+| `tests/import-boundaries.spec.ts` | The import gate: core's hashing and internal-path exceptions, Source paths into and outside app, and module reference forms including type imports, re-exports, `import()` and `require` |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
@@ -517,6 +517,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/delivery.spec.ts` | `AgentDelivery` |
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
+| `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
 | `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |

@@ -8,14 +8,19 @@ Run focused checks from `plugin/` as soon as the change is runnable. Pass the re
 
 | Change | Existing checks |
 | --- | --- |
+| New class or source module | Run `pnpm test tests/class-docs.spec.ts tests/docs.spec.ts` before the full check. Fix missing class JSDoc and missing module or test index entries before proceeding. |
+| Source imports or import boundary gate | `pnpm check:imports` on the current sources; when changing the gate itself, also run `pnpm test tests/import-boundaries.spec.ts`. |
 | Session tool or model-facing schema | `tests/tools.spec.ts` for public behavior and role boundaries; `tests/model-surface.spec.ts` for the registered surface and prompt budget |
 | Bundled skill or prompt registration | `tests/prompts.spec.ts`, `tests/model-surface.spec.ts`, `tests/tools.spec.ts` and `tests/panel-prompts.spec.tsx` for role scope, resource inventory and settings labels |
 | Doc Tree routes or committed-candidate inspection | `tests/docs.spec.ts` for this repository's navigation and source/test index; `tests/doc-tree.spec.ts` for Git snapshots and target-repository navigation |
+| Project selection or crash recovery | `pnpm test tests/runtime-crash.spec.ts`; for a deployed headless host, record the [live connection smoke check](006-deployment.md#live-headless-connection-smoke-check) separately. |
 
 ## Pin the candidate and review
 
 1. Finish all writes, including delegated edits, before validation and review. Record the base and candidate as full commit SHAs. Run candidate checks in a clean checkout of that candidate so local edits cannot affect the result.
 2. Give both independent reviewers the same pair and the command `git diff <base-sha> <candidate-sha>`. Give the standards reviewer the applicable repository guidance and the spec reviewer the ticket and acceptance references. Neither conclusion substitutes for the other. The full local check can run in parallel on the clean candidate; see [development checks](006-deployment.md#development-checks) for the command and for matching CI evidence to the PR head.
+
+   Leave worktree ownership and recovery semantics to the review agents. Passing static checks does not establish who may reuse a worktree or what happens when execution resumes after an interruption.
 3. After an amendment or a base move, pin the new pair, rerun affected checks and have both reviewers assess the new diff. Prior findings are context, not sign-off on the new pair. Before merging, confirm that the reviews cover that pair and the required CI results cover the final PR head. After an interruption, check the actual Git and PR state before reusing any result.
 
 ## Handoff evidence

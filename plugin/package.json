@@ -46,10 +46,10 @@
   },
   "scripts": {
     "build": "tsdown",
-    "check:core": "node scripts/check-core-imports.mjs",
+    "check:imports": "node scripts/check-imports.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "pnpm check:core && pnpm typecheck && pnpm test && pnpm build",
+    "check": "node scripts/check.mjs",
     "hooks:install": "node scripts/install-hooks.mjs",
     "verify:linux": "node scripts/verify-linux.mjs"
   },

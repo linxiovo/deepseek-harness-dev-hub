@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, mkdirSync, realpathSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -25,11 +25,26 @@ if (configuredPaths.some((value) => comparable(value) !== comparable(hooksDirect
   throw new Error(`Refusing to replace an existing core.hooksPath: ${configuredPaths.join(', ')}`);
 }
 
+const dispatcher = [
+  '#!/bin/sh',
+  'set -eu',
+  'repo_root=$(git rev-parse --show-toplevel)',
+  'cd "$repo_root"',
+  'exec sh "plugin/.githooks/${0##*/}" "$@"',
+  '',
+].join('\n');
+
 mkdirSync(hooksDirectory, { recursive: true });
-for (const name of ['pre-commit', 'commit-msg']) {
-  const destination = join(hooksDirectory, name);
-  copyFileSync(join(repositoryRoot, 'plugin', '.githooks', name), destination);
-  chmodSync(destination, 0o755);
+const stagingDirectory = mkdtempSync(join(hooksDirectory, '.install-'));
+try {
+  for (const name of ['pre-commit', 'commit-msg']) {
+    const staged = join(stagingDirectory, name);
+    writeFileSync(staged, dispatcher);
+    chmodSync(staged, 0o755);
+    renameSync(staged, join(hooksDirectory, name));
+  }
+} finally {
+  rmSync(stagingDirectory, { recursive: true, force: true });
 }
 execFileSync('git', ['-C', repositoryRoot, 'config', '--local', 'core.hooksPath', hooksDirectory], {
   stdio: 'inherit',

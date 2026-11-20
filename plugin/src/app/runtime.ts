@@ -29,12 +29,14 @@ import { evalsHealth } from './views/overview.ts'
 import { TextCache } from './cache.ts'
 import { Effects } from './effects.ts'
 import { Handoffs } from './handoffs.ts'
+import { TopicBinding } from './topic-binding.ts'
 import { Installation, projectDatabase, projectHubId } from './installation.ts'
 import { InstallationError } from './installation-api.ts'
 import { Planning } from './planning.ts'
 import { Plans } from './plans.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
+import { projectNavigationLink } from '../navigation.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
@@ -43,8 +45,8 @@ import { HealthBoard } from '../infra/health.ts'
 import { Outbox } from './outbox.ts'
 import { Passes } from './passes.ts'
 import { Setup } from './setup.ts'
-import { feishuSettings } from '../sources/feishu.ts'
-import { health, type Health, type SourceContext, type SourceHost } from '../sources/host.ts'
+import { feishuSettings, SOURCE as FEISHU } from '../sources/feishu.ts'
+import { health, type FeishuTopic, type Health, type SourceContext, type SourceHost } from '../sources/host.ts'
 import { SessionMeter } from './session-meter.ts'
 import { Sessions, splitterSessionId } from './sessions.ts'
 import { Settings } from './settings.ts'
@@ -70,6 +72,7 @@ export class Runtime extends Service implements SourceHost {
   readonly prompts: Prompts
   readonly effects: Effects
   readonly handoffs: Handoffs
+  readonly topicBinding?: TopicBinding
   readonly plans: Plans
   readonly planning: Planning
   readonly sources: SourceRegistry
@@ -93,6 +96,7 @@ export class Runtime extends Service implements SourceHost {
   private releaseLock?: () => Promise<void>
   private closingFlag = false
   private recoveryPending = false
+  private setupFeishuCli?: string
   private stopping?: Promise<void>
   private readonly sourceDeps: SourceContextDeps
   private readonly toolHost: MainToolsHost & ExecutorToolsHost & PlannerToolsHost & SplitterToolsHost
@@ -144,7 +148,8 @@ export class Runtime extends Service implements SourceHost {
       const meter = this.meter = new SessionMeter({ context: ctx, store, lifetime: this.lifetime })
       const board = this.board
       const effects = this.effects = new Effects(store, board)
-      const handoffs = this.handoffs = new Handoffs(store, effects, project, () => installation.assertNewWork())
+      const handoffs = this.handoffs = new Handoffs(store, effects, project, () => installation.assertNewWork(),
+        handoff => this.topicBinding?.changed(handoff))
       const plans = this.plans = new Plans(store, handoffs, effects)
       const sources = this.sources = new SourceRegistry(() => store.settings(), board, kind => {
         // Sync source member lists once startup completes when a source plugin loads dynamically.
@@ -193,7 +198,29 @@ export class Runtime extends Service implements SourceHost {
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
-      const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused() })
+      const outbox = this.outbox = new Outbox({ store, effects, commands, paused: () => this.paused(), sources: {
+        instance: sources.instance.bind(sources), channelAllowed: channel => channel.address.bindingEpoch !== undefined
+          ? channel.source === FEISHU : sources.channelAllowed(channel),
+        send: async (message, deliveryCommands) => {
+          if (message.channel.address.bindingEpoch !== undefined) {
+            if (!this.topicBinding?.allows(message.channel)) return 'waiting'
+            const revision = store.get(KV.settings.revision)
+            await installation.validateWorkspace()
+            if (!this.topicBinding.allows(message.channel) || revision !== store.get(KV.settings.revision)) return 'waiting'
+          }
+          return sources.send(message, deliveryCommands)
+        },
+      } })
+      if (project) {
+        const link = (view: 'project' | 'settings') => projectNavigationLink(`http://127.0.0.1:${ctx.webServer.port}`, project.id, view)
+        this.topicBinding = new TopicBinding({ store, handoffs, outbox, projectId: project.id,
+          get projectLink() { return link('project') }, get settingsLink() { return link('settings') },
+          available: () => this.topicBindingAvailable(), botIdentity: () => {
+            const bot = setup.configured() ? setup.deployment.feishu : undefined
+            return bot && `${bot.appId}:${bot.botId}`
+          },
+        })
+      }
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor, ...(project ? { projectId: project.id } : {}),
@@ -219,10 +246,19 @@ export class Runtime extends Service implements SourceHost {
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
         health: this.runtimeHealth, lifetime: this.lifetime, configured: () => this.configured(), closing: () => this.closing() })
       const sourceInactive = () => this.closing() || !installation.github
+      const topicHealth = project ? board.claim('feishuBinding') : undefined
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
         get deployment() { return setup.deployment }, configured: () => this.configured(), closing: sourceInactive,
-        get setupProblem() { return runtime.setupProblem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => {
+        get setupProblem() { return runtime.setupProblem }, get feishuProblem() { return setup.feishuProblem },
+        ...(topicHealth ? { feishuTopic: { target: () => this.feishuTopic(),
+          receive: (trigger, epoch) => this.receiveBoundFeishu(trigger, epoch), report: value => topicHealth.set(value) } } : {}),
+        receive: (trigger, kind) => {
           if (sourceInactive()) throw new InstallationError(409, installation.transitioning() ? 'switching' : 'githubSetupRequired')
+          if (kind === FEISHU && trigger.source === FEISHU && this.topicBinding) {
+            if (this.topicBinding.matches(trigger)) return this.receiveBoundFeishu(trigger)
+            // A replay of a consumed message after unbinding is still not a generic request.
+            if (this.topicBinding.receive(trigger)) return 'filtered'
+          }
           return passes.receive(trigger)
         } }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, settings: this.settings, assessor, resources, handoffs, plans, lifetime: this.lifetime,
@@ -271,6 +307,46 @@ export class Runtime extends Service implements SourceHost {
   private closing(): boolean { return this.closingFlag || this.lifetime.aborted || this.installation.transitioning() }
   /** Hold evaluation, dispatch, and outbound delivery while paused or awaiting setup; sources still record incoming triggers. */
   private paused(): boolean { return this.closing() || !this.configured() || this.store.settings().paused }
+  private topicBindingAvailable(): boolean {
+    if (this.paused() || !this.installation.project || !this.deployment.feishu) return false
+    const instance = this.sources.instance(FEISHU)
+    return instance?.enabled === true && instance.config.cli === this.setupFeishuCli
+  }
+  private feishuTopic(): FeishuTopic | undefined {
+    if (this.closing()) return undefined
+    const target = this.topicBinding?.pollTarget()
+    if (target && target.projectId === this.installation.project?.id)
+      return { epoch: target.epoch, since: target.boundAt, chatId: target.chatId, direct: target.direct,
+        sourceRevision: this.store.blockRevision(`source:${FEISHU}`),
+        ...(target.rootId ? { rootId: target.rootId } : {}) }
+    return undefined
+  }
+  /** Verify the mounted checkout as well as the Feishu setup before accepting a bound ingress or creating a binding. */
+  private async verifyTopicBinding(): Promise<void> {
+    this.installation.assertNewWork()
+    if (!this.topicBindingAvailable()) throw new InstallationError(409, 'projectSetupRequired', 'Enable the verified Feishu Source first.')
+    const revision = this.store.get(KV.settings.revision)
+    await this.installation.validateWorkspace()
+    this.installation.assertNewWork()
+    if (!this.topicBindingAvailable() || revision !== this.store.get(KV.settings.revision)) throw new InstallationError(409, 'staleProject')
+  }
+  private async receiveBoundFeishu(trigger: Trigger, expectedEpoch?: string): Promise<ReceiveResult> {
+    const binding = this.topicBinding
+    const target = this.feishuTopic()
+    if (!binding || (expectedEpoch !== undefined && target?.epoch !== expectedEpoch) || !binding.matches(trigger)) return 'filtered'
+    if (!target || trigger.human !== true || trigger.actor.source !== FEISHU
+      || !binding.view()?.allowedActors.includes(trigger.actor.id) || !(Date.parse(trigger.at) >= Date.parse(target.since))) {
+      binding.discard(trigger)
+      return 'filtered'
+    }
+    await this.verifyTopicBinding()
+    const current = this.feishuTopic()
+    if (current?.epoch !== target.epoch || current.sourceRevision !== target.sourceRevision) {
+      if (!this.closing() && binding.view()?.epoch !== target.epoch) binding.discard(trigger)
+      return 'filtered'
+    }
+    return binding.receive(trigger) ? 'stored' : 'filtered'
+  }
   private recoverable() {
     return {
       assignments: this.store.tickets.open().filter(ticket => latestAssignment(ticket)?.state !== 'ended').length,
@@ -303,7 +379,9 @@ export class Runtime extends Service implements SourceHost {
         return
       }
     }
-    if ((this.installation.project && !this.installation.github) || !await this.setup.run(this.store.settings())) {
+    const settings = this.store.settings()
+    this.setupFeishuCli = String(settings.sources[FEISHU]?.config.cli ?? '').trim()
+    if ((this.installation.project && !this.installation.github) || !await this.setup.run(settings)) {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
       return
     }
@@ -350,6 +428,7 @@ export class Runtime extends Service implements SourceHost {
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, setup, passes, installation,
       meter } = this
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, meter, installation,
+      topicBinding: this.topicBinding, verifyTopicBinding: () => this.verifyTopicBinding(),
       get ready() { return runtime.ready }, assertNewWork: () => installation.assertNewWork(),
       ownsSession: id => this.ownsSession(id),
       get deployment() { return setup.deployment },

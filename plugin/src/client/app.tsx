@@ -1,6 +1,7 @@
 /** Root panel shell: header with global search and glossary, top-level navigation tabs, and active route view. */
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import type { SearchView } from './api.ts'
+import { projectNavigation, type ProjectNavigation } from '../navigation.ts'
+import { usePoll, type SearchView } from './api.ts'
 import { Button, Dot, Icon, Input, Modal, SegmentedTabs } from './controls.tsx'
 import type { DeploymentForm } from './deployment.tsx'
 import { EvalStatus } from './eval.tsx'
@@ -138,12 +139,42 @@ function Header({ masterId }: { masterId: string | undefined }) {
   </header>
 }
 
-function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab: Tab) => void; deploymentForm: DeploymentForm }) {
+/** Opening a link never changes the mounted project. An operator can explicitly select the exact linked project. */
+function LinkedProject({ target }: { target: ProjectNavigation }) {
+  const { t, call, restart, notify } = usePanel()
+  const { reload } = usePanelData()
+  const { data, error } = usePoll(() => call('GET projects'), [call])
+  const [selecting, setSelecting] = useState(false)
+  const project = data?.projects.find(item => item.id === target.projectId)
+  const select = async () => {
+    if (!project || selecting) return
+    setSelecting(true)
+    try {
+      const result = await call('POST projects/:projectId/select', { projectId: project.id })
+      if (result.restarting) restart()
+      else await reload()
+    } catch (failure) { notify(errorText(failure)); setSelecting(false) }
+  }
+  return <main className="dt-page"><div className="dt-column">
+    <h1>{t('title')}</h1>
+    {error ? <p role="alert">{error.message}</p> : !data ? <p role="status">{t('loading')}</p> : project
+      ? <><p>{t('linkedProjectInactive', { repository: project.repository })}</p>
+        <Button variant="primary" disabled={selecting} onClick={() => { void select() }}>{t('linkedProjectSelect')}</Button></>
+      : <p role="alert">{t('linkedProjectMissing')}</p>}
+  </div></main>
+}
+
+function Pages({ route, openTab, deploymentForm, target }: { route: Route; openTab: (tab: Tab) => void; deploymentForm: DeploymentForm;
+  target?: ProjectNavigation | undefined }) {
   const { t } = usePanel()
   const { state, error, reload } = usePanelData()
   // Keep the active tab scrolled into view on narrow screens when routes change via links.
   useEffect(() => { document.getElementById(`dt-tab-${route.page}`)?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }) }, [route.page])
   const waiting = error ? <p className="dt-error" role="alert">{error.message}</p> : <p className="dt-hint">{t('loading')}</p>
+  if (target) {
+    if (!state || error) return <main className="dt-page">{waiting}</main>
+    if (state.projectId !== target.projectId) return <LinkedProject target={target} />
+  }
   const page = (() => {
     switch (route.page) {
       case 'overview': return <OverviewPage />
@@ -171,7 +202,9 @@ function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab
 
 /** Root panel component managing route history and shared panel state. */
 export function App({ t, openSession, deploymentForm }: AppProps) {
-  const [location, setLocation] = useState(initialLocation)
+  const [target] = useState(() => projectNavigation(window.location.search))
+  const [location, setLocation] = useState<Location>(() => target ? { stack: [],
+    route: target.view === 'settings' ? settingsRoute('source', { source: 'feishu' }) : HOME } : initialLocation())
   useEffect(() => { remember(location) }, [location])
   // Preserve the last opened settings group across navigation so the Settings tab reopens at it.
   const move = useCallback((next: (current: Location) => Pick<Location, 'route' | 'stack'>) =>
@@ -183,6 +216,6 @@ export function App({ t, openSession, deploymentForm }: AppProps) {
   const openTab = useCallback((tab: Tab) => move(current => ({ stack: [], route: tab === 'settings'
     ? settingsRoute(lastSettingsGroup(current)) : { page: tab, id: undefined } })), [move])
   return <PanelProvider t={t} openSession={openSession} navigate={navigate} back={back} backLabel={routeLabel(t, location.stack.at(-1) ?? HOME)}>
-    <Pages route={location.route} openTab={openTab} deploymentForm={deploymentForm} />
+    <Pages route={location.route} openTab={openTab} deploymentForm={deploymentForm} target={target} />
   </PanelProvider>
 }

@@ -8,16 +8,16 @@ import { threadKey, type Thread, type Trigger } from '../core/index.ts'
 import { feishuChatLink } from './feishu-channel.ts'
 import type { FeishuBot } from '../deployment.ts'
 import { batchInvocation, validItems, type Tally } from '../infra/commands.ts'
-import { readFeishu, type FeishuRef } from './feishu-read.ts'
+import { feishuBoundThread, readFeishu, type FeishuRef } from './feishu-read.ts'
 import { feishuRef, feishuTime, feishuTrigger, HistoricalMessageSchema, historyEvent, HistoryPageSchema, SOURCE, topicEvent }
   from './feishu-trigger.ts'
-import { health, type SourceContext } from './host.ts'
+import { health, type FeishuTopic, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
 import { cursorAt, POLL_HORIZON_MS, polled, pollThreads as pollEach } from './poll.ts'
 import type { FeishuConfig } from './feishu.ts'
 
 export const runFeishu = (ctx: SourceContext, signal: AbortSignal): Promise<unknown> =>
-  Promise.allSettled([watch, backfillLoop, chatNamesLoop].map(loop => loop(ctx, signal)))
+  Promise.allSettled([watch, backfillLoop, chatNamesLoop, ...(ctx.feishuTopic ? [boundTopicLoop] : [])].map(loop => loop(ctx, signal)))
 const enabled = (ctx: SourceContext): FeishuConfig | undefined => ctx.config<FeishuConfig>(SOURCE)
 const bot = (ctx: SourceContext): FeishuBot => {
   const resolved = ctx.deployment.feishu
@@ -25,7 +25,7 @@ const bot = (ctx: SourceContext): FeishuBot => {
   return resolved
 }
 async function receive(ctx: SourceContext, trigger: Trigger): Promise<void> {
-  await ctx.receive(trigger)
+  if (await ctx.receive(trigger) === 'filtered') return
   const chatId = String(trigger.meta.chatId ?? '')
   if (!chatId) return
   const name = ctx.state.get(KV.sources.labels(SOURCE))?.[chatId] ?? chatId
@@ -225,6 +225,85 @@ export async function backfillChat(ctx: SourceContext, chatId: string, direct: b
   ctx.state.set(topicsKey, topics)
   for (const id of Object.keys(topics)) await scan('thread', id)
   ctx.state.set(topicsKey, topics)
+}
+
+/** Binding polls independently of chat filters and the Ticket subscription horizon. */
+async function boundTopicLoop(ctx: SourceContext, signal: AbortSignal): Promise<void> {
+  const connection = ctx.feishuTopic
+  if (!connection) return
+  await ctx.ready
+  let cursor: { epoch: string; at: string } | undefined
+  let reported = false
+  while (!signal.aborted) {
+    const topic = connection.target()
+    if (topic) {
+      const until = new Date().toISOString()
+      const since = cursor?.epoch === topic.epoch ? cursor.at : topic.since
+      try {
+        if (await pollBoundTopic(ctx, topic, signal, since, until)) {
+          cursor = { epoch: topic.epoch, at: cursorAt(until) }
+          if (reported) connection.report({ state: 'ready', detail: 'Bound Feishu conversation recovered', at: until })
+          reported = false
+        }
+      } catch (error) {
+        if (!signal.aborted && connection.target()?.epoch === topic.epoch) {
+          connection.report({ state: 'error', detail: `Could not poll the bound Feishu conversation: ${String(error)}` })
+          reported = true
+        }
+      }
+    }
+    await delay(30_000, undefined, { signal }).catch(() => {})
+  }
+}
+
+/** The fetched messages are pinned to this epoch; they can never be rerouted to a Ticket. */
+export async function pollBoundTopic(ctx: SourceContext, topic: FeishuTopic, signal: AbortSignal, since = topic.since,
+  until = new Date().toISOString()): Promise<boolean> {
+  const connection = ctx.feishuTopic
+  const active = () => {
+    if (signal.aborted) return false
+    const current = connection?.target()
+    return current?.epoch === topic.epoch && current.sourceRevision === topic.sourceRevision
+  }
+  if (!connection || !active()) return false
+  const commands = ctx.commands.withSignal(signal)
+  const { botId, appId } = bot(ctx)
+  const rootId = topic.rootId
+  if (!topic.direct && !rootId) throw new Error('The bound Feishu group topic has no root message')
+  const threadId = rootId ? await feishuBoundThread(commands, topic.chatId, rootId) : undefined
+  // Keep the initial cursor while the group root has no thread, so the first reply cannot be lost.
+  if (!topic.direct && !threadId) return false
+  const from = Date.parse(since), to = Date.parse(until)
+  const pages = new Set<string>()
+  let page: string | undefined
+  do {
+    if (!active()) return false
+    const params = { container_id_type: threadId ? 'thread' : 'chat', container_id: threadId ?? topic.chatId,
+      sort_type: threadId ? 'ByCreateTimeDesc' : 'ByCreateTimeAsc', page_size: 50,
+      // Feishu supports time bounds on chat pages, not on thread pages.
+      ...(!threadId ? { start_time: String(Math.floor(from / 1000)), end_time: String(Math.ceil(to / 1000)) } : {}),
+      ...(page ? { page_token: page } : {}) }
+    const result = HistoryPageSchema.parse(await commands.lark(['api', 'GET', '/open-apis/im/v1/messages', '--params', JSON.stringify(params)]))
+    let older = false
+    for (const message of validItems(HistoricalMessageSchema, result.items)) {
+      if (!active()) return false
+      if (message.chat_id !== topic.chatId || (threadId && ((message.thread_id && message.thread_id !== threadId)
+        || (message.root_id && message.root_id !== rootId)))) throw new Error('Feishu returned a message outside the bound conversation')
+      if (message.deleted || message.message_id === rootId) continue
+      const at = Date.parse(feishuTime(message.create_time))
+      if (at < from) { older = true; continue }
+      if (at > to) continue
+      // The exact thread endpoint may omit the root on replies. It is safe to supply the verified ID here only.
+      const event = historyEvent(rootId ? { ...message, root_id: rootId } : message, topic.chatId, topic.direct)
+      const trigger = feishuTrigger(event, botId, appId)
+      if (trigger) await connection.receive(trigger, topic.epoch)
+    }
+    if (threadId && older) break
+    if (result.has_more && (!result.page_token || pages.has(result.page_token))) throw new Error('Feishu pagination did not advance')
+    page = result.has_more ? result.page_token : undefined
+    if (page) pages.add(page)
+  } while (page)
+  return active()
 }
 
 /** Resolves the retained source message reference for polling a subscribed thread. */

@@ -24,7 +24,8 @@ export interface SourceContextDeps {
   /** Why setup found no Feishu bot even though the Feishu Source names a CLI. */
   readonly feishuProblem?: SetupProblem | undefined
   /** Hands a Trigger to the Engine and schedules the pass that assesses it. */
-  receive(trigger: Trigger): ReceiveResult | Promise<ReceiveResult>
+  receive(trigger: Trigger, kind: string): ReceiveResult | Promise<ReceiveResult>
+  readonly feishuTopic?: SourceContext['feishuTopic']
 }
 
 /**
@@ -49,7 +50,8 @@ export function sourceContextOf(deps: SourceContextDeps, kind: { kind: string; h
       const instance = deps.sources.instance<C>(id)
       return instance?.enabled ? instance.config : undefined
     },
-    receive: trigger => deps.receive(trigger),
+    receive: trigger => deps.receive(trigger, kind.kind),
+    ...(kind.kind === 'feishu' && deps.feishuTopic ? { feishuTopic: deps.feishuTopic } : {}),
     atomic: work => active(() => store.atomic(work)),
     state: {
       get: name => active(() => store.get(name)),

@@ -319,6 +319,9 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET projects': { answer: installationUnavailable },
   'POST projects': { body: true, answer: installationUnavailable },
   'POST projects/:projectId/select': { answer: installationUnavailable },
+  'GET topic-binding': { answer: installationUnavailable },
+  'POST topic-binding': { body: true, answer: installationUnavailable },
+  'POST topic-binding/unbind': { answer: installationUnavailable },
   'GET state': { answer: stateView },
   'GET overview': { answer: overviewView },
   'GET search': { query: ['q'], answer: async ({ query }) => {

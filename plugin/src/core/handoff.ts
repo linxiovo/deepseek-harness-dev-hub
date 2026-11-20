@@ -16,6 +16,8 @@ export interface HandoffQuestion {
   affectedAcceptance: string[]
   status: 'awaiting' | 'answered'
   answer?: string
+  /** Present for answers received from the bound Feishu topic; identity comes from the observed human event. */
+  answeredBy?: { source: 'feishu'; actorId: string; triggerId: string }
 }
 export interface SpecAcceptance { statement: string; observable: string; delivery: typeof PLAN_FEATURE_KINDS[number] }
 export interface SpecInput {

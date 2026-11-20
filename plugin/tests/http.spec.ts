@@ -27,7 +27,7 @@ function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.
       yield* chunks
     } }
     await handler(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
-    return { status, body: JSON.parse(text) as Record<string, unknown> }
+    return { status, body: JSON.parse(text) as unknown }
   }
 }
 
@@ -233,6 +233,79 @@ it('hides unexpected onboarding failures and reports an unavailable installation
 const projectHeader = (id: string) => ({ 'x-orchestrator-project-id': id })
 const alpha = { id: 'alpha', repository: 'org/alpha', workspace: 'D:/repos/alpha', hubSessionId: 'hub-alpha' }
 const beta = { id: 'beta', repository: 'org/beta', workspace: 'D:/repos/beta', hubSessionId: 'hub-beta' }
+const bindingInstallation = (activeProjectId: () => string = () => alpha.id) => ({
+  projects: () => ({ activeProjectId: activeProjectId(), projects: [alpha, beta] }),
+  runtime: (): RuntimeView => ({ mode: 'desktop', status: 'ready', reason: null, projectId: activeProjectId(), resumedFrom: null }),
+})
+
+it('rejects a topic binding when the project changes before the request body finishes', async () => {
+  let activeProjectId = alpha.id
+  const binds: unknown[] = []
+  const call = serve({
+    installation: bindingInstallation(() => activeProjectId),
+    topicBinding: { bind: (...args: unknown[]) => { binds.push(args) } },
+  })
+  const result = await call('POST', 'topic-binding', { triggerId: 'e1', allowedActors: ['ou_alice'] }, projectHeader(alpha.id), async () => {
+    activeProjectId = beta.id
+  })
+  expect(result).toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  expect(binds).toEqual([])
+})
+
+it('reads, binds, and unbinds only within the trusted mounted project', async () => {
+  const topic = { projectId: alpha.id, epoch: 'binding-1', boundAt: '2026-11-18T00:00:00Z', triggerId: 'e1', chatId: 'oc_team',
+    rootId: 'om_topic', direct: false, allowedActors: ['ou_alice'] }
+  let current: typeof topic | null = null
+  const topicBinding: NonNullable<HttpHost['topicBinding']> = {
+    view: () => current,
+    bind: (triggerId, allowedActors) => {
+      expect({ triggerId, allowedActors }).toEqual({ triggerId: 'e1', allowedActors: ['ou_alice'] })
+      return current = topic
+    },
+    unbind: () => current = null,
+  }
+  const call = serve({ installation: bindingInstallation(), topicBinding })
+  const headers = projectHeader(alpha.id)
+  const body = { triggerId: 'e1', allowedActors: ['ou_alice'] }
+  expect(await call('GET', 'topic-binding', undefined, headers)).toEqual({ status: 200, body: null })
+  expect(await call('POST', 'topic-binding', body, { ...headers, origin: 'http://untrusted.example' })).toMatchObject({ status: 403 })
+  expect(await call('POST', 'topic-binding', body)).toMatchObject({ status: 409, body: { code: 'projectScopeRequired' } })
+  expect(await call('POST', 'topic-binding', body, headers)).toEqual({ status: 200, body: topic })
+  expect(await call('GET', 'topic-binding')).toMatchObject({ status: 409, body: { code: 'projectScopeRequired' } })
+  expect(await call('GET', 'topic-binding', undefined, projectHeader(beta.id))).toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  expect(await call('POST', 'topic-binding/unbind', undefined, projectHeader(beta.id)))
+    .toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  expect(await call('GET', 'topic-binding', undefined, headers)).toEqual({ status: 200, body: topic })
+  expect(await call('POST', 'topic-binding/unbind', undefined, headers)).toEqual({ status: 200, body: null })
+  expect(await call('GET', 'topic-binding', undefined, headers)).toEqual({ status: 200, body: null })
+})
+
+it('refuses caller-supplied destinations and implicit or invalid Feishu actor grants', async () => {
+  let bound = false
+  const call = serve({
+    installation: bindingInstallation(),
+    topicBinding: { bind: () => { bound = true; return null } },
+  })
+  const body = { triggerId: 'e1', allowedActors: ['ou_alice'] }
+  for (const invalid of [{ ...body, chatId: 'oc_other' }, { ...body, rootId: 'om_other' }, { ...body, actor: 'ou_bob' },
+    { triggerId: 'e1' }, { ...body, allowedActors: ['*'] }, { ...body, allowedActors: ['oc_team'] }]) {
+    expect(await call('POST', 'topic-binding', invalid, projectHeader(alpha.id))).toEqual({ status: 400,
+      body: { error: 'Invalid topic binding request' } })
+  }
+  expect(bound).toBe(false)
+})
+
+it('rechecks topic binding scope at mutation after asynchronous project verification', async () => {
+  let activeProjectId = alpha.id, bound = false
+  const call = serve({
+    installation: bindingInstallation(() => activeProjectId),
+    verifyTopicBinding: async () => { activeProjectId = beta.id },
+    topicBinding: { bind: () => { bound = true; return null } },
+  })
+  const result = await call('POST', 'topic-binding', { triggerId: 'e1', allowedActors: ['ou_alice'] }, projectHeader(alpha.id))
+  expect(result).toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  expect(bound).toBe(false)
+})
 
 it('fences project writes and blocks new work without blocking a scoped pause change', async () => {
   let setupReady = false, retries = 0, requeues = 0

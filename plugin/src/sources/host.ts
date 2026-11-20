@@ -27,6 +27,15 @@ export interface SourceHost {
 }
 /** Display label, URL, and facts (`null` removes a fact) that a Source publishes on a Thread. */
 export interface ThreadDescription { label?: string; url?: string; facts?: Record<string, ThreadFact | null> }
+/** A mounted project's exact Feishu conversation and the earliest eligible message time. */
+export interface FeishuTopic {
+  epoch: string
+  sourceRevision: number
+  since: string
+  chatId: string
+  direct: boolean
+  rootId?: string
+}
 /** Application capabilities exposed to a Source kind for reading state, ingesting triggers, managing threads/tickets, and reporting health. */
 export interface SourceContext {
   readonly deployment: Deployment
@@ -40,6 +49,12 @@ export interface SourceContext {
   config<C extends Record<string, unknown>>(kind: string): C | undefined
   /** Ingests a trigger into the Engine and schedules the next evaluation pass; callers should await completion before advancing read cursors. */
   receive(trigger: Trigger): ReceiveResult | Promise<ReceiveResult>
+  /** Independent of generic chat subscriptions. A fetch pinned to an epoch must never fall through to Engine intake. */
+  feishuTopic?: {
+    target(): FeishuTopic | undefined
+    receive(trigger: Trigger, epoch: string): Promise<ReceiveResult>
+    report(health: Health): void
+  }
   atomic<T>(work: () => T): T
   /** Source-scoped KV records (such as read cursors); setting `undefined` removes an entry. */
   state: { get<V>(key: Key<V>): V | undefined; set<V>(key: Key<V>, value: V | undefined): void; keys<V>(family: Family<V, never>): Key<V>[] }

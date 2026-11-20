@@ -37,7 +37,7 @@ const dispatcher = [
 mkdirSync(hooksDirectory, { recursive: true });
 const stagingDirectory = mkdtempSync(join(hooksDirectory, '.install-'));
 try {
-  for (const name of ['pre-commit', 'commit-msg']) {
+  for (const name of ['pre-commit', 'commit-msg', 'pre-push']) {
     const staged = join(stagingDirectory, name);
     writeFileSync(staged, dispatcher);
     chmodSync(staged, 0o755);

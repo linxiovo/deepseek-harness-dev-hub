@@ -1,5 +1,6 @@
 /** Session tool registration, role-scoped resource reads, and routing/settings tool contracts. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { spawnSync } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { TICKET_STATES } from '../src/app/cards.ts'
@@ -57,8 +58,11 @@ it('reads the lists, a ticket, a decision, the settings, the prompts and the mod
   }
   expect(JSON.parse((await read('settings/policy') as { text: string }).text).value.sources.feishu.allowed).toEqual([{ id: 'ou_alice', name: 'Alice' }])
   await expect(read('settings/source:retired')).rejects.toThrow('Unknown settings block')
-  const skills = { built_in: ['dsh-superagent-feishu', 'dsh-superagent-github', 'dsh-superagent-doc-tree'], team: [] }
+  const skills = { built_in: ['dsh-superagent-feishu', 'dsh-superagent-github', 'dsh-superagent-doc-tree',
+    'dsh-worker-implement', 'dsh-worker-tdd', 'dsh-worker-test-scope'], team: [] }
   expect(await read('prompts')).toMatchObject({ revision: 0, read: 'prompts/0', skills, items: [expect.objectContaining({ revision: 0 })], next_offset: null })
+  const { body: promptSettings } = await h.api('GET', 'prompts')
+  expect(promptSettings.builtin).toEqual(['feishu', 'github', 'to-spec', 'doc-tree'])
   const models = [{ id: 'm1', name: 'One' }, { id: 'm2', name: 'Two' }]
   const catalog = { default: { provider: 'p', model: 'm1' }, groups: [{ id: 'p', name: 'Provider', models }], failures: [] }
   Object.assign(h.controller, { modelCatalog: vi.fn(async () => catalog) })
@@ -155,6 +159,62 @@ it('retains an unchanged impact rationale without treating missing navigation as
   await expect(h.runTool(sessionId, 'orchestrator_doc_impact', args)).rejects.toThrow(/candidate|HEAD/)
   await expect(h.runTool(sessionId, 'orchestrator_doc_impact', { ...args, candidate: amended }))
     .resolves.toMatchObject({ candidate: amended, semantic_review: 'required' })
+})
+
+it('reports replayable red and green runs for a public behavior in the Worker worktree', async () => {
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('scoped-tdd', '@bot Trim the displayed label'))
+  const worktree = ticket.execution!.directory
+  const git = (...args: string[]) => h.localGit!.git('-C', worktree, ...args)
+  const write = (path: string, text: string) => writeFileSync(join(worktree, path), text)
+  const commit = (message: string) => { git('add', '.'); git('commit', '-qm', message); return git('rev-parse', 'HEAD') }
+  write('label.mjs', 'export const label = value => value\n')
+  commit('add the public label formatter')
+  write('label.test.mjs', `import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { label } from './label.mjs'
+test('trims a displayed label', () => assert.equal(label('  alert  '), 'alert'))\n`)
+  const revision = commit('specify trimmed labels')
+  const flags = ['--test', '--test-reporter=tap', 'label.test.mjs']
+  const command = ['node', ...flags].join(' ')
+  const run = () => spawnSync(process.execPath, flags, { cwd: worktree, encoding: 'utf8' })
+  const red = run()
+  expect(red.status).toBe(1)
+  expect(red.stdout).toContain('ERR_ASSERTION')
+
+  write('label.mjs', 'export const label = value => value.trim()\n')
+  const candidate = commit('trim the label')
+  const green = run()
+  expect(green.status).toBe(0)
+  expect(green.stdout).toContain('# pass 1')
+  const args = { candidate, scope: 'focused', reason: 'The label formatter has one public entry and its source is the only affected module.',
+    checks: [{ command, directory: '.', status: 'passed', observed: '# pass 1' }],
+    red: [{ revision, command, directory: '.', observed: "ERR_ASSERTION: expected 'alert' for input '  alert  '" }] }
+  const evidence = (input: unknown = args) => h.runTool(sessionId, 'orchestrator_test_evidence', input)
+  await expect(h.runTool(h.runtime.masterId, 'orchestrator_test_evidence', args)).rejects.toThrow(/not registered/i)
+  await expect(evidence({ ...args, checks: [] })).resolves.toMatchObject({ result: 'unverified' })
+  await expect(evidence({ ...args, red: [] })).resolves.toMatchObject({ result: 'unverified' })
+  for (const status of ['not_run', 'pending', 'cancelled', 'failed']) {
+    await expect(evidence({ ...args, checks: [{ ...args.checks[0], status }] })).resolves.toMatchObject({
+      result: status === 'failed' ? 'failed' : 'unverified',
+    })
+  }
+  await expect(evidence({ ...args, checks: [{ ...args.checks[0], command: 'node --test another.test.mjs' }] }))
+    .resolves.toMatchObject({ result: 'unverified' })
+  await expect(evidence({ ...args, red: [{ ...args.red[0], revision: candidate }] })).rejects.toThrow(/precede/i)
+  git('tag', '-a', 'candidate-label', '-m', 'candidate label')
+  const tag = git('rev-parse', 'refs/tags/candidate-label')
+  await expect(evidence({ ...args, red: [{ ...args.red[0], revision: tag }] })).rejects.toThrow(/commit hash/i)
+  const result = await evidence()
+  expect(result).toMatchObject({ ...args, base: h.localGit!.base.sha, result: 'reported_passed', source: 'worker' })
+  const summary = JSON.stringify(result)
+  await h.runTool(sessionId, 'orchestrator_report', { state: 'progress', summary })
+  write('label.mjs', 'export const label = value => value.trimStart().trimEnd()\n')
+  await expect(evidence()).rejects.toThrow(/clean/i)
+  commit('revise candidate')
+  await h.restart()
+  await h.runtime.idle()
+  expect(await read(`ticket/${ticket.id}/result`)).toMatchObject({ text: summary })
+  await expect(evidence()).rejects.toThrow(/HEAD/i)
 })
 
 it('reads configured GitHub Actions evidence for a ticket at its complete commit SHA', async () => {

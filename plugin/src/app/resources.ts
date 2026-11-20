@@ -13,7 +13,8 @@ import { ASSIGNMENTS, INPUTS, assignmentLine, decisionCard, decisionDetails, inp
   ticketDetails, triggerCard, type TicketThread } from './cards.ts'
 import { threadTitle } from './views/records.ts'
 import { transcriptEntry } from './context.ts'
-import { builtInParts, defaultPrompts } from './prompts.ts'
+import { builtInParts, defaultPrompts, SKILL_PREFIX } from './prompts.ts'
+import { bundledSkills, isBundledSkill } from './skill-files.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Commands } from '../infra/commands.ts'
 import { sameDirectory } from '../infra/environment.ts'
@@ -240,8 +241,8 @@ const ROUTES: readonly Route[] = [
     return { revision: status.revision, read: `prompts/${current.revision}`, notification_pending: status.notificationPending,
       ...changed.length ? { default_changed: changed } : {}, ...removed.length ? { removed_parts: removed } : {},
       sessions: status.sessions.map(session => ({ session_id: session.sessionId, revision: session.revision })),
-      skills: { built_in: skills.filter(name => !(name in current.config.skills)).map(name => `dsh-superagent-${name}`),
-        team: Object.keys(current.config.skills).map(name => `dsh-superagent-${name}`) },
+      skills: { built_in: skills.filter(isBundledSkill).map(name => bundledSkills[name].name),
+        team: skills.filter(name => !isBundledSkill(name)).map(name => `${SKILL_PREFIX}${name}`) },
       items: history.revisions.map(({ previousRevision, savedAt, ...version }) =>
         ({ ...version, previous_revision: previousRevision, saved_at: savedAt })),
       next_offset: history.next_offset }

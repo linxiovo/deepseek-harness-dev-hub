@@ -4,7 +4,7 @@ import { UserError, key } from '../core/index.ts'
 import { policyVersion, type Settings, type SettingsOrigin } from '../policy.ts'
 import { masterPrompt, workerPrompt, sharedPrompt, guides, mainAdmissionPolicy, handoffPolicy, teamDefaults, sourceSkills, cliNotes } from './context.ts'
 import { environmentLines, type Variable } from './execution-environment.ts'
-import { bundledSkills, isBundledSkill, promptFile, splitterSkill } from './skill-files.ts'
+import { bundledSkills, isBundledSkill, promptFile, splitterSkill, workerSkills } from './skill-files.ts'
 import { promptsNotice } from './notices.ts'
 import type { Sessions } from './sessions.ts'
 import type { Store } from './store.ts'
@@ -26,7 +26,8 @@ const SPLITTER_SKILL_PART = `skill/${SPLITTER_SKILL_KEY}` as const
 /** The built-in parts a team may override, by key: all roles' parts, bundled skills, and generated templates. */
 const PART_KEYS = ['runtime/shared', 'runtime/orchestrator', 'runtime/worker', 'runtime/planner', 'runtime/splitter', 'runtime/subscriptions', 'runtime/replies',
   'runtime/dispatch', 'runtime/work', 'runtime/admission', 'runtime/handoff/orchestrator', 'runtime/handoff/worker', 'runtime/environment',
-  'runtime/policy', 'runtime/policy/none', 'skill/feishu', 'skill/github', 'skill/to-spec', 'skill/doc-tree', SPLITTER_SKILL_PART] as const
+  'runtime/policy', 'runtime/policy/none', 'skill/feishu', 'skill/github', 'skill/to-spec', 'skill/doc-tree',
+  'skill/worker/implement', 'skill/worker/tdd', 'skill/worker/test-scope', SPLITTER_SKILL_PART] as const
 export type PartKey = typeof PART_KEYS[number]
 /** A team's text for a built-in part, and `base`, the key of the built-in text it was edited from. */
 const OverrideSchema = z.object({ text: z.string(),
@@ -74,6 +75,9 @@ export const builtInParts = (): Readonly<Record<PartKey, BuiltInPart>> => parts 
   'skill/github': { roles: BOTH, text: `${sourceSkills.github}\n\n## CLI usage\n${cliNotes}` },
   'skill/to-spec': { roles: PLANNER, text: bundledSkills['to-spec'].content },
   'skill/doc-tree': { roles: WORKER, text: bundledSkills['doc-tree'].content },
+  'skill/worker/implement': { roles: WORKER, text: workerSkills['worker/implement'].content },
+  'skill/worker/tdd': { roles: WORKER, text: workerSkills['worker/tdd'].content },
+  'skill/worker/test-scope': { roles: WORKER, text: workerSkills['worker/test-scope'].content },
   [SPLITTER_SKILL_PART]: { roles: SPLITTER, text: splitterSkill.content },
 }
 /** The key of a built-in text, which an override's `base` records. */
@@ -127,7 +131,7 @@ export function promptParts(config: PromptConfig, role: Role, environment?: stri
 export function composePrompt(config: PromptConfig, role: Role, environment?: string, policy?: { key: string; text: string }): string {
   return promptParts(config, role, environment, policy).map(part => part.text).join('\n\n')
 }
-/** Renders a skill by its preview key; only the splitter uses a scoped key. */
+/** Renders a skill by its preview key, including role-scoped packaged skills. */
 export function composeSkill(config: PromptConfig, name: string): string {
   if (name === SPLITTER_SKILL_KEY) return builtIn(config, SPLITTER_SKILL_PART)
   return isBundledSkill(name) ? builtIn(config, `skill/${name}`) : config.skills[name] ?? ''
@@ -159,7 +163,7 @@ export class Prompts {
   skills(config: PromptConfig, role: Role = 'worker'): [string, string][] {
     if (role === 'planner') return [['to-spec', composeSkill(config, 'to-spec')]]
     if (role === 'splitter') return [[splitterSkill.shortName, composeSkill(config, SPLITTER_SKILL_KEY)]]
-    const names = [...this.feishu() ? ['feishu'] : [], 'github', ...role === 'worker' ? ['doc-tree'] : []]
+    const names = [...this.feishu() ? ['feishu'] : [], 'github', ...role === 'worker' ? ['doc-tree', ...Object.keys(workerSkills)] : []]
     return names.map((name): [string, string] => [name, composeSkill(config, name)])
       .concat(Object.entries(config.skills).filter(([name]) => !isBundledSkill(name)))
   }

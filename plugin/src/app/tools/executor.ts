@@ -16,7 +16,7 @@ export interface ExecutorToolsHost {
   readonly store: Pick<Store, 'tickets' | 'atomic'>
   readonly sessions: Pick<Sessions, 'relay' | 'notify'>
   readonly resources: ResourceHost
-  readonly executor: Pick<DshExecutor, 'inspectDocImpact'>
+  readonly executor: Pick<DshExecutor, 'inspectDocImpact' | 'inspectTestEvidence'>
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
 }
@@ -28,10 +28,25 @@ const impactSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('updated'), documents: docPaths.refine(paths => paths.length > 0), contracts: docPaths }),
   z.strictObject({ kind: z.literal('unchanged'), reason: z.string().trim().min(1).max(1000) }),
 ])
+const commitHash = z.string().refine(sha => /^(?:[a-f\d]{40}|[a-f\d]{64})$/.test(sha), 'Expected a full lowercase commit hash')
 const docImpactSchema = z.strictObject({
-  candidate: z.string().refine(sha => /^(?:[a-f\d]{40}|[a-f\d]{64})$/.test(sha), 'Expected a full lowercase commit hash'),
+  candidate: commitHash,
   root: markdownPath.nullable(), routes: docPaths, leaves: docPaths,
   impact: z.looseObject({ kind: z.enum(['updated', 'unchanged']) }),
+})
+
+const runEvidence = {
+  directory: z.string().min(1).max(512).refine(path => path === '.' || !/[\\:\x00-\x1f\x7f]/.test(path)
+    && path.split('/').every(part => part !== '' && part !== '.' && part !== '..'), 'Expected a worktree-relative directory'),
+  command: z.string().trim().min(1).max(1000),
+  observed: z.string().trim().min(1).max(1000),
+}
+const testEvidenceSchema = z.strictObject({
+  candidate: commitHash,
+  scope: z.enum(['focused', 'consumers', 'full']),
+  reason: z.string().trim().min(1).max(1000),
+  checks: z.array(z.strictObject({ ...runEvidence, status: z.enum(['passed', 'failed', 'not_run', 'pending', 'cancelled']) })).max(50),
+  red: z.array(z.strictObject({ ...runEvidence, revision: commitHash })).max(50).nullable(),
 })
 
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId: string): Tool[] {
@@ -63,6 +78,19 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId
         }
         return { ...revision, scope: { root, routes, leaves }, impact, structure: issues.length ? 'issues' : root === null ? 'not-applicable' : 'checked',
           issues, semantic_review: 'required' }
+      },
+    }),
+    tool({
+      name: 'orchestrator_test_evidence',
+      description: 'Bind observed test runs and scope to the clean Worker candidate as the implement skill says.',
+      schema: testEvidenceSchema,
+      execute: async (args, signal) => {
+        const { candidate, checks, red } = args
+        const revision = await host.executor.inspectTestEvidence(ticketId, sessionId, candidate, red?.map(run => run.revision) ?? [], signal)
+        const allPassed = checks.length > 0 && checks.every(check => check.status === 'passed')
+        const redCovered = red === null || red.length > 0 && red.every(run => checks.some(check => check.directory === run.directory && check.command === run.command))
+        const result = checks.some(check => check.status === 'failed') ? 'failed' : allPassed && redCovered ? 'reported_passed' : 'unverified'
+        return { ...args, ...revision, result, source: 'worker' }
       },
     }),
     tool({

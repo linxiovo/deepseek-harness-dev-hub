@@ -1,0 +1,10 @@
+{
+  "message_id": "om_reply",
+  "chat_id": "oc_team",
+  "chat_type": "group",
+  "sender_id": "ou_alice",
+  "sender_type": "user",
+  "content": "reply to the direct parent",
+  "create_time": "1757376000000",
+  "reply_to": "om_parent"
+}

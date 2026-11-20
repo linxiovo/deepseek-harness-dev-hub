@@ -171,6 +171,8 @@ Each profile stores logs and control files under `.artifacts/`:
 
 Open the URL printed in the log, then choose **Superagent** in the sidebar.
 
+During a local Harness UI smoke check, if the UI reports `dsh web authentication required; reopen the URL printed by dsh web`, the operator must reopen and authenticate through the exact URL printed by the current launch before starting the task. The agent pauses instead of bypassing authentication; never continue a task unauthenticated. A restart invalidates an earlier login URL, and a project or repository link does not grant or replace authentication. Do not paste the authentication query string into a task, transcript, log or ticket.
+
 ### Headless access over SSH
 
 Keep the server profile's `webserver.host` at `127.0.0.1`. From the operator machine, forward the same port on local loopback to server loopback through an authenticated SSH connection:

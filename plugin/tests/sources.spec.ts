@@ -24,6 +24,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+/** Minimal live-message shape from lark-cli 1.0.100's `event schema` output; no vendor metadata, secrets, parent_id or root_id. */
+type LiveReplyShape = {
+  message_id: string; chat_id: string; chat_type: 'group'; sender_id: string; sender_type: 'user'
+  content: string; create_time: string; reply_to: string
+}
+const LIVE_REPLY_FIXTURE = join(import.meta.dirname, 'fixtures', 'feishu-live-reply-lark-cli-1.0.100.json')
 const MEMBER = 'ou_alice'
 function host(overrides: Partial<SourceContextDeps> = {}) {
   const store = new Store(join(mkdtempSync(join(tmpdir(), 'sources-')), 'db.sqlite'))
@@ -123,11 +129,36 @@ describe('feishu source', () => {
     expect(feishuTrigger({ message_id: 'om_3', chat_id: 'oc_1', chat_type: 'p2p', sender_id: 'ou_bot', sender_type: 'bot', content: 'me', create_time: '1' }, 'ou_bot', 'cli_bot')).toBeUndefined()
     expect(feishuTrigger(historyEvent({ message_id: 'om_4', chat_id: 'oc_1', create_time: '2', sender: { id: 'ou_x', sender_type: 'app' }, body: { content: '{"text":"from app"}' } }, 'oc_1', false), 'ou_bot', 'cli_bot')).toMatchObject({ human: false, text: 'from app', threads: [{ id: 'oc_1:om_4' }] })
   })
-  it('resolves the parent of a live reply without treating it as a topic root', () => {
-    const reply = feishuTrigger({ message_id: 'om_reply', chat_id: 'oc_team', chat_type: 'group', sender_id: MEMBER,
-      sender_type: 'user', content: 'reply', create_time: '1', reply_to: 'om_parent' }, 'ou_bot', 'cli_bot')!
-    expect(feishuParent(reply)).toBe(feishuTriggerId('om_parent'))
+  it('maps a live reply_to from lark-cli 1.0.100 to its direct parent when no root topic accompanies it', () => {
+    const event = JSON.parse(readFileSync(LIVE_REPLY_FIXTURE, 'utf8')) as LiveReplyShape
+    // The captured shape stays minimal: root_id and the vendor's other fields are absent.
+    expect(event).not.toHaveProperty('root_id')
+    expect(Object.keys(event).sort()).toEqual(['chat_id', 'chat_type', 'content', 'create_time', 'message_id', 'reply_to', 'sender_id', 'sender_type'])
+    const reply = feishuTrigger(event, 'ou_bot', 'cli_bot')!
+    expect(reply).toMatchObject({ id: feishuTriggerId(event.message_id), threads: [{ source: 'feishu', id: `${event.chat_id}:${event.message_id}` }],
+      meta: { chatId: event.chat_id, messageId: event.message_id, parentId: event.reply_to } })
     expect(reply.meta).not.toHaveProperty('rootId')
+    expect(feishuParent(reply)).toBe(feishuTriggerId(event.reply_to))
+    // A consumer that restarts and replays the event line derives the same trigger and direct parent.
+    const replayed = feishuTrigger(JSON.parse(readFileSync(LIVE_REPLY_FIXTURE, 'utf8')) as LiveReplyShape, 'ou_bot', 'cli_bot')!
+    expect(replayed).toEqual(reply)
+    expect(feishuParent(replayed)).toBe(feishuTriggerId(event.reply_to))
+    // reply_to records context only: the bot's own replay is dropped, and an unlisted member gains no addressed request.
+    expect(reply).not.toHaveProperty('addressed')
+    expect(feishuTrigger({ ...event, sender_id: 'ou_guest' }, 'ou_bot', 'cli_bot')).not.toHaveProperty('addressed')
+    expect(feishuTrigger({ ...event, sender_id: 'ou_bot', sender_type: 'bot' }, 'ou_bot', 'cli_bot')).toBeUndefined()
+  })
+  it('keeps the historical parent_id path on the same direct parent as a live reply_to', () => {
+    const event = JSON.parse(readFileSync(LIVE_REPLY_FIXTURE, 'utf8')) as LiveReplyShape
+    const historical = { message_id: event.message_id, chat_id: event.chat_id, create_time: event.create_time,
+      sender: { id: event.sender_id, sender_type: event.sender_type }, body: { content: JSON.stringify({ text: event.content }) },
+      parent_id: event.reply_to }
+    const fromHistory = feishuTrigger(historyEvent(historical, event.chat_id, false), 'ou_bot', 'cli_bot')!
+    expect(fromHistory.id).toBe(feishuTriggerId(event.message_id))
+    expect(fromHistory.meta).not.toHaveProperty('rootId')
+    expect(feishuParent(fromHistory)).toBe(feishuTriggerId(event.reply_to))
+    // History pages carry parent_id instead of reply_to; both paths stay equal so replay is idempotent.
+    expect(fromHistory).toEqual(feishuTrigger(event, 'ou_bot', 'cli_bot'))
   })
   it('polls subscribed threads and stores unseen replies as triggers on that thread', async () => {
     const h = host()

@@ -135,6 +135,7 @@ it('exposes review submission only to actual Worker descendants and restores ind
   expect(await read(`ticket/${ticket.id}/review/${evidence.id}`)).toMatchObject({ reviewer_session: specSession,
     base: ticket.execution!.base!.sha, candidate, aggregate: 'passed' })
   await h.restart()
+  expect(await read(`ticket/${ticket.id}/reviews`, { limit: 1 })).toMatchObject({ history: [expect.any(Object)], next_offset: 1 })
   expect(await reviewsRead()).toMatchObject({ aggregate: 'passed', standards: [expect.objectContaining({ reviewer_session: standardsSession })],
     spec: [expect.objectContaining({ reviewer_session: specSession })] })
 })

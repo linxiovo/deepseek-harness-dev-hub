@@ -388,12 +388,13 @@ const ROUTES: readonly Route[] = [
       const active = matches ? evidence.filter(review => review.base === base && review.candidate === candidate) : []
       const aggregate = !clean || !currentHead || !reviews?.target || reviews.target.base !== base || reviews.target.candidate !== candidate
         ? 'pending' : reviewStatus(assignment!)
-      return section === 'review' ? { ...item, current_base: base, current_candidate: candidate,
+      if (section === 'review') return { ...item, current_base: base, current_candidate: candidate,
         stale: !matches, aggregate: matches ? aggregate : 'pending' }
-        : { ticket_id: id, assignment_id: assignment?.id ?? null, base, candidate, clean, stale: !matches,
-          aggregate: matches ? aggregate : 'pending', standards: active.filter(review => review.axis === 'standards'),
-          spec: active.filter(review => review.axis === 'spec'), history: evidence.map(review => ({ ...review,
-            read: `ticket/${id}/review/${review.id}` })) }
+      const history = list(read, (offset, count) => evidence.slice().reverse().slice(offset, offset + count).map(review => ({ ...review,
+        read: `ticket/${id}/review/${review.id}` })))
+      return { ticket_id: id, assignment_id: assignment?.id ?? null, base, candidate, clean, stale: !matches,
+        aggregate: matches ? aggregate : 'pending', standards: active.filter(review => review.axis === 'standards'),
+        spec: active.filter(review => review.axis === 'spec'), history: history.items, next_offset: history.next_offset }
     }
     if (section === 'assignments' || section === 'inputs') {
       if (part !== undefined) throw new Error('Unknown context resource')

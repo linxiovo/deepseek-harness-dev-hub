@@ -15,6 +15,9 @@ import { health, type FeishuTopic, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
 import { cursorAt, POLL_HORIZON_MS, polled, pollThreads as pollEach } from './poll.ts'
 import type { FeishuConfig } from './feishu.ts'
+const TimedHistoricalMessageSchema = HistoricalMessageSchema.extend({ create_time: z.string().refine(value => {
+  try { feishuTime(value); return true } catch { return false }
+}) })
 
 export const runFeishu = (ctx: SourceContext, signal: AbortSignal): Promise<unknown> =>
   Promise.allSettled([watch, backfillLoop, chatNamesLoop, ...(ctx.feishuTopic ? [boundTopicLoop] : [])].map(loop => loop(ctx, signal)))
@@ -200,7 +203,7 @@ export async function backfillChat(ctx: SourceContext, chatId: string, direct: b
         sort_type: 'ByCreateTimeAsc', page_size: 50, ...(page ? { page_token: page } : {}) }
       const request = ['api', 'GET', '/open-apis/im/v1/messages', '--params', JSON.stringify(parameters)]
       const result = HistoryPageSchema.parse(await commands.lark(request))
-      for (const message of validItems(HistoricalMessageSchema, result.items, tally)) {
+      for (const message of validItems(TimedHistoricalMessageSchema, result.items, tally)) {
         const outside = message.chat_id !== chatId || (kind === 'thread' && message.thread_id !== id)
         if (outside) throw new Error('Feishu history returned a message outside the requested chat or thread')
         if (message.deleted) continue
@@ -279,6 +282,7 @@ export async function pollBoundTopic(ctx: Pick<SourceContext, 'commands' | 'depl
   if (!topic.direct && !rootId) throw new Error('The bound Feishu group topic has no root message')
   const threadId = rootId ? await feishuBoundThread(commands, topic.chatId, rootId) : undefined
   // Keep the initial cursor while the group root has no thread, so the first reply cannot be lost.
+  const tally = { skipped: 0 }
   if (!topic.direct && !threadId) return false
   const from = Date.parse(since), to = Date.parse(until)
   const pages = new Set<string>()
@@ -294,7 +298,7 @@ export async function pollBoundTopic(ctx: Pick<SourceContext, 'commands' | 'depl
       ...(page ? { page_token: page } : {}) }
     const result = HistoryPageSchema.parse(await commands.lark(['api', 'GET', '/open-apis/im/v1/messages', '--params', JSON.stringify(params)]))
     let older = false
-    for (const message of validItems(HistoricalMessageSchema, result.items)) {
+    for (const message of validItems(TimedHistoricalMessageSchema, result.items, tally)) {
       if (!active()) return false
       if (message.chat_id !== topic.chatId || (threadId && ((message.thread_id && message.thread_id !== threadId)
         || (message.root_id && message.root_id !== rootId)))) throw new Error('Feishu returned a message outside the bound conversation')
@@ -319,6 +323,8 @@ export async function pollBoundTopic(ctx: Pick<SourceContext, 'commands' | 'depl
     if (!active()) return false
     await connection.receive(backlog.pop()!, topic.epoch)
   }
+  connection.report(tally.skipped ? { state: 'error', detail: `${tally.skipped} unreadable bound-topic messages skipped` }
+    : { state: 'ready', detail: 'Bound Feishu conversation recovered', at: new Date().toISOString() })
   return active()
 }
 

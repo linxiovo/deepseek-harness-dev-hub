@@ -1273,6 +1273,35 @@ setInterval(() => {}, 60_000)
     expect(off.chats).toEqual(['oc_a', 'oc_b'])
     expect(off.cursors.oc_dm).toBe(hour)
   }, 20_000)
+  it('skips malformed history timestamps, takes authorized replies, and advances the cursor', async () => {
+    const hour = new Date(Date.now() - 3_600_000).toISOString()
+    const { ctx, health, store } = consumerSource(cli('ready'), { chats: [{ chatId: 'oc_team', listen: 'mentions' }] })
+    store.set(KV.feishu.history('oc_team'), hour)
+    const lark = vi.spyOn(Commands.prototype, 'lark').mockImplementation(async args => {
+      if (args[0] !== 'api') return { chats: [] }
+      return { has_more: false, items: [
+        { message_id: 'om_bad_time', chat_id: 'oc_team', create_time: 'not-a-time',
+          sender: { id: 'cli_bot', sender_type: 'app' }, body: { content: '{"text":"bad timestamp"}' } },
+        { message_id: 'om_authorized', chat_id: 'oc_team', create_time: String(Date.now()),
+          sender: { id: 'ou_alice', sender_type: 'user' }, mentions: [{ id: 'ou_bot' }], body: { content: '{"text":"@bot answer"}' } },
+      ] }
+    })
+    const loops = running = runFeishu(ctx, controller.signal)
+    try {
+      await vi.waitFor(() => expect(health.history).toMatchObject({ state: 'ready', detail: expect.stringContaining('1 unreadable messages skipped') }), until)
+      expect(store.triggers.get(feishuTriggerId('om_authorized'))).toBeDefined()
+      expect(store.triggers.get(feishuTriggerId('om_bad_time'))).toBeUndefined()
+      expect(Date.parse(store.get(KV.feishu.history('oc_team'))!)).toBeGreaterThan(Date.parse(hour))
+      // Replay the fetched batch as after a restart before the cursor checkpoint; trigger identity is stable.
+      await backfillChat(ctx, 'oc_team', false, hour, new Date().toISOString(), controller.signal)
+      expect(store.triggers.get(feishuTriggerId('om_authorized'))).toBeDefined()
+      expect(lark.mock.calls.filter(([args]) => args[0] === 'api')).toHaveLength(2)
+    } finally {
+      controller.abort()
+      await loops
+      lark.mockRestore()
+    }
+  }, 20_000)
   it('reports an error when the consumer is not ready within 45 seconds', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
     const { ctx, turnOff } = consumerSource(cli('never'))

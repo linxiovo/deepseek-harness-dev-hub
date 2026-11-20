@@ -4,7 +4,8 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import type { Trigger } from '../src/core/index.ts'
 import { Commands } from '../src/infra/commands.ts'
-import { pollBoundTopic } from '../src/sources/feishu-loops.ts'
+import { pollBoundTopic, runFeishu } from '../src/sources/feishu-loops.ts'
+import { KV } from '../src/kv.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { gitRepository } from './fixtures/git.ts'
 import { feishu, MEMBER, startRuntime, type Host } from './fixtures/host.ts'
@@ -33,6 +34,46 @@ async function bind(triggerId: string) {
 const messages = () => vi.mocked(Commands.prototype.lark).mock.calls.map(([args]) => args)
   .filter(args => args.includes('+messages-reply')).map(args => ({ to: args[args.indexOf('--message-id') + 1], text: args[args.indexOf('--markdown') + 1]! }))
 
+it('clears only binding health after a persisted unbind when the Feishu Source still has an authorization failure', async () => {
+  const anchor = feishu('30', 'topic root')
+  await receive(anchor)
+  await bind(anchor.id)
+  const context = host.runtime.context(feishuKind)
+  context.state.set(KV.feishu.history('oc_team'), '2026-09-08T00:00:00.000Z')
+  vi.mocked(Commands.prototype.lark).mockRejectedValue(new Error('Feishu authorization denied'))
+  const controller = new AbortController()
+  const running = runFeishu(context, controller.signal)
+  try {
+    await vi.waitFor(() => expect(host.runtime.health.feishuBinding).toMatchObject({
+      state: 'error', detail: expect.stringContaining('Feishu authorization denied'),
+    }))
+    await vi.waitFor(() => expect(host.runtime.health.history).toMatchObject({
+      state: 'error', detail: expect.stringContaining('Feishu authorization denied'),
+    }))
+    const unbound = await host.api('POST', 'topic-binding/unbind', undefined, project.id)
+    expect(unbound).toMatchObject({ status: 200 })
+    expect(host.runtime.topicBinding?.view()).toBeNull()
+    expect(host.runtime.health.feishuBinding).toMatchObject({ state: 'ready', detail: 'No Feishu topic is bound' })
+    expect(host.runtime.health.history).toMatchObject({ state: 'error', detail: expect.stringContaining('Feishu authorization denied') })
+  } finally {
+    controller.abort()
+    await running
+  }
+})
+it('does not reset binding health when shutdown has started before unbind completes', async () => {
+  const anchor = feishu('31', 'topic root')
+  await receive(anchor)
+  await bind(anchor.id)
+  const previous = host.runtime
+  previous.context(feishuKind).feishuTopic?.report({ state: 'error', detail: 'Bound-topic poll failed' })
+  expect(previous.health.feishuBinding).toMatchObject({ state: 'error', detail: 'Bound-topic poll failed' })
+  const stopping = previous.stop()
+  previous.topicBinding?.unbind()
+  expect(previous.health.feishuBinding).toMatchObject({ state: 'error', detail: 'Bound-topic poll failed' })
+  await stopping
+  await host.restart()
+  expect(host.runtime.health.feishuBinding).toBeUndefined()
+})
 it('confirms only the selected topic once, including after a restart and retry', async () => {
   const anchor = feishu('1', 'topic root')
   await receive(anchor)

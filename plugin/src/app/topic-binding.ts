@@ -31,6 +31,7 @@ interface Options {
   sources: Pick<SourceRegistry, 'confirmationNotice'>
   available: () => boolean
   botIdentity: () => string | undefined
+  unbound: () => void
 }
 /** An operator binding request was invalid, referenced unknown input, or conflicted with current project or bot state. */
 export class TopicBindingError extends Error {
@@ -129,7 +130,7 @@ export class TopicBinding {
 
   unbind(): null {
     const { store, outbox } = this.options
-    return store.atomic(() => {
+    const removed = store.atomic(() => {
       const binding = this.view()
       if (binding) {
         store.delete(KV.topicBinding.active)
@@ -137,8 +138,10 @@ export class TopicBinding {
           if (receipt.channel.source === SOURCE && receipt.channel.address.bindingEpoch === binding.epoch) outbox.withdraw(receipt.id)
         }
       }
-      return null
+      return binding !== null
     })
+    if (removed) this.options.unbound()
+    return null
   }
 
   matches(trigger: Trigger): boolean {

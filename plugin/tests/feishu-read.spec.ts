@@ -124,3 +124,22 @@ it.each(['bound', 'unbound while fetching', 'wrong root', 'aborted during replay
     expect(lark).toHaveBeenCalledTimes(3) // The pre-cursor item on page two ends the descending scan.
     expect(JSON.parse(lark.mock.calls[2]![0].at(-1)!)).toMatchObject({ page_token: 'older', sort_type: 'ByCreateTimeDesc' })
   })
+it('skips one malformed timestamp in an exact bound-topic backlog and still delivers valid replies', async () => {
+  const topic: FeishuTopic = { epoch: 'epoch-malformed-time', sourceRevision: 1, since: new Date(Date.now() - 1000).toISOString(),
+    chatId: 'oc_chat', direct: false, rootId: 'om_root' }
+  const delivered: string[] = []
+  const ctx: Pick<SourceContext, 'commands' | 'deployment' | 'feishuTopic'> = { commands, deployment: testDeployment(), feishuTopic: {
+    target: () => topic, claims: () => true, report: vi.fn(), receive: async trigger => { delivered.push(trigger.text); return 'stored' },
+  } }
+  const malformed = { message_id: 'om_bad_time', chat_id: topic.chatId, thread_id: 'omt_thread', root_id: topic.rootId,
+    sender: { id: 'ou_alice', sender_type: 'user' }, create_time: 'not-a-time', body: { content: '{"text":"malformed"}' } }
+  const valid = { ...malformed, message_id: 'om_valid_reply', create_time: String(Date.now()),
+    body: { content: '{"text":"answer abcdefabcdefabcdefabcdef: valid reply"}' } }
+  vi.spyOn(Commands.prototype, 'lark').mockResolvedValueOnce({ items: [{ message_id: topic.rootId, chat_id: topic.chatId, thread_id: 'omt_thread' }] })
+    .mockResolvedValueOnce({ items: [malformed, valid], has_more: false })
+  const recovered = pollBoundTopic(ctx, topic, new AbortController().signal, topic.since, new Date(Date.now() + 1000).toISOString())
+  await expect(recovered).resolves.toBe(true)
+  expect(ctx.feishuTopic!.report).toHaveBeenCalledWith(expect.objectContaining({ state: 'error',
+    detail: expect.stringContaining('1 unreadable bound-topic messages skipped') }))
+  expect(delivered).toEqual(['answer abcdefabcdefabcdefabcdef: valid reply'])
+})

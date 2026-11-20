@@ -213,6 +213,7 @@ export class Runtime extends Service implements SourceHost {
           return sources.send(message, deliveryCommands)
         },
       } })
+      const topicHealth = project ? board.claim('feishuBinding') : undefined
       if (project) {
         const link = (view: 'project' | 'settings') => projectNavigationLink(`http://127.0.0.1:${ctx.webServer.port}`, project.id, view)
         this.topicBinding = new TopicBinding({ store, handoffs, outbox, sources, projectId: project.id,
@@ -220,6 +221,10 @@ export class Runtime extends Service implements SourceHost {
           available: () => this.topicBindingAvailable(), botIdentity: () => {
             const bot = setup.configured() ? setup.deployment.feishu : undefined
             return bot && `${bot.appId}:${bot.botId}`
+          },
+          unbound: () => {
+            if (!this.closing() && this.topicBinding?.view() === null)
+              topicHealth?.set({ state: 'ready', detail: 'No Feishu topic is bound', at: now() })
           },
         })
       }
@@ -248,7 +253,6 @@ export class Runtime extends Service implements SourceHost {
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
         health: this.runtimeHealth, lifetime: this.lifetime, configured: () => this.configured(), closing: () => this.closing() })
       const sourceInactive = () => this.closing() || !installation.github
-      const topicHealth = project ? board.claim('feishuBinding') : undefined
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
         get deployment() { return setup.deployment }, configured: () => this.configured(), closing: sourceInactive,
         get setupProblem() { return runtime.setupProblem }, get feishuProblem() { return setup.feishuProblem },

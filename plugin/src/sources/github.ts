@@ -3,6 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { key, type Thread } from '../core/index.ts'
 import { sameName } from '../infra/text.ts'
 import { GithubAccountsSchema } from '../deployment.ts'
+import { RequiredActionsCheckSchema } from './actions-evidence.ts'
 import { githubEnvironment } from './github-environment.ts'
 import { CliError, validItems, type Tally } from '../infra/commands.ts'
 import { ciCounts, ciFact, ciFailures, ciSummary, githubThreadContext, pullChecks } from './github-read.ts'
@@ -26,7 +27,7 @@ const NotificationSchema = z.looseObject({
 const GithubConfigSchema = GithubAccountsSchema.extend({ pollSeconds: z.number().int().min(60).max(3600).default(60),
   failuresBeforeError: z.number().int().min(1).max(20).default(3),
   observeIssues: z.boolean().default(false), observePulls: z.boolean().default(false), observeComments: z.boolean().default(false),
-  observeCi: z.boolean().default(false), requiredChecks: z.array(z.object({ id: z.string().min(1) }).strict()).default([]) }).strict()
+  observeCi: z.boolean().default(false), requiredChecks: z.array(RequiredActionsCheckSchema).default([]) }).strict()
 export type GithubConfig = z.infer<typeof GithubConfigSchema>
 const OBSERVED = { issues: 'observeIssues', pulls: 'observePulls', comments: 'observeComments', ci: 'observeCi' } as const
 type Scope = keyof typeof OBSERVED
@@ -57,8 +58,9 @@ export const githubKind: SourceKind<GithubConfig> = {
     { key: 'observeCi', type: 'switch', label: { zh: '接收默认分支的 CI', en: 'Receive the default branch\'s CI' },
       hint: { zh: '打开后，默认分支的 CI 失败和恢复会收到，由策略的接收表决定是否成为候选。', en: 'Failures of the default branch\'s CI, and its recovery, are received, and the Policy\'s admission table decides whether they become candidates.' } },
     { key: 'requiredChecks', type: 'rows', label: { zh: '必需的 GitHub Actions 任务', en: 'Required GitHub Actions jobs' },
-      hint: { zh: '逐一填写 GitHub Actions 任务的完整名称；未配置或缺少任务时，提交的 CI 证据不算通过。', en: 'Enter each exact GitHub Actions job name. Unconfigured or missing jobs never count as passing commit evidence.' },
-      columns: [{ key: 'id', type: 'text', label: { zh: '任务名称', en: 'Job name' }, pattern: '.+' }] }],
+      hint: { zh: '逐一填写工作流 ID 和任务的完整名称；缺少任一信息或检查时，提交的 CI 证据不算通过。', en: 'Enter the workflow ID and exact job name for each required check. Missing settings or checks never count as passing evidence.' },
+      columns: [{ key: 'id', type: 'text', label: { zh: '任务名称', en: 'Job name' }, pattern: '.+' },
+        { key: 'workflowId', type: 'text', label: { zh: '工作流 ID', en: 'Workflow ID' }, pattern: '[1-9][0-9]*' }] }],
   // What the Source observes across the repository it receives in full; elsewhere, only what addresses the agent.
   scope: ({ meta }, config) => {
     const row = scopeOf(meta)

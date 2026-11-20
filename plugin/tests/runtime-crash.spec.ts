@@ -63,7 +63,16 @@ async function withCrash(point: CrashPoint, verify: (before: Evidence, after: Ev
   }
   try {
     const before = await run('crash')
-    const crashOffset = readJournal().length
+    const journal = readJournal()
+    const crashOffset = journal.length
+    if (point === 'dispatch') {
+      const session = before.ticket!.execution!.active_writer!.session
+      const [delivery] = journal.filter(event => event.kind === 'delivery' && event.session === session)
+      if (delivery?.kind !== 'delivery') throw new Error(`No dispatch observed for ${session} before process death`)
+      // Read the DSH substitute's persisted Session after SIGKILL and before recovery can change it.
+      const persisted = JSON.parse(readFileSync(join(directory, `session-${session}.json`), 'utf8'))
+      expect(persisted.events).toContainEqual(expect.objectContaining({ type: 'user/message', data: expect.objectContaining({ id: delivery.message }) }))
+    }
     const lock = join(directory, 'installation.lock')
     expect(statSync(lock).isDirectory()).toBe(true)
     // Simulate the stale-lock interval passing only after confirmed process death. Leave the lock and SQLite to normal recovery.

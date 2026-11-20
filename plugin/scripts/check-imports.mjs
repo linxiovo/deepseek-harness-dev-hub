@@ -28,10 +28,11 @@ function inspect(file, layer) {
       reject(node, '(non-literal module reference)')
       return
     }
-    const local = specifier === '.' || specifier === '..' || specifier.startsWith('./') || specifier.startsWith('../')
+    const path = specifier.replaceAll('\\', '/')
+    const local = path === '.' || path === '..' || path.startsWith('./') || path.startsWith('../')
     if (layer === 'core') {
-      if (specifier !== 'node:crypto' && !(local && contains(core, resolve(directory, specifier)))) reject(node, specifier)
-    } else if ((local || isAbsolute(specifier)) && contains(app, resolve(directory, specifier))) {
+      if (specifier !== 'node:crypto' && !(local && contains(core, resolve(directory, path)))) reject(node, specifier)
+    } else if ((local || isAbsolute(path)) && contains(app, resolve(directory, path))) {
       reject(node, specifier)
     }
   }

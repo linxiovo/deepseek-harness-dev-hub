@@ -298,15 +298,17 @@ const ROUTES: readonly Route[] = [
     const handoff = kind === 'plan' ? host.handoffs.get(id) : undefined
     if (!ticket && !handoff) throw new Error('Unknown ticket or handoff')
     const commands = host.commands.withSignal(read.signal)
-    const required = githubKind.schema.parse(host.store.settings().sources.github?.config ?? {}).requiredChecks.map(item => item.id)
+    const { requiredChecks: required } = githubKind.schema.parse(host.store.settings().sources.github?.config ?? {})
     return sourcePage(read, 'github', async () => {
       if (ticket) {
-        const ownPull = ticket.follows?.filter(follow => follow.own && follow.thread.startsWith('github:')).at(-1)
-        if (ownPull) {
-          const number = Number(ownPull.thread.slice('github:'.length))
-          if (!Number.isSafeInteger(number) || number <= 0) throw new Error('Ticket has no verifiable own pull request')
+        const ownPull = ticket.follows?.findLast(follow => follow.own && follow.thread.startsWith('github:'))
+        const origin = ownPull ? undefined : host.store.triggers.get(ticket.origin.triggerId)
+        const fromPull = origin?.source === 'github' && origin.meta.isPr === true
+        if (ownPull || fromPull) {
+          const number = ownPull ? Number(ownPull.thread.slice('github:'.length)) : origin?.meta.number
+          if (typeof number !== 'number' || !Number.isSafeInteger(number) || number <= 0) throw new Error('Ticket has no verifiable pull request')
           const pull = await commands.api(pullEvidence, `pulls/${number}`)
-          if (pull.head.sha !== sha || pull.head.repo?.full_name.toLowerCase() !== commands.repository.toLowerCase()) {
+          if (pull.head.sha !== sha || !pull.head.repo || (ownPull && pull.head.repo.full_name.toLowerCase() !== commands.repository.toLowerCase())) {
             throw new Error('Commit is not verified for this ticket')
           }
           return actionsEvidence(commands, { kind, id }, sha, required,

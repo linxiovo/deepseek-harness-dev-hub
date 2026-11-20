@@ -57,6 +57,7 @@ it('accepts Source imports from outside app, including sibling directories and l
 it.each([
   ['a static import', "import '../app/runtime.ts'"],
   ['a type-only import', "import type { Runtime } from '../app/runtime.ts'"],
+  ['a Windows-style type-only import', `import type { Runtime } from ${JSON.stringify('..\\app\\runtime.ts')}`],
   ['a normalized path from a nested directory', "import '../../core/../app/runtime.ts'", 'nested/fixture.ts'],
   ['a re-export', "export * from '../app/runtime.ts'"],
   ['an import type expression', "type Runtime = import('../app/runtime.ts').Runtime"],

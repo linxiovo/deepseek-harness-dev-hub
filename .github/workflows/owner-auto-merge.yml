@@ -1,0 +1,44 @@
+name: Owner PR auto-merge
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, ready_for_review, synchronize, edited]
+
+permissions: {}
+
+jobs:
+  enable:
+    # Match the PR author, not the commit author or the person who triggered this run.
+    if: >-
+      github.event.repository.id == 1461034541 &&
+      github.event.pull_request.user.id == 220323999 &&
+      !github.event.pull_request.draft &&
+      (github.event.action != 'synchronize' || github.event.sender.id == 220323999) &&
+      (github.event.action != 'edited' || github.event.changes.base.ref.from != null)
+    concurrency:
+      group: owner-auto-merge-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    environment: owner-auto-merge
+    steps:
+      # Run trusted base-branch code only. Never check out or execute PR code here.
+      - name: Enable native auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.OWNER_AUTO_MERGE_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo '::error::Set OWNER_AUTO_MERGE_TOKEN in the owner-auto-merge environment.'
+            exit 1
+          fi
+          pr=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
+          if ! jq -e --arg head "$PR_HEAD" '.state == "open" and .base.ref == "main" and .user.id == 220323999 and .draft == false and .head.sha == $head and .auto_merge == null' <<< "$pr" >/dev/null; then
+            exit 0
+          fi
+          title=$(jq -r '.title' <<< "$pr")
+          gh pr merge "$PR_NUMBER" --repo "$REPO" --auto --merge --match-head-commit "$PR_HEAD" \
+            --subject "合入 #$PR_NUMBER：$title"

@@ -435,14 +435,22 @@ export class Sessions {
     return undefined
   }
   /**
-   * A subagent of an Executor Session, or of one of its subagents, which runs under DSH's `standard` preset with the worker's
-   * permissions, gets the same work tools as the worker, and none once the worker's ticket ended. Any other agent is left as
-   * it is.
+   * Ordinary Worker descendants inherit the ticket work tools. A marked code-review descendant is limited to `REVIEW_TOOLS`
+   * and a single submission tool. Both remain guarded by the owning Worker's live writer lease.
    */
-  /** Read the immutable review assignment from the first message to a real DSH subagent Session. */
+  /** Read a review assignment from a real DSH subagent that loaded the packaged review Skill. */
   private reviewAssignment(agent: Agent) {
     if (agent.session.header.origin !== 'subagent') return undefined
-    const initial = agent.session.snapshotEvents().find(event => event.type === 'user/message')
+    const events = agent.session.snapshotEvents()
+    const loaded = events.some(event => {
+      if (event.type !== 'tool/call' || event.data.name !== 'skill') return false
+      try {
+        const args: unknown = JSON.parse(event.data.arguments)
+        return !!args && typeof args === 'object' && 'name' in args && args.name === 'dsh-worker-code-review'
+      } catch { return false }
+    })
+    if (!loaded) return undefined
+    const initial = events.find(event => event.type === 'user/message')
     if (!initial) return undefined
     const text = initial.data.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
     const marker = /^DSH_REVIEW_ASSIGNMENT: (\{[^\n]+\})$/m.exec(text)?.[1]
@@ -474,10 +482,11 @@ export class Sessions {
     if (this.bindings.get(agent) !== pending || this.host.closing()) return
     if (ticketId === undefined) { this.release(agent); return }
     // Install the ticket guard before lifting the temporary one; an inspection error leaves the latter in place.
-    pending.disposers.push(...this.workOnly(agent, ticketId, REVIEW_TOOLS))
+    const review = this.reviewAssignment(agent)
+    pending.disposers.push(...this.workOnly(agent, ticketId, review ? REVIEW_TOOLS : WORK_TOOLS))
     pending.disposers.shift()!()
     const ticket = this.host.store.tickets.get(ticketId)
-    if (!ticket) return
+    if (!ticket || !review) return
     const register = this.registerTool(agent, pending)
     for (const tool of this.host.tools(agent, ticket, 'review')) {
       if (tool.name === 'orchestrator_review_submit') register(tool.name, tool.description, tool.schema, tool.execute)

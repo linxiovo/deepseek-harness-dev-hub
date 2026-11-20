@@ -115,6 +115,17 @@ it('exposes review submission only to actual Worker descendants and restores ind
   const specSession = await h.reviewSubagent(sessionId, 'spec')
   expect(h.tools.get(standardsSession)?.has('orchestrator_review_submit')).toBe(true)
   expect(h.tools.get(specSession)?.has('orchestrator_review_submit')).toBe(true)
+  const unqualified = await h.reviewSubagent(sessionId, 'standards', undefined, false)
+  expect(h.tools.get(unqualified)?.has('orchestrator_review_submit')).toBe(false)
+  await expect(h.runTool(unqualified, 'orchestrator_review_submit', { candidate: h.localGit!.base.sha, axis: 'standards',
+    basis: ['fake reviewer'], conclusion: 'passed', summary: 'Not a reviewer.', blockers: [] })).rejects.toThrow(/not registered/i)
+  for (const reviewer of [standardsSession, specSession]) {
+    const allowed = h.toolLimits.get(reviewer)!
+    expect(allowed.has('bash')).toBe(true)
+    expect(allowed.has('write')).toBe(false)
+    expect(allowed.has('edit')).toBe(false)
+    expect(allowed.has('subagent')).toBe(false)
+  }
   const candidate = h.localGit!.git('-C', ticket.execution!.directory, 'rev-parse', 'HEAD')
   const other = await h.acceptedTicket(feishu('2', '@bot another ticket'))
   const foreignReviewer = await h.reviewSubagent(other.sessionId, 'spec')

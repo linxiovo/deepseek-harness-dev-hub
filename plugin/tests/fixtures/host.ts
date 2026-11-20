@@ -209,6 +209,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   const steps = new Map<string, () => void>(), claims = new Map<string, () => void>()
   let reviewChildSequence = 0
   const tools = new Map<string, Map<string, RegisteredTool>>()
+  const toolLimits = new Map<string, Set<string>>()
   const deliveries = vi.fn<(request: Delivery) => void>()
   let http!: HttpHandler
   const resolveDefault = async (id: string) => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }
@@ -357,13 +358,14 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     return await tool.execute(args, { signal: new AbortController().signal }) as Record<string, unknown>
   }
   /** Create a real Cordis Agent boundary for a Worker descendant; authorization still runs through Sessions and DSH tools. */
-  async function reviewSubagent(parentId: string, axis: ReviewAxis, childId = `review-${++reviewChildSequence}`) {
+  async function reviewSubagent(parentId: string, axis: ReviewAxis, childId = `review-${++reviewChildSequence}`, loadReviewSkill = true) {
     const parent = agents.get(parentId)
     if (!parent) throw new Error(`Session ${parentId} does not exist`)
     const agentCtx = new Context(), sessionTools = new Map<string, RegisteredTool>()
     tools.set(childId, sessionTools)
     agentCtx.reflect.provide('tools', { register: (tool: RegisteredTool) => { sessionTools.set(tool.name, tool); return () => sessionTools.delete(tool.name) },
-      get: () => undefined, restrict: vi.fn(() => () => {}), guard: vi.fn(() => () => {}) })
+      get: (name: string) => name, restrict: vi.fn(({ allow }: { allow: string[] }) => { toolLimits.set(childId, new Set(allow)); return () => {} }),
+      guard: vi.fn(() => () => {}) })
     agentCtx.reflect.provide('skills', { register: () => () => {} })
     agentCtx.reflect.provide('systemPrompt', { section: () => () => {} })
     const parentSession = parent.session as unknown as { header?: { cwd?: string } } | undefined
@@ -372,8 +374,9 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     const candidate = localGit!.git('-C', ticket.execution!.directory, 'rev-parse', 'HEAD')
     const assignment = JSON.stringify({ axis, base, candidate, generation })
     const reviewEvent = { type: 'user/message', data: { role: 'user', content: [{ type: 'text', text: `DSH_REVIEW_ASSIGNMENT: ${assignment}` }] } } as never
+    const loadedReviewSkill = { type: 'tool/call', data: { name: 'skill', arguments: JSON.stringify({ name: 'dsh-worker-code-review' }) } } as never
     const session = { id: childId, header: { cwd: parentSession?.header?.cwd ?? '', parentSession: parentId, origin: 'subagent' },
-      snapshotEvents: () => [reviewEvent], requestHeader: () => undefined }
+      snapshotEvents: () => [reviewEvent, ...(loadReviewSkill ? [loadedReviewSkill] : [])], requestHeader: () => undefined }
     const agent = { ...parent, id: childId, ctx: agentCtx, session, status: 'idle' } as never
     agents.set(childId, agent)
     ctx.emit('agent/created', { agent } as never)
@@ -431,7 +434,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   const step = (sessionId: string) => { steps.get(sessionId)!() }
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
-  return { get runtime() { return runtime }, get ctx() { return ctx }, restart, idlePlanning, idleRelay, directory, localGit, agents, tools, deliveries, relays, candidates, runTool, sendUserMessage, record, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
+  return { get runtime() { return runtime }, get ctx() { return ctx }, get toolLimits() { return toolLimits }, restart, idlePlanning, idleRelay, directory, localGit, agents, tools, deliveries, relays, candidates, runTool, sendUserMessage, record, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
     jobs, subagents, reviewSubagent, step, claim }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>

@@ -636,11 +636,11 @@ Each Worker Executor has eight application tools. A Worker descendant used as an
 | `orchestrator_thread_follow` | Subscribe to a related Thread for context and tell the main Session |
 | `orchestrator_trigger_handback` | Hand back a message once, with a reason carried by its candidate |
 
-Only a live Worker descendant can call `orchestrator_review_submit`, with `candidate`, `axis`, `basis`, `conclusion`, `summary` and `blockers`. The runtime binds the reviewer Session and pinned base, persists the evidence on the Assignment, and returns the current aggregate; the parent Worker cannot submit a review for itself.
+Only a live Worker descendant whose first user message carries a valid `DSH_REVIEW_ASSIGNMENT` marker and whose Session history contains a `skill` call loading `dsh-worker-code-review` can call `orchestrator_review_submit`. The marker binds axis, pinned base, candidate and writer generation; the runtime supplies the actual reviewer Session ID. Submission rechecks the clean current candidate. The Engine persists evidence on the Assignment and aggregates only the active generation; the parent Worker cannot submit a review for itself.
 
 A hand-back returns `queued: false` if another Ticket still owns the message, or this Ticket never owned it. For example, a bot message went to Eval independently.
 
-The worker preset is defined in `cordis.patch.yml` and selected through `WORKER_PRESET`. `WORK_TOOLS` in `src/app/sessions.ts` retains available file, search, shell, job, web, skill, todo and subagent tools. Workers do not receive tools for asking or presenting to a person, changing the profile, scheduling work outside worker slots, starting or messaging other Sessions, or editing external documents. Tool calls are refused once the Ticket ends, and while no live verified writer grant authorizes the worker, for the worker and for every subagent at any depth below it.
+Ordinary Worker descendants retain the `WORK_TOOLS` surface described in `010-session-boundaries.md`; only a valid marked review child receives the narrower `REVIEW_TOOLS` surface and review tool.
 
 ### Result shapes and assessment context
 

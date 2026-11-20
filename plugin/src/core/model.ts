@@ -222,6 +222,7 @@ export interface ReviewEvidence {
   id: string
   axis: ReviewAxis
   reviewer_session: string
+  generation: number
   basis: string[]
   base: string
   candidate: string
@@ -233,7 +234,7 @@ export interface ReviewEvidence {
 export type ReviewStatus = 'pending' | 'blocked' | 'passed'
 /** The currently selected candidate/base, plus all durable submissions; old candidates remain auditable. */
 export interface AssignmentReviews {
-  target?: { base: string; candidate: string }
+  target?: { base: string; candidate: string; generation: number }
   evidence: ReviewEvidence[]
 }
 /** Binding between a ticket and one executor instance. */
@@ -393,10 +394,11 @@ export function reached(ticket: Ticket, trigger: Trigger, thread: (key: string) 
   }) || (input && (context || !trigger.threads.every(ref => thread(threadKey(ref))?.context?.includes(ticket.id))))
 }
 /** Aggregate only the exact selected base/candidate; stale historical evidence can never satisfy a new candidate. */
-export function reviewStatus(assignment: Pick<Assignment, 'reviews'>): ReviewStatus {
+export function reviewStatus(assignment: Pick<Assignment, 'reviews' | 'writer'>): ReviewStatus {
   const reviews = assignment.reviews
-  if (!reviews?.target) return 'pending'
-  const current = reviews.evidence.filter(item => item.base === reviews.target!.base && item.candidate === reviews.target!.candidate)
+  if (!reviews?.target || assignment.writer?.generation !== reviews.target.generation) return 'pending'
+  const current = reviews.evidence.filter(item => item.base === reviews.target!.base && item.candidate === reviews.target!.candidate
+    && item.generation === reviews.target!.generation)
   if (current.some(item => item.conclusion === 'blocked' || item.blockers.length > 0)) return 'blocked'
   const standards = current.filter(item => item.axis === 'standards')
   const spec = current.filter(item => item.axis === 'spec')

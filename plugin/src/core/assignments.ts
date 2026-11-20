@@ -143,17 +143,19 @@ export class Assignments extends EnginePart {
       throw new Error('Review submission requires the active ticket writer grant')
     if (!reviewerSession || reviewerSession === writer.session) throw new Error('Review submission must come from an independent descendant Session')
     const base = ticket.execution.base?.sha
+    const generation = writer.generation
     if (!base || input.base !== base) throw new Error('Review base does not match the ticket pinned base')
     if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(input.candidate)) throw new Error('Review candidate must be a full lowercase commit hash')
     const reviews = assignment.reviews ??= { evidence: [] }
-    if (reviews.evidence.some(item => item.axis === input.axis && item.candidate === input.candidate))
+    if (reviews.evidence.some(item => item.base === base && item.generation === generation
+      && item.axis === input.axis && item.candidate === input.candidate))
       throw new Error('This review axis has already submitted this candidate')
-    if (reviews.evidence.some(item => item.base === base && item.candidate === input.candidate
+    if (reviews.evidence.some(item => item.base === base && item.generation === generation && item.candidate === input.candidate
       && item.reviewer_session === reviewerSession && item.axis !== input.axis))
       throw new Error('Independent review axes require different reviewer Sessions')
-    reviews.target = { base, candidate: input.candidate }
-    const evidence: ReviewEvidence = { id: key('review', assignment.id, input.axis, input.candidate), axis: input.axis,
-      reviewer_session: reviewerSession, basis: [...input.basis], base, candidate: input.candidate,
+    reviews.target = { base, candidate: input.candidate, generation }
+    const evidence: ReviewEvidence = { id: key('review', assignment.id, input.axis, input.candidate, String(generation)), axis: input.axis,
+      reviewer_session: reviewerSession, generation, basis: [...input.basis], base, candidate: input.candidate,
       conclusion: input.blockers.length ? 'blocked' : input.conclusion, blockers: [...input.blockers], summary: input.summary, at: this.now() }
     reviews.evidence.push(evidence)
     ticket.updatedAt = evidence.at

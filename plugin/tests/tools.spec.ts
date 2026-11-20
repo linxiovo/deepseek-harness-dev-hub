@@ -137,7 +137,7 @@ it('exposes review submission only to actual Worker descendants and restores ind
   await h.restart()
   expect(await read(`ticket/${ticket.id}/reviews`, { limit: 1 })).toMatchObject({ history: [expect.any(Object)], next_offset: 1 })
   expect(await reviewsRead()).toMatchObject({ aggregate: 'passed', standards: [expect.objectContaining({ reviewer_session: standardsSession })],
-    spec: [expect.objectContaining({ reviewer_session: specSession })] })
+    spec: [expect.objectContaining({ reviewer_session: specSession })], history: expect.arrayContaining([expect.any(Object)]) })
 })
 
 it('checks documentation impact in the active worker candidate and never approves its semantics', async () => {

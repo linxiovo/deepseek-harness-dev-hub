@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { Engine, MemoryRepositories, UserError, followupOwners, key, runningAssignment, ticketOutcome, ticketStage,
+import { Engine, MemoryRepositories, UserError, followupOwners, key, reviewStatus, runningAssignment, ticketOutcome, ticketStage,
   waitsForPerson } from '../src/core/index.ts'
 import type { Assessor, Assignment, Candidate, EngineOptions, Executor, OutboundMessage, Outcome, Policy, Ticket, Trigger } from '../src/core/index.ts'
 
@@ -1527,6 +1527,9 @@ describe('assignment review evidence', () => {
     expect(h.engine.recordReview(ticketId, 'child-standards', { ...common, axis: 'standards', base }).status).toBe('pending')
     expect(h.engine.recordReview(ticketId, 'child-spec', { ...common, axis: 'spec', base }).status).toBe('passed')
     expect(h.repo.tickets.get(ticketId)!.assignments[0]!.reviews?.evidence).toHaveLength(2)
+    const assignment = h.repo.tickets.get(ticketId)!.assignments[0]!
+    assignment.writer!.generation = 2
+    expect(reviewStatus(assignment)).toBe('pending')
   })
 
   it('does not pass on missing, blocked, duplicate, or mismatched review evidence', () => {
@@ -1540,6 +1543,11 @@ describe('assignment review evidence', () => {
       .toBe('blocked')
     expect(h.engine.recordReview(ticketId, 'child-spec-new-candidate', { ...common, axis: 'spec', candidate: '4'.repeat(40) }).status)
       .toBe('pending')
+    const changed = h.repo.tickets.get(ticketId)!
+    changed.execution!.base = { ref: 'main', sha: '3'.repeat(40) }
+    changed.assignments[0]!.writer!.generation = 2
+    h.repo.tickets.save(changed)
+    expect(h.engine.recordReview(ticketId, 'child-new-base', { ...common, base: '3'.repeat(40), axis: 'standards' }).status).toBe('pending')
   })
 })
 

@@ -43,8 +43,9 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
     + 'branch, base, worker Session and active writer when available; its trigger, decision and threads, latest assignments with the '
     + 'start of each report, and inputs, newest first', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
-  { name: 'ticket/<id>/reviews', holds: 'review evidence', executor: true },
-  { name: 'ticket/<id>/assignments', holds: 'its assignments, newest first, with the start of each report', executor: true },
+  { name: 'ticket/<id>/reviews', holds: 'reviews', executor: true },
+  { name: 'ticket/<id>/review/<id>', holds: 'one review', executor: true },
+  { name: 'ticket/<id>/assignments', holds: 'assignment pages, newest first', executor: true },
   { name: 'ticket/<id>/inputs', holds: 'its inputs, newest first', executor: true },
   { name: 'ticket/<id>/result', holds: 'its latest report', executor: true },
   { name: 'ticket/<id>/report/<id>', holds: 'the report of one of its assignments', executor: true },
@@ -383,11 +384,13 @@ const ROUTES: readonly Route[] = [
       }
       const base = ticket.execution?.base?.sha ?? reviews?.target?.base ?? null
       const candidate = currentHead ?? reviews?.target?.candidate ?? null
-      const matches = !!reviews?.target && reviews.target.base === base && reviews.target.candidate === candidate && clean
+      const generation = assignment?.writer?.generation ?? null
+      const matches = !!reviews?.target && reviews.target.base === base && reviews.target.candidate === candidate
+        && reviews.target.generation === generation && clean
       const evidence = reviews?.evidence ?? []
-      const active = matches ? evidence.filter(review => review.base === base && review.candidate === candidate) : []
+      const active = matches ? evidence.filter(review => review.base === base && review.candidate === candidate && review.generation === generation) : []
       const aggregate = !clean || !currentHead || !reviews?.target || reviews.target.base !== base || reviews.target.candidate !== candidate
-        ? 'pending' : reviewStatus(assignment!)
+        || reviews.target.generation !== generation ? 'pending' : reviewStatus(assignment!)
       if (section === 'review') return { ...item, current_base: base, current_candidate: candidate,
         stale: !matches, aggregate: matches ? aggregate : 'pending' }
       const history = list(read, (offset, count) => evidence.slice().reverse().slice(offset, offset + count).map(review => ({ ...review,

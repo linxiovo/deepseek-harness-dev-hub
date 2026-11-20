@@ -49,6 +49,12 @@ After both platform checks pass, the Ubuntu job uploads `plugin-check-<github.sh
 
 When using the build as evidence, match the manifest to the expected repository, commit and run attempt. A successful rerun replaces the artifact; a rerun that fails before upload can leave the previous attempt's artifact available. An artifact alone is not proof that both required jobs passed for the candidate commit.
 
+#### Owner PR auto-merge
+
+In `linxiovo/deepseek-harness-dev-hub`, `.github/workflows/owner-auto-merge.yml` automatically enables GitHub auto-merge for ready PRs opened by `linxiovo` (account ID `220323999`) and targeting `main`. GitHub still requires `windows` and `check` to pass and blocks merges with conflicts. The workflow does not enroll PRs from other authors or re-enable auto-merge after someone other than the owner pushes to the PR. To take a PR out of automatic merging, mark it as a draft before the checks pass.
+
+Keep repository **Allow auto-merge** enabled and restrict the `owner-auto-merge` Actions environment to the `main` branch. Store `OWNER_AUTO_MERGE_TOKEN` in that environment, not as a repository-wide secret. Use a fine-grained token for this repository with **Contents**, **Pull requests**, and **Workflows** write access (the last allows merging changes to workflow files). The built-in `GITHUB_TOKEN` would not trigger the post-merge `push` CI on `main`. The merge job never checks out or runs PR code.
+
 ## Accounts
 
 ### Agent GitHub account

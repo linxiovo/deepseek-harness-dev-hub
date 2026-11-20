@@ -1533,6 +1533,7 @@ describe('assignment review evidence', () => {
     const { h, ticketId } = readyForReviews()
     const common = { basis: ['ticket/1'], candidate, base, conclusion: 'passed' as const, blockers: [], summary: 'Checked.' }
     expect(h.engine.recordReview(ticketId, 'child', { ...common, axis: 'standards' }).status).toBe('pending')
+    expect(() => h.engine.recordReview(ticketId, 'child', { ...common, axis: 'spec' })).toThrow(/different reviewer Sessions/)
     expect(() => h.engine.recordReview(ticketId, 'child-again', { ...common, axis: 'standards' })).toThrow(/already submitted/)
     expect(() => h.engine.recordReview(ticketId, 'child-spec', { ...common, axis: 'spec', base: '3'.repeat(40) })).toThrow(/pinned base/)
     expect(h.engine.recordReview(ticketId, 'child-spec', { ...common, axis: 'spec', conclusion: 'blocked', blockers: ['Missing API contract'] }).status)

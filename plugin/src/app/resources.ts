@@ -386,9 +386,8 @@ const ROUTES: readonly Route[] = [
       const matches = !!reviews?.target && reviews.target.base === base && reviews.target.candidate === candidate && clean
       const evidence = reviews?.evidence ?? []
       const active = matches ? evidence.filter(review => review.base === base && review.candidate === candidate) : []
-      const blocked = active.some(review => review.conclusion === 'blocked' || review.blockers.length > 0)
       const aggregate = !clean || !currentHead || !reviews?.target || reviews.target.base !== base || reviews.target.candidate !== candidate
-        ? 'pending' : blocked ? 'blocked' : reviewStatus(assignment!)
+        ? 'pending' : reviewStatus(assignment!)
       return section === 'review' ? { ...item, current_base: base, current_candidate: candidate,
         stale: !matches, aggregate: matches ? aggregate : 'pending' }
         : { ticket_id: id, assignment_id: assignment?.id ?? null, base, candidate, clean, stale: !matches,

@@ -1,7 +1,7 @@
 /** What the Executor and its workers report about the Assignments that run tickets. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
-import { latestAssignment, liveTicket, runningAssignment } from './model.ts'
+import { latestAssignment, liveTicket, reviewStatus, runningAssignment } from './model.ts'
 import type { ReviewAxis, ReviewConclusion, ReviewEvidence, ReportState, Ticket } from './model.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
@@ -148,6 +148,9 @@ export class Assignments extends EnginePart {
     const reviews = assignment.reviews ??= { evidence: [] }
     if (reviews.evidence.some(item => item.axis === input.axis && item.candidate === input.candidate))
       throw new Error('This review axis has already submitted this candidate')
+    if (reviews.evidence.some(item => item.base === base && item.candidate === input.candidate
+      && item.reviewer_session === reviewerSession && item.axis !== input.axis))
+      throw new Error('Independent review axes require different reviewer Sessions')
     reviews.target = { base, candidate: input.candidate }
     const evidence: ReviewEvidence = { id: key('review', assignment.id, input.axis, input.candidate), axis: input.axis,
       reviewer_session: reviewerSession, basis: [...input.basis], base, candidate: input.candidate,
@@ -155,10 +158,7 @@ export class Assignments extends EnginePart {
     reviews.evidence.push(evidence)
     ticket.updatedAt = evidence.at
     this.repo.tickets.save(ticket)
-    const current = reviews.evidence.filter(item => item.base === base && item.candidate === input.candidate)
-    const status = current.some(item => item.conclusion === 'blocked' || item.blockers.length > 0) ? 'blocked'
-      : current.filter(item => item.axis === 'standards').length === 1 && current.filter(item => item.axis === 'spec').length === 1
-        && current.every(item => item.conclusion === 'passed') ? 'passed' : 'pending'
+    const status = reviewStatus(assignment)
     return { evidence, status }
   }
   /** The ticket, while it is open and `assignmentId` runs it. */

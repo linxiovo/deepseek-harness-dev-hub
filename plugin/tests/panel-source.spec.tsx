@@ -93,6 +93,20 @@ it('renders each Source\'s settings from its kind\'s fields and saves one Source
   expect(server.revisions['source:github']).toBe(6)
 })
 
+it('lets an operator add the workflow ID to a saved required job', async () => {
+  const saved = server.settings.sources.github!
+  server.settings.sources.github = { ...saved, config: { ...saved.config, requiredChecks: [{ id: 'check' }] } }
+  await mount()
+  await click(tab(zh['tab.settings']))
+  const github = all('.dt-card')[1]!
+  const workflow = field<HTMLInputElement>('工作流 ID')
+  expect(workflow.checkValidity()).toBe(false)
+  await type(workflow, '421566471')
+  expect(workflow.checkValidity()).toBe(true)
+  await act(async () => { github.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) }); await settle()
+  expect(server.settings.sources.github!.config).toMatchObject({ requiredChecks: [{ id: 'check', workflowId: '421566471' }] })
+})
+
 it('shows the account each CLI signs in as, and keeps a saved CLI on screen while dsh-superagent restarts', async () => {
   await mount()
   await click(tab(zh['tab.settings']))

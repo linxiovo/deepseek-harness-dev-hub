@@ -3,10 +3,24 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync }
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { expect, it } from 'vitest'
+import { build } from 'tsdown'
+import { afterAll, beforeAll, expect, it } from 'vitest'
 import type { CrashPoint, Evidence, Observation } from './fixtures/runtime-crash-child.ts'
 
-const childEntry = fileURLToPath(new URL('./fixtures/runtime-crash-child.ts', import.meta.url))
+const fixture = fileURLToPath(new URL('./fixtures/runtime-crash-child.ts', import.meta.url))
+const entryName = 'runtime-crash-child.mjs'
+let bundleDir: string
+
+beforeAll(async () => {
+  // Match the plugin build target: Node 22's native TypeScript loader leaves `await using` intact.
+  bundleDir = mkdtempSync(fileURLToPath(new URL('../node_modules/.runtime-crash-', import.meta.url)))
+  await build({ config: false, entry: fixture, outDir: bundleDir, outputOptions: { entryFileNames: entryName },
+    format: 'esm', platform: 'node', target: 'es2024', deps: { neverBundle: true }, dts: false, logLevel: 'warn' })
+})
+
+afterAll(() => {
+  if (bundleDir) rmSync(bundleDir, { recursive: true, force: true })
+})
 
 async function withCrash(point: CrashPoint, verify: (before: Evidence, after: Evidence, timeline: Observation[], crashOffset: number) => void) {
   const directory = mkdtempSync(join(realpathSync.native(tmpdir()), 'orchestrator-crash-'))
@@ -16,8 +30,8 @@ async function withCrash(point: CrashPoint, verify: (before: Evidence, after: Ev
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error }
   }
   async function run(phase: 'crash' | 'recover', ticket?: string) {
-    const child = fork(childEntry, [point, phase, directory, ...ticket ? [ticket] : []], {
-      execArgv: ['--experimental-transform-types'], stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    const child = fork(join(bundleDir, entryName), [point, phase, directory, ...ticket ? [ticket] : []], {
+      execArgv: [], stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     })
     let logs = ''
     for (const stream of [child.stdout, child.stderr]) stream?.on('data', chunk => { logs = `${logs}${chunk}`.slice(-16_384) })
@@ -49,7 +63,16 @@ async function withCrash(point: CrashPoint, verify: (before: Evidence, after: Ev
   }
   try {
     const before = await run('crash')
-    const crashOffset = readJournal().length
+    const journal = readJournal()
+    const crashOffset = journal.length
+    if (point === 'dispatch') {
+      const session = before.ticket!.execution!.active_writer!.session
+      const [delivery] = journal.filter(event => event.kind === 'delivery' && event.session === session)
+      if (delivery?.kind !== 'delivery') throw new Error(`No dispatch observed for ${session} before process death`)
+      // Read the DSH substitute's persisted Session after SIGKILL and before recovery can change it.
+      const persisted = JSON.parse(readFileSync(join(directory, `session-${session}.json`), 'utf8'))
+      expect(persisted.events).toContainEqual(expect.objectContaining({ type: 'user/message', data: expect.objectContaining({ id: delivery.message }) }))
+    }
     const lock = join(directory, 'installation.lock')
     expect(statSync(lock).isDirectory()).toBe(true)
     // Simulate the stale-lock interval passing only after confirmed process death. Leave the lock and SQLite to normal recovery.

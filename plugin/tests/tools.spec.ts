@@ -9,6 +9,7 @@ import { key, UserError } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
 import { RESOURCES } from '../src/app/resources.ts'
 import { CliError, Commands } from '../src/infra/commands.ts'
+import { commentTrigger } from '../src/sources/github-trigger.ts'
 import { IM_WORDS, NOTE_WORDS } from '../src/infra/text.ts'
 import { CHAT, feishu, startRuntime, type Host } from './fixtures/host.ts'
 
@@ -222,12 +223,12 @@ it('reads configured GitHub Actions evidence for a ticket at its complete commit
   const git = checkouts({ [ticket.execution!.directory]: { sha } })
   const settings = h.runtime.store.settings()
   await h.runTool(h.runtime.masterId, 'orchestrator_settings_save', { block: 'source', source: 'github',
-    value: { ...settings.sources.github!, config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build' }] } },
+    value: { ...settings.sources.github!, config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build', workflowId: '4' }] } },
     revision: h.runtime.store.blockRevision('source:github') })
-  expect(JSON.parse((await read('settings/source:github') as { text: string }).text).value.config.requiredChecks).toEqual([{ id: 'build' }])
+  expect(JSON.parse((await read('settings/source:github') as { text: string }).text).value.config.requiredChecks).toEqual([{ id: 'build', workflowId: '4' }])
   const gh = vi.spyOn(Commands.prototype, 'gh')
     .mockResolvedValueOnce({ total_count: 1, workflow_runs: [
-      { id: 21, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success', html_url: 'https://github.com/acme/widgets/actions/runs/21' },
+      { id: 21, workflow_id: 4, run_number: 1, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success', html_url: 'https://github.com/acme/widgets/actions/runs/21' },
     ] })
     .mockResolvedValueOnce({ total_count: 1, jobs: [
       { id: 37, run_id: 21, run_attempt: 1, head_sha: sha, name: 'build', status: 'completed', conclusion: 'success', html_url: 'https://github.com/acme/widgets/actions/runs/21/job/37' },
@@ -252,12 +253,12 @@ it('binds ticket and handoff evidence to their own commit SHA and required job n
   checkouts({ [ticket.execution!.directory]: { sha: shaTicket }, [handoff.project.workspace]: { sha: shaPlan } })
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, github: { ...settings.sources.github!,
-    config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'release / build' }] } } } })
+    config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'release / build', workflowId: '4' }] } } } })
   const gh = vi.spyOn(Commands.prototype, 'gh').mockImplementation(async ([, path]) => {
     const sha = path?.includes('head_sha=') ? path.split('head_sha=')[1]?.split('&')[0] : path?.includes('/runs/11/') ? shaTicket : shaPlan
     const run = sha === shaTicket ? 11 : 22
     if (path?.includes('head_sha=')) return { total_count: 1, workflow_runs: [
-      { id: run, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success', html_url: `https://github.com/acme/widgets/actions/runs/${run}` },
+      { id: run, workflow_id: 4, run_number: 1, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success', html_url: `https://github.com/acme/widgets/actions/runs/${run}` },
     ] }
     if (path?.includes('/jobs?')) return { total_count: 1, jobs: [
       { id: run + 100, run_id: run, run_attempt: 1, head_sha: sha, name: 'release / build', status: 'completed', conclusion: 'success',
@@ -285,7 +286,7 @@ it('does not count unconfigured or missing required Actions jobs as passing evid
   checkouts({ [ticket.execution!.directory]: { sha } })
   const gh = vi.spyOn(Commands.prototype, 'gh').mockImplementation(async ([, path]) => {
     if (path?.includes('head_sha=')) return { total_count: 1, workflow_runs: [
-      { id: 31, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success', html_url: 'https://github.com/acme/widgets/actions/runs/31' },
+      { id: 31, workflow_id: 4, run_number: 1, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success', html_url: 'https://github.com/acme/widgets/actions/runs/31' },
     ] }
     if (path?.includes('/jobs?')) return { total_count: 1, jobs: [
       { id: 32, run_id: 31, head_sha: sha, name: 'build', status: 'completed', conclusion: 'success',
@@ -298,7 +299,7 @@ it('does not count unconfigured or missing required Actions jobs as passing evid
   expect(unconfigured).toMatchObject({ required: [], satisfied: false, reason: 'required_checks_unconfigured' })
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, github: { ...settings.sources.github!,
-    config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build' }, { id: 'lint' }] } } } })
+    config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build', workflowId: '4' }, { id: 'lint', workflowId: '4' }] } } } })
   let text = '', offset: number | null = 0
   while (offset !== null) {
     const page = await read(resource, { offset, limit: 70 }) as { text: string; next_offset: number | null }
@@ -334,7 +335,7 @@ it('refuses unrelated green SHAs for existing tickets and handoffs before asking
   const unrelated = 'e'.repeat(40)
   checkouts({ [ticket.execution!.directory]: { sha: 'a'.repeat(40) }, [handoff.project.workspace]: { sha: 'b'.repeat(40) } })
   const gh = vi.spyOn(Commands.prototype, 'gh').mockResolvedValue({ total_count: 1, workflow_runs: [
-    { id: 1, head_sha: unrelated, run_attempt: 1, status: 'completed', conclusion: 'success' },
+    { id: 1, workflow_id: 4, run_number: 1, head_sha: unrelated, run_attempt: 1, status: 'completed', conclusion: 'success' },
   ] })
   await expect(read(`actions/ticket/${ticket.id}/commit/${unrelated}`)).rejects.toThrow('not verified for this ticket')
   await expect(read(`actions/plan/${handoff.id}/commit/${unrelated}`)).rejects.toThrow('not verified for this plan')
@@ -360,19 +361,27 @@ it('refuses handoffs for another repository and ticket directories that cannot p
   expect(gh).not.toHaveBeenCalled()
 })
 
-it('accepts only a current own PR head and its matching PR run, never a merge SHA lookup', async () => {
-  const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
-  h.runtime.engine.bindThread(ticket.id, { source: 'github', id: '42' }, true)
+async function acceptEvidencePr(own: boolean) {
+  const { ticket } = await h.acceptedTicket(own ? feishu('1', '@bot 修一下回归') : commentTrigger({
+    id: 1, body: '@agent-bot please fix the regression', user: { login: 'alice' },
+    html_url: 'https://github.com/acme/widgets/pull/42#issuecomment-1', created_at: new Date().toISOString(),
+  }, { number: 42, isPr: true }, 'conversation', 'agent-bot'))
+  h.runtime.engine.bindThread(ticket.id, { source: 'github', id: '42' }, own)
+  return ticket
+}
+
+it.each([['own', true], ['source', false]] as const)('accepts only a current %s PR head and its matching PR run, never a merge SHA lookup', async (_kind, own) => {
+  const ticket = await acceptEvidencePr(own)
   const sha = 'a'.repeat(40), base = 'b'.repeat(40), merge = 'c'.repeat(40)
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, github: { ...settings.sources.github!,
-    config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build' }] } } } })
+    config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build', workflowId: '4' }] } } } })
   const git = vi.spyOn(Commands.prototype, 'git').mockClear().mockRejectedValue(new Error('The PR proves ownership without a local checkout'))
-  const gh = vi.spyOn(Commands.prototype, 'gh').mockImplementation(async ([, path]) => {
+  const gh = vi.spyOn(Commands.prototype, 'gh').mockClear().mockImplementation(async ([, path]) => {
     if (path === 'repos/acme/widgets/pulls/42') return { head: { sha, repo: { full_name: 'acme/widgets' } },
       base: { sha: base }, merge_commit_sha: merge }
     if (path?.includes('head_sha=')) return { total_count: 1, workflow_runs: [
-      { id: 21, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success',
+      { id: 21, workflow_id: 4, run_number: 1, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success',
         html_url: 'https://github.com/acme/widgets/actions/runs/21', pull_requests: [{ number: 42, head: { sha }, base: { sha: base } }] },
     ] }
     if (path?.includes('/jobs?')) return { total_count: 1, jobs: [
@@ -391,22 +400,26 @@ it('accepts only a current own PR head and its matching PR run, never a merge SH
   expect(git).not.toHaveBeenCalled()
 })
 
-it('does not pass a green PR run associated with an obsolete base commit', async () => {
-  const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
-  h.runtime.engine.bindThread(ticket.id, { source: 'github', id: '42' }, true)
+it.each([
+  ['obsolete base on an own PR', true, 42, 'c'],
+  ['obsolete base on an adopted PR', false, 42, 'c'],
+  ['another PR with the same head and base as the adopted PR', false, 43, 'b'],
+] as const)('does not pass a green run for %s', async (_label, own, runPull, runBase) => {
+  const ticket = await acceptEvidencePr(own)
   const sha = 'a'.repeat(40), base = 'b'.repeat(40)
+  checkouts({ [ticket.execution!.directory]: { sha } })
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, github: { ...settings.sources.github!,
-    config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build' }] } } } })
+    config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build', workflowId: '4' }] } } } })
   vi.spyOn(Commands.prototype, 'gh').mockImplementation(async ([, path]) => {
     if (path === 'repos/acme/widgets/pulls/42') return { head: { sha, repo: { full_name: 'acme/widgets' } },
       base: { sha: base }, merge_commit_sha: 'd'.repeat(40) }
     if (path?.includes('head_sha=')) return { total_count: 1, workflow_runs: [
-      { id: 21, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success',
-        html_url: 'https://github.com/acme/widgets/actions/runs/21', pull_requests: [{ number: 42, head: { sha }, base: { sha: 'c'.repeat(40) } }] },
+      { id: 21, workflow_id: 4, run_number: 1, head_sha: sha, run_attempt: 1, status: 'completed', conclusion: 'success',
+        html_url: 'https://github.com/acme/widgets/actions/runs/21', pull_requests: [{ number: runPull, head: { sha }, base: { sha: runBase.repeat(40) } }] },
     ] }
     if (path?.includes('/jobs?')) return { total_count: 1, jobs: [
-      { id: 37, run_id: 21, run_attempt: 1, head_sha: sha, name: 'build', status: 'completed', conclusion: 'success' },
+      { id: 37, run_id: 21, run_attempt: 1, head_sha: sha, name: 'build', status: 'completed', conclusion: 'success', html_url: null },
     ] }
     if (path?.includes('/artifacts?')) return { total_count: 0, artifacts: [] }
     throw new Error(`Unexpected GitHub API path: ${path}`)

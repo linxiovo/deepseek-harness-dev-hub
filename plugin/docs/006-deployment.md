@@ -41,7 +41,9 @@ Enable or refresh the local Git hooks by running `node plugin/scripts/install-ho
 
 Pre-commit runs from the active worktree's `plugin` directory and verifies that pnpm matches the version declared in `package.json`. It then runs the import boundary gate, typechecking, and the focused tests listed in `plugin/.githooks/pre-commit`. The full `pnpm check` runs each stage with the pnpm CLI that started the check.
 
-Set the GitHub Source's `requiredChecks` to `[{"id":"check"},{"id":"windows"}]` for Ticket and plan evidence. Where branch protection is available, require both jobs there too. Those are separate settings; the workflow changes neither, and a job dependency alone does not restrict merging.
+Before pushing a branch for a pull request, commit your changes and push from a clean worktree checked out at the commit being pushed. The `pre-push` hook runs `pnpm check` once for that commit and stops the push if it fails. If pushing multiple branch updates from different commits, check out and push each commit separately. Tag-only pushes and deletions do not run checks. Run the installer again in existing clones to enable `pre-push`; linked worktrees use their own versioned hook files. The hook runs only the local platform's suite. A PR opened from a branch that was already pushed does not trigger it, so run `pnpm -C plugin check` before opening such a PR if the candidate was not checked locally.
+
+For Ticket and plan evidence, configure two GitHub Source `requiredChecks` rows: `[{"id":"check","workflowId":"<id>"},{"id":"windows","workflowId":"<id>"}]`. Use the same decimal workflow ID (as a string) for both. In this repository, get it with `gh api repos/{owner}/{repo}/actions/workflows/plugin-ci.yml --jq .id`. Installations with name-only rows must fill in the workflow IDs before evidence can pass. Where branch protection is available, require both jobs there too. Those are separate settings; the workflow changes neither, and a job dependency alone does not restrict merging.
 
 #### Verify a committed candidate on Windows
 
@@ -63,6 +65,12 @@ Each run gets a new evidence directory with `manifest.json` and logs for the sta
 After both platform checks pass, the Ubuntu job uploads `plugin-check-<github.sha>` from `plugin/lib` and `plugin/ci-evidence`. The evidence directory contains the workflow YAML and `commit.json`, which records `repository`, `sha`, `ref`, `run_id`, `run_attempt`, `workflow`, and, for pull requests, `pull_request_head_sha`. On a push, `sha` is the pushed commit. On a pull request, `sha` and the artifact name identify the synthetic merge commit that CI built, while `pull_request_head_sha` identifies the candidate commit used for the Actions evidence lookup.
 
 When using the build as evidence, match the manifest to the expected repository, commit and run attempt. A successful rerun replaces the artifact; a rerun that fails before upload can leave the previous attempt's artifact available. An artifact alone is not proof that both required jobs passed for the candidate commit.
+
+#### Owner PR auto-merge
+
+In `linxiovo/deepseek-harness-dev-hub`, `.github/workflows/owner-auto-merge.yml` automatically enables GitHub auto-merge for ready PRs opened by `linxiovo` (account ID `220323999`) and targeting `main`. GitHub still requires `windows` and `check` to pass and blocks merges with conflicts. The workflow does not enroll PRs from other authors or re-enable auto-merge after someone other than the owner pushes to the PR. To take a PR out of automatic merging, mark it as a draft before the checks pass.
+
+Keep repository **Allow auto-merge** enabled and restrict the `owner-auto-merge` Actions environment to the `main` branch. Store `OWNER_AUTO_MERGE_TOKEN` in that environment, not as a repository-wide secret. Use a fine-grained token for this repository with **Contents**, **Pull requests**, and **Workflows** write access (the last allows merging changes to workflow files). The built-in `GITHUB_TOKEN` would not trigger the post-merge `push` CI on `main`. The merge job never checks out or runs PR code.
 
 ## Accounts
 
@@ -273,7 +281,7 @@ A refusal has a status and `error`, its English text:
 
 The blocks:
 
-- `source:github`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository`, `cli`, `requiredChecks` (`[{"id": "…"}]`, empty by default, naming exact required GitHub Actions jobs), and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
+- `source:github`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository`, `cli`, [`requiredChecks`](#development-checks) (`[{"id":"<exact job name>","workflowId":"<decimal workflow ID>"}]`, empty by default), and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
 - `policy`: `{"rules": […], "sources": {"github": {"allowed": [{"id": "<login>"}], "bots": [{"id": "dependabot[bot]"}]}, "feishu": {"allowed": [{"id": "ou_…", "name": "…"}], "syncChat": "oc_…", "admission": {"oc_…": {"unlistedAddressed": "explicit"}}}}}`. `bots` lists the bots whose messages may become inferred candidates. An `admission` row is keyed by chat id, `other` or `direct` for Feishu, and by `issues`, `pulls`, `comments` or `ci` for GitHub; an unset cell takes its default (see [002 Authorization](002-authorization.md)).
 - `eval`: `mode`, `timeoutSeconds` and `model`.
 - `executor`: `model`, `maxWorkers`, `repository`, `baseRef`, `directory`, `prepare` and `blockedCommands`. The processing pause is a setting of its own, `paused`, which `POST executor/pause` sets.

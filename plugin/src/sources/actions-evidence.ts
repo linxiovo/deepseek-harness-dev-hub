@@ -3,6 +3,9 @@ import { z } from 'zod'
 import type { Commands } from '../infra/commands.ts'
 
 export type EvidenceWork = { kind: 'ticket' | 'plan'; id: string }
+/** GitHub workflow ID and exact job name; a legacy name-only setting cannot certify a check. */
+export const RequiredActionsCheckSchema = z.strictObject({ id: z.string().min(1), workflowId: z.string().regex(/^[1-9][0-9]*$/).optional() })
+type RequiredActionsCheck = z.output<typeof RequiredActionsCheckSchema>
 export interface ActionsEvidence {
   provider: 'github-actions'
   repository: string
@@ -11,6 +14,7 @@ export interface ActionsEvidence {
   required: string[]
   checks: {
     name: string
+    workflowId: string
     status: string
     conclusion: string | null
     passed: boolean
@@ -19,12 +23,12 @@ export interface ActionsEvidence {
     artifacts: { id: number; name: string; url: string; expired: boolean }[]
   }[]
   satisfied: boolean
-  reason?: 'required_checks_unconfigured'
+  reason?: 'required_checks_unconfigured' | 'required_workflow_unconfigured'
 }
 
 const Run = z.looseObject({ id: z.number(), head_sha: z.string(), run_attempt: z.number().int().positive(),
   status: z.string().nullable(), conclusion: z.string().nullable(), html_url: z.string(),
-  workflow_id: z.number().optional(), updated_at: z.string().optional(),
+  workflow_id: z.number().int().positive(), run_number: z.number().int().positive(),
   pull_requests: z.array(z.looseObject({ number: z.number().int().positive(),
     head: z.looseObject({ sha: z.string() }), base: z.looseObject({ sha: z.string() }) })).optional() })
 const Job = z.looseObject({ id: z.number(), run_id: z.number(), head_sha: z.string(), name: z.string(),
@@ -48,62 +52,63 @@ async function actionPages<T>(commands: Commands, path: string, field: 'workflow
 }
 
 /** Reads Actions evidence for a commit; PR runs must match the current head and base, not a synthetic merge run SHA. */
-export async function actionsEvidence(commands: Commands, work: EvidenceWork, sha: string, required: readonly string[],
+export async function actionsEvidence(commands: Commands, work: EvidenceWork, sha: string, required: readonly RequiredActionsCheck[],
   pr?: { number: number; baseSha: string; mergeSha?: string }): Promise<ActionsEvidence> {
   if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error('A complete lowercase commit SHA is required')
   if (pr && (!Number.isSafeInteger(pr.number) || pr.number <= 0 || !/^[0-9a-f]{40}$/.test(pr.baseSha) ||
     (pr.mergeSha != null && !/^[0-9a-f]{40}$/.test(pr.mergeSha)))) {
     throw new Error('A positive pull request number and complete lowercase base/merge SHAs are required')
   }
-  if (required.length === 0) return { provider: 'github-actions', repository: commands.repository, work, sha,
-    required: [], checks: [], satisfied: false, reason: 'required_checks_unconfigured' }
+  const summary = { provider: 'github-actions' as const, repository: commands.repository, work, sha, required: required.map(check => check.id) }
+  if (!required.length) return { ...summary, checks: [], satisfied: false, reason: 'required_checks_unconfigured' }
+  if (!required.every((check): check is Required<RequiredActionsCheck> => !!check.workflowId)) {
+    return { ...summary, checks: [], satisfied: false, reason: 'required_workflow_unconfigured' }
+  }
+  const workflows = new Map<string, Set<string>>()
+  for (const { id, workflowId } of required) {
+    let names = workflows.get(workflowId)
+    if (!names) workflows.set(workflowId, names = new Set())
+    names.add(id)
+  }
   const runs = await actionPages(commands, `actions/runs?head_sha=${sha}`, 'workflow_runs', Run)
-  const found = new Map<string, { evidence: ActionsEvidence['checks'][number]; workflowId?: number }>()
-  const requiredNames = new Set(required)
-  // GitHub normally returns newest first; process oldest first so newer executions replace previous ones.
-  runs.sort((a, b) => a.updated_at && b.updated_at ? a.updated_at.localeCompare(b.updated_at) || a.id - b.id : a.id - b.id)
-  for (const workflowRun of runs) {
-    if (workflowRun.head_sha !== sha ||
-      (pr && !workflowRun.pull_requests?.some(link => link.number === pr.number && link.head.sha === sha && link.base.sha === pr.baseSha))) continue
-    const jobs = await actionPages(commands, `actions/runs/${workflowRun.id}/jobs?filter=latest`, 'jobs', Job)
-    const artifacts = await actionPages(commands, `actions/runs/${workflowRun.id}/artifacts`, 'artifacts', Artifact)
+  const selected = new Map<string, z.infer<typeof Run>>()
+  for (const run of runs) {
+    const workflowId = String(run.workflow_id)
+    if (!workflows.has(workflowId) || run.head_sha !== sha ||
+      (pr && !run.pull_requests?.some(link => link.number === pr.number && link.head.sha === sha && link.base.sha === pr.baseSha))) continue
+    const previous = selected.get(workflowId)
+    // A late update or rerun of an older execution does not supersede a newer run of this workflow.
+    if (!previous || run.run_number > previous.run_number ||
+      (run.run_number === previous.run_number && run.run_attempt > previous.run_attempt)) selected.set(workflowId, run)
+  }
+  const found = new Map<string, Map<string, ActionsEvidence['checks'][number]>>()
+  for (const [workflowId, run] of selected) {
+    const jobs = await actionPages(commands, `actions/runs/${run.id}/jobs?filter=latest`, 'jobs', Job)
+    const artifacts = await actionPages(commands, `actions/runs/${run.id}/artifacts`, 'artifacts', Artifact)
+    const names = workflows.get(workflowId)!
     const latest = new Map<string, z.infer<typeof Job>>()
     for (const job of jobs) {
-      if (job.run_id !== workflowRun.id || job.head_sha !== sha ||
-        job.run_attempt !== workflowRun.run_attempt || !requiredNames.has(job.name)) continue
+      if (job.run_id !== run.id || job.head_sha !== sha || job.run_attempt !== run.run_attempt || !names.has(job.name)) continue
       const previous = latest.get(job.name)
       if (!previous || job.id > previous.id) latest.set(job.name, job)
     }
-    const runArtifacts: ActionsEvidence['checks'][number]['artifacts'] = []
-    for (const artifact of artifacts) {
-      if (artifact.workflow_run != null && (artifact.workflow_run.id !== workflowRun.id || artifact.workflow_run.head_sha !== sha)) continue
-      runArtifacts.push({ id: artifact.id, name: artifact.name, url: artifact.archive_download_url, expired: artifact.expired })
-    }
-    const runEvidence = { id: workflowRun.id, attempt: workflowRun.run_attempt, sha: workflowRun.head_sha, url: workflowRun.html_url,
-      ...pr?.mergeSha ? { mergeSha: pr.mergeSha } : {} }
-    for (const name of required) {
+    const runArtifacts = artifacts.filter(artifact => artifact.workflow_run == null ||
+      (artifact.workflow_run.id === run.id && artifact.workflow_run.head_sha === sha))
+      .map(artifact => ({ id: artifact.id, name: artifact.name, url: artifact.archive_download_url, expired: artifact.expired }))
+    const runEvidence = { id: run.id, attempt: run.run_attempt, sha, url: run.html_url, ...pr?.mergeSha ? { mergeSha: pr.mergeSha } : {} }
+    const success = run.status === 'completed' && run.conclusion === 'success'
+    const checks = new Map<string, ActionsEvidence['checks'][number]>()
+    for (const name of names) {
       const job = latest.get(name)
-      if (!job) {
-        const previous = found.get(name)
-        // An unscheduled job on a newer execution supersedes the same workflow's previous green job.
-        if (!previous || workflowRun.workflow_id == null || previous.workflowId == null || workflowRun.workflow_id === previous.workflowId) {
-          const unscheduledOnSuccess = workflowRun.status === 'completed' && workflowRun.conclusion === 'success'
-          found.set(name, { workflowId: workflowRun.workflow_id, evidence: { name,
-            status: unscheduledOnSuccess ? 'not_run' : workflowRun.status ?? 'pending',
-            conclusion: unscheduledOnSuccess ? null : workflowRun.conclusion,
-            passed: false, run: runEvidence, artifacts: runArtifacts } })
-        }
-        continue
-      }
-      found.set(name, { workflowId: workflowRun.workflow_id, evidence: { name, status: job.status, conclusion: job.conclusion,
-        passed: workflowRun.status === 'completed' && workflowRun.conclusion === 'success' &&
-          job.status === 'completed' && job.conclusion === 'success',
-        run: runEvidence,
-        ...job.html_url ? { job: { id: job.id, url: job.html_url } } : {}, artifacts: runArtifacts } })
+      checks.set(name, { name, workflowId, run: runEvidence, artifacts: runArtifacts,
+        status: job?.status ?? (success ? 'not_run' : run.status ?? 'pending'),
+        conclusion: job ? job.conclusion : success ? null : run.conclusion,
+        passed: success && job?.status === 'completed' && job.conclusion === 'success',
+        ...job?.html_url ? { job: { id: job.id, url: job.html_url } } : {} })
     }
+    found.set(workflowId, checks)
   }
-  const checks = required.map(name => found.get(name)?.evidence ??
-    { name, status: 'not_run', conclusion: null, passed: false, artifacts: [] })
-  return { provider: 'github-actions', repository: commands.repository, work, sha, required: [...required], checks,
-    satisfied: checks.every(check => check.passed) }
+  const checks = required.map(({ id: name, workflowId }) => found.get(workflowId)?.get(name) ??
+    { name, workflowId, status: 'not_run', conclusion: null, passed: false, artifacts: [] })
+  return { ...summary, checks, satisfied: checks.every(check => check.passed) }
 }

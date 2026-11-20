@@ -111,11 +111,18 @@ it('exposes review submission only to actual Worker descendants and restores ind
   expect(h.tools.get(sessionId)?.has('orchestrator_review_submit')).toBe(false)
   await expect(h.runTool(sessionId, 'orchestrator_review_submit', { candidate: h.localGit!.base.sha, axis: 'standards',
     basis: ['plugin/docs/007-architecture.md'], conclusion: 'passed', summary: 'Reviewed.', blockers: [] })).rejects.toThrow(/not registered/i)
-  const standardsSession = await h.reviewSubagent(sessionId)
-  const specSession = await h.reviewSubagent(sessionId)
+  const standardsSession = await h.reviewSubagent(sessionId, 'standards')
+  const specSession = await h.reviewSubagent(sessionId, 'spec')
   expect(h.tools.get(standardsSession)?.has('orchestrator_review_submit')).toBe(true)
   expect(h.tools.get(specSession)?.has('orchestrator_review_submit')).toBe(true)
   const candidate = h.localGit!.git('-C', ticket.execution!.directory, 'rev-parse', 'HEAD')
+  const other = await h.acceptedTicket(feishu('2', '@bot another ticket'))
+  const foreignReviewer = await h.reviewSubagent(other.sessionId, 'spec')
+  const foreign = await h.runTool(foreignReviewer, 'orchestrator_review_submit', { candidate, axis: 'spec',
+    basis: ['another ticket'], conclusion: 'passed', summary: 'Cross-ticket review.', blockers: [] })
+  expect(foreign.aggregate).toBe('pending')
+  await expect(h.runTool(standardsSession, 'orchestrator_review_submit', { candidate, axis: 'spec',
+    basis: ['plugin/docs/007-architecture.md'], conclusion: 'passed', summary: 'Wrong lane.', blockers: [] })).rejects.toThrow(/code-review descendant assigned to this axis/)
   const submit = (reviewer: string, axis: 'standards' | 'spec') => h.runTool(reviewer, 'orchestrator_review_submit', {
     candidate, axis, basis: ['plugin/docs/007-architecture.md'], conclusion: 'passed', summary: `${axis} checked.`, blockers: [],
   })
@@ -136,8 +143,7 @@ it('exposes review submission only to actual Worker descendants and restores ind
     base: ticket.execution!.base!.sha, candidate, aggregate: 'passed' })
   await h.restart()
   expect(await read(`ticket/${ticket.id}/reviews`, { limit: 1 })).toMatchObject({ history: [expect.any(Object)], next_offset: 1 })
-  expect(await reviewsRead()).toMatchObject({ aggregate: 'passed', standards: [expect.objectContaining({ reviewer_session: standardsSession })],
-    spec: [expect.objectContaining({ reviewer_session: specSession })], history: expect.arrayContaining([expect.any(Object)]) })
+  expect(await reviewsRead()).toMatchObject({ aggregate: 'pending', standards: [], spec: [], history: expect.arrayContaining([expect.any(Object)]) })
 })
 
 it('checks documentation impact in the active worker candidate and never approves its semantics', async () => {

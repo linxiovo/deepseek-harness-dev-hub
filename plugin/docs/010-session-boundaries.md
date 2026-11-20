@@ -23,6 +23,7 @@ An Executor Session is created with `WORKER_PRESET` (`dsh-superagent-worker`) an
 ### Independent review subagents
 
 Workers use two separate code-review subagent Sessions for the `standards` and `spec` lanes; each receives the same pinned base/candidate pair and its own evidence sources. Only the reviewer submits its conclusion with `orchestrator_review_submit`, whose runtime identity comes from that actual child Session. The implementer cannot submit a review for either child or replace a missing result with self-assessment. Review submissions are candidate evidence, not a Hub reply or message to a person; both lanes must match the same revisions and pass before the Worker can report ready. The review skill is mounted only in Worker Sessions, never Hub, Planner or Splitter.
+Each review descendant loses direct file-write/edit/patch, job-management, delegation and message tools, but retains a shell for Git inspection; this remains a cooperative guardrail, not an OS sandbox. Its review skill forbids changing the checkout. Submission rechecks the full candidate SHA and clean worktree; the Hub resource reports pending unless that evidence still matches the live Worker lease generation after restart or reclaim.
 
 ### Internal take-up
 

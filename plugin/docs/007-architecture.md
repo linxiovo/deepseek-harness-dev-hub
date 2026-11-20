@@ -33,7 +33,7 @@ flowchart TB
 Startup registers management routes, initializes the installation binding and runs Setup. After setup resolves, it installs Session and Executor hooks, ensures the main Session exists, syncs Policy, resumes handoffs and interrupted Assignments, and starts passes and effects. `Runtime.ready` marks completion of startup; the installation API can answer before that promise resolves.
 
 Source plugins inject Runtime as the `orchestrator` service through the narrow `SourceHost` interface.
-Ticket review evidence is submitted only by a Worker descendant through `orchestrator_review_submit`; `Sessions` binds the real descendant Session ID, `DshExecutor` verifies the clean current worktree HEAD against the pinned base, and the Engine atomically records evidence on the current Assignment. `ticket/<id>/reviews` returns current-version evidence and an explicit pending state when the worktree HEAD or cleanliness no longer matches; `ticket/<id>/review/<review-id>` reads one persisted review.
+Ticket review evidence is submitted only by a Worker descendant through `orchestrator_review_submit`; `Sessions` binds the real descendant Session ID, `DshExecutor` verifies the clean current worktree HEAD against the pinned base, and the Engine atomically records evidence on the current Assignment and writer generation. `ticket/<id>/reviews` returns current-generation evidence and pending when the live Worker lease, worktree HEAD or cleanliness no longer matches; `ticket/<id>/review/<review-id>` reads one persisted review.
 
 | Part | Module | Does |
 | --- | --- | --- |

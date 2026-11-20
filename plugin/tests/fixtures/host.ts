@@ -18,7 +18,7 @@ import { feishuKind, feishuTrigger } from '../../src/sources/feishu.ts'
 import { githubKind } from '../../src/sources/github.ts'
 import { Commands } from '../../src/infra/commands.ts'
 import { credentialHelper, workerGitConfig } from '../../src/infra/environment.ts'
-import type { Trigger } from '../../src/core/index.ts'
+import type { ReviewAxis, Trigger } from '../../src/core/index.ts'
 import { testMachine } from './deployment.ts'
 import { gitEnv, gitRepository } from './git.ts'
 
@@ -357,7 +357,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     return await tool.execute(args, { signal: new AbortController().signal }) as Record<string, unknown>
   }
   /** Create a real Cordis Agent boundary for a Worker descendant; authorization still runs through Sessions and DSH tools. */
-  async function reviewSubagent(parentId: string, childId = `review-${++reviewChildSequence}`) {
+  async function reviewSubagent(parentId: string, axis: ReviewAxis, childId = `review-${++reviewChildSequence}`) {
     const parent = agents.get(parentId)
     if (!parent) throw new Error(`Session ${parentId} does not exist`)
     const agentCtx = new Context(), sessionTools = new Map<string, RegisteredTool>()
@@ -367,7 +367,13 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     agentCtx.reflect.provide('skills', { register: () => () => {} })
     agentCtx.reflect.provide('systemPrompt', { section: () => () => {} })
     const parentSession = parent.session as unknown as { header?: { cwd?: string } } | undefined
-    const session = { id: childId, header: { cwd: parentSession?.header?.cwd ?? '', parentSession: parentId }, snapshotEvents: () => [], requestHeader: () => undefined }
+    const ticket = runtime.store.tickets.get(parentId.slice('worker-'.length))!
+    const base = ticket.execution!.base!.sha, generation = ticket.assignments.at(-1)!.writer!.generation
+    const candidate = localGit!.git('-C', ticket.execution!.directory, 'rev-parse', 'HEAD')
+    const assignment = JSON.stringify({ axis, base, candidate, generation })
+    const reviewEvent = { type: 'user/message', data: { role: 'user', content: [{ type: 'text', text: `DSH_REVIEW_ASSIGNMENT: ${assignment}` }] } } as never
+    const session = { id: childId, header: { cwd: parentSession?.header?.cwd ?? '', parentSession: parentId, origin: 'subagent' },
+      snapshotEvents: () => [reviewEvent], requestHeader: () => undefined }
     const agent = { ...parent, id: childId, ctx: agentCtx, session, status: 'idle' } as never
     agents.set(childId, agent)
     ctx.emit('agent/created', { agent } as never)

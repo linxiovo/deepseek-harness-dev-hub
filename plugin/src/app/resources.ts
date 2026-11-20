@@ -75,6 +75,7 @@ export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(r
 
 export interface ResourceHost {
   ownsSession?(id: string): boolean
+  reviewGeneration?(ticketId: string): number | undefined
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
   readonly pages: TextCache
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'skills' | 'defaultChanged'>
@@ -384,7 +385,7 @@ const ROUTES: readonly Route[] = [
       }
       const base = ticket.execution?.base?.sha ?? reviews?.target?.base ?? null
       const candidate = currentHead ?? reviews?.target?.candidate ?? null
-      const generation = assignment?.writer?.generation ?? null
+      const generation = host.reviewGeneration?.(id) ?? null
       const matches = !!reviews?.target && reviews.target.base === base && reviews.target.candidate === candidate
         && reviews.target.generation === generation && clean
       const evidence = reviews?.evidence ?? []
@@ -395,7 +396,7 @@ const ROUTES: readonly Route[] = [
         stale: !matches, aggregate: matches ? aggregate : 'pending' }
       const history = list(read, (offset, count) => evidence.slice().reverse().slice(offset, offset + count).map(review => ({ ...review,
         read: `ticket/${id}/review/${review.id}` })))
-      return { ticket_id: id, assignment_id: assignment?.id ?? null, base, candidate, clean, stale: !matches,
+      return { ticket_id: id, assignment_id: assignment?.id ?? null, base, candidate, generation, clean, stale: !matches,
         aggregate: matches ? aggregate : 'pending', standards: active.filter(review => review.axis === 'standards'),
         spec: active.filter(review => review.axis === 'spec'), history: history.items, next_offset: history.next_offset }
     }

@@ -527,6 +527,15 @@ export class DshExecutor implements Executor {
       && ticket.execution.active_writer?.assignment === assignment.id && ticket.execution.active_writer.session === sessionId
       && assignment.writer?.state === 'active' && assignment.writer.session === sessionId
   }
+  /** Current worker lease generation; absent means a persisted lease has no live in-process writer. */
+  reviewGeneration(ticketId: string): number | undefined {
+    const ticket = this.host.store.tickets.get(ticketId)
+    const assignment = ticket && latestAssignment(ticket)
+    const generation = assignment?.writer?.generation
+    if (generation === undefined || !ticket || !assignment) return undefined
+    if (ticket.ended && assignment.writer?.state === 'idle') return generation
+    return this.writerAuthorized(ticketId, workerSessionId(ticketId)) ? generation : undefined
+  }
   private async inspectCandidate<T>(ticketId: string, sessionId: string, candidate: string, purpose: string, signal: AbortSignal,
     collect: (worktree: string, base: string, signal: AbortSignal) => Promise<T>) {
     const { store, commands, lifetime } = this.host
@@ -587,13 +596,18 @@ export class DshExecutor implements Executor {
   }
   /** Verify a review candidate is the clean current ticket HEAD and return its pinned base. */
   async inspectReviewCandidate(ticketId: string, _reviewerSession: string, candidate: string, signal: AbortSignal) {
-    const { candidate: head, base } = await this.inspectCandidate(ticketId, workerSessionId(ticketId), candidate, 'Review', signal,
+    const revision = await this.inspectCandidate(ticketId, workerSessionId(ticketId), candidate, 'Review', signal,
       async (worktree, _base, stopped) => {
         stopped.throwIfAborted()
         if (await this.host.commands.git(['status', '--porcelain=v1', '--untracked-files=all'], worktree))
           throw new Error('Review requires a clean candidate worktree')
       })
-    return { candidate: head, base }
+    const worktree = this.host.store.tickets.get(ticketId)?.execution?.directory
+    if (!worktree || (await this.host.commands.git(['rev-parse', '--verify', 'HEAD'], worktree)).trim() !== candidate
+      || (await this.host.commands.git(['status', '--porcelain=v1', '--untracked-files=all'], worktree)).trim()) {
+      throw new Error('Review candidate changed or became dirty before submission')
+    }
+    return { candidate: revision.candidate, base: revision.base }
   }
   /** Stop every loaded worker and release only claims this instance can prove fully idle before Store closes. */
   async shutdown(): Promise<void> {

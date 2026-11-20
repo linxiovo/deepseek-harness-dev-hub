@@ -1547,7 +1547,8 @@ describe('assignment review evidence', () => {
     changed.execution!.base = { ref: 'main', sha: '3'.repeat(40) }
     changed.assignments[0]!.writer!.generation = 2
     h.repo.tickets.save(changed)
-    expect(h.engine.recordReview(ticketId, 'child-new-base', { ...common, base: '3'.repeat(40), axis: 'standards' }).status).toBe('pending')
+    expect(h.engine.recordReview(ticketId, 'child-new-base-standards', { ...common, base: '3'.repeat(40), axis: 'standards' }).status).toBe('pending')
+    expect(h.engine.recordReview(ticketId, 'child-new-base-spec', { ...common, base: '3'.repeat(40), axis: 'spec' }).status).toBe('passed')
   })
 })
 

@@ -67,8 +67,8 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId
       description: 'Submit your independent standards or specification review of the exact clean current ticket candidate. Cite concrete repository documents or ticket/spec evidence in basis; report blockers explicitly.',
       schema: reviewSubmitSchema,
       execute: async (args, signal) => {
-        if (!await host.sessions.authorizeReviewSession?.(ticketId, sessionId))
-          throw new Error('Review submission requires an active descendant Session of this ticket Worker with its writer grant')
+        if (!await host.sessions.authorizeReviewSession?.(ticketId, sessionId, args.axis, args.candidate))
+          throw new Error('Review submission requires an active code-review descendant assigned to this axis')
         const revision = await host.executor.inspectReviewCandidate(ticketId, sessionId, args.candidate, signal)
         const recorded = host.engine.recordReview(ticketId, sessionId, { ...args, base: revision.base })
         return { evidence: recorded.evidence, aggregate: recorded.status }

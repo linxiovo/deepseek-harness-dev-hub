@@ -20,7 +20,7 @@ import { testDeployment } from './fixtures/deployment.ts'
 import { SettingsSchema, settingsPolicy } from '../src/policy.ts'
 import { sourceContextOf, type SourceContextDeps } from '../src/app/source-context.ts'
 import { SetupError, type SetupProblem } from '../src/setup.ts'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -1071,27 +1071,48 @@ describe('feishu event consumer', () => {
   let dir: string
   let controller: AbortController
   let running: Promise<unknown> | undefined
+  const stores: Store[] = []
   let originalTestNode: string | undefined
   // The fake CLI is a real process, which starts slower while the whole suite runs.
   const until = { timeout: 10_000 }
+  const realSetTimeout = setTimeout
+  // vi.waitFor also advances fake time. Poll the OS without advancing the deadline or the Source toggle check.
+  async function waitInRealTime<T>(check: () => T): Promise<T> {
+    const deadline = performance.now() + until.timeout
+    for (;;) {
+      try { return check() }
+      catch (error) { if (performance.now() >= deadline) throw error }
+      await new Promise(resolve => realSetTimeout(resolve, 50))
+    }
+  }
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'feishu-consumer-'))
     controller = new AbortController()
+    running = undefined
+    stores.length = 0
     originalTestNode = process.env.FEISHU_CONSUMER_TEST_NODE
   })
   afterEach(async () => {
     // Release a fake CLI waiting at the events handshake even when the test failed before it did.
     try { writeFileSync(join(dir, 'go'), '') } catch { /* The directory may already be gone. */ }
-    controller.abort()
-    await running
-    vi.useRealTimers()
-    if (originalTestNode === undefined) delete process.env.FEISHU_CONSUMER_TEST_NODE
-    else process.env.FEISHU_CONSUMER_TEST_NODE = originalTestNode
+    try {
+      controller.abort()
+      await running
+    } finally {
+      vi.useRealTimers()
+      if (originalTestNode === undefined) delete process.env.FEISHU_CONSUMER_TEST_NODE
+      else process.env.FEISHU_CONSUMER_TEST_NODE = originalTestNode
+      for (const store of stores) store.close()
+    }
+    // Windows can close cmd.exe and its pipes before the Node CLI has finished exiting.
+    await vi.waitFor(() => {
+      for (const pid of pids()) expect(alive(pid), `fake CLI ${pid} is still running`).toBe(false)
+    }, until)
     rmSync(dir, { recursive: true, force: true })
   })
   /**
-   * A bot CLI whose `event consume` behaves as `mode` says. Both wrappers run the same Node process: POSIX execs it,
-   * and Windows forwards its stdin so ending the consumer also stops the child of cmd.exe.
+   * A bot CLI whose `event consume` behaves as `mode` says. POSIX execs it; Windows runs it under cmd.exe.
+   * Each Node process leaves its own PID marker for assertions and teardown.
    */
   function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late' | 'late-ready'): string {
     process.env.FEISHU_CONSUMER_TEST_NODE = process.execPath
@@ -1100,10 +1121,10 @@ const fs = require('node:fs')
 const { join } = require('node:path')
 const dir = __dirname
 if (process.argv[2] !== 'event') { console.log('{"ok":true,"data":{}}'); process.exit(0) }
+fs.writeFileSync(join(dir, 'pid-' + process.pid), '')
 const runs = join(dir, 'runs')
 const n = (fs.existsSync(runs) ? Number(fs.readFileSync(runs, 'utf8')) : 0) + 1
 fs.writeFileSync(runs, String(n))
-fs.writeFileSync(join(dir, 'pid'), String(process.pid))
 const mode = ${JSON.stringify(mode)}
 const print = () => {
   fs.writeSync(1, fs.readFileSync(join(dir, 'events')))
@@ -1141,10 +1162,18 @@ setInterval(() => {}, 60_000)
     return path
   }
   const runs = () => existsSync(join(dir, 'runs')) ? Number(readFileSync(join(dir, 'runs'), 'utf8')) : 0
-  const alive = (pid: number) => { try { process.kill(pid, 0); return true } catch { return false } }
+  const pids = () => readdirSync(dir).filter(name => /^pid-\d+$/.test(name)).map(name => Number(name.slice(4)))
+  function alive(pid: number): boolean {
+    try { process.kill(pid, 0); return true }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false
+      throw error
+    }
+  }
   /** The Feishu Source's context, on a fresh Store whose Feishu Source is on, with `cli` as the bot CLI. */
   function consumerSource(path: string, config: Record<string, unknown> = { chats: [] }) {
-    const store = new Store(join(dir, 'db.sqlite'))
+    const store = new Store(join(dir, `db-${stores.length}.sqlite`))
+    stores.push(store)
     store.saveSettings(SettingsSchema.parse({ sources: { feishu: { enabled: true, config } } }))
     const board = new HealthBoard()
     const sources = new SourceRegistry(() => store.settings(), board)
@@ -1173,18 +1202,16 @@ setInterval(() => {}, 60_000)
     const { ctx, health, store } = consumerSource(cli('late-ready'))
     const report = vi.spyOn(ctx, 'report')
     running = runFeishu(ctx, controller.signal)
-    try {
-      await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_3'))).toBeDefined(), until)
-      expect(['om_1', 'om_2'].map(id => store.triggers.get(feishuTriggerId(id))?.meta.direct)).toEqual([false, true])
-      expect(store.get(KV.feishu.chats)).toEqual({ oc_group: false, oc_dm: true })
-      expect(report).toHaveBeenCalledWith('feishu', expect.objectContaining({ state: 'error', detail: expect.stringContaining('JSON') }))
-      expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
-      // Independent stdout/stderr pipes can deliver readiness after malformed event data.
-      writeFileSync(join(dir, 'release-ready'), 'ready')
-      await vi.waitFor(() => expect(existsSync(join(dir, 'ready-emitted'))).toBe(true), until)
-    } finally {
-      controller.abort(); await running; store.close()
-    }
+    await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_3'))).toBeDefined(), until)
+    expect(['om_1', 'om_2'].map(id => store.triggers.get(feishuTriggerId(id))?.meta.direct)).toEqual([false, true])
+    expect(store.get(KV.feishu.chats)).toEqual({ oc_group: false, oc_dm: true })
+    expect(report).toHaveBeenCalledWith('feishu', expect.objectContaining({ state: 'error', detail: expect.stringContaining('JSON') }))
+    expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
+    // Independent stdout/stderr pipes can deliver readiness after malformed event data.
+    writeFileSync(join(dir, 'release-ready'), 'ready')
+    await vi.waitFor(() => expect(existsSync(join(dir, 'ready-emitted'))).toBe(true), until)
+    controller.abort()
+    await running
     expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
   }, 20_000)
   it('keeps a malformed event error when readiness precedes the event lines', async () => {
@@ -1192,16 +1219,12 @@ setInterval(() => {}, 60_000)
       event('om_3', 'oc_group', 'group')].join('\n') + '\n')
     const { ctx, health, store } = consumerSource(cli('events'))
     running = runFeishu(ctx, controller.signal)
-    try {
-      await vi.waitFor(() => expect(health.feishu).toMatchObject({ state: 'ready' }), until)
-      writeFileSync(join(dir, 'go'), '')
-      await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_3'))).toBeDefined(), until)
-      expect(['om_1', 'om_2'].map(id => store.triggers.get(feishuTriggerId(id))?.meta.direct)).toEqual([false, true])
-      expect(store.get(KV.feishu.chats)).toEqual({ oc_group: false, oc_dm: true })
-      await vi.waitFor(() => expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') }), until)
-    } finally {
-      controller.abort(); await running; store.close()
-    }
+    await vi.waitFor(() => expect(health.feishu).toMatchObject({ state: 'ready' }), until)
+    writeFileSync(join(dir, 'go'), '')
+    await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_3'))).toBeDefined(), until)
+    expect(['om_1', 'om_2'].map(id => store.triggers.get(feishuTriggerId(id))?.meta.direct)).toEqual([false, true])
+    expect(store.get(KV.feishu.chats)).toEqual({ oc_group: false, oc_dm: true })
+    await vi.waitFor(() => expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') }), until)
   }, 20_000)
   it('drops the events it reads once the Source is off', async () => {
     writeFileSync(join(dir, 'events'), event('om_9', 'oc_group', 'group') + '\n')
@@ -1213,7 +1236,6 @@ setInterval(() => {}, 60_000)
     await vi.waitFor(() => expect(existsSync(join(dir, 'printed'))).toBe(true), until)
     await new Promise(resolve => setTimeout(resolve, 300))
     expect(store.triggers.get(feishuTriggerId('om_9'))).toBeUndefined()
-    controller.abort(); await running; store.close()
   }, 20_000)
   it('keeps a chat\'s history cursor when its read fails, and recovers known direct chats only while direct messages are on', async () => {
     const hour = new Date(Date.now() - 3_600_000).toISOString()
@@ -1230,14 +1252,16 @@ setInterval(() => {}, 60_000)
         return { has_more: false, items: [] }
       })
       const stop = new AbortController()
-      const loops = runFeishu(ctx, AbortSignal.any([stop.signal, controller.signal]))
-      await vi.waitFor(() => expect(['ready', 'error']).toContain(health.history?.state), until)
-      stop.abort(); await loops; lark.mockRestore()
+      const loops = running = runFeishu(ctx, AbortSignal.any([stop.signal, controller.signal]))
+      try {
+        await vi.waitFor(() => expect(['ready', 'error']).toContain(health.history?.state), until)
+      } finally {
+        stop.abort()
+        await loops
+        lark.mockRestore()
+      }
       const cursors = Object.fromEntries(['oc_a', 'oc_b', 'oc_dm'].map(chat => [chat, store.get(KV.feishu.history(chat))]))
-      const result = { chats, cursors, history: health.history }
-      store.close(); rmSync(join(dir, 'db.sqlite'), { force: true }); rmSync(join(dir, 'db.sqlite-wal'), { force: true })
-      rmSync(join(dir, 'db.sqlite-shm'), { force: true })
-      return result
+      return { chats, cursors, history: health.history }
     }
     const on = await recovered(true)
     expect(on.chats).toEqual(['oc_a', 'oc_b', 'oc_dm'])
@@ -1250,44 +1274,51 @@ setInterval(() => {}, 60_000)
     expect(off.cursors.oc_dm).toBe(hour)
   }, 20_000)
   it('reports an error when the consumer is not ready within 45 seconds', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    const { ctx, health, store } = consumerSource(cli('never'))
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
+    const { ctx, turnOff } = consumerSource(cli('never'))
+    const report = vi.spyOn(ctx, 'report')
     running = runFeishu(ctx, controller.signal)
-    await vi.waitFor(() => expect(runs()).toBe(1), until)
-    const pid = Number(readFileSync(join(dir, 'pid'), 'utf8'))
-    await vi.advanceTimersByTimeAsync(45_000)
-    await vi.waitFor(() => expect(health.feishu).toMatchObject({ state: 'error',
-      detail: expect.stringContaining('did not become ready within 45 seconds') }), until)
-    expect(alive(pid)).toBe(false)
-    controller.abort(); await running; store.close()
+    const pid = await waitInRealTime(() => {
+      const started = pids()
+      expect(started).toHaveLength(1)
+      return started[0]!
+    })
+    vi.advanceTimersByTime(45_000)
+    // A retry sees the Source off, but its frozen toggle check cannot stop the original process for us.
+    turnOff()
+    await waitInRealTime(() => {
+      expect(report).toHaveBeenCalledWith('feishu', expect.objectContaining({ state: 'error',
+        detail: expect.stringContaining('did not become ready within 45 seconds') }))
+      expect(alive(pid), `timed-out CLI ${pid} is still running`).toBe(false)
+    })
+    expect(pids()).toEqual([pid])
   }, 20_000)
   it('reports a warning the consumer prints as an error', async () => {
-    const { ctx, health, store } = consumerSource(cli('warn'))
+    const { ctx, health } = consumerSource(cli('warn'))
     running = runFeishu(ctx, controller.signal)
     await vi.waitFor(() => expect(health.feishu).toMatchObject({ state: 'error', detail: 'WARN the connection was reset' }), until)
-    controller.abort(); await running; store.close()
   }, 20_000)
   it('stops the consumer within five seconds once the Source is off', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
-    const { ctx, health, store, turnOff } = consumerSource(cli('ready'))
+    const { ctx, health, turnOff } = consumerSource(cli('ready'))
     running = runFeishu(ctx, controller.signal)
     await vi.waitFor(() => expect(health.feishu).toMatchObject({ state: 'ready', detail: 'Listening for bot events' }), until)
-    const pid = Number(readFileSync(join(dir, 'pid'), 'utf8'))
+    const pidsAtReadiness = pids()
+    expect(pidsAtReadiness).toHaveLength(1)
+    const pid = pidsAtReadiness[0]!
     turnOff()
     await vi.advanceTimersByTimeAsync(5000)
     await vi.waitFor(() => expect(health.feishu).toMatchObject({ state: 'paused', code: 'sourceOff' }), until)
-    expect(alive(pid)).toBe(false)
-    controller.abort(); await running; store.close()
+    await waitInRealTime(() => expect(alive(pid), `disabled CLI ${pid} is still running`).toBe(false))
   }, 20_000)
   it('starts the consumer again after it exits, and is ready once the next run listens', async () => {
-    const { ctx, health, store } = consumerSource(cli('flaky'))
+    const { ctx, health } = consumerSource(cli('flaky'))
     running = runFeishu(ctx, controller.signal)
     const exited = { state: 'error', detail: expect.stringContaining('exited (1, ready=true)') }
     await vi.waitFor(() => expect(health.feishu).toMatchObject(exited), until)
     // The first restart waits a second.
     await vi.waitFor(() => expect(runs()).toBe(2), until)
     await vi.waitFor(() => expect(health.feishu).toMatchObject({ state: 'ready' }), until)
-    controller.abort(); await running; store.close()
   }, 20_000)
 })
 

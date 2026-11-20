@@ -622,13 +622,14 @@ New main Sessions use `dsh-superagent-router` (`ROUTER_PRESET`), a read-only pre
 
 ### Executor tools
 
-Each Executor has seven application tools:
+Each Executor has eight application tools.
 
 | Tool | Purpose |
 | --- | --- |
 | `orchestrator_read` | Read resources available to its own Ticket |
 | `orchestrator_ack` | Record the worker's internal take-up of a request; no message is queued for a person |
 | `orchestrator_doc_impact` | Collect candidate-bound documentation evidence; input and results are defined in `011-doc-tree-impact.md` |
+| `orchestrator_test_evidence` | Bind Worker-reported checks to the current candidate as described in `013-development-verification.md` |
 | `orchestrator_report` | Report progress or an outcome, binding a pull request under the pull-request rules; it notifies the Hub only and queues no Channel message directly |
 | `orchestrator_thread_unrelated` | Drop an unrelated attached Thread, hand back its owned follow-ups and tell the main Session why |
 | `orchestrator_thread_follow` | Subscribe to a related Thread for context and tell the main Session |

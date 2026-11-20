@@ -51,7 +51,9 @@
     "test": "vitest run",
     "check": "node scripts/check.mjs",
     "hooks:install": "node scripts/install-hooks.mjs",
-    "verify:linux": "node scripts/verify-linux.mjs"
+    "verify:linux": "node scripts/verify-linux.mjs",
+    "verify:windows": "node scripts/verify-windows.mjs",
+    "worker:smoke": "node scripts/worker-smoke.mjs"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0",

@@ -12,6 +12,7 @@ import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { latestAssignment } from '../src/core/index.ts'
 import { promptParts } from '../src/app/prompts.ts'
 import { RESOURCES } from '../src/app/resources.ts'
+import { bundledSkills, workerSkills } from '../src/app/skill-files.ts'
 import { TICKET_STATES } from '../src/app/cards.ts'
 import { Runtime } from '../src/app/runtime.ts'
 import { workerSessionId } from '../src/executor/dsh.ts'
@@ -39,7 +40,7 @@ interface Skill { name: string; description: string; content: string }
  * Maximum combined character count of system prompt and tool definitions per role (~5% above baseline).
  * Lower this limit when shrinking model-facing text; raise it only intentionally and explain why in the commit message.
  */
-const BUDGET: Record<Role, number> = { orchestrator: 60_000, worker: 40_500 }
+const BUDGET: Record<Role, number> = { orchestrator: 60_000, worker: 41_000 }
 const PROMPTS = 'prompts/, skills/', TOOLS = 'src/app/tools/', SESSIONS = 'src/app/sessions.ts'
 const NOTICES = 'src/app/notices.ts', LINKS = 'src/app/links.ts'
 const EXECUTOR = 'src/executor/dsh.ts', ERRORS = 'src/core/errors.ts'
@@ -297,7 +298,9 @@ function collect(host: Host, { a, b, workerA, workerB, refusal }: Awaited<Return
     surfaces.push({ where: `skill ${name}`, owner: PROMPTS, role: 'both', text: `${description}\n${content}` })
   }
   for (const { name, description, content } of host.skills.get(workerA)!) {
-    if (name === 'dsh-superagent-doc-tree') surfaces.push({ where: `skill ${name}`, owner: PROMPTS, role: 'worker', text: `${description}\n${content}` })
+    if (name === bundledSkills['doc-tree'].name || Object.values(workerSkills).some(skill => skill.name === name)) {
+      surfaces.push({ where: `skill ${name}`, owner: PROMPTS, role: 'worker', text: `${description}\n${content}` })
+    }
   }
   surfaces.push({ where: 'orchestrator tool orchestrator_reply error', owner: ERRORS, role: 'orchestrator', text: refusal })
   for (const { text } of host.inputs.filter(input => input.sessionId === runtime.masterId)) {
@@ -388,7 +391,7 @@ function failures(): Map<string, string> {
 
 it('collects both roles\' tools, prompts, skills and inputs', () => {
   expect([...toolsOf('worker').keys()].sort()).toEqual(['orchestrator_ack', 'orchestrator_doc_impact', 'orchestrator_read', 'orchestrator_report',
-    'orchestrator_thread_follow',
+    'orchestrator_test_evidence', 'orchestrator_thread_follow',
     'orchestrator_thread_unrelated', 'orchestrator_trigger_handback'])
   expect([...toolsOf('orchestrator').keys()]).toEqual(expect.arrayContaining(['orchestrator_route', 'orchestrator_eval_decide', 'orchestrator_reply']))
   // The one routing tool takes the place of four.
@@ -397,6 +400,7 @@ it('collects both roles\' tools, prompts, skills and inputs', () => {
   }
   const wheres = new Set(surfaces.map(surface => surface.where))
   for (const where of ['orchestrator prompt runtime/dispatch', 'worker prompt runtime/work', 'skill dsh-superagent-github', 'skill dsh-superagent-feishu', 'skill dsh-superagent-doc-tree',
+    'skill dsh-worker-implement', 'skill dsh-worker-tdd', 'skill dsh-worker-test-scope',
     'orchestrator prompt runtime/admission', 'orchestrator input candidate', 'orchestrator input worker_attention', 'orchestrator input worker_report',
     'orchestrator input thread_unrelated', 'orchestrator input ticket_ended', 'orchestrator input settings_saved', 'worker input assignment (explicit)',
     'worker input assignment (inferred)', 'worker input policy-changed', 'worker input resumed', 'worker input status',

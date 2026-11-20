@@ -681,6 +681,8 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 
 Ticket Threads are marked `context` for context-only follows and `bound` for Source bindings. Assignment pages are newest first and include report previews. Continue lists with `next_offset`. `/input/<id>` accepts an Input's name or id. `settings` includes small blocks in full and summarizes Policy and Source blocks.
 
+`ticket/<id>/reviews` returns `{ticket_id, assignment_id, base, candidate, generation, clean, stale, aggregate, standards, spec, history, next_offset}`. `aggregate` is `pending`, `blocked` or `passed`; it is pending whenever the observed HEAD/cleanliness or the in-process Worker lease generation does not match the recorded target. `standards` and `spec` contain only current-generation evidence. Each evidence item has `{id, axis, reviewer_session, generation, basis, base, candidate, conclusion, blockers, summary, at}`. `history` is newest first and paged with `offset`/`limit` (up to 50), with `next_offset` and a `read` pointer for each row. `/review/<review id>` returns one retained item plus the observed current base/candidate and whether it is stale; stale history never changes the aggregate.
+
 Source resources include message neighborhoods, `github/pulls/<n>/thread/<comment id>` and `github/commits/<sha>/checks`.
 
 `actions/<ticket|plan>/<id>/commit/<40 lowercase hex SHA>` exposes [Actions evidence](#actions-evidence) to the main Session only. The resource requires a stored Ticket or handoff and an exact commit, not a ref or abbreviated SHA. Before querying Actions, it verifies that the candidate belongs to the work item and the configured repository:

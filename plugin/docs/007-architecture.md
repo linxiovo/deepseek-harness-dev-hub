@@ -33,6 +33,7 @@ flowchart TB
 Startup registers management routes, initializes the installation binding and runs Setup. After setup resolves, it installs Session and Executor hooks, ensures the main Session exists, syncs Policy, resumes handoffs and interrupted Assignments, and starts passes and effects. `Runtime.ready` marks completion of startup; the installation API can answer before that promise resolves.
 
 Source plugins inject Runtime as the `orchestrator` service through the narrow `SourceHost` interface.
+Ticket review evidence is submitted only by a Worker descendant through `orchestrator_review_submit`; `Sessions` binds the real descendant Session ID, `DshExecutor` verifies the clean current worktree HEAD against the pinned base, and the Engine atomically records evidence on the current Assignment. `ticket/<id>/reviews` returns current-version evidence and an explicit pending state when the worktree HEAD or cleanliness no longer matches; `ticket/<id>/review/<review-id>` reads one persisted review.
 
 | Part | Module | Does |
 | --- | --- | --- |
@@ -522,7 +523,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
 | `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
-| `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
+| `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, review evidence and child-only review submission, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
 | `tests/topic-binding.spec.ts` | Uses a mounted project and normalized Feishu events to verify topic isolation, answer provenance and idempotent outbound delivery |
 | `tests/plans.spec.ts` | Automatic spec continuation, idempotent restart and registration, graph and role queries, invalid graph refusal, and root/node message isolation through the public Session tools |
@@ -622,7 +623,7 @@ New main Sessions use `dsh-superagent-router` (`ROUTER_PRESET`), a read-only pre
 
 ### Executor tools
 
-Each Executor has eight application tools.
+Each Worker Executor has eight application tools. A Worker descendant used as an independent reviewer additionally receives the child-only `orchestrator_review_submit` tool; the parent Worker, Hub, Planner and Splitter do not.
 
 | Tool | Purpose |
 | --- | --- |
@@ -634,6 +635,8 @@ Each Executor has eight application tools.
 | `orchestrator_thread_unrelated` | Drop an unrelated attached Thread, hand back its owned follow-ups and tell the main Session why |
 | `orchestrator_thread_follow` | Subscribe to a related Thread for context and tell the main Session |
 | `orchestrator_trigger_handback` | Hand back a message once, with a reason carried by its candidate |
+
+Only a live Worker descendant can call `orchestrator_review_submit`, with `candidate`, `axis`, `basis`, `conclusion`, `summary` and `blockers`. The runtime binds the reviewer Session and pinned base, persists the evidence on the Assignment, and returns the current aggregate; the parent Worker cannot submit a review for itself.
 
 A hand-back returns `queued: false` if another Ticket still owns the message, or this Ticket never owned it. For example, a bot message went to Eval independently.
 

@@ -349,7 +349,7 @@ function failures(): Map<string, string> {
   })
   for (const name of ['decision', 'purpose', 'state']) expect(options.has(name), `${name} has options`).toBe(true)
   const tools = { orchestrator: new Set(toolsOf('orchestrator').keys()), worker: new Set(toolsOf('worker').keys()) }
-  const registered = (token: string) => tools.orchestrator.has(token) || tools.worker.has(token)
+  const childOnly: Record<string, true> = { orchestrator_review_submit: true }, registered = (token: string) => tools.orchestrator.has(token) || tools.worker.has(token) || childOnly[token] === true
   const variables = new Set(host.runtime.ticketEnvironment(host.runtime.store.tickets.get(sessions.a)!).map(variable => variable.key))
   for (const { where, owner, role, text } of surfaces) {
     const fail = (problem: string) => found.set(`${where}: ${problem}`, owner)
@@ -381,7 +381,7 @@ function failures(): Map<string, string> {
         if (Number(count) !== limit) fail(`"${count} words" is not ${limit}`)
       }
       for (const [token] of other && !names.test(sentence) ? sentence.matchAll(/\borchestrator_[a-z_]+/g) : []) {
-        if (!registered(token) || tools[role as Role].has(token)) continue
+        if (childOnly[token] || !registered(token) || tools[role as Role].has(token)) continue
         fail(`tells the ${role} to use ${token}, which only the ${other} has`)
       }
     }
@@ -391,8 +391,8 @@ function failures(): Map<string, string> {
 
 it('collects both roles\' tools, prompts, skills and inputs', () => {
   expect([...toolsOf('worker').keys()].sort()).toEqual(['orchestrator_ack', 'orchestrator_doc_impact', 'orchestrator_read', 'orchestrator_report',
-    'orchestrator_test_evidence', 'orchestrator_thread_follow',
-    'orchestrator_thread_unrelated', 'orchestrator_trigger_handback'])
+    'orchestrator_test_evidence', 'orchestrator_thread_follow', 'orchestrator_thread_unrelated', 'orchestrator_trigger_handback'])
+  expect(toolsOf('worker').has('orchestrator_review_submit')).toBe(false)
   expect([...toolsOf('orchestrator').keys()]).toEqual(expect.arrayContaining(['orchestrator_route', 'orchestrator_eval_decide', 'orchestrator_reply']))
   // The one routing tool takes the place of four.
   for (const name of ['orchestrator_ticket_accept', 'orchestrator_ticket_attach', 'orchestrator_ticket_stop', 'orchestrator_trigger_ignore']) {
@@ -400,7 +400,7 @@ it('collects both roles\' tools, prompts, skills and inputs', () => {
   }
   const wheres = new Set(surfaces.map(surface => surface.where))
   for (const where of ['orchestrator prompt runtime/dispatch', 'worker prompt runtime/work', 'skill dsh-superagent-github', 'skill dsh-superagent-feishu', 'skill dsh-superagent-doc-tree',
-    'skill dsh-worker-implement', 'skill dsh-worker-tdd', 'skill dsh-worker-test-scope',
+    'skill dsh-worker-implement', 'skill dsh-worker-tdd', 'skill dsh-worker-test-scope', 'skill dsh-worker-code-review',
     'orchestrator prompt runtime/admission', 'orchestrator input candidate', 'orchestrator input worker_attention', 'orchestrator input worker_report',
     'orchestrator input thread_unrelated', 'orchestrator input ticket_ended', 'orchestrator input settings_saved', 'worker input assignment (explicit)',
     'worker input assignment (inferred)', 'worker input policy-changed', 'worker input resumed', 'worker input status',

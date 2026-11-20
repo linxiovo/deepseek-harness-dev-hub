@@ -2,7 +2,7 @@
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { latestAssignment, liveTicket, runningAssignment } from './model.ts'
-import type { ReportState, Ticket } from './model.ts'
+import type { ReviewAxis, ReviewConclusion, ReviewEvidence, ReportState, Ticket } from './model.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
 import { automatic, type Tickets } from './tickets.ts'
@@ -130,6 +130,36 @@ export class Assignments extends EnginePart {
     const outcome = report.state === 'dropped' ? this.tickets.followsDone(ticket)?.outcome ?? 'dropped' : report.state === 'ready' ? ready : undefined
     if (outcome) this.tickets.end(ticketId, 'executor', outcome, at)
     return this.require(ticketId)
+  }
+  /** Records one independently authorized review against the running ticket's pinned base. */
+  review(ticketId: string, reviewerSession: string, input: { axis: ReviewAxis; basis: string[]; base: string; candidate: string;
+    conclusion: ReviewConclusion; blockers: string[]; summary: string }): { evidence: ReviewEvidence; status: 'pending' | 'blocked' | 'passed' } {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    const assignment = runningAssignment(ticket)
+    if (!assignment || assignment.id !== ticket.execution?.active_writer?.assignment) throw new UserError('assignmentEnded')
+    const writer = assignment.writer, active = ticket.execution.active_writer
+    if (!writer || writer.state !== 'active' || !writer.session || active?.assignment !== assignment.id || active.session !== writer.session)
+      throw new Error('Review submission requires the active ticket writer grant')
+    if (!reviewerSession || reviewerSession === writer.session) throw new Error('Review submission must come from an independent descendant Session')
+    const base = ticket.execution.base?.sha
+    if (!base || input.base !== base) throw new Error('Review base does not match the ticket pinned base')
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(input.candidate)) throw new Error('Review candidate must be a full lowercase commit hash')
+    const reviews = assignment.reviews ??= { evidence: [] }
+    if (reviews.evidence.some(item => item.axis === input.axis && item.candidate === input.candidate))
+      throw new Error('This review axis has already submitted this candidate')
+    reviews.target = { base, candidate: input.candidate }
+    const evidence: ReviewEvidence = { id: key('review', assignment.id, input.axis, input.candidate), axis: input.axis,
+      reviewer_session: reviewerSession, basis: [...input.basis], base, candidate: input.candidate,
+      conclusion: input.blockers.length ? 'blocked' : input.conclusion, blockers: [...input.blockers], summary: input.summary, at: this.now() }
+    reviews.evidence.push(evidence)
+    ticket.updatedAt = evidence.at
+    this.repo.tickets.save(ticket)
+    const current = reviews.evidence.filter(item => item.base === base && item.candidate === input.candidate)
+    const status = current.some(item => item.conclusion === 'blocked' || item.blockers.length > 0) ? 'blocked'
+      : current.filter(item => item.axis === 'standards').length === 1 && current.filter(item => item.axis === 'spec').length === 1
+        && current.every(item => item.conclusion === 'passed') ? 'passed' : 'pending'
+    return { evidence, status }
   }
   /** The ticket, while it is open and `assignmentId` runs it. */
   private running(ticketId: string, assignmentId: string): Ticket | undefined {

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { Store } from '../src/app/store.ts'
-import { Prompts, builtInBase, composePrompt, defaultPrompts, policySection, promptParts, type PromptConfig } from '../src/app/prompts.ts'
+import { Prompts, builtInBase, builtInParts, composePrompt, defaultPrompts, policySection, promptParts, type PromptConfig } from '../src/app/prompts.ts'
 import { USER_ERRORS, UserError } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
 import { SettingsSchema, policyVersion } from '../src/policy.ts'
@@ -136,7 +136,7 @@ it('mounts the bundled Doc Tree skill only for workers, even with an older same-
   })
 })
 
-it.each(['implement', 'tdd', 'test-scope'])('mounts the bundled %s skill for workers alongside a same-name team skill', name => {
+it.each(['implement', 'tdd', 'test-scope', 'code-review'])('mounts the bundled %s skill for workers alongside a same-name team skill', name => {
   withStore(store => {
     const prompts = promptsOf(store), config = defaultPrompts()
     const saved = prompts.save({ ...config, skills: { [name]: 'Team workflow.' } }, 0, 'panel').config
@@ -148,6 +148,10 @@ it.each(['implement', 'tdd', 'test-scope'])('mounts the bundled %s skill for wor
       expect(prompts.skills(saved, role).map(([key]) => key)).not.toContain(`worker/${name}`)
     }
   })
+})
+
+it('registers the code-review prompt part for workers only', () => {
+  expect(builtInParts()['skill/worker/code-review']).toMatchObject({ roles: ['worker'], text: expect.stringContaining('orchestrator_review_submit') })
 })
 
 it('round-trips a team to-tickets skill without replacing the splitter’s bundled skill', () => {

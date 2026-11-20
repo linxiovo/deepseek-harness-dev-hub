@@ -1,7 +1,7 @@
 /** Serves paginated context resources to orchestrator_read so large bodies stay out of model prompts until requested. */
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
-import { UserError, key, latestReport, reached, runningAssignment, threadKey, type Ticket, type Trigger } from '../core/index.ts'
+import { UserError, key, latestReport, reached, reviewStatus, runningAssignment, threadKey, type Ticket, type Trigger } from '../core/index.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { readGithub } from '../sources/github-read.ts'
 import { actionsEvidence } from '../sources/actions-evidence.ts'
@@ -43,6 +43,7 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
     + 'branch, base, worker Session and active writer when available; its trigger, decision and threads, latest assignments with the '
     + 'start of each report, and inputs, newest first', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
+  { name: 'ticket/<id>/reviews', holds: 'review evidence', executor: true },
   { name: 'ticket/<id>/assignments', holds: 'its assignments, newest first, with the start of each report', executor: true },
   { name: 'ticket/<id>/inputs', holds: 'its inputs, newest first', executor: true },
   { name: 'ticket/<id>/result', holds: 'its latest report', executor: true },
@@ -367,6 +368,33 @@ const ROUTES: readonly Route[] = [
       const threads = [...subscribed.map(thread => marked(thread.key, !!thread.context?.includes(id))),
         ...[...bound].filter(key => !subscribed.some(thread => thread.key === key)).map(key => marked(key, false))]
       return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId), ...retry }
+    }
+    if (section === 'reviews' || section === 'review') {
+      const assignment = ticket.assignments.at(-1)
+      const reviews = assignment?.reviews
+      if (section === 'review' && !part || section === 'reviews' && part !== undefined) throw new Error('Unknown context resource')
+      const item = section === 'review' ? assignment?.reviews?.evidence.find(review => review.id === part) : undefined
+      if (section === 'review' && !item) throw new Error('Unknown ticket review')
+      let currentHead: string | undefined
+      let clean = false
+      if (ticket.execution?.directory) {
+        currentHead = (await host.commands.git(['rev-parse', '--verify', 'HEAD'], ticket.execution.directory)).trim()
+        clean = !(await host.commands.git(['status', '--porcelain=v1', '--untracked-files=all'], ticket.execution.directory)).trim()
+      }
+      const base = ticket.execution?.base?.sha ?? reviews?.target?.base ?? null
+      const candidate = currentHead ?? reviews?.target?.candidate ?? null
+      const matches = !!reviews?.target && reviews.target.base === base && reviews.target.candidate === candidate && clean
+      const evidence = reviews?.evidence ?? []
+      const active = matches ? evidence.filter(review => review.base === base && review.candidate === candidate) : []
+      const blocked = active.some(review => review.conclusion === 'blocked' || review.blockers.length > 0)
+      const aggregate = !clean || !currentHead || !reviews?.target || reviews.target.base !== base || reviews.target.candidate !== candidate
+        ? 'pending' : blocked ? 'blocked' : reviewStatus(assignment!)
+      return section === 'review' ? { ...item, current_base: base, current_candidate: candidate,
+        stale: !matches, aggregate: matches ? aggregate : 'pending' }
+        : { ticket_id: id, assignment_id: assignment?.id ?? null, base, candidate, clean, stale: !matches,
+          aggregate: matches ? aggregate : 'pending', standards: active.filter(review => review.axis === 'standards'),
+          spec: active.filter(review => review.axis === 'spec'), history: evidence.map(review => ({ ...review,
+            read: `ticket/${id}/review/${review.id}` })) }
     }
     if (section === 'assignments' || section === 'inputs') {
       if (part !== undefined) throw new Error('Unknown context resource')

@@ -45,8 +45,9 @@ export interface SessionsHost {
   splitterWorkspace(handoffId: string): string | undefined
   /** In-process writer grant; a stored lease cannot authorize worker turns after a restart. */
   workerAuthorized?(ticketId: string, sessionId: string): boolean
-  /** Handoff roles receive only their own tools, rather than the Hub's or a worker ticket's. */
-  tools(agent: Agent, ticket?: Ticket, role?: 'planner' | 'splitter'): Tool[]
+  authorizeReviewSession?(ticketId: string, sessionId: string): Promise<boolean>
+  /** Handoff and review-subagent roles receive only their own tools, rather than Hub or Worker tools. */
+  tools(agent: Agent, ticket?: Ticket, role?: 'planner' | 'splitter' | 'review'): Tool[]
 }
 
 /**
@@ -434,6 +435,15 @@ export class Sessions {
    * permissions, gets the same work tools as the worker, and none once the worker's ticket ended. Any other agent is left as
    * it is.
    */
+  /** A live descendant of this ticket's Worker may submit evidence only while the real Worker grant remains active. */
+  async authorizeReviewSession(ticketId: string, sessionId: string): Promise<boolean> {
+    const agent = this.ctx.agents.get(sessionId as SessionId)
+    if (!agent || agent.id !== sessionId || agent.session.header.parentSession === undefined
+      || this.host.closing() || this.host.workerAuthorized?.(ticketId, workerSessionId(ticketId)) !== true) return false
+    const current = this.host.store.tickets.get(ticketId)
+    if (!current || !liveTicket(current)) return false
+    return await this.owningTicket(agent) === ticketId
+  }
   private async limitSubagent(agent: Agent): Promise<void> {
     if (agent.session.header.parentSession === undefined) return
     // A live Session reloaded on startup can invoke tools while persistence resolves an unloaded parent.
@@ -445,6 +455,12 @@ export class Sessions {
     // Install the ticket guard before lifting the temporary one; an inspection error leaves the latter in place.
     pending.disposers.push(...this.workOnly(agent, ticketId))
     pending.disposers.shift()!()
+    const ticket = this.host.store.tickets.get(ticketId)
+    if (!ticket) return
+    const register = this.registerTool(agent, pending)
+    for (const tool of this.host.tools(agent, ticket, 'review')) {
+      if (tool.name === 'orchestrator_review_submit') register(tool.name, tool.description, tool.schema, tool.execute)
+    }
   }
   /** Register the skills of a prompt version in the agent's skill scope, in place of an earlier version's. */
   private bindSkills(binding: SessionBinding, version: PromptVersion): void {

@@ -207,6 +207,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   Object.assign(agents, { list: () => [...agents.values()] })
   /** Each Session's next step, which takes the messages that wait for one. */
   const steps = new Map<string, () => void>(), claims = new Map<string, () => void>()
+  let reviewChildSequence = 0
   const tools = new Map<string, Map<string, RegisteredTool>>()
   const deliveries = vi.fn<(request: Delivery) => void>()
   let http!: HttpHandler
@@ -355,6 +356,26 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     if (!tool) throw new Error(`Tool ${name} is not registered for ${sessionId}`)
     return await tool.execute(args, { signal: new AbortController().signal }) as Record<string, unknown>
   }
+  /** Create a real Cordis Agent boundary for a Worker descendant; authorization still runs through Sessions and DSH tools. */
+  async function reviewSubagent(parentId: string, childId = `review-${++reviewChildSequence}`) {
+    const parent = agents.get(parentId)
+    if (!parent) throw new Error(`Session ${parentId} does not exist`)
+    const agentCtx = new Context(), sessionTools = new Map<string, RegisteredTool>()
+    tools.set(childId, sessionTools)
+    agentCtx.reflect.provide('tools', { register: (tool: RegisteredTool) => { sessionTools.set(tool.name, tool); return () => sessionTools.delete(tool.name) },
+      get: () => undefined, restrict: vi.fn(() => () => {}), guard: vi.fn(() => () => {}) })
+    agentCtx.reflect.provide('skills', { register: () => () => {} })
+    agentCtx.reflect.provide('systemPrompt', { section: () => () => {} })
+    const parentSession = parent.session as unknown as { header?: { cwd?: string } } | undefined
+    const session = { id: childId, header: { cwd: parentSession?.header?.cwd ?? '', parentSession: parentId }, snapshotEvents: () => [], requestHeader: () => undefined }
+    const agent = { ...parent, id: childId, ctx: agentCtx, session, status: 'idle' } as never
+    agents.set(childId, agent)
+    ctx.emit('agent/created', { agent } as never)
+    const { promise, resolve } = Promise.withResolvers<void>()
+    setTimeout(resolve, 0)
+    for (let tries = 0; tries < 20 && !sessionTools.has('orchestrator_review_submit'); tries++) await promise
+    return childId
+  }
   const sendUserMessage = (sessionId: string, text: string) => {
     const agent = agents.get(sessionId)
     if (!agent) throw new Error(`Session ${sessionId} does not exist`)
@@ -405,6 +426,6 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
   return { get runtime() { return runtime }, get ctx() { return ctx }, restart, idlePlanning, idleRelay, directory, localGit, agents, tools, deliveries, relays, candidates, runTool, sendUserMessage, record, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
-    jobs, subagents, step, claim }
+    jobs, subagents, reviewSubagent, step, claim }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>

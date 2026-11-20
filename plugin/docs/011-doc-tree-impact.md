@@ -18,6 +18,8 @@ Structure is not a full inventory or a comparison with source. A well-formed lin
 
 The Worker records the candidate and base, document diff paths or unchanged rationale, and actual structural results and limits in the internal report and the candidate's PR description. After a restart, amendment or change of base, it checks the actual worktree and repeats evidence for the current revision. A tool result does not approve or merge the candidate, change ticket state, or unlock any successor. Independent reviewers check the scope and compare the stated contract to the candidate code and public verification.
 
+Semantic review is a separate dual-review fact, not a structural checker result. The standards and specification reviewers submit their own conclusions through `orchestrator_review_submit`; `ticket/<id>/reviews` retains each reviewer identity, basis, pinned base, candidate and blockers. A structurally valid link does not pass when the API contract's path, method, inputs, outputs or errors are semantically wrong, and a missing or stale review keeps the candidate non-passing.
+
 ## Code and verification
 
 - `src/app/tools/executor.ts` defines the Worker tool; `src/executor/dsh.ts` binds it to the active worktree; `src/executor/doc-tree.ts` reads candidate structure.

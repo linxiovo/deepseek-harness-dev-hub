@@ -585,6 +585,16 @@ export class DshExecutor implements Executor {
       })
     return { candidate: head, base }
   }
+  /** Verify a review candidate is the clean current ticket HEAD and return its pinned base. */
+  async inspectReviewCandidate(ticketId: string, _reviewerSession: string, candidate: string, signal: AbortSignal) {
+    const { candidate: head, base } = await this.inspectCandidate(ticketId, workerSessionId(ticketId), candidate, 'Review', signal,
+      async (worktree, _base, stopped) => {
+        stopped.throwIfAborted()
+        if (await this.host.commands.git(['status', '--porcelain=v1', '--untracked-files=all'], worktree))
+          throw new Error('Review requires a clean candidate worktree')
+      })
+    return { candidate: head, base }
+  }
   /** Stop every loaded worker and release only claims this instance can prove fully idle before Store closes. */
   async shutdown(): Promise<void> {
     const tickets = this.host.store.tickets.list()

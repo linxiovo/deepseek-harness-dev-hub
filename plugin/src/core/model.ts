@@ -214,6 +214,28 @@ export type AssignmentState = 'pending' | 'running' | 'ended'
  * ready (`ready`), a person must act to unblock or recover it (`blocked` or `failed`), or nothing is left to do (`dropped`).
  */
 export type ReportState = 'progress' | 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped'
+/** Independent review axes used to evaluate an Assignment candidate. */
+export type ReviewAxis = 'standards' | 'spec'
+export type ReviewConclusion = 'passed' | 'blocked'
+/** One immutable, independently submitted review of an exact candidate against the ticket's pinned base. */
+export interface ReviewEvidence {
+  id: string
+  axis: ReviewAxis
+  reviewer_session: string
+  basis: string[]
+  base: string
+  candidate: string
+  conclusion: ReviewConclusion
+  blockers: string[]
+  summary: string
+  at: string
+}
+export type ReviewStatus = 'pending' | 'blocked' | 'passed'
+/** The currently selected candidate/base, plus all durable submissions; old candidates remain auditable. */
+export interface AssignmentReviews {
+  target?: { base: string; candidate: string }
+  evidence: ReviewEvidence[]
+}
 /** Binding between a ticket and one executor instance. */
 export interface Assignment {
   id: string
@@ -234,6 +256,7 @@ export interface Assignment {
   recoveryInputId?: string
   /** Fenced write lease; ending an Assignment requests a stop but does not prove this lease idle. */
   writer?: { generation: number; state: 'preparing' | 'active' | 'stopping' | 'idle'; session?: string }
+  reviews?: AssignmentReviews
 }
 
 export type TicketInput =
@@ -368,6 +391,17 @@ export function reached(ticket: Ticket, trigger: Trigger, thread: (key: string) 
     const current = thread(threadKey(ref))
     return current?.subscriptions.includes(ticket.id) === true && (context || !current.context?.includes(ticket.id))
   }) || (input && (context || !trigger.threads.every(ref => thread(threadKey(ref))?.context?.includes(ticket.id))))
+}
+/** Aggregate only the exact selected base/candidate; stale historical evidence can never satisfy a new candidate. */
+export function reviewStatus(assignment: Pick<Assignment, 'reviews'>): ReviewStatus {
+  const reviews = assignment.reviews
+  if (!reviews?.target) return 'pending'
+  const current = reviews.evidence.filter(item => item.base === reviews.target!.base && item.candidate === reviews.target!.candidate)
+  if (current.some(item => item.conclusion === 'blocked' || item.blockers.length > 0)) return 'blocked'
+  const standards = current.filter(item => item.axis === 'standards')
+  const spec = current.filter(item => item.axis === 'spec')
+  return standards.length === 1 && spec.length === 1
+    && standards[0]!.conclusion === 'passed' && spec[0]!.conclusion === 'passed' ? 'passed' : 'pending'
 }
 export const latestAssignment = (ticket: Ticket): Assignment | undefined => ticket.assignments.at(-1)
 /** The latest report any of a ticket's Assignments made, which is what the ticket last said. */

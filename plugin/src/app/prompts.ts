@@ -27,7 +27,7 @@ const SPLITTER_SKILL_PART = `skill/${SPLITTER_SKILL_KEY}` as const
 const PART_KEYS = ['runtime/shared', 'runtime/orchestrator', 'runtime/worker', 'runtime/planner', 'runtime/splitter', 'runtime/subscriptions', 'runtime/replies',
   'runtime/dispatch', 'runtime/work', 'runtime/admission', 'runtime/handoff/orchestrator', 'runtime/handoff/worker', 'runtime/environment',
   'runtime/policy', 'runtime/policy/none', 'skill/feishu', 'skill/github', 'skill/to-spec', 'skill/doc-tree',
-  'skill/worker/implement', 'skill/worker/tdd', 'skill/worker/test-scope', SPLITTER_SKILL_PART] as const
+  'skill/worker/implement', 'skill/worker/tdd', 'skill/worker/test-scope', 'skill/worker/code-review', SPLITTER_SKILL_PART] as const
 export type PartKey = typeof PART_KEYS[number]
 /** A team's text for a built-in part, and `base`, the key of the built-in text it was edited from. */
 const OverrideSchema = z.object({ text: z.string(),
@@ -78,6 +78,7 @@ export const builtInParts = (): Readonly<Record<PartKey, BuiltInPart>> => parts 
   'skill/worker/implement': { roles: WORKER, text: workerSkills['worker/implement'].content },
   'skill/worker/tdd': { roles: WORKER, text: workerSkills['worker/tdd'].content },
   'skill/worker/test-scope': { roles: WORKER, text: workerSkills['worker/test-scope'].content },
+  'skill/worker/code-review': { roles: WORKER, text: workerSkills['worker/code-review'].content },
   [SPLITTER_SKILL_PART]: { roles: SPLITTER, text: splitterSkill.content },
 }
 /** The key of a built-in text, which an override's `base` records. */

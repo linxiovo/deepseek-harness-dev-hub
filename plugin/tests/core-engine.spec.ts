@@ -1507,6 +1507,40 @@ describe('routing review', () => {
     expect([first, second].map(id => h.repo.tickets.get(id)!.ended?.outcome)).toEqual(['stopped', 'stopped'])
   })
 })
+describe('assignment review evidence', () => {
+  const base = '1'.repeat(40), candidate = '2'.repeat(40)
+  function readyForReviews() {
+    const h = harness()
+    const decision = accepted(h)
+    const ticket = h.repo.tickets.get(decision.ticketId!)!
+    const assignment = runningAssignment(ticket)!
+    assignment.writer = { generation: 1, state: 'active', session: `worker-${ticket.id}` }
+    ticket.execution = { name: 'fix', directory: '/worktree', assignment: assignment.id, base: { ref: 'main', sha: base },
+      active_writer: { assignment: assignment.id, session: `worker-${ticket.id}` } }
+    h.repo.tickets.save(ticket)
+    return { h, ticketId: ticket.id }
+  }
+
+  it('passes only with one independent standards and specification review of the same candidate and base', () => {
+    const { h, ticketId } = readyForReviews()
+    const common = { basis: ['plugin/docs/007-architecture.md'], candidate, conclusion: 'passed' as const, blockers: [], summary: 'Checked.' }
+    expect(h.engine.recordReview(ticketId, 'child-standards', { ...common, axis: 'standards', base }).status).toBe('pending')
+    expect(h.engine.recordReview(ticketId, 'child-spec', { ...common, axis: 'spec', base }).status).toBe('passed')
+    expect(h.repo.tickets.get(ticketId)!.assignments[0]!.reviews?.evidence).toHaveLength(2)
+  })
+
+  it('does not pass on missing, blocked, duplicate, or mismatched review evidence', () => {
+    const { h, ticketId } = readyForReviews()
+    const common = { basis: ['ticket/1'], candidate, base, conclusion: 'passed' as const, blockers: [], summary: 'Checked.' }
+    expect(h.engine.recordReview(ticketId, 'child', { ...common, axis: 'standards' }).status).toBe('pending')
+    expect(() => h.engine.recordReview(ticketId, 'child-again', { ...common, axis: 'standards' })).toThrow(/already submitted/)
+    expect(() => h.engine.recordReview(ticketId, 'child-spec', { ...common, axis: 'spec', base: '3'.repeat(40) })).toThrow(/pinned base/)
+    expect(h.engine.recordReview(ticketId, 'child-spec', { ...common, axis: 'spec', conclusion: 'blocked', blockers: ['Missing API contract'] }).status)
+      .toBe('blocked')
+    expect(h.engine.recordReview(ticketId, 'child-spec-new-candidate', { ...common, axis: 'spec', candidate: '4'.repeat(40) }).status)
+      .toBe('pending')
+  })
+})
 
 describe('what a worker read', () => {
   /** A ticket that ended, resumed by a person's message `2`, whose new Assignment started; its Inputs wait for delivery. */

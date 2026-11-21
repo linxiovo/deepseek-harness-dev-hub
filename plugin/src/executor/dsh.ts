@@ -569,13 +569,18 @@ export class DshExecutor implements Executor {
       return inspectWorktree(commands, { mode: 'reuse', previous, repository: previous.repository, directory: previous.worktree,
         branch: previous.branch, base: previous.base, ticket: ticketId, assignment: previous.assignment, session: sessionId })
     }
+    const repair = store.tickets.get(ticketId)?.deliveryCheck?.events.findLast(event => event.kind === 'repair')?.revision.candidate
     const { worktree, head, base } = await inspect()
     if (candidate !== head) throw new Error(`${purpose} candidate must match the ticket worktree HEAD`)
     authorize()
+    if (repair && repair !== candidate) {
+      try { await commands.git(['merge-base', '--is-ancestor', repair, candidate], worktree) }
+      catch (error) { throw new Error('Candidate must retain the recorded repair lineage', { cause: error }) }
+    }
     const checked = await collect(worktree, base.sha, stopped)
     if ((await inspect()).head !== head) throw new Error(`${purpose} candidate changed while collecting evidence`)
-    authorize()
-    return { candidate: head, base: base.sha, checked }
+    const { generation } = authorize()
+    return { candidate: head, base: base.sha, generation, checked }
   }
 
   async inspectDocImpact(ticketId: string, sessionId: string, candidate: string, scope: Parameters<typeof checkDocTree>[4], signal: AbortSignal) {
@@ -586,7 +591,7 @@ export class DshExecutor implements Executor {
 
   async inspectTestEvidence(ticketId: string, sessionId: string, candidate: string, red: readonly string[], signal: AbortSignal) {
     const git = this.host.commands.git.bind(this.host.commands)
-    const { candidate: head, base } = await this.inspectCandidate(ticketId, sessionId, candidate, 'Test', signal,
+    const { candidate: head, base, generation } = await this.inspectCandidate(ticketId, sessionId, candidate, 'Test', signal,
       async (worktree, base, stopped) => {
         for (const revision of new Set(red)) {
           stopped.throwIfAborted()
@@ -606,7 +611,35 @@ export class DshExecutor implements Executor {
           throw new Error('Test evidence requires a clean candidate worktree')
         }
       })
-    return { candidate: head, base }
+    return { candidate: head, base, generation }
+  }
+  /** Bind a retro observation to the clean current candidate, and prove a recorded repair changes its predecessor's tree. */
+  async inspectDeliveryCandidate(ticketId: string, sessionId: string, candidate: string, prior: string | undefined, signal: AbortSignal) {
+    const { checked: worktree, ...revision } = await this.inspectCandidate(ticketId, sessionId, candidate, 'Delivery', signal,
+      async (directory, _base, stopped) => {
+        const git = this.host.commands.git.bind(this.host.commands)
+        stopped.throwIfAborted()
+        if (prior) {
+          try { await git(['merge-base', '--is-ancestor', prior, candidate], directory) }
+          catch (error) {
+            if (error instanceof CliError && error.exitCode === 1) throw new Error('Repair must descend from the candidate with the finding')
+            throw error
+          }
+          const before = await git(['rev-parse', '--verify', `${prior}^{tree}`], directory)
+          const after = await git(['rev-parse', '--verify', `${candidate}^{tree}`], directory)
+          if (before === after) throw new Error('Repair must change the committed candidate tree')
+        }
+        return directory
+      })
+    const { commands } = this.host
+    if ((await commands.git(['rev-parse', '--verify', 'HEAD'], worktree)).trim() !== candidate
+      || (await commands.git(['status', '--porcelain=v1', '--untracked-files=all'], worktree)).trim()) {
+      throw new Error('Delivery evidence requires an unchanged, clean candidate worktree')
+    }
+    signal.throwIfAborted()
+    if (!this.writerAuthorized(ticketId, sessionId) || this.reviewGeneration(ticketId) !== revision.generation)
+      throw new Error('Delivery evidence requires the active writer for this ticket worktree')
+    return revision
   }
   /** Verify a review candidate is the clean current ticket HEAD and return its pinned base. */
   async inspectReviewCandidate(ticketId: string, _reviewerSession: string, candidate: string, signal: AbortSignal) {

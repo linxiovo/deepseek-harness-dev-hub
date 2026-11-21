@@ -33,7 +33,7 @@ import { TopicBinding } from './topic-binding.ts'
 import { Installation, projectDatabase, projectHubId } from './installation.ts'
 import { InstallationError } from './installation-api.ts'
 import { Planning } from './planning.ts'
-import { Plans, planDeliveryWriter } from './plans.ts'
+import { Plans } from './plans.ts'
 import { PlanDispatcher } from './plan-dispatch.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
@@ -167,8 +167,7 @@ export class Runtime extends Service implements SourceHost {
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
       const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx,
-        meter: { read: (id, signal) => this.readScopedMeter(id, signal) },
-        ownsSession: id => this.ownsSession(id),
+        meter: { read: (id, signal) => this.readScopedMeter(id, signal) }, plans, handoffs,
         reviewGeneration: ticketId => runtime.executor?.reviewGeneration(ticketId),
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
@@ -270,7 +269,6 @@ export class Runtime extends Service implements SourceHost {
             assignment.startedAt !== undefined && ticket.assignments[index - 1]?.endedReason === 'retried')
         }
       }
-      const planDelivery = planDeliveryWriter(plans)
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
       const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
@@ -288,7 +286,7 @@ export class Runtime extends Service implements SourceHost {
           if (kind === FEISHU && this.topicBinding?.claims(trigger)) return this.receiveBoundFeishu(trigger)
           return passes.receive(trigger)
         } }
-      this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, planDispatcher: this.planDispatcher, planDelivery, settings: this.settings, assessor, resources, projectMeter, handoffs, plans, lifetime: this.lifetime,
+      this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, planDispatcher: this.planDispatcher, settings: this.settings, assessor, resources, projectMeter, handoffs, plans, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }

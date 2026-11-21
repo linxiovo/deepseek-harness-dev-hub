@@ -7,6 +7,7 @@ import type { PlanNode } from './plan.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
+import type { DeliveryEvent, DeliveryRevision } from './delivery-check.ts'
 import { Evals, type Outcome } from './evals.ts'
 import { Intake, type ReceiveResult } from './intake.ts'
 import { Replies, type Reply, type ReplyRequest, type TakeUp } from './replies.ts'
@@ -302,8 +303,12 @@ export class Engine {
   report(ticketId: string, report: WorkerReport): Ticket { return this.repo.atomic(() => this.assignments.report(ticketId, report)) }
   /** Persist one review through the Engine's single-write transaction boundary. */
   recordReview(ticketId: string, reviewerSession: string, input: { axis: ReviewAxis; basis: string[]; base: string; candidate: string;
-    conclusion: ReviewConclusion; blockers: string[]; summary: string }) {
+    conclusion: ReviewConclusion; blockers: string[]; summary: string; reuses?: string[] }) {
     return this.repo.atomic(() => this.assignments.review(ticketId, reviewerSession, input))
+  }
+  /** Persist evidence only for the active, inspected Worker revision. */
+  recordDeliveryEvidence(ticketId: string, sessionId: string, revision: DeliveryRevision, event: DeliveryEvent, repairFrom?: DeliveryRevision) {
+    return this.repo.atomic(() => this.assignments.deliveryEvidence(ticketId, sessionId, revision, event, repairFrom))
   }
   /**
    * Handles an assignment that was running when the host stopped: restarts it with a recovery note unless its latest report is
@@ -335,5 +340,5 @@ export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reeva
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
 export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
-  | 'assignmentInterrupted' | 'report' | 'recordReview' | 'markUnrelated' | 'handback' | 'followForContext' | 'takeUp'
+  | 'assignmentInterrupted' | 'report' | 'recordReview' | 'recordDeliveryEvidence' | 'markUnrelated' | 'handback' | 'followForContext' | 'takeUp'
   | 'reserveExecution' | 'recordExecutionVerified' | 'rejectExecution' | 'acquireExecutionWriter' | 'releaseExecutionWriter'>

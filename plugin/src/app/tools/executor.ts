@@ -5,18 +5,18 @@ import { claimPull, readPull } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
 import type { DshExecutor } from '../../executor/dsh.ts'
 import { isMarkdownDocument } from '../../executor/doc-tree.ts'
-import { readResource, type ResourceHost } from '../resources.ts'
+import { deliveryAcceptance, readResource, resourceName, type ResourceHost } from '../resources.ts'
 import type { Store } from '../store.ts'
 import { reportRelay, threadFollowedNotice } from '../notices.ts'
 import type { Sessions } from '../sessions.ts'
 import { readTool, tool, type Tool } from './tool.ts'
 
 export interface ExecutorToolsHost {
-  readonly engine: Pick<EngineForExecutor, 'report' | 'recordReview' | 'takeUp' | 'markUnrelated' | 'handback' | 'followForContext'>
+  readonly engine: Pick<EngineForExecutor, 'report' | 'recordReview' | 'recordDeliveryEvidence' | 'takeUp' | 'markUnrelated' | 'handback' | 'followForContext'>
   readonly store: Pick<Store, 'tickets' | 'atomic'>
   readonly sessions: Pick<Sessions, 'relay' | 'notify' | 'authorizeReviewSession'>
   readonly resources: ResourceHost
-  readonly executor: Pick<DshExecutor, 'inspectDocImpact' | 'inspectTestEvidence' | 'inspectReviewCandidate'>
+  readonly executor: Pick<DshExecutor, 'inspectDocImpact' | 'inspectTestEvidence' | 'inspectReviewCandidate' | 'inspectDeliveryCandidate'>
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
 }
@@ -29,10 +29,15 @@ const impactSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('unchanged'), reason: z.string().trim().min(1).max(1000) }),
 ])
 const commitHash = z.string().refine(sha => /^(?:[a-f\d]{40}|[a-f\d]{64})$/.test(sha), 'Expected a full lowercase commit hash')
+const evidenceReference = z.string().trim().min(1).max(1000)
+const evidenceLinks = z.array(evidenceReference).min(1).max(20)
+const evidenceId = z.string().trim().min(1).max(100)
+const evidenceKeys = z.array(evidenceId).max(100)
 const docImpactSchema = z.strictObject({
   candidate: commitHash,
   root: markdownPath.nullable(), routes: docPaths, leaves: docPaths,
   impact: z.looseObject({ kind: z.enum(['updated', 'unchanged']) }),
+  reference: evidenceReference.optional(),
 })
 
 const runEvidence = {
@@ -47,6 +52,7 @@ const testEvidenceSchema = z.strictObject({
   reason: z.string().trim().min(1).max(1000),
   checks: z.array(z.strictObject({ ...runEvidence, status: z.enum(['passed', 'failed', 'not_run', 'pending', 'cancelled']) })).max(50),
   red: z.array(z.strictObject({ ...runEvidence, revision: commitHash })).max(50).nullable(),
+  reference: evidenceReference.optional(),
 })
 const reviewSubmitSchema = z.strictObject({
   candidate: commitHash,
@@ -55,6 +61,15 @@ const reviewSubmitSchema = z.strictObject({
   conclusion: z.enum(['passed', 'blocked']),
   summary: z.string().trim().min(1).max(4000),
   blockers: z.array(z.string().trim().min(1).max(1000)).max(50),
+  reuses: evidenceKeys.optional(),
+})
+const retroSchema = z.strictObject({
+  candidate: commitHash,
+  kind: z.enum(['first-retro', 'acceptance', 'final-retro', 'repair']),
+  findings: z.array(z.strictObject({ id: evidenceId, category: z.enum(['correctness', 'security', 'standard', 'optional']),
+    summary: evidenceReference, evidence: evidenceLinks, affects: evidenceKeys.optional() })).max(50).optional(),
+  results: z.array(z.strictObject({ id: evidenceId, status: z.enum(['passed', 'failed', 'not_run']), evidence: evidenceLinks })).max(100).optional(),
+  fixes: z.array(z.strictObject({ id: evidenceId, evidence: evidenceLinks })).min(1).max(100).optional(),
 })
 
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId: string, reviewOnly = false): Tool[] {
@@ -75,10 +90,42 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId
       },
     }),
     tool({
+      name: 'orchestrator_retro_evidence',
+      description: 'Record candidate delivery evidence.',
+      schema: retroSchema,
+      execute: async ({ candidate, kind, findings, results, fixes }, signal) => {
+        const count = Number(findings !== undefined) + Number(results !== undefined) + Number(fixes !== undefined)
+        const expected = kind === 'acceptance' ? results : kind === 'repair' ? fixes : findings
+        if (count !== 1 || !expected) throw new Error('Supply only findings for retro, results for acceptance, or fixes for repair')
+        const current = host.store.tickets.get(ticketId)
+        if (!current) throw new Error('Unknown ticket')
+        const prior = kind === 'repair' ? current.deliveryCheck?.events.at(-1)?.revision : undefined
+        if (kind === 'repair' && !prior) throw new Error('No retro or acceptance finding has been recorded for repair')
+        const revision = await host.executor.inspectDeliveryCandidate(ticketId, sessionId, candidate, prior?.candidate, signal)
+        const event = kind === 'acceptance' && results ? { kind, results, expected: deliveryAcceptance(host.resources, current) }
+          : kind === 'repair' && fixes ? { kind, fixes }
+          : (kind === 'first-retro' || kind === 'final-retro') && findings ? { kind, findings } : undefined
+        if (!event) throw new Error('Missing evidence for this delivery step')
+        const evidence = event.kind === 'acceptance' ? event.results : event.kind === 'repair' ? event.fixes : event.findings
+        for (const item of evidence) for (const ref of item.evidence) {
+          const reference = resourceName(ref)
+          if (reference === `ticket/${ticketId}/delivery-check`) throw new Error('Cite the original observation, not the delivery-check package itself')
+          if (!reference.startsWith('ticket/') || !reference.includes('/delivery-observation/')) continue
+          const match = /^ticket\/([^/]+)\/delivery-observation\/(0|[1-9]\d*)$/.exec(reference)
+          const observation = match?.[1] === ticketId ? current.deliveryCheck?.events[Number(match[2])] : undefined
+          if (!observation) throw new Error('Delivery observation is missing or belongs to another ticket')
+          if (event.kind === 'acceptance' && (observation.revision.candidate !== candidate || observation.revision.base !== revision.base
+            || observation.revision.generation !== revision.generation)) throw new Error('Acceptance observation must match the current revision')
+        }
+        host.engine.recordDeliveryEvidence(ticketId, sessionId, revision, event, prior)
+        return { ...revision, recorded: kind, read: `ticket/${ticketId}/delivery-check` }
+      },
+    }),
+    tool({
       name: 'orchestrator_doc_impact',
       description: 'Check candidate Doc Tree impact as the doc-tree skill says.',
       schema: docImpactSchema,
-      execute: async ({ candidate, root, routes, leaves, impact: declaration }, signal) => {
+      execute: async ({ candidate, root, routes, leaves, impact: declaration, reference }, signal) => {
         const impact = impactSchema.parse(declaration)
         if (root === null && (routes.length || leaves.length || impact.kind === 'updated')) {
           throw new Error('Doc Tree updates and declared nodes require a navigation root')
@@ -96,8 +143,12 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId
           for (const path of impact.documents) if (!changed.has(path)) throw new Error(`Document is not changed in this candidate: ${path}`)
           for (const path of changedDocuments) if (!impact.documents.includes(path)) throw new Error(`Changed Doc Tree document is not declared: ${path}`)
         }
-        return { ...revision, scope: { root, routes, leaves }, impact, structure: issues.length ? 'issues' : root === null ? 'not-applicable' : 'checked',
-          issues, semantic_review: 'required' }
+        const structure = issues.length ? 'issues' : root === null ? 'not-applicable' : 'checked'
+        const evidence = { scope: { root, routes, leaves }, impact, issues: issues.map(issue => ({ ...issue })), semantic_review: 'required' as const }
+        const index = host.engine.recordDeliveryEvidence(ticketId, sessionId, revision,
+          { kind: 'docs', structure, evidence, reference: reference ?? `ticket/${ticketId}/delivery-check` })
+        const { base } = revision
+        return { candidate, base, ...evidence, structure, read: `ticket/${ticketId}/delivery-observation/${index}` }
       },
     }),
     tool({
@@ -105,12 +156,14 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId
       description: 'Bind observed test runs and scope to the clean Worker candidate as the implement skill says.',
       schema: testEvidenceSchema,
       execute: async (args, signal) => {
-        const { candidate, checks, red } = args
+        const { candidate, checks, red, reference, scope, reason } = args
         const revision = await host.executor.inspectTestEvidence(ticketId, sessionId, candidate, red?.map(run => run.revision) ?? [], signal)
         const allPassed = checks.length > 0 && checks.every(check => check.status === 'passed')
         const redCovered = red === null || red.length > 0 && red.every(run => checks.some(check => check.directory === run.directory && check.command === run.command))
         const result = checks.some(check => check.status === 'failed') ? 'failed' : allPassed && redCovered ? 'reported_passed' : 'unverified'
-        return { ...args, ...revision, result, source: 'worker' }
+        const index = host.engine.recordDeliveryEvidence(ticketId, sessionId, revision, { kind: 'tests', result, evidence: { scope, reason, checks, red },
+          reference: reference ?? `ticket/${ticketId}/delivery-check` })
+        return { ...args, base: revision.base, result, source: 'worker', read: `ticket/${ticketId}/delivery-observation/${index}` }
       },
     }),
     tool({

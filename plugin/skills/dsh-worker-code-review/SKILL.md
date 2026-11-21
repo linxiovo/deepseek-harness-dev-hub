@@ -22,8 +22,10 @@ For a formal review, confirm `orchestrator_review_submit` is available before in
 
 Keep findings on your assigned axis. If you discover an issue belonging to the other axis, do not recategorize it as your evidence: report the mismatch as a blocker for this review. Missing sources, a missing review lane, or any base/candidate mismatch always blocks. A standards pass cannot compensate for a spec failure, and vice versa.
 
+For a repair, independently inspect the repair diff, original observations and Worker's scope judgment on your axis. Name an unaffected passing result in `reuses` only when you can explain why the same observation still applies to the new pair. Use `tests`, `docs` or `acceptance:<id>` with the canonical criterion ID. Omit a key if it was affected, missing or uncertain; it must be reacquired unless both fresh reviewers independently reaffirm it. A prior approval is not consent for the live candidate.
+
 ## Submit
 
-For a formal submission, use the actual `reviewer_session` identity and the runtime-resolved base; never invent them. For either mode, cite the sources actually inspected in `basis`. Use `passed` with empty `blockers`, or `blocked` with each concrete issue. Include a short `summary` of the evidence checked.
+For a formal submission, use the actual `reviewer_session` identity and runtime-resolved base. For either mode, cite inspected sources in `basis`. Use `passed` with empty `blockers`, or `blocked` with each concrete issue. Include a short `summary` of checked evidence.
 
-For a formal review, call `orchestrator_review_submit` with `candidate`, `axis`, `basis`, `conclusion`, `summary`, and `blockers`. Submit your own conclusion. If the tool rejects the evidence or becomes unavailable, report the formal lane as blocked. Local feedback names the pinned versions, axis, basis, conclusion and blockers; it never authorizes readiness.
+A formal review calls `orchestrator_review_submit` with `candidate`, `axis`, `basis`, `conclusion`, `summary`, `blockers`, and `reuses` when reaffirming specific observations. Submit only your own conclusion. If submission is unavailable or rejects your identity, axis, basis or candidate, report the formal lane as blocked. Local feedback names pinned versions, axis, basis, conclusion and blockers; it never authorizes readiness.

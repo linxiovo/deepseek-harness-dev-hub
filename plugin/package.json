@@ -49,6 +49,7 @@
     "check:imports": "node scripts/check-imports.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:session-tools": "vitest run tests/tools.spec.ts tests/model-surface.spec.ts tests/cards.spec.ts",
     "check": "node scripts/check.mjs",
     "hooks:install": "node scripts/install-hooks.mjs",
     "verify:linux": "node scripts/verify-linux.mjs",

@@ -538,6 +538,12 @@ describe('a worker whose work runs in the background', () => {
     await h.runtime.idle()
     // A subagent still runs, whose release is slow; one Input waits in the Session's inbox, another in the ticket.
     h.subagents.spawn(one.sessionId)
+    const gate = deferred(), draining = deferred(), drain = h.subagents.service.drainChildren.getMockImplementation()!
+    h.subagents.service.drainChildren.mockImplementationOnce(async (parent, ids) => {
+      draining.resolve()
+      await gate.promise
+      await drain(parent, ids)
+    })
     agent.inbox.nextStep.push({ id: 'taken-later', role: 'user', content: [{ type: 'text', text: 'Handed over' }], source: { kind: 'user' } } as never)
     const lateText = 'One more thing'
     const stored = ticket()
@@ -547,23 +553,15 @@ describe('a worker whose work runs in the background', () => {
     const late = expect.objectContaining({ sessionId: one.sessionId, text: expect.stringContaining(lateText) })
     const reports = () => h.relays(h.runtime.masterId).filter(item => item.kind === 'worker_report').length
     const reported = reports()
-    const gate = deferred(), entered = deferred(), deadline = deferred<never>()
-    const drain = h.subagents.service.drainChildren.getMockImplementation()!
-    const timer = setTimeout(() => deadline.reject(new Error('Restart did not enter drainChildren')), 3_000)
     try {
-      h.subagents.service.drainChildren.mockImplementationOnce(async (parent, ids) => {
-        entered.resolve()
-        await gate.promise
-        await drain(parent, ids)
-      })
       h.runtime.executor.resume()
-      await Promise.race([entered.promise, deadline.promise])
+      await draining.promise
       expect(h.deliveries).not.toHaveBeenCalledWith(late)
       expect(ticket().undelivered).toEqual(['input-late'])
     } finally {
-      clearTimeout(timer)
       gate.resolve()
     }
+    // The recovered writer revalidates its Git worktree before the queued Input can be delivered.
     await h.runtime.idle()
     const delivered = h.deliveries.mock.calls.flatMap(([call], index) =>
       call.sessionId === one.sessionId && call.text.includes(lateText) ? [h.deliveries.mock.invocationCallOrder[index]!] : [])
@@ -572,7 +570,8 @@ describe('a worker whose work runs in the background', () => {
     const cancelled = agent.cancel.mock.invocationCallOrder.at(-1)!
     expect(cancelled).toBeGreaterThan(h.subagents.service.drainChildren.mock.invocationCallOrder.at(-1)!)
     expect(delivered[0]).toBeGreaterThan(cancelled)
-    expect(h.deliveries).not.toHaveBeenCalledWith(expect.objectContaining({ sessionId: one.sessionId, text: expect.stringContaining('Handed over') }))
+    expect(h.deliveries).not.toHaveBeenCalledWith(expect.objectContaining({ sessionId: one.sessionId,
+      text: expect.stringContaining('Handed over') }))
     expect(agent.cancel).not.toHaveBeenCalledWith({ kind: 'user' }, { keepInbox: false })
     expect(agent.inbox.nextStep.map(message => message.id)).toContain('taken-later')
     // The turn the subagent's end woke and the release cancelled reports nothing.

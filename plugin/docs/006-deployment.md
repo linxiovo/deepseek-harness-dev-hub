@@ -382,6 +382,32 @@ This is an operator-run real-model check, separate from automated tests and CI; 
 
 For a real-host Plan credential pause and verification, use the separate operator smoke check in `015-scoped-attention.md`.
 
+## Run-limit live/model smoke check
+
+**Manual verification with a real model.** Use a one-off DSH profile, managed project and disposable repository that contain no production work. Configure a real provider credential with a strict, explicitly authorized spend/quota limit; model calls can incur real supplier charges, including a call interrupted locally. Do not use production model traffic, exceed the credential's authorization, or put credentials in commands, logs or evidence. A simulated host/provider is not a live-model check, and `pnpm check` does not include this smoke.
+
+Before starting, identify the selected project's mounted ID, the chosen model adapter's declared combined input/output context bound, and the credential's authorized limit. For the strict per-Ticket `ticketTokens` cap, configure a value no greater than the authorized limit and at least the combined context bound; otherwise a normal bounded model request cannot start. Set finite project and Ticket caps that cover only the calls needed for this exercise and fit within the authorization. The two-worker contention case needs project capacity for two request bounds: the first in-flight reservation should leave insufficient unreserved balance for the second, while the settled balance after the first real usage receipt must still permit the second full bound. Give each Ticket its own strict cap. Do not assume the provider's reported usage equals the bound or that any request succeeds.
+
+Use the existing operator-only loopback API with `x-orchestrator-request: 1`, `Host: 127.0.0.1:<port>` (or `localhost:<port>`), and `x-orchestrator-project-id: <mounted ID>` on scoped reads and writes; if sending `Origin`, use `http://<Host>`. Obtain the whole `blocks.executor.value` and its block `revision` from `GET /orchestrator/api/settings`, save the whole Executor block through `PUT /orchestrator/api/settings/executor`, and verify the resolved configuration and balances through:
+
+```sh
+api=http://127.0.0.1:3082/orchestrator/api
+scope='<mounted project ID>'
+curl -sS -H 'x-orchestrator-request: 1' -H "x-orchestrator-project-id: $scope" "$api/project/run-limits"
+curl -sS -H 'x-orchestrator-request: 1' -H "x-orchestrator-project-id: $scope" "$api/tickets/<ticket-id>/run-limits"
+```
+
+For dispatch, inspect each registered Plan node's `orchestrator_plan_dispatch` result and its `limits`; compare `maxWorkers`, project/Ticket caps and stagnation values with the effective configuration returned by the scoped run-limit read. Use the exact mounted scope on the HTTP reads. Confirm that the selected node's Ticket cap matches the resolved override/default rather than assuming the project's default applies to every Ticket.
+
+1. Register three disposable Tickets with independent Ticket caps. Use two Workers on the first two. Observe the real provider boundary and run-limit status: while the first call is in flight, the second must wait without its own provider I/O; after the first call's authoritative usage is settled, the second may make its provider call only if both current pools still cover its full bound. Confirm this from provider-side/request evidence and the `inFlight`, `reportedCalls`, `accountedTokens` and `availableTokens` values, not merely from dispatch status. Record actual valid `totalTokens` reported by the model stream; never substitute the reservation, estimate, or sum of components for usage. If usage is absent or contradictory, leave it missing and treat the strict pool as unknown, not zero.
+2. Continue only until one Ticket's scoped budget read actually reports `exhausted` or `usage-missing`. Confirm that this pauses only that Ticket and produces one `quota-paused` notification for the continuous scope pause. Verify that another Ticket with its own cap and sufficient remaining project capacity can still proceed. If the observed status does not reach either state, record this part as not demonstrated; do not fabricate usage or raise the authorized limit to force the outcome.
+3. As the Hub, attempt `orchestrator_settings_save` changes to `maxWorkers` and `runLimits`, including a save that omits/deletes those fields. Each attempt must be refused with `panelOnlyRunLimits`; confirm the effective operator-saved values are unchanged. Do not use the Hub to alter run limits.
+4. Verify classification boundaries: an exhausted or unknown strict pool for Ticket A must not pause Ticket B when B has its own usable cap and aggregate project capacity remains; a PR close, report, or dispatch status must not by itself close a Ticket. Inspect Ticket state rather than inferring it from a PR or a dispatch response.
+5. On the disposable setup only, interrupt the host process at the observed point after provider admission but before result/usage has been durably settled, then restart the same DSH profile and project. Inspect the scoped Ticket and project run-limit reads before any retry. The interrupted call must remain visible as missing/interrupted, not as an active call or a zero-usage receipt; fail closed while strict usage is unknown. Do not claim the request failed to reach the supplier: it may already have arrived and incurred a charge. Before any retry, read the status and limits again and proceed only under the resulting strict authorization; never retry blindly.
+
+Keep evidence to redacted status/dispatch responses, Ticket state, non-secret provider usage evidence, profile/project identifiers and timestamps. Do not record API credentials, authentication URLs, private local paths or request secrets. Mark unavailable prerequisites and unobserved outcomes **not run**; neither `pnpm check` nor a simulated host/provider substitutes for this live check.
+
+
 ## Troubleshooting
 
 Setup problems appear on the overview with a link to the fix, in the panel's language; the log and the API show the English text below.

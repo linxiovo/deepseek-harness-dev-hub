@@ -8,7 +8,7 @@ import { addAbortListener } from 'node:events'
 export const RUN_LIMIT_REFUSAL = 'SUPERAGENT_RUN_LIMIT'
 
 export type ModelAdmission = { admitted: true; settle(totalTokens: number | null): void }
-  | { admitted: false; reason: string; wait?: Promise<void> }
+  | { admitted: false; reason: string; wait?: Promise<void>; requiresOperator?: true }
 interface AdmissionHost {
   owns(sessionId: string): boolean
   acquire(sessionId: string, reservation: number | null, signal?: AbortSignal): ModelAdmission
@@ -90,6 +90,7 @@ export function installModelAdmission(context: Context, host: AdmissionHost, lif
         try { decision = host.acquire(subject, maximum, signal) }
         catch { throw new LlmError('Host could not reserve model usage.', 'SUPERAGENT_USAGE_RESERVATION_FAILED') }
         if (decision.admitted) { lease = decision; break }
+        if (decision.requiresOperator) throw new LlmError(decision.reason, 'SUPERAGENT_RUN_LIMIT_CONFIGURATION')
         if (!decision.wait) refuse(decision.reason)
         waitSignal ??= signal ? AbortSignal.any([signal, lifetime]) : lifetime
         await waitForBalance(decision.wait, waitSignal)

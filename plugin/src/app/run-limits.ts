@@ -114,9 +114,10 @@ export class RunLimits {
         if (budget.state === 'exhausted' || budget.state === 'usage-missing') {
           return { admitted: false, reason: `Run limit paused: ${budget.state}` }
         }
-        if (maximumTokens === null) return { admitted: false, reason: 'Run limit requires a verified request token bound' }
+        if (maximumTokens === null) return { admitted: false, requiresOperator: true,
+          reason: 'Run limits require a model route with a verified request token bound.' }
         if (maximumTokens > budget.limitTokens - (budget.accountedTokens ?? 0)) {
-          return { admitted: false, reason: 'Run limit balance cannot cover this request' }
+          return { admitted: false, requiresOperator: true, reason: 'The model request bound exceeds the settled run limit balance.' }
         }
         waiting ||= budget.availableTokens === null || maximumTokens > budget.availableTokens
       }

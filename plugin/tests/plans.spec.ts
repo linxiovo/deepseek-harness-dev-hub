@@ -320,6 +320,8 @@ describe('managed project plan pause', () => {
     expect(await second).toBe('completed')
     expect(providerCalls).toBe(1)
     expect(await read('project/run-limits')).toMatchObject({ budget: { accountedTokens: 77, availableTokens: 23, reportedCalls: 2 } })
+    await expect(h.modelRequest(b.session, 24, later)).rejects.toMatchObject({ code: 'SUPERAGENT_RUN_LIMIT_CONFIGURATION' })
+    expect(providerCalls).toBe(1)
   })
 
   it.each(['usage-missing', 'exhausted'] as const)('keeps a %s quota pause local and reports it once across restart', async state => {

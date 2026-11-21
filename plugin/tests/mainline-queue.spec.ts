@@ -6,6 +6,7 @@ import { Commands } from '../src/infra/commands.ts'
 import { githubKind } from '../src/sources/github.ts'
 import { observePull } from '../src/sources/github-pull.ts'
 import { feishu, startRuntime, type Host } from './fixtures/host.ts'
+import type { MainlineRepair } from '../src/core/model.ts'
 
 let h: Host
 beforeEach(async () => { h = await startRuntime() })
@@ -178,6 +179,8 @@ function actionsHost() {
     setPull: (value: Pull) => { pull = value; return pullResponse(value) } }
 }
 
+  vi.spyOn(Object.getPrototypeOf(h.runtime.executor), 'requestMainlineRepair').mockImplementation(async function (...args: unknown[]) {
+    const [ticketId, repair] = args as [string, MainlineRepair]
 it('serializes two reviewed Plan candidates, then verifies a conflict repair only with fresh evidence', async () => {
   const { repository, git } = h.localGit!
   mkdirSync(join(repository, 'docs'))

@@ -91,26 +91,40 @@ As with other management routes, project scope and same-origin checks are not an
    ```
 
    Replace the example ID and path with the actual registered ID and installed executable. The profile name here is a non-secret selector for that verifier's own configuration. On Windows use an absolute executable path such as `'C:\OperatorTools\check-widget-test-account.exe'`. The runtime invokes the configured argv directly, from the Machine state directory, with stdin ignored and a 30-second deadline. Only exit code `0` without a terminating signal or abort counts as passed. A nonzero exit, timeout, signal, launch error or missing check leaves the action awaiting (a concurrent mount shutdown instead refuses the request). The verifier should test actual use of the account and should not print secrets; captured output does not go to HTTP or the Hub.
-3. When the Hub receives a credential action, configure the account through its credential provider, then invoke verification through loopback (or the [authorized SSH tunnel](006-deployment.md#headless-access-over-ssh)). For example, set `project_id` to the intended mount ID and `configuration` to the action's returned `/orchestrator/api/attention/credentials/<id>` path:
+3. When the Hub receives a credential action, configure the account through its approved provider, not through the management request. A chat acknowledgement or caller-supplied `verified` field cannot resume the Ticket.
 
-   ```sh
-   base=http://127.0.0.1:3082
-   curl -sS -H 'x-orchestrator-request: 1' -H "x-orchestrator-project-id: $project_id" \
-     "$base/orchestrator/api/attention/summary"
-   curl -sS -H 'x-orchestrator-request: 1' -H "x-orchestrator-project-id: $project_id" \
-     "$base$configuration"
-   curl -sS -H 'x-orchestrator-request: 1' -H "x-orchestrator-project-id: $project_id" \
-     -H 'Content-Type: application/json' -d '{}' "$base$configuration/verify"
+## Live test-account smoke check
+
+Use the [credential smoke CLI](../scripts/credential-smoke.mjs) from `plugin/` against a running **candidate bundle** in a dedicated DSH profile, with an isolated test project and real, dedicated provider test account. This is not a production account check. Run on the host or through an [authenticated SSH tunnel](006-deployment.md#headless-access-over-ssh) whose local and remote port numbers match. Verify separately that the endpoint is your intended host/profile and that access is limited to authorized OS users or authenticated SSH operators. The fixed management headers are not same-machine user authentication. Do not expose the port to untrusted local users or let another client verify this action during the smoke check. The existing interface does not correlate a POST receipt with a unique verifier invocation if another client verifies the same action between the CLI's GET and POST.
+
+1. Confirm the candidate revision installed in the profile and the intended selected project ID (`GET /orchestrator/api/runtime` in the [management API](006-deployment.md#management-api)). Set up the trusted verifier above to test actual account access, with no secret in its arguments. In the provider, prepare a known denial on this isolated account (for example, temporarily revoke a test-only grant). Confirm that the verifier is installed and runnable; a failed receipt alone cannot tell an account denial from a verifier launch error or timeout.
+2. Let the current root Worker of a live Plan Ticket report the test-account blocker. In Harness, confirm the Hub sends one credential `human-action` notice for the intended Ticket with the controlled configuration reference, without requesting secrets. Copy the mounted project ID and the current action's relative `configuration` path from that notice, not the credential identifier or provider URL. Note the Ticket's Assignment, Worker Session and worktree before verification so you can check continuation. Do not race this check with another verification or a project switch.
+3. Read the status, then verify the failing state explicitly. Replace the example IDs in **all** commands with those of the selected project and current action. `--url` defaults to `http://127.0.0.1:3082`; for a different port supply `--url http://127.0.0.1:<port>` on each invocation. These commands use no shell-specific substitutions and run on Windows and Unix.
+
+   ```text
+   pnpm credential:smoke --project 0123456789abcdef0123456789abcdef --action /orchestrator/api/attention/credentials/11111111111111111111111111111111
+   pnpm credential:smoke verify --project 0123456789abcdef0123456789abcdef --action /orchestrator/api/attention/credentials/11111111111111111111111111111111 --expect failed
    ```
 
-   If the result is `awaiting` / `failed`, inspect or repair the account in the operator-controlled provider and verify again. A chat acknowledgement or caller-supplied `verified` field cannot resume the Ticket.
+   The initial read should show `awaiting / not-checked` for a fresh action. The failing verification must exit 0 with `awaiting / failed`. Confirm in Harness that the Ticket stays paused with no duplicate credential notice. If verification unexpectedly passes, the CLI exits nonzero but the host may already have resumed the Ticket. Investigate and start with a fresh blocker; do not count it as a passing smoke check.
+4. Restore the test account's access through the provider, outside this CLI. For the **same** action:
+
+   ```text
+   pnpm credential:smoke verify --project 0123456789abcdef0123456789abcdef --action /orchestrator/api/attention/credentials/11111111111111111111111111111111 --expect passed
+   ```
+
+   This requires an `awaiting / failed` record beforehand and exits 0 only on the matching `verified / passed` receipt. Confirm in Harness that the original Ticket continues in the same Assignment, Worker Session and worktree without a second credential notice. Verification is not formal delivery and must not alone unblock a successor. A read can show a stored verified receipt; running `verify` on it is refused and is not a new live check.
+5. Record the candidate and test profile, the two observed results and the manual Harness checks in verification evidence. Record no credentials or raw verifier output. If the verification call is interrupted or times out, the host may still finish the operation: read status before attempting anything else. An observed stored receipt does not repair missing live evidence; use a fresh action for a new sequence. If the candidate host, isolated provider or manual verification is unavailable, record the live smoke check as **not run**, not passed on the strength of simulated results.
+
+Use `pnpm credential:smoke --help` for the contract. A status read exits 0 on any valid matching receipt, not on a fresh verification; `verify` exits 0 only for the expected pair. Exit 1 means refusal, incomplete request or unexpected result; exit 2 means invalid arguments. Only explicit `verify` sends a POST, with `{}`. The CLI never reads or configures credentials, opens provider pages, follows redirects, or prints raw management responses or verifier output.
 
 ## Code and verification
 
 The action lifecycle and shared read model live in [scoped-attention.ts](../src/app/scoped-attention.ts); [api.ts](../src/app/api.ts) and [http.ts](../src/app/http.ts) own the management contract. [deployment.ts](../src/deployment.ts) validates the Machine configuration and [runtime.ts](../src/app/runtime.ts) owns the subprocess invocation. [resources.ts](../src/app/resources.ts) and [tools/executor.ts](../src/app/tools/executor.ts) own the Session interfaces; [dsh.ts](../src/executor/dsh.ts) owns suspension and continuation.
 
-From `plugin/`, the acceptance entry point is `pnpm test tests/plans.spec.ts tests/http.spec.ts tests/docs.spec.ts`:
+From `plugin/`, the automated acceptance entry point is `pnpm test tests/plans.spec.ts tests/http.spec.ts tests/credential-smoke.spec.ts tests/docs.spec.ts`:
 
 - [plans.spec.ts](../tests/plans.spec.ts), `pauses only the Plan ticket with a missing test account and sends one controlled action request`: dispatch independent A/B/C Tickets (`catalog`, `accounts`, `export`); B pauses while A/C still work, and B's successor `dashboard` remains blocked. The test exercises replay, shared summary and Hub relay, cross-project and self-attested verification refusals, failed verification surviving restart without a duplicate relay, and successful verification reusing B's claim. Verification uses a simulated Harness host, not a production credential.
 - [http.spec.ts](../tests/http.spec.ts): loopback and project-scope management transport, error and concurrent-write boundaries.
+- [credential-smoke.spec.ts](../tests/credential-smoke.spec.ts): CLI subprocess against a simulated IPv4 loopback listener. It checks default GET-only behavior, project and action scope, explicit POST, redaction, and refusal of redirects, interrupted or unexpected verification, and stored-receipt replay. It does not exercise a real host or provider.
 - [docs.spec.ts](../tests/docs.spec.ts): consecutive numbering, root index registration, link rules, and source and test index coverage.

@@ -48,13 +48,15 @@
     "build": "tsdown",
     "check:imports": "node scripts/check-imports.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "test:session-tools": "vitest run tests/tools.spec.ts tests/model-surface.spec.ts tests/cards.spec.ts",
+    "test": "node scripts/test.mjs",
+    "test:session-tools": "node scripts/test.mjs tests/tools.spec.ts tests/model-surface.spec.ts tests/cards.spec.ts",
+    "test:recovery": "node scripts/test.mjs tests/plans.spec.ts tests/runtime-concurrency.spec.ts tests/runtime-crash.spec.ts",
     "check": "node scripts/check.mjs",
     "hooks:install": "node scripts/install-hooks.mjs",
     "verify:linux": "node scripts/verify-linux.mjs",
     "verify:windows": "node scripts/verify-windows.mjs",
-    "worker:smoke": "node scripts/worker-smoke.mjs"
+    "worker:smoke": "node scripts/worker-smoke.mjs",
+    "credential:smoke": "node scripts/credential-smoke.mjs"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0",

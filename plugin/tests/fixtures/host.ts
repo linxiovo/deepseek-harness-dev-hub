@@ -368,10 +368,21 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     return runtime
   }
 
-  /** Parsed JSON payloads delivered to `sessionId`. */
+  /** Legacy JSON-only projection retained for existing fixture consumers. */
   const relays = (sessionId: string) => deliveries.mock.calls.map(([call]) => call).filter(call => call.sessionId === sessionId)
     .map(call => JSON.parse(call.text) as Record<string, unknown>)
   const candidates = () => relays(runtime.masterId).filter(item => item.kind === 'candidate').map(item => item.trigger_id)
+  /** Parse only JSON object relays of the requested kind; plain text, malformed JSON and other kinds are ignored. */
+  const jsonRelays = <T extends { kind: string }>(sessionId: string, kind: T['kind']): T[] => {
+    const matches: T[] = []
+    for (const [call] of deliveries.mock.calls) {
+      if (call.sessionId !== sessionId) continue
+      let value: unknown
+      try { value = JSON.parse(call.text) } catch { continue }
+      if (value && typeof value === 'object' && !Array.isArray(value) && 'kind' in value && value.kind === kind) matches.push(value as T)
+    }
+    return matches
+  }
   const runTool = async (sessionId: string, name: string, args: unknown) => {
     const tool = tools.get(sessionId)?.get(name)
     if (!tool) throw new Error(`Tool ${name} is not registered for ${sessionId}`)
@@ -477,7 +488,41 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   const step = (sessionId: string) => { steps.get(sessionId)!() }
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
-  return { get runtime() { return runtime }, get ctx() { return ctx }, get toolLimits() { return toolLimits }, restart, idlePlanning, idleRelay, directory, localGit, agents, tools, deliveries, relays, candidates, runTool, sendUserMessage, record, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
+  return { get runtime() { return runtime }, get ctx() { return ctx }, get toolLimits() { return toolLimits }, restart, idlePlanning, idleRelay, directory, localGit, agents, tools, deliveries, relays, jsonRelays, candidates, runTool, sendUserMessage, record, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
     jobs, subagents, reviewSubagent, useStoredLog, step, claim }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>
+interface ManagedProject {
+  host: Host
+  /** Project projection accepted directly as the `project` field of a handoff brief. */
+  projectBrief: { repository: string; workspace: string }
+  project: { id: string; repository: string; workspace: string; hubSessionId: string }
+}
+
+/** Start an isolated managed project by registering a real checkout through HTTP, then mounting its selected project. */
+export async function startManagedProject(options: { withFeishu?: boolean; machine?: Partial<Machine>
+  | ((project: ManagedProject['project']) => Partial<Machine>) } = {}): Promise<ManagedProject> {
+  const host = await startRuntime(undefined, { withFeishu: options.withFeishu, separateCheckout: true })
+  try {
+    const checkout = host.localGit!, repository = 'acme/widgets'
+    const registration = await host.api('POST', 'projects', { repository, workspace: checkout.repository, baseRef: checkout.base.ref })
+    const registered = registration.body.project
+    if (registration.status !== 200 || registration.body.restarting !== true || !registered || typeof registered !== 'object'
+      || !('id' in registered) || typeof registered.id !== 'string' || !registered.id
+      || !('repository' in registered) || registered.repository !== repository
+      || !('workspace' in registered) || registered.workspace !== checkout.repository
+      || !('hubSessionId' in registered) || typeof registered.hubSessionId !== 'string') {
+      throw new Error(`Managed project registration failed (${registration.status}): ${JSON.stringify(registration.body)}`)
+    }
+    const project = { id: registered.id, repository, workspace: registered.workspace, hubSessionId: registered.hubSessionId }
+    await host.restart(typeof options.machine === 'function' ? options.machine(project) : options.machine)
+    const projects = await host.api('GET', 'projects')
+    if (projects.status !== 200 || projects.body.activeProjectId !== project.id) {
+      throw new Error(`Managed project ${project.id} was not selected after restart: ${JSON.stringify(projects.body)}`)
+    }
+    return { host, project, projectBrief: { repository, workspace: project.workspace } }
+  } catch (error) {
+    await host.stop()
+    throw error
+  }
+}

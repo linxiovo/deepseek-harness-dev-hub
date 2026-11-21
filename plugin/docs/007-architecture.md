@@ -499,6 +499,8 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 
 `scripts/` holds standalone operational CLIs outside `src/`: `scripts/dsh-superagent` manages the local service process, and `scripts/verify-linux.mjs` runs `pnpm install --frozen-lockfile && pnpm check` against a committed Linux or WSL snapshot with logs and a manifest under `plugin/.artifacts/verify/`.
 
+`scripts/test.mjs` is the shared `pnpm test*` runner; its Windows scheduling contract is in `013-development-verification.md`. `scripts/credential-smoke.mjs` exercises the real host's scoped credential management interface; see `015-scoped-attention.md` for its operator procedure and limits.
+
 ## Tests
 
 | Test | Covers |
@@ -536,6 +538,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
 | `tests/topic-binding.spec.ts` | Uses a mounted project and normalized Feishu events to verify topic isolation, answer provenance and idempotent outbound delivery |
 | `tests/plans.spec.ts` | Automatic spec continuation, restart and registration, graph and role queries, invalid graph refusal, root/node message isolation, scoped usage, and credential pause, verification and claim replay through public Session tools and HTTP |
+| `tests/credential-smoke.spec.ts` | Credential smoke CLI against loopback HTTP: request scope, explicit verification and safe results; not a live account check |
 | `tests/runtime-concurrency.spec.ts` | Overlapping Triggers, deliveries and launches; Worker inbox recovery after restart, checked after the runtime drains launch and delivery effects against real Git worktrees |
 | `tests/http.spec.ts` | Management request bounds; ticket worktree and writer projections; meter status, ID decoding, same-origin protection and project switch races |
 | `tests/projects.spec.ts` | Durable project registration, selection, re-open and workspace collision checks |

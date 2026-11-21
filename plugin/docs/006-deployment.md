@@ -364,6 +364,8 @@ To run directly inside WSL, use a clone on the distribution's native Linux files
 
 This is an operator-run real-model check, separate from automated tests and CI; do not report `pnpm check` or CI as covering it.
 
+For a real-host Plan credential pause and verification, use the separate operator smoke check in `015-scoped-attention.md`.
+
 ## Troubleshooting
 
 Setup problems appear on the overview with a link to the fix, in the panel's language; the log and the API show the English text below.

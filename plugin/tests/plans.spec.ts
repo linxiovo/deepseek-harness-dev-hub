@@ -1,19 +1,18 @@
-import { afterEach, beforeEach, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { z } from 'zod'
 import { resolve } from 'node:path'
 import { KV } from '../src/kv.ts'
 import { planDeliveryWriter } from '../src/app/plans.ts'
-import { startRuntime, type Host } from './fixtures/host.ts'
+import { startManagedProject, startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host
-beforeEach(async () => { h = await startRuntime(undefined, { withFeishu: false }) })
-afterEach(async () => { await h.stop() })
+let brief: { project: { repository: string; workspace: string }; goal: string; constraints: string[];
+  acceptanceScope: string[]; authorization: { scope: string; release: 'not-authorized' } }
 
-const brief = {
-  project: { repository: 'acme/widgets', workspace: resolve('workspaces/widgets') },
-  goal: 'Let shoppers view their saved products.', constraints: ['Saved products are private.'],
-  acceptanceScope: ['A shopper can see their saved products.'],
-  authorization: { scope: 'Implement and verify private saved products.', release: 'not-authorized' },
+function savedProductsBrief(project: typeof brief.project) {
+  return { project, goal: 'Let shoppers view their saved products.', constraints: ['Saved products are private.'],
+    acceptanceScope: ['A shopper can see their saved products.'],
+    authorization: { scope: 'Implement and verify private saved products.', release: 'not-authorized' as const } }
 }
 const spec = {
   body: 'Provide an authenticated saved-products endpoint and a page for signed-in shoppers.',
@@ -66,6 +65,19 @@ const fanInDraft = {
   ],
 }
 
+async function registeredFanIn() {
+  const published = await publish({ ...brief, goal: fanInSpec.body }, fanInSpec)
+  await h.runtime.idle()
+  await published.register(fanInDraft)
+  return published
+}
+
+describe('plans on the legacy host fixture', () => {
+  beforeEach(async () => {
+    h = await startRuntime(undefined, { withFeishu: false })
+    brief = savedProductsBrief({ repository: 'acme/widgets', workspace: resolve('workspaces/widgets') })
+  })
+  afterEach(async () => { await h.stop() })
 it('automatically delegates a published spec, resumes interrupted splitting, and registers without starting a Worker', async () => {
   const { id, specId, sessionId, register } = await publish()
   await h.runtime.idle()
@@ -205,6 +217,7 @@ it('keeps direct root background and single-node instructions separate across a 
 })
 
 
+})
 const fanInSpec = {
   ...spec,
   body: 'Build independent catalog and account backends followed by a dashboard.',
@@ -223,25 +236,21 @@ type PlanDispatch = z.infer<typeof PlanDispatchSchema>
 const dispatchPlan = async (planId: string, nodeId: string): Promise<PlanDispatch> => PlanDispatchSchema.parse(
   await h.runTool(h.runtime.masterId, 'orchestrator_plan_dispatch', { planId, nodeId }))
 
-async function registeredFanIn() {
-  const published = await publish({ ...brief, goal: fanInSpec.body }, fanInSpec)
-  await h.runtime.idle()
-  await published.register(fanInDraft)
-  return published
-}
 
-it('pauses only the Plan ticket with a missing test account and sends one controlled action request', async () => {
-  await h.stop()
-  h = await startRuntime(undefined, { withFeishu: false, separateCheckout: true })
-  const repository = h.localGit!
-  const mounted = await h.api('POST', 'projects', { repository: 'acme/widgets', workspace: repository.repository, baseRef: repository.base.ref })
-  expect(mounted.status, JSON.stringify(mounted.body)).toBe(200)
-  const project = mounted.body.project as { id: string; repository: string; workspace: string }
-  await h.restart({ credentialChecks: [{ projectId: project.id, id: 'test-account', executable: process.execPath,
-    args: ['--fixture-check-test-account'], providerUrl: 'https://account.example.test/test-account' }] })
+describe('managed project plan pause', () => {
+  let managedHost: Host | undefined
+  afterEach(async () => { if (managedHost) { await managedHost.stop(); managedHost = undefined } })
+  it('pauses only the Plan ticket with a missing test account and sends one controlled action request', async () => {
+  const managed = await startManagedProject({ withFeishu: false, machine: project => ({ credentialChecks: [{ projectId: project.id,
+    id: 'test-account', executable: process.execPath, args: ['--fixture-check-test-account'],
+    providerUrl: 'https://account.example.test/test-account' }] }) })
+  managedHost = managed.host
+  h = managed.host
+  const project = managed.project
+  brief = savedProductsBrief(managed.projectBrief)
 
   const third = { id: 'export', kind: 'backend' }
-  const { id, register } = await publish({ ...brief, project: { repository: project.repository, workspace: project.workspace }, goal: fanInSpec.body }, fanInSpec)
+  const { id, register } = await publish({ ...brief, goal: fanInSpec.body }, fanInSpec)
   await h.runtime.idle()
   await register({ features: [...fanInDraft.features, third], nodes: [
     ...fanInDraft.nodes.map(node => node.id === 'dashboard' ? { ...node, blockedBy: ['accounts'] } : node),
@@ -269,7 +278,7 @@ it('pauses only the Plan ticket with a missing test account and sends one contro
   expect(await read(`plan/${id}/attention`)).toMatchObject(expected)
   expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['accounts'] })
   expect(await read(`plan/${id}/node/accounts`)).toMatchObject({ attention: { id: action.id, status: 'awaiting' } })
-  const push = () => h.relays(h.runtime.masterId).filter(relay => relay.kind === 'human-action')
+  const push = () => h.jsonRelays<{ kind: string } & Record<string, unknown>>(h.runtime.masterId, 'human-action')
   expect(push()).toEqual([expect.objectContaining({ kind: 'human-action', ...expected, action: expect.objectContaining({
     ticketId: b.ticketId, title: 'Account lookup', affectedNodes: ['dashboard'], configuration: expect.any(String),
   }) })])
@@ -340,6 +349,13 @@ it('pauses only the Plan ticket with a missing test account and sends one contro
   await h.runtime.idle()
   expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['accounts'] })
 })
+})
+describe('plans on the legacy host fixture after managed scenario', () => {
+  beforeEach(async () => {
+    h = await startRuntime(undefined, { withFeishu: false })
+    brief = savedProductsBrief({ repository: 'acme/widgets', workspace: resolve('workspaces/widgets') })
+  })
+  afterEach(async () => { await h.stop() })
 
 it('counts a forked review once and keeps one Hub call across two active Tickets in shared project usage', async () => {
   const { id } = await registeredFanIn()
@@ -622,4 +638,5 @@ it('does not meter a preallocated Worker ID before its verified Session is hande
   expect(await read(meter)).toMatchObject(expected)
   await h.restart()
   expect(await read(meter)).toMatchObject(expected)
+})
 })

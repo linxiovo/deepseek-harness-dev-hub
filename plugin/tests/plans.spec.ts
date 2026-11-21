@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, it } from 'vitest'
 import { z } from 'zod'
 import { resolve } from 'node:path'
+import { KV } from '../src/kv.ts'
 import { planDeliveryWriter } from '../src/app/plans.ts'
 import { startRuntime, type Host } from './fixtures/host.ts'
 
@@ -228,6 +229,117 @@ async function registeredFanIn() {
   return published
 }
 
+it('counts a forked review once and keeps one Hub call across two active Tickets in shared project usage', async () => {
+  const { id } = await registeredFanIn()
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, maxWorkers: 2 } })
+  const catalog = (await dispatchPlan(id, 'catalog')).claim!
+  const accounts = (await dispatchPlan(id, 'accounts')).claim!
+  await h.runtime.idle()
+
+  const master = h.runtime.masterId
+  const at = Date.UTC(2026, 10, 20)
+  const context = { type: 'request/context', time: at, data: { provider: 'fixture', model: 'fixture-model', contextWindow: 8192 } }
+  const message = (totalTokens: number) => {
+    const usage = { inputTokens: totalTokens - 2, outputTokens: 1, cacheReadTokens: 1, totalTokens }
+    return { type: 'assistant/message', time: at + 1, data: { turn: 1, step: 1, usage, message: { role: 'assistant', content: [] },
+      stream: [{ type: 'chunk', time: at + 1, chunk: { type: 'usage', usage } }] } }
+  }
+  h.record(catalog.session, [context, message(10)])
+  const review = await h.reviewSubagent(catalog.session, 'spec', undefined, true, [context, message(10)])
+  h.record(review, [message(6)])
+  h.record(accounts.session, [context, { type: 'assistant/attempt', time: at + 2, data: { turn: 1, step: 1, stream: [] } },
+    { type: 'turn/end', time: at + 3, data: { turn: 1, reason: 'cancelled' } }])
+  h.record(master, [context, message(5)])
+  h.record('unowned-fork', [context, message(10), message(100)], 2)
+
+  const expected = { scope: 'project', id: null, attributed: { reported_total_tokens: 16 }, shared: { reported_total_tokens: 5 },
+    total: { reported_total_tokens: 21, reported_total_calls: 3, total_complete: false, quality: 'partial' } }
+  const project = await h.api('GET', 'project/meter')
+  expect(project).toMatchObject({ status: 200, body: expected })
+  expect(await read('project/meter')).toEqual(project.body)
+
+  const ticket = await h.api('GET', `tickets/${catalog.ticketId}/meter`)
+  expect(ticket).toMatchObject({ status: 200, body: { scope: 'ticket', id: catalog.ticketId,
+    attributed: { reported_total_tokens: 16 }, shared: { reported_total_tokens: 5 }, total: { reported_total_tokens: 16 },
+    sessions: expect.arrayContaining([
+      expect.objectContaining({ session_id: catalog.session, roles: ['implementation'], ticket_id: catalog.ticketId, plan_id: id,
+        context: expect.objectContaining({ model: 'fixture-model', capacity_tokens: 8192, source: 'session-events', quality: 'unknown',
+          sampled_at: new Date(at + 1).toISOString() }),
+        own: expect.objectContaining({ input_tokens: 8, output_tokens: 1, reported_total_tokens: 10 }),
+        including_children: expect.objectContaining({ reported_total_tokens: 16 }) }),
+      expect.objectContaining({ session_id: review, parent_session_id: catalog.session, roles: expect.arrayContaining(['review']),
+        own: expect.objectContaining({ reported_total_tokens: 6 }) }),
+    ]),
+  } })
+  expect(await read(`ticket/${catalog.ticketId}/meter`)).toEqual(ticket.body)
+  const plan = await h.api('GET', `plans/${id}/meter`)
+  expect(plan).toMatchObject({ status: 200, body: { scope: 'plan', id, attributed: { reported_total_tokens: 16 },
+    shared: { reported_total_tokens: 5 }, total: { reported_total_tokens: 16, counted_calls: 2 } } })
+  expect(await read(`plan/${id}/meter`)).toEqual(plan.body)
+
+  const cancelled = await h.api('GET', `tickets/${accounts.ticketId}/meter`)
+  expect(cancelled).toMatchObject({ status: 200, body: { attributed: { reported_total_tokens: null, quality: 'unknown' },
+    total: { input_tokens: null, reported_total_tokens: null,
+      missing: [expect.objectContaining({ session_id: accounts.session, reason: 'no-usage', from: expect.any(Number), through: expect.any(Number) })] },
+    shared: { reported_total_tokens: 5 } } })
+  expect(await h.api('GET', 'plans/unknown/meter')).toMatchObject({ status: 404 })
+  expect(await h.api('GET', 'tickets/unknown/meter')).toMatchObject({ status: 404 })
+  await expect(h.runTool(catalog.session, 'orchestrator_read', { resource: `ticket/${catalog.ticketId}/meter` })).rejects.toThrow()
+
+  // Reopen with a new Hub identity and the business child unloaded, while all old logs stay durable.
+  h.agents.delete(review)
+  h.runtime.store.set(KV.runtime.masterId, 'rotated-hub')
+  await h.restart()
+  expect(h.runtime.masterId).toBe('rotated-hub')
+  const after = await h.api('GET', 'project/meter')
+  expect(after).toMatchObject({ status: 200, body: { ...expected, sessions: expect.arrayContaining([
+    expect.objectContaining({ session_id: master, roles: ['hub'] }),
+    expect.objectContaining({ session_id: 'rotated-hub', roles: ['hub'] }),
+    expect.objectContaining({ session_id: catalog.session, parent_session_id: master }),
+  ]) } })
+  expect(await h.api('GET', `sessions/${review}/meter`)).toMatchObject({ status: 200, body: { inherited_events: 2,
+    usage: { reported_total_tokens: 6, counted_calls: 1 } } })
+})
+
+it.each(['HTTP', 'Hub'] as const)('does not mix physical log generations in a %s meter read', async entry => {
+  const { id } = await registeredFanIn()
+  const { session, ticketId } = (await dispatchPlan(id, 'catalog')).claim!
+  await h.runtime.idle()
+  const query = async () => {
+    if (entry === 'Hub') return read(`ticket/${ticketId}/meter`)
+    const response = await h.api('GET', `tickets/${ticketId}/meter`)
+    expect(response.status).toBe(200)
+    return response.body
+  }
+  const message = (inputTokens: number, outputTokens: number, totalTokens: number) => ({ type: 'assistant/message',
+    data: { turn: 1, step: 1, usage: { inputTokens, outputTokens, totalTokens }, stream: [], message: { role: 'assistant', content: [] } } })
+  h.record(session, [message(8, 2, 10)])
+  expect(await query()).toMatchObject({ attributed: { reported_total_tokens: 10, counted_calls: 1 } })
+
+  const opening = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+  h.hooks.openingLog = id => {
+    if (id !== session) return undefined
+    opening.resolve()
+    return release.promise
+  }
+  const pending = query()
+  let restore: (() => void) | undefined
+  try {
+    await Promise.race([opening.promise, pending.then(() => { throw new Error('The meter did not open the Worker log') })])
+    restore = h.useStoredLog(session, Date.now(), [message(3, 1, 4)])
+    release.resolve()
+    expect(await pending).toMatchObject({ attributed: { reported_total_tokens: null, counted_calls: 0 },
+      sessions: expect.arrayContaining([expect.objectContaining({ session_id: session, log_status: 'unverified', context: null })]) })
+  } finally {
+    release.resolve()
+    delete h.hooks.openingLog
+    restore?.()
+  }
+  h.record(session, [message(5, 1, 6)])
+  expect(await query()).toMatchObject({ attributed: { reported_total_tokens: 16, counted_calls: 2 } })
+})
+
 it('claims only frontier nodes, records role/session/action before start, and deduplicates a node claim', async () => {
   const { id } = await registeredFanIn()
   const settings = h.runtime.store.settings()
@@ -358,4 +470,20 @@ it('replays a durable claim after restart without creating a second Worker deliv
   expect(deliveries).toHaveLength(1)
   expect((await read(`plan/${published.id}/node/saved-api`)).status).toBe('running')
   expect(await dispatchPlan(published.id, 'saved-page')).toMatchObject({ status: 'blocked', waitingOn: ['saved-api'] })
+})
+
+it('does not meter a preallocated Worker ID before its verified Session is handed off', async () => {
+  const { id } = await registeredFanIn()
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, paused: true })
+  const claim = h.runtime.planDispatcher.dispatch(id, 'catalog').claim!
+  await h.controller.create({ sessionId: claim.session, workspaceId: h.directory })
+  h.record(claim.session, [{ type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [] },
+    stream: [], usage: { inputTokens: 90, outputTokens: 10, totalTokens: 100 } } }])
+  const meter = `ticket/${claim.ticketId}/meter`
+  const expected = { attributed: { counted_calls: 0, reported_total_tokens: null, quality: 'unknown' },
+    sessions: expect.arrayContaining([expect.objectContaining({ session_id: claim.session, context: null })]) }
+  expect(await read(meter)).toMatchObject(expected)
+  await h.restart()
+  expect(await read(meter)).toMatchObject(expected)
 })

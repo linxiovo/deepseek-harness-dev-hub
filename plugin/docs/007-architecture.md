@@ -42,6 +42,7 @@ Ticket review evidence is submitted only by a Worker descendant through `orchest
 | Outbox | `src/app/outbox.ts` | The `Outbox` port for every Channel message and the only writer of its receipts: the Hub's replies, the acceptance acknowledgement, pull-request end notices and Source notices all go through `send`, which keeps a message's receipt and queues its `reply` effect in one transaction, and the effect's handler sends it through `SourceRegistry.send`; a message waits while its Source is off, and is dropped when the conversation is gone or not listened to |
 | Notices | `src/app/notices.ts` | Converts domain events and worker activity into main-Session messages. `eventNotice` handles domain notices; `reportRelay` forwards questions immediately, keeps ordinary progress on its Ticket, and relays other reports; `followupRelay` names the Tickets that own a human follow-up. Relays arriving during a turn are delivered together at its next step through the DeepSeek Harness inbox |
 | Session meter | `src/app/session-meter.ts` | One Session's context snapshot and cumulative usage read from its durable event log, with provenance, coverage ranges and the persisted exclusive cursor; a fork's inherited prefix is not charged to the child |
+| Project meter | `src/app/project-meter.ts` | Persists Session attribution and business parentage; rolls up the Session meter's own usage across Tickets, Plans, and the mounted project |
 
 ### Engine
 
@@ -296,10 +297,12 @@ Its fields, grouped by object:
    last_input_tokens, last_input_at, last_input_range, stale},
  usage: {input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
    known_components_total_tokens, reported_total_tokens, reported_total_calls, total_complete,
-   counted_calls, missing, in_flight, range, sampled_at, source, quality, billing_status}}
+   counted_calls, missing, in_flight, range, sampled_at, source, quality, billing_status, logs?}}
 ```
 
 Each `range`, including one in `missing`, is `{from, through}`; a `missing` entry adds `reason` (`no-usage` or `coverage-gap`). `context.source` is `dsh-token-meter`, `session-events` or `none`; `usage.source` is `session-events`. `context.quality` is `measured`, `estimated` or `unknown`; `usage.quality` is `measured`, `partial` or `unknown`. A token field whose evidence is absent is `null`, not zero, and `billing_status` is always `not-final`.
+
+For a reused ID, `usage.logs` separates physical log instances by `created_at` (omitted if an older persisted prefix had no provable creation timestamp). Entries include `sampled_at`, `range`, `missing`, `in_flight` and `status` (`current` or `unavailable`). The top-level context, cursor and untagged ranges still refer to the current instance; cumulative token counts include the prior known prefix. An old cursor with ambiguous log identity is not reused. See the scoped coverage contract in `plugin/docs/014-project-metering.md`.
 
 Validation: `tests/session-meter.spec.ts` covers the read seam (absent vs corrupt logs, capacity present and absent, stale input samples after tool results and compaction, fresh vs absent or stale DSH `contextPressure.projectedTokens` projections, one settlement across message and stream, attempts and compaction summaries without treating `shadowedTokenCount` as usage or occupancy, failed attempts kept `in_flight` until close without fabricating gaps, unsettled retries as `coverage-gap`, `no-usage` ranges, the four buckets against authoritative totals, fork prefixes with child `createdAt` sampling on empty own ranges, and cursor replay and durability flushes across restarts and concurrent reads); `tests/http.spec.ts` covers the route's statuses and parameters; `tests/tools.spec.ts` covers the Hub resource, its main-Session restriction and equality with the HTTP read.
 
@@ -330,6 +333,7 @@ Validation: `tests/session-meter.spec.ts` covers the read seam (absent vs corrup
   | A Ticket's worktree ownership and write access (`execution.ownership`, `execution.active_writer`) | `Tickets`, through `reserveExecution`, `recordExecutionVerified`, `rejectExecution`, `acquireExecutionWriter` and `releaseExecutionWriter`; the Executor supplies the Git verification and confirms the previous writer idle |
   | Confirmed handoffs and immutable specifications | `Handoffs` |
   | Plan DAGs, root background, and addressed node instructions | `Plans` |
+  | Project Session attribution and business parentage | `ProjectMeter`, through `bind` at a trusted delegation seam |
   | A Source's read positions, and the meta it keeps on its Threads (`label`, `url`, `facts` and its own keys) | That Source, through `SourceContext` |
   | Settings and their history | Settings |
   | Prompt versions | Prompts |
@@ -411,6 +415,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
 | `src/app/sessions.ts` | Sessions |
 | `src/app/session-meter.ts` | `SessionMeter`: one Session's context snapshot and cumulative usage from its durable event log, with provenance, missing and in-flight ranges, and the persisted exclusive cursor; forked prefixes are excluded |
+| `src/app/project-meter.ts` | `ProjectMeter`: project-local Session bindings and deduplicated scoped usage; contract in `plugin/docs/014-project-metering.md` |
+| `src/app/meter-recovery.ts` | Restores detached review attribution from durable review receipts and verified Session parent metadata |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
@@ -528,9 +534,9 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, review evidence and child-only review submission, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
 | `tests/topic-binding.spec.ts` | Uses a mounted project and normalized Feishu events to verify topic isolation, answer provenance and idempotent outbound delivery |
-| `tests/plans.spec.ts` | Automatic spec continuation, idempotent restart and registration, graph and role queries, invalid graph refusal, and root/node message isolation through the public Session tools |
+| `tests/plans.spec.ts` | Automatic spec continuation, restart and registration, graph and role queries, invalid graph refusal, root/node message isolation, and deduplicated scoped usage through the public Session tools and HTTP |
 | `tests/runtime-concurrency.spec.ts` | Overlapping Triggers, deliveries and launches; Worker inbox recovery after restart, checked after the runtime drains launch and delivery effects against real Git worktrees |
-| `tests/http.spec.ts` | Management request bounds; ticket worktree and writer projections; Session meter success, errors, ID decoding and same-origin protection |
+| `tests/http.spec.ts` | Management request bounds; ticket worktree and writer projections; meter status, ID decoding, same-origin protection and project switch races |
 | `tests/projects.spec.ts` | Durable project registration, selection, re-open and workspace collision checks |
 | `tests/project-work.spec.ts` | Bound handoff and Hub work gates, legacy receipt replay and project-scoped Worker IDs |
 | `tests/github-onboarding.spec.ts` | Managed setup only uses the verified account and bound repository |
@@ -679,6 +685,7 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 | `prompts`, `prompts/<revision>`, `prompts/current`, `prompts/defaults`, `prompt-preview/<id>` | Prompt configurations and composed text |
 | `models`, `models/<provider>` | Available models |
 | `session/<id>` | The `SessionMeterView` of one Session: its `context` snapshot and cumulative `usage`, with provenance, quality, sampled ranges and missing ranges; main Session only |
+| `project/meter`, `plan/<id>/meter`, `ticket/<id>/meter` | Hub-only scoped usage, shared overhead, and per-Session samples; contract in `plugin/docs/014-project-metering.md` |
 | `feishu/<trigger id>/…`, `github/…` | Original Source records, described in the Source skills |
 | `actions/<ticket\|plan>/<id>/commit/<40 lowercase hex SHA>` | GitHub Actions evidence for one owned commit, main Session only |
 

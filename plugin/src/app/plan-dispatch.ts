@@ -24,6 +24,7 @@ interface PlanDispatcherHost {
   readonly plans: Pick<Plans, 'get' | 'state' | 'waitingOn' | 'claim' | 'list' | 'rearm'>
   readonly engine: Pick<Engine, 'createPlanTicket'>
   readonly executor: Pick<DshExecutor, 'reserveLaunch' | 'releaseLaunch' | 'start'>
+  bindWorker(ticketId: string, sessionId: string): void
   readonly now?: () => string
 }
 
@@ -38,10 +39,8 @@ export class PlanDispatcher {
     if (!node) throw new UserError('unknownPlanNode', { id: planId, node: nodeId })
     if (!PLAN_ROLES.includes(node.role)) throw new UserError('invalidPlan', { detail: `Node ${planId}/${nodeId} has an untrusted execution role` })
     const current = this.host.plans.state(planId, nodeId)
-    const expectedTicketId = key('plan-ticket', planId, nodeId), expectedAssignmentId = key('assignment', expectedTicketId, '0')
     if (current) {
-      if (current.claim.role !== node.role || current.claim.ticketId !== expectedTicketId || current.claim.assignmentId !== expectedAssignmentId
-        || current.claim.session !== `worker-${expectedTicketId}`) throw new UserError('invalidPlan', { detail: `Node state ${planId}/${nodeId} has an untrusted claim identity` })
+      this.bindClaim(current, node.role)
       return this.result(planId, nodeId, node.role, current, true)
     }
     const waitingOn = this.host.plans.waitingOn(planId, node)
@@ -62,12 +61,32 @@ export class PlanDispatcher {
         if (ticket.id !== ticketId || latestAssignment(ticket)?.id !== assignmentId) {
           throw new Error(`Plan node ${planId}/${nodeId} did not create its stable Ticket and Assignment`)
         }
+        this.host.bindWorker(ticket.id, claim.session)
       })
       committed = true
       return this.result(planId, nodeId, node.role, state, false)
     } finally {
       if (!committed) this.host.executor.releaseLaunch(ticketId)
     }
+  }
+
+  /** Reconcile pre-meter reservations, including terminal and paused work, without starting any worker. */
+  restoreBindings(): void {
+    for (const plan of this.host.plans.list()) for (const node of plan.nodes) {
+      const state = this.host.plans.state(plan.id, node.id)
+      if (state) this.bindClaim(state, node.role)
+    }
+  }
+
+  private bindClaim({ claim }: PlanNodeState, role: PlanRole): void {
+    const { planId, nodeId } = claim
+    const ticketId = key('plan-ticket', planId, nodeId), ticket = this.host.store.tickets.get(ticketId)
+    if (claim.ticketId !== ticketId || claim.role !== role || claim.session !== `worker-${ticketId}`
+      || claim.assignmentId !== key('assignment', ticketId, '0') || ticket?.assignments[0]?.id !== claim.assignmentId
+      || ticket.plan?.planId !== planId || ticket.plan.nodeId !== nodeId || ticket.plan.role !== role) {
+      throw new UserError('invalidPlan', { detail: `Node state ${planId}/${nodeId} has an untrusted claim identity` })
+    }
+    this.host.bindWorker(ticketId, claim.session)
   }
 
   /** Rearm durable launch intents before the normal Executor recovery pass. */

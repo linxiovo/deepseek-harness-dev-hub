@@ -1,9 +1,9 @@
 /** Lifecycle, prompt/tool/skill decoration, message delivery, and budget retry tracking for managed DSH Sessions. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { MessageId } from '@deepseek-ai/dsh-llm'
+import type { MessageId, UserMessage } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import { realpathSync } from 'node:fs'
 import { dirname, isAbsolute, relative } from 'node:path'
 import { z } from 'zod'
@@ -18,6 +18,7 @@ import { RetryHealth } from './retry-health.ts'
 import { initializeRoleModel } from './role-models.ts'
 import { bundledSkills, isBundledSkill, promptFile, splitterSkill } from './skill-files.ts'
 import { SKILL_PREFIX, type PromptVersion, type Prompts, type Role as PromptRole } from './prompts.ts'
+import type { ProjectMeter } from './project-meter.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
@@ -27,6 +28,7 @@ export interface SessionsHost {
   /** DSH Cordis context: sessions, agents, persistence, and their events. */
   readonly context: Context
   readonly store: Pick<Store, 'tickets' | 'settings' | 'get' | 'set' | 'keys'>
+  readonly projectMeter: Pick<ProjectMeter, 'bind' | 'owns'>
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'compose' | 'skills'>
   readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'idle' | 'pending'>
   /** The `models` health entry, which reports managed sessions waiting on a model-budget retry. */
@@ -44,8 +46,7 @@ export interface SessionsHost {
   /** Workspace authorized by a persisted published specification, including after registration for idempotent replay. */
   splitterWorkspace(handoffId: string): string | undefined
   /** In-process writer grant; a stored lease cannot authorize worker turns after a restart. */
-  workerAuthorized?(ticketId: string, sessionId: string): boolean
-  authorizeReviewSession?(ticketId: string, sessionId: string, axis: ReviewAxis, candidate: string): Promise<boolean>
+  workerAuthorized(ticketId: string, sessionId: string): boolean
   /** Handoff and review-subagent roles receive only their own tools, rather than Hub or Worker tools. */
   tools(agent: Agent, ticket?: Ticket, role?: 'planner' | 'splitter' | 'review'): Tool[]
 }
@@ -55,11 +56,45 @@ export interface SessionsHost {
  * its skills are registered in, and the skills of one prompt revision; for a worker's subagent, only its tool limits.
  */
 interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void };
-  role?: PromptRole; subagent?: true; ready?: Promise<void> }
+  role?: PromptRole; subagent?: true; ready?: Promise<void>; observeDelegation?: (initial?: UserMessage) => void;
+  review?: { ticketId: string; grant: z.infer<typeof ReviewAssignmentSchema> } }
 
 /** The agent presets Executor, planner and main Sessions are created with, which the bundle's patch defines. */
 const ReviewAssignmentSchema = z.strictObject({ axis: z.enum(['standards', 'spec']), base: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/),
   candidate: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/), generation: z.number().int().positive() })
+
+/** DSH appends this descriptor in native child setup; a fork can only copy its source's descriptor before the cut. */
+function nativeDescriptor(events: readonly SessionEvent[], cut: number): boolean {
+  const event = events.find(event => event.seq >= cut && (event.type as string) === 'subagent/descriptor')
+  const data: unknown = event?.data
+  return !!data && typeof data === 'object' && 'version' in data && data.version === 3
+    && 'mode' in data && (data.mode === 'one-shot' || data.mode === 'continuable') && 'provider' in data && typeof data.provider === 'string'
+}
+
+function reviewTask(message: UserMessage) {
+  if (message.source.kind !== 'user') return undefined
+  const text = message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
+  const marker = /^DSH_REVIEW_ASSIGNMENT: (\{[^\n]+\})$/m.exec(text)?.[1]
+  if (!marker) return undefined
+  try { return ReviewAssignmentSchema.safeParse(JSON.parse(marker)).data } catch { return undefined }
+}
+
+function reviewSkillCall(event: SessionEvent): event is SessionEvent<'tool/call'> {
+  if (event.type !== 'tool/call' || event.data.name !== 'skill') return false
+  try { return JSON.parse(event.data.arguments)?.name === bundledSkills['worker/code-review'].name } catch { return false }
+}
+
+function loadedReviewSkill(events: readonly SessionEvent[], after: number): boolean {
+  const calls = new Map<string, SessionEvent<'tool/call'>['data']>()
+  for (const event of events) {
+    if (event.seq <= after) continue
+    if (reviewSkillCall(event)) calls.set(event.data.callId, event.data)
+    if (event.type !== 'tool/result' || event.data.message.isError !== false || event.data.error) continue
+    const call = calls.get(event.data.message.toolCallId)
+    if (call?.turn === event.data.turn && call.step === event.data.step) return true
+  }
+  return false
+}
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router', PLANNER_PRESET = 'dsh-superagent-planner'
 const plannerHandoffId = (sessionId: string): string | undefined =>
   sessionId.startsWith('planner-') && sessionId.length > 'planner-'.length ? sessionId.slice('planner-'.length) : undefined
@@ -141,9 +176,13 @@ export class Sessions {
       this.release(agent)
       this.retryHealth.clear(agent.id); this.updateModelHealth()
     })
+    ctx.on('agent/inbox/claimed', ({ agent, message }) => this.bindings.get(agent)?.observeDelegation?.(message))
     ctx.on('session/event', (session, event) => {
       const agent = ctx.agents.get(session.id)
       const binding = agent && agent.session === session ? this.bindings.get(agent) : undefined
+      if (binding?.observeDelegation && (event.type === 'user/message' || (event.type as string) === 'subagent/descriptor' || event.type === 'tool/result')) {
+        binding.observeDelegation()
+      }
       if (!agent || !binding?.ready || binding.subagent) return
       this.retryHealth.observe(agent.id, event)
       this.updateModelHealth()
@@ -179,19 +218,38 @@ export class Sessions {
       throw new Error('A splitter Session needs its persisted published spec and project workspace')
     }
     const ticketId = role === 'worker' ? ticketOfSession(id) : undefined
-    if (role === 'worker' && (!ticketId || this.host.workerAuthorized?.(ticketId, id) === false)) {
+    if (role === 'worker' && (!ticketId || !this.host.workerAuthorized(ticketId, id))) {
       throw new Error(`Worker ${id} has no verified writer grant; refusing to create its Session`)
+    }
+    const bind = () => {
+      if (this.host.closing()) throw new Error('Session dispatch is stopping')
+      if (role === 'orchestrator') {
+        if (id !== this.host.masterId) throw new Error('The Hub Session must match its persisted project identity')
+      } else if (ticketId !== undefined) {
+        if (!this.host.workerAuthorized(ticketId, id)) throw new Error(`Worker ${id} lost its writer grant before Session setup`)
+        this.bindWorker(ticketId, id)
+      } else if (role === 'planner' || role === 'splitter') {
+        if (plannerId ? !this.host.plannerActive(plannerId) : !splitterId || this.host.splitterWorkspace(splitterId) !== cwd) {
+          throw new Error('Planning dispatch changed before Session setup')
+        }
+        this.host.projectMeter.bind({ session_id: id, role,
+          ...this.host.projectMeter.owns(id) ? {} : { parent_session_id: this.host.masterId } })
+      }
     }
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
       const workspace = await ctx.workspaceRegistry.create(cwd)
+      if (role === 'worker') bind() // Plan Workers already have a durable reservation; standalone Workers reserve here.
       // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml).
       await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id,
         agentPreset: role === 'planner' || role === 'splitter' ? PLANNER_PRESET : role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
       result = await ctx.sessionController.resolveAgent(id as SessionId)
     }
     if ('error' in result) throw result.error
+    if (result.agent.session.header.parentSession !== undefined || result.agent.session.header.origin === 'subagent') {
+      throw new Error(`Expected a root Session for ${role} dispatch`)
+    }
     if (splitterId) {
       this.host.lifetime.throwIfAborted()
       if (!this.isSplitterSession(result.agent)) throw new Error(`Splitter ${id} is outside its published handoff workspace`)
@@ -208,14 +266,26 @@ export class Sessions {
       const [sessionPath, expectedPath] = await Promise.all([physicalPath(createdIn), physicalPath(cwd)])
       const same = process.platform === 'win32' ? sessionPath.toLowerCase() === expectedPath.toLowerCase() : sessionPath === expectedPath
       if (!same) throw new Error(`Worker ${id} belongs to ${createdIn}, not the verified ticket worktree ${cwd}`)
-      if (this.host.workerAuthorized?.(ticketId!, id) === false) throw new Error(`Worker ${id} lost its writer grant before Session setup`)
     }
+    bind()
     const settings = this.host.store.settings()
     await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
     await this.decorate(result.agent)
     ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
     return result.agent
+  }
+  /** Trusted host dispatch/receipt seam. A binding records attribution, never permission to start a turn. */
+  bindWorker(ticketId: string, sessionId: string, retry = false): void {
+    const scope = { session_id: sessionId, ticket_id: ticketId,
+      ...this.host.projectMeter.owns(sessionId) ? {} : { parent_session_id: this.host.masterId } }
+    this.host.projectMeter.bind({ ...scope, role: 'implementation' })
+    if (retry) this.host.projectMeter.bind({ ...scope, role: 'retry' })
+  }
+  /** Automatic executor retries continue the very same Session and cumulative cursor. */
+  async retry(ticketId: string, sessionId: string, requestId: string, text: string): Promise<void> {
+    if (!this.host.workerAuthorized(ticketId, sessionId)) throw new Error(`No verified writer for retry of ${sessionId}`)
+    await this.prompt(sessionId, requestId, text, 'queue', undefined, () => this.bindWorker(ticketId, sessionId, true))
   }
   /** Returns whether `sessionId` already holds the message delivered under `requestId`, or `false` if the session does not exist. */
   async holds(sessionId: string, requestId: string): Promise<boolean> {
@@ -227,7 +297,7 @@ export class Sessions {
     accepted?: () => void): Promise<void> {
     const ticketId = ticketOfSession(sessionId)
     const granted = () => {
-      if (ticketId && this.host.workerAuthorized?.(ticketId, sessionId) === false) {
+      if (ticketId && !this.host.workerAuthorized(ticketId, sessionId)) {
         throw new Error(`Worker ${sessionId} has no verified writer grant; refusing its turn`)
       }
       authorize?.()
@@ -319,6 +389,15 @@ export class Sessions {
       this.release(agent)
     }
     const host = this.host
+    // A native child can carry a caller-selected id. Never decorate one as a privileged root by its prefix.
+    if (agent.session.header.parentSession !== undefined) {
+      const planner = plannerHandoffId(agent.id), splitter = splitterHandoffId(agent.id), worker = ticketOfSession(agent.id)
+      if (agent.id === host.masterId || (planner && host.ownsPlanner(planner)) || (splitter && host.splitterWorkspace(splitter))
+        || (worker && host.store.tickets.get(worker))) {
+        this.bindings.set(agent, { disposers: [agent.ctx.tools.guard(() => WORKER_ANCESTRY_PENDING)] })
+      } else await this.limitSubagent(agent)
+      return
+    }
     const master = agent.id === host.masterId
     const plannerId = master ? undefined : plannerHandoffId(agent.id)
     const splitterId = master ? undefined : splitterHandoffId(agent.id)
@@ -330,7 +409,7 @@ export class Sessions {
         return
       }
     }
-    if (!master && !plannerId && !splitterId && !ticket) { await this.limitSubagent(agent); return }
+    if (!master && !plannerId && !splitterId && !ticket) return
     const handoffRole = plannerId ? 'planner' : splitterId ? 'splitter' : undefined
     const role: PromptRole = handoffRole ?? (master ? 'orchestrator' : 'worker')
     const binding: SessionBinding = { disposers: [], role }
@@ -411,7 +490,7 @@ export class Sessions {
     return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
       const current = store.tickets.get(ticketId)
       if (!current || !liveTicket(current)) return WORKER_TICKET_ENDED
-      if (this.host.workerAuthorized?.(ticketId, workerSessionId(ticketId)) === false) return WORKER_WRITER_REQUIRED
+      if (!this.host.workerAuthorized(ticketId, workerSessionId(ticketId))) return WORKER_WRITER_REQUIRED
       return undefined
     })]
   }
@@ -421,76 +500,101 @@ export class Sessions {
    * intermediate Session is no longer live. A cycle or a chain proven not to reach a worker ends the search; an inspection
    * failure does not prove non-ownership and must leave the Session guarded.
    */
-  private async owningTicket(agent: Agent): Promise<string | undefined> {
-    const seen = new Set<string>()
-    let parent = agent.session.header.parentSession
+  private async owningTicket(agent: Agent): Promise<{ ticketId: string; nativeParents: boolean } | undefined> {
+    const seen = new Set<string>([agent.id])
+    let parent = agent.session.header.parentSession, nativeParents = true
     while (parent !== undefined && !seen.has(parent)) {
       seen.add(parent)
-      const ticketId = ticketOfSession(parent)
-      if (ticketId !== undefined) return ticketId
-      const loaded = this.ctx.agents.get(parent)
-      if (loaded) { parent = loaded.session.header.parentSession; continue }
-      parent = (await this.ctx.sessionController.inspect(parent)).meta?.parentSession
+      const ticketId = ticketOfSession(parent), loaded = this.ctx.agents.get(parent)
+      if (ticketId !== undefined) return { ticketId, nativeParents: nativeParents && loaded?.session.header.parentSession === undefined }
+      if (loaded) {
+        const session = loaded.session
+        nativeParents &&= session.header.origin === 'subagent' && nativeDescriptor(session.snapshotEvents(), session.inheritedEventCount)
+        parent = session.header.parentSession
+      } else {
+        const inspection = await this.ctx.sessionController.inspect(parent, this.host.lifetime)
+        nativeParents &&= inspection.meta?.origin === 'subagent' && nativeDescriptor(inspection.events, inspection.inheritedEventCount)
+        parent = inspection.meta?.parentSession
+      }
     }
     return undefined
   }
-  /**
-   * Ordinary Worker descendants inherit the ticket work tools. A marked code-review descendant is limited to `REVIEW_TOOLS`
-   * and a single submission tool. Both remain guarded by the owning Worker's live writer lease.
-   */
-  /** Read a review assignment from a real DSH subagent that loaded the packaged review Skill. */
-  private reviewAssignment(agent: Agent) {
-    if (agent.session.header.origin !== 'subagent') return undefined
-    const events = agent.session.snapshotEvents()
-    const loaded = events.some(event => {
-      if (event.type !== 'tool/call' || event.data.name !== 'skill') return false
-      try {
-        const args: unknown = JSON.parse(event.data.arguments)
-        return !!args && typeof args === 'object' && 'name' in args && args.name === 'dsh-worker-code-review'
-      } catch { return false }
-    })
-    if (!loaded) return undefined
-    const initial = events.find(event => event.type === 'user/message')
-    if (!initial) return undefined
-    const text = initial.data.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
-    const marker = /^DSH_REVIEW_ASSIGNMENT: (\{[^\n]+\})$/m.exec(text)?.[1]
-    if (!marker) return undefined
-    try {
-      const parsed: unknown = JSON.parse(marker)
-      const result = ReviewAssignmentSchema.safeParse(parsed)
-      return result.success ? result.data : undefined
-    } catch { return undefined }
-  }
-  /** A live descendant may submit only its assigned review lane for this ticket's current pinned candidate and writer generation. */
+  /** Review submissions also check the clean HEAD in the Executor. An old role binding never grants current writer authority. */
   async authorizeReviewSession(ticketId: string, sessionId: string, axis: ReviewAxis, candidate: string): Promise<boolean> {
     const agent = this.ctx.agents.get(sessionId as SessionId)
-    if (!agent || agent.id !== sessionId || agent.session.header.parentSession === undefined
-      || this.host.closing() || this.host.workerAuthorized?.(ticketId, workerSessionId(ticketId)) !== true) return false
-    const current = this.host.store.tickets.get(ticketId)
-    const assignment = current && latestAssignment(current)
-    const grant = this.reviewAssignment(agent)
-    if (!current || !liveTicket(current) || !assignment || !grant || grant.axis !== axis || grant.candidate !== candidate
-      || grant.base !== current.execution?.base?.sha || grant.generation !== assignment.writer?.generation) return false
-    return await this.owningTicket(agent) === ticketId
+    const review = agent && this.bindings.get(agent)?.review
+    if (review?.ticketId !== ticketId || this.host.closing() || !this.host.workerAuthorized(ticketId, workerSessionId(ticketId))) return false
+    const current = this.host.store.tickets.get(ticketId), { grant } = review
+    return !!current && liveTicket(current) && grant.axis === axis && grant.candidate === candidate
+      && grant.base === current.execution?.base?.sha && grant.generation === latestAssignment(current)?.writer?.generation
   }
   private async limitSubagent(agent: Agent): Promise<void> {
-    if (agent.session.header.parentSession === undefined) return
+    const parent = agent.session.header.parentSession
+    if (parent === undefined) return
     // A live Session reloaded on startup can invoke tools while persistence resolves an unloaded parent.
     const pending: SessionBinding = { disposers: [agent.ctx.tools.guard(() => WORKER_ANCESTRY_PENDING)], subagent: true }
     this.bindings.set(agent, pending)
-    const ticketId = await this.owningTicket(agent)
+    const lineage = await this.owningTicket(agent)
     if (this.bindings.get(agent) !== pending || this.host.closing()) return
-    if (ticketId === undefined) { this.release(agent); return }
-    // Install the ticket guard before lifting the temporary one; an inspection error leaves the latter in place.
-    const review = this.reviewAssignment(agent)
-    pending.disposers.push(...this.workOnly(agent, ticketId, review ? REVIEW_TOOLS : WORK_TOOLS))
-    pending.disposers.shift()!()
-    const ticket = this.host.store.tickets.get(ticketId)
-    if (!ticket || !review) return
-    const register = this.registerTool(agent, pending)
-    for (const tool of this.host.tools(agent, ticket, 'review')) {
-      if (tool.name === 'orchestrator_review_submit') register(tool.name, tool.description, tool.schema, tool.execute)
+    if (!lineage) { this.release(agent); return }
+    const { ticketId, nativeParents } = lineage
+    pending.disposers.push(...this.workOnly(agent, ticketId))
+    if (agent.session.header.origin !== 'subagent') { pending.disposers.shift()!(); return }
+    // Native children without a proven dispatch keep their guard, including a native child of an ordinary fork.
+    if (nativeParents && this.host.projectMeter.owns(parent)) this.observeChild(agent, pending, ticketId, parent)
+  }
+
+  /** Child setup precedes its task; the Skill call comes later still. Never read either out of inherited history. */
+  private observeChild(agent: Agent, binding: SessionBinding, ticketId: string, parent: string): void {
+    const host = this.host, worker = workerSessionId(ticketId), session = agent.session
+    const issued = host.store.tickets.get(ticketId)
+    const cwd = session.header.cwd, worktree = issued?.execution?.worktree
+    if (!cwd || !worktree || relative(worktree, cwd) !== '' || issued?.execution?.session !== worker) return
+    const bound = host.store.get(KV.projectMeter.binding(agent.id))
+    if (bound && (bound.ticket_id !== ticketId || bound.parent_session_id !== parent)) return
+    let limited = false
+    let admitted = false
+    let initial: UserMessage | undefined
+    const observe = (claimed?: UserMessage) => {
+      if (host.closing()) return
+      const events = session.snapshotEvents(), cut = session.inheritedEventCount
+      if (!nativeDescriptor(events, cut)) return
+      const task = events.find(event => event.seq >= cut && event.type === 'user/message')
+      initial ??= claimed
+      const message = task?.type === 'user/message' ? task.data : initial
+      if (!message) return
+      const grant = reviewTask(message)
+      const ticket = host.store.tickets.get(ticketId)
+      if (!ticket) return
+      if (grant && !limited) {
+        // Restrict as soon as the delegated task is known, not after the first model call/Skill lookup.
+        binding.disposers.push(...this.workOnly(agent, ticketId, REVIEW_TOOLS))
+        const skill = bundledSkills['worker/code-review']
+        binding.disposers.push(agent.ctx.skills.register({ name: skill.name, description: skill.description, content: skill.content,
+          source: 'runtime', resourceBase: { kind: 'directory', path: dirname(skill.path) } }))
+        limited = true
+      }
+      const writer = latestAssignment(ticket)?.writer
+      const review = grant && grant.base === ticket.execution?.base?.sha && grant.generation === writer?.generation
+      // Attribution recognizes a proven native dispatch even while its writer is being restored. Tools still require a live writer.
+      if (!host.projectMeter.owns(agent.id)) {
+        const historicalReview = grant && grant.base === ticket.execution?.base?.sha
+          && ticket.assignments.some(item => item.writer?.generation === grant.generation)
+        host.projectMeter.bind({ session_id: agent.id, parent_session_id: parent, ticket_id: ticketId, role: historicalReview ? 'review' : 'implementation' })
+      }
+      if (!admitted) { binding.disposers.shift()!(); admitted = true }
+      if (review && grant) {
+        if (!task || !loadedReviewSkill(events, task.seq)) return
+        binding.review = { ticketId, grant }
+        const register = this.registerTool(agent, binding)
+        for (const tool of host.tools(agent, ticket, 'review')) {
+          if (tool.name === 'orchestrator_review_submit') register(tool.name, tool.description, tool.schema, tool.execute)
+        }
+      }
+      delete binding.observeDelegation
     }
+    binding.observeDelegation = observe
+    observe()
   }
   /** Register the skills of a prompt version in the agent's skill scope, in place of an earlier version's. */
   private bindSkills(binding: SessionBinding, version: PromptVersion): void {

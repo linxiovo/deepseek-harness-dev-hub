@@ -10,6 +10,8 @@ import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'v
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { Runtime } from '../src/app/runtime.ts'
+import { restoreReviewBindings } from '../src/app/meter-recovery.ts'
+import { ProjectMeter } from '../src/app/project-meter.ts'
 import { ROUTER_PRESET, WORKER_PRESET } from '../src/app/sessions.ts'
 import { jobRegistry } from './fixtures/host.ts'
 import { gitEnv, gitRepository, type GitRepository } from './fixtures/git.ts'
@@ -49,6 +51,7 @@ type RegisteredTool = { name: string; description: string; parameters: Record<st
 type ContainerResult = { isError: boolean; content: { type: string; text?: string }[]; value?: unknown; error?: { message: string } }
 type Section = { name: string; text: (context: { signal?: AbortSignal }) => string; interpolate?: boolean }
 let sections: Map<string, Section>
+let inheritedGitConfigGlobal: string | undefined
 type HttpHandler = (req: unknown, res: unknown) => Promise<void>
 let http: HttpHandler
 async function api(method: string, path: string, body?: unknown, projectId?: string): Promise<{ status: number; body: unknown }> {
@@ -216,6 +219,7 @@ async function acceptedTicket(trigger = feishu('1', '@bot 修一下回归')) {
   return { trigger, ticket, sessionId: `worker-${ticket.id}` }
 }
 beforeEach(async () => {
+  inheritedGitConfigGlobal = process.env.GIT_CONFIG_GLOBAL
   directory = mkdtempSync(join(realpathSync.native(tmpdir()), 'orchestrator-runtime-'))
   repository = gitRepository(directory)
   vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : args[1]?.includes('/pulls?state=all&head=') ? [] : args[1]?.includes('/pulls/') ? { state: 'open', user: { login: 'agent-bot' }, html_url: 'https://github.com/acme/widgets/pull/' + args[1].split('/').at(-1), head: { ref: `agent/${String(runtime.store.tickets.list()[0]?.execution?.name)}`, sha: 'head-1', repo: { full_name: 'acme/widgets' } } } : { default_branch: 'master', permissions: { push: true } })
@@ -250,7 +254,7 @@ beforeEach(async () => {
         : agentPreset === WORKER_PRESET ? presets.get(WORKER_PRESET)! : presets.get('standard')!
       const modelEvents: { type: string; data: unknown }[] = []
       const agent = { id: sessionId, status: 'idle', inject: vi.fn(),
-        session: { id: sessionId, header: { agentPreset, cwd: workspaceId }, snapshotEvents: () => modelEvents, requestHeader: () => undefined,
+        session: { id: sessionId, header: { id: sessionId, isSeeded: false, agentPreset, cwd: workspaceId }, snapshotEvents: () => modelEvents, requestHeader: () => undefined,
           append: vi.fn((type: string, data: unknown) => { modelEvents.push({ type, data }) }) },
         cancel: vi.fn(() => finishSessionTurn(sessionId)),
         whenIdle: () => {
@@ -401,6 +405,11 @@ it('keeps project binding, authorization, cursors and Hub sessions separate acro
   expect(await api('POST', 'executor/pause', { paused: true }, project.id)).toMatchObject({ status: 409, body: { code: 'staleProject' } })
   expect(await api('GET', `sessions/${project.hubSessionId}/meter`, undefined, other.id)).toMatchObject({ status: 404 })
   expect(await api('GET', `tickets/${firstWork.ticket.id}`, undefined, other.id)).toMatchObject({ status: 404 })
+  expect(await api('GET', 'project/meter', undefined, project.id)).toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  expect(await api('GET', `tickets/${firstWork.ticket.id}/meter`, undefined, other.id)).toMatchObject({ status: 404 })
+  expect(await api('GET', 'project/meter', undefined, other.id)).toMatchObject({ status: 200, body: {
+    scope: 'project', sessions: [expect.objectContaining({ session_id: other.hubSessionId, roles: ['hub'] })],
+  } })
   const incoming = mention('acme/gadgets', 'bob')
   const run = vi.mocked(Commands.prototype.run)
   const runCommand = run.getMockImplementation()!
@@ -1248,7 +1257,7 @@ it('runs setup again while the Feishu bot check failed, and restores the process
   const broken = await restart()
   await broken.ready
   expect(broken.setupProblem).toMatchObject({ place: 'deployment', code: 'gitTooOld' })
-  expect(process.env.GIT_CONFIG_GLOBAL).toBeUndefined()
+  expect(process.env.GIT_CONFIG_GLOBAL).toBe(inheritedGitConfigGlobal)
   expect(process.env.PATH?.split(delimiter)).not.toContain(join(directory, 'worker-bin'))
 })
 
@@ -1279,7 +1288,7 @@ it('writes worker shims and the agent environment from the configuration only, a
   expect(process.env.GIT_AUTHOR_NAME).toBeUndefined()
   expect(process.env.PATH?.split(delimiter)[0]).toBe(bin)
   await next.stop()
-  expect(process.env.GIT_CONFIG_GLOBAL).toBeUndefined()
+  expect(process.env.GIT_CONFIG_GLOBAL).toBe(inheritedGitConfigGlobal)
   expect(process.env.PATH?.split(delimiter)).not.toContain(bin)
 })
 
@@ -2016,6 +2025,77 @@ test('slugify("  Worker Boundary!  ") returns "worker-boundary"', () => {
   expect(denied.isError).toBe(true)
   expect(resultText(denied)).toContain('Ticket ended; new work needs a new authorized ticket')
   expect(readFileSync(modulePath, 'utf8')).toBe(moduleSource)
+})
+
+it('recovers only detached reviewer receipts with verified direct business parents, without starting Sessions', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  const { store, projectMeter } = runtime
+  const native = (id: string, parentSession = sessionId, createdAt = 0) => ({ id, origin: 'subagent', parentSession, createdAt })
+  const headers: Partial<Record<string, { id: string; origin?: string; parentSession: string; createdAt: number }>> = {
+    'direct-review': native('direct-review'),
+    'nested-review': native('nested-review', 'bound-parent'),
+    'bound-parent': native('bound-parent'),
+    'already-bound': native('already-bound'),
+    'manual-fork': { id: 'manual-fork', parentSession: sessionId, createdAt: 0 },
+    'recreated-review': native('recreated-review', sessionId, Date.UTC(2099, 0, 1)),
+    'foreign-review': native('foreign-review', 'foreign-worker'),
+    'unbound-lineage': native('unbound-lineage', 'unbound-parent'),
+    'unbound-parent': native('unbound-parent'),
+    'marker-only': native('marker-only'),
+  }
+  const reviewers = ['direct-review', 'nested-review', 'already-bound', 'manual-fork', 'foreign-review',
+    'unbound-lineage', 'unreadable-review', 'missing-review', 'direct-review', 'recreated-review']
+  const base = ticket.execution!.base!.sha
+  reviewers.forEach((id, index) => runtime.engine.recordReview(ticket.id, id, {
+    axis: 'standards', base, candidate: (index + 1).toString(16).repeat(40), basis: ['Ticket specification'],
+    conclusion: 'passed', blockers: [], summary: 'Checked.',
+  }))
+  projectMeter.bind({ session_id: 'bound-parent', ticket_id: ticket.id, parent_session_id: sessionId, role: 'implementation' })
+  projectMeter.bind({ session_id: 'already-bound', ticket_id: ticket.id, parent_session_id: 'bound-parent', role: 'implementation' })
+  runtime.engine.stopTicket(ticket.id)
+  await runtime.idle()
+
+  const stat = vi.fn(async (id: string, _options: { signal: AbortSignal }) => {
+    if (id === 'unreadable-review') throw new Error('cannot read session log')
+    const header = headers[id]
+    return header && { header }
+  })
+  const open = vi.fn()
+  const ctx = new Context()
+  ctx.reflect.provide('sessionPersistence', { stat, open })
+  ctx.reflect.provide('sessionController', controller)
+  controller.create.mockClear(); controller.resolveAgent.mockClear(); controller.inspect.mockClear()
+  const binding = (id: string) => store.get(KV.projectMeter.binding(id))
+  const priorChild = binding('already-bound')
+  const signal = new AbortController().signal
+  await restoreReviewBindings(ctx, store, projectMeter, signal)
+  expect(binding('direct-review')).toMatchObject({ roles: ['review'], ticket_id: ticket.id, parent_session_id: sessionId })
+  expect(binding('nested-review')).toMatchObject({ roles: ['review'], ticket_id: ticket.id, parent_session_id: 'bound-parent' })
+  expect(stat.mock.calls.filter(([id]) => id === 'direct-review')).toHaveLength(1)
+  expect(stat).toHaveBeenCalledWith('direct-review', { signal })
+  expect(stat).not.toHaveBeenCalledWith('already-bound', { signal })
+  expect(binding('already-bound')).toEqual(priorChild)
+  for (const id of ['manual-fork', 'foreign-review', 'unbound-lineage', 'unreadable-review', 'missing-review', 'marker-only', 'recreated-review']) {
+    expect(binding(id), id).toBeUndefined()
+  }
+
+  const priorWorker = binding(sessionId)
+  const rotated = new ProjectMeter({ store, meter: runtime.meter, masterId: 'rotated-recovery-hub' })
+  const keys = store.keys(KV.projectMeter.binding).sort()
+  stat.mockClear()
+  await restoreReviewBindings(ctx, store, rotated, signal)
+  expect(store.keys(KV.projectMeter.binding).sort()).toEqual(keys)
+  expect(binding(sessionId)).toEqual(priorWorker)
+  expect(binding('already-bound')).toEqual(priorChild)
+  expect(binding('direct-review')?.parent_session_id).toBe(sessionId)
+  expect(binding('nested-review')?.parent_session_id).toBe('bound-parent')
+  for (const id of ['already-bound', 'direct-review', 'nested-review', 'marker-only', 'unbound-parent']) {
+    expect(stat).not.toHaveBeenCalledWith(id, { signal })
+  }
+  expect(open).not.toHaveBeenCalled()
+  expect(controller.create).not.toHaveBeenCalled()
+  expect(controller.resolveAgent).not.toHaveBeenCalled()
+  expect(controller.inspect).not.toHaveBeenCalled()
 })
 
 it('withholds a reloaded worker child\'s work tools while its stored ancestry is being inspected', async () => {

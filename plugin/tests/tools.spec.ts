@@ -754,6 +754,29 @@ it('reads one Session\'s meter through the Hub resource and the HTTP route from 
   expect(RESOURCES.find(resource => resource.name === 'session/<id>')?.executor).toBeUndefined()
 })
 
+it('keeps Worker retry usage on the same Ticket and supports a project-only inspection role', async () => {
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const message = (inputTokens: number, outputTokens: number, totalTokens: number) => ({ type: 'assistant/message',
+    data: { turn: 1, step: 1, message: { role: 'assistant', content: [] }, stream: [], usage: { inputTokens, outputTokens, totalTokens } } })
+  h.record(sessionId, [message(3, 1, 4)])
+  await h.runTool(sessionId, 'orchestrator_report', { state: 'failed', summary: 'Build broke after the first attempt.' })
+  await h.runTool(h.runtime.masterId, 'orchestrator_ticket_retry', { ticket_id: ticket.id })
+  await h.runtime.idle()
+  h.record(sessionId, [message(2, 1, 3)])
+
+  // A trusted lifecycle caller can register a read-only inspection without a Ticket or a Plan.
+  const inspection = 'scheduled-inspection'
+  await h.controller.create({ sessionId: inspection, workspaceId: h.directory })
+  h.runtime.projectMeter.bind({ session_id: inspection, role: 'inspection' })
+  h.record(inspection, [message(7, 1, 8)])
+  expect(await read(`ticket/${ticket.id}/meter`)).toMatchObject({ attributed: { reported_total_tokens: 7, counted_calls: 2 },
+    shared: { reported_total_tokens: 8 }, sessions: expect.arrayContaining([
+      expect.objectContaining({ session_id: sessionId, roles: ['implementation', 'retry'], own: expect.objectContaining({ reported_total_tokens: 7 }) }),
+      expect.objectContaining({ session_id: inspection, roles: ['inspection'], ticket_id: null, plan_id: null }),
+    ]) })
+  expect(await read('project/meter')).toMatchObject({ total: { reported_total_tokens: 15, counted_calls: 3 } })
+})
+
 it('answers every routing tool in one shape: the decision it recorded, why, and the ticket card', async () => {
   const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
   const card = expect.objectContaining({ ticket_id: ticket.id })

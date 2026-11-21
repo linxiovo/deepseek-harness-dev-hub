@@ -24,6 +24,7 @@ import { sameDirectory } from '../infra/environment.ts'
 import { KV } from '../kv.ts'
 import type { Handoffs } from './handoffs.ts'
 import type { Plans } from './plans.ts'
+import type { ProjectMeter } from './project-meter.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
 import type { SessionMeter } from './session-meter.ts'
 import type { Sessions } from './sessions.ts'
@@ -33,7 +34,7 @@ import type { TextCache } from './cache.ts'
 
 /** Resource descriptors exposed via orchestrator_read, marking which resources worker sessions may also read for their own ticket. */
 export const RESOURCES: readonly { name: string; holds: string; executor?: true }[] = [
-  { name: 'tickets', holds: 'ticket cards, newest first; a card\'s state is person/review after a ready report, person/blocked or person/failed after those reports, person/answer with a question, person/delivery when an input could not reach the worker, working or working/queued while it works, idle once the worker ended its turn without a report, else how the ticket ended' },
+  { name: 'tickets', holds: 'newest ticket cards: person/review, person/blocked, person/failed, person/answer and person/delivery need attention; working/queued awaits a slot; idle has no fresh report' },
   { name: 'triggers', holds: 'trigger cards with where each went, newest first' },
   { name: 'threads', holds: 'subscribed threads, newest activity first, with their labels, tickets, current assessment and polling errors' },
   { name: 'thread/<key>', holds: 'one thread: its label and link, its tickets and latest decisions, and its triggers, newest first', executor: true },
@@ -43,9 +44,7 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'spec/<id>', holds: 'the published specification for this handoff, with observable acceptance and test interfaces; pending until publication' },
   { name: 'plan/<id>', holds: 'the handoff’s Plan DAG, roles, dependencies, Frontier, node claims and formal delivery progress, plus root background' },
   { name: 'plan/<id>/node/<node-id>', holds: 'one Slice Ticket with its role, waiting reason or claim/session/action state, delivery receipt and addressed instructions' },
-  { name: 'ticket/<id>', holds: 'a ticket\'s card, Plan role/node claim when applicable, recorded preparation status and rejection reason, verified repository, worktree, '
-    + 'branch, base, worker Session and active writer when available; its trigger, decision and threads, latest assignments with the '
-    + 'start of each report, and inputs, newest first', executor: true },
+  { name: 'ticket/<id>', holds: 'ticket and Plan claim, preparation or rejection, repository, worktree, branch, base, Session and active writer; trigger, decision, threads, assignments, reports and inputs', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
   { name: 'ticket/<id>/delivery-check', holds: 'current candidate queue readiness and paginated canonical acceptance, ordered evidence and required CI; never formal delivery', executor: true },
   { name: 'ticket/<id>/delivery-observation/<n>', holds: 'one durable delivery observation', executor: true },
@@ -71,8 +70,10 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'prompt-preview/<id>', holds: 'a composed prompt that orchestrator_prompts_save previewed' },
   { name: 'models', holds: 'model providers, the DSH default and each role\'s model' },
   { name: 'models/<provider>', holds: 'one provider\'s models' },
-  { name: 'session/<id>', holds: 'one Session by id: its context snapshot with model, request-plus-response capacity, occupancy, '
-    + 'sampling range and quality, and its cumulative usage by bucket with what is missing or still in flight; never a provider bill' },
+  { name: 'session/<id>', holds: 'context window sample and cumulative token buckets, including coverage gaps; not a bill' },
+  { name: 'project/meter', holds: 'deduplicated usage including shared overhead and Session details' },
+  { name: 'plan/<id>/meter', holds: 'Plan usage with shared overhead separate' },
+  { name: 'ticket/<id>/meter', holds: 'Ticket usage with shared overhead separate' },
   { name: 'feishu/<trigger-id>/…', holds: 'a Feishu original, as the dsh-superagent-feishu skill describes', executor: true },
   { name: 'github/…', holds: 'a GitHub original, as the dsh-superagent-github skill describes', executor: true },
   { name: 'actions/<ticket|plan>/<id>/commit/<40 lowercase hex SHA>', holds: 'GitHub Actions jobs and artifacts for one owned ticket or handoff at exactly this commit; reports missing required checks, without CI logs' },
@@ -81,7 +82,7 @@ export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(r
   .map(({ name, holds }) => executor ? `${name}:` : `${name}: ${holds}`).join('; ')
 
 export interface ResourceHost {
-  ownsSession?(id: string): boolean
+  ownsSession?(id: string): boolean | Promise<boolean>
   reviewGeneration?(ticketId: string): number | undefined
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
   readonly handoffs?: Pick<Handoffs, 'spec'>
@@ -99,6 +100,7 @@ export interface ResourceHost {
   sourceLink(trigger: Trigger, signal?: AbortSignal): Promise<{ source_url?: string; source_url_read?: string }>
 }
 export interface MainResourceHost extends ResourceHost {
+  readonly projectMeter: Pick<ProjectMeter, 'read'>
   readonly sessions: Pick<Sessions, 'status' | 'modelRetry'>
   readonly settings: Pick<Settings, 'view' | 'block'>
   readonly handoffs: Pick<Handoffs, 'get' | 'spec'>
@@ -135,10 +137,24 @@ const main = ({ host, ticketId }: Read): MainResourceHost => {
   return host as MainResourceHost
 }
 const text = ({ resource, offset, limit }: Read, body: string) => textPage(resource, body, offset, limit ?? 4000)
+const DEFAULT_LIST_SIZE = 20, MAX_LIST_SIZE = 50
 function list<T>({ offset, limit }: Read, fetch: (offset: number, count: number) => T[]) {
-  const size = Math.min(limit ?? 20, 50)
+  const size = Math.min(limit ?? DEFAULT_LIST_SIZE, MAX_LIST_SIZE)
   const items = fetch(offset, size + 1)
   return { items: items.slice(0, size), next_offset: items.length > size ? offset + size : null }
+}
+
+async function projectMeter(read: Read, scope: 'project' | 'plan' | 'ticket', id?: string) {
+  const view = await main(read).projectMeter.read(scope, id, read.signal)
+  if (!view) {
+    if (scope === 'plan' && id) throw new UserError('unknownPlan', { id })
+    if (scope === 'ticket') throw new UserError('unknownTicket')
+    throw new Error('Unknown project')
+  }
+  // Page only the detail list. The totals and their coverage describe the full scope on every page.
+  const end = read.offset + Math.min(read.limit ?? DEFAULT_LIST_SIZE, MAX_LIST_SIZE)
+  if (read.offset === 0 && end >= view.sessions.length) return view
+  return { ...view, sessions: view.sessions.slice(read.offset, end), next_offset: end < view.sessions.length ? end : null }
 }
 /** Check whether a worker session's ticket is authorized to read a trigger (via delivery, ticket origin, or followed thread). */
 const readable = (host: ResourceHost, ticket: Ticket, trigger: Trigger): boolean => reached(ticket, trigger, key => host.store.threads.get(key))
@@ -441,6 +457,7 @@ const ROUTES: readonly Route[] = [
   ['plan/', read => {
     const { plans, handoffs } = main(read)
     const [id, section, nodeId, ...extra] = read.rest.split('/')
+    if (id && section === 'meter' && nodeId === undefined) return projectMeter(read, 'plan', id)
     if (!id || extra.length || (section !== undefined && (section !== 'node' || !nodeId))) throw new Error('Unknown plan resource')
     if (nodeId) {
       const node = plans.node(id, nodeId)
@@ -511,11 +528,12 @@ const ROUTES: readonly Route[] = [
   // One reading for the Hub and the panel: the meter owns the persistence cursor, so neither entry recomputes usage.
   ['session/', async read => {
     const host = main(read)
-    if (host.ownsSession?.(read.rest) === false) throw new Error('Unknown session')
+    if ((await host.ownsSession?.(read.rest)) === false) throw new Error('Unknown session')
     const view = await host.meter.read(read.rest, read.signal)
     if (!view) throw new Error('Unknown session')
     return view
   }],
+  ['project/meter', read => projectMeter(read, 'project')],
   ['feishu/', async read => {
     const source = trigger(read.host, read.rest.split('/')[0]!, read.ticketId)
     const ref = feishuRef(source)
@@ -573,6 +591,7 @@ const ROUTES: readonly Route[] = [
     const { host, resource, rest, ticketId, signal } = read
     const [id, section, part, ...more] = rest.split('/')
     if (!id || more.length) throw new Error('Unknown context resource')
+    if (section === 'meter' && part === undefined) return projectMeter(read, 'ticket', id)
     if (ticketId && ticketId !== id) throw new Error('Ticket does not belong to this worker')
     const ticket = host.store.tickets.get(id)
     if (!ticket) throw new UserError('unknownTicket')

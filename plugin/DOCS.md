@@ -32,3 +32,4 @@
 | 011 文档影响 | Worker 候选的 Doc Tree 结构检查、接口契约与独立审查证据 | [docs/011-doc-tree-impact.md](docs/011-doc-tree-impact.md) |
 | 012 项目运行时 | GitHub 身份验证、项目目录与切换恢复、安装 API 和项目作用域 | [docs/012-project-runtime.md](docs/012-project-runtime.md) |
 | 013 开发验证 | 候选验证、双审、复盘、验收与可排队证据 | [docs/013-development-verification.md](docs/013-development-verification.md) |
+| 014 项目计量接口 | 项目、计划与票的 HTTP 和 Hub 查询、归属与共享开销、采样范围及错误契约 | [docs/014-project-metering.md](docs/014-project-metering.md) |

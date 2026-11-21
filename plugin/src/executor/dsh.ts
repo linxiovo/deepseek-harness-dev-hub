@@ -90,7 +90,7 @@ export interface ExecutorHost {
   readonly machine: Pick<Machine, 'stateDir'>
   readonly lifetime: AbortSignal
   /** Session manager for worker sessions and for relaying worker reports to the main Session. */
-  readonly sessions: Pick<Sessions, 'ensure' | 'prompt' | 'promptedId' | 'relay' | 'holds'>
+  readonly sessions: Pick<Sessions, 'ensure' | 'prompt' | 'retry' | 'promptedId' | 'relay' | 'holds' | 'bindWorker'>
   closing(): boolean
   /** Whether processing is paused, which holds launches and input deliveries. */
   paused(): boolean
@@ -800,7 +800,8 @@ export class DshExecutor implements Executor {
         ...(batch.length ? { batch } : {}), ...retried })
     const requestId = later ? `assignment:${ticket.id}:${assignment.id}` : first
     await this.host.sessions.prompt(sessionId, requestId, text, 'queue',
-      () => { if (!current() || !this.writerAuthorized(ticket.id, sessionId)) throw new Error('Launch authorization changed before worker delivery') })
+      () => { if (!current() || !this.writerAuthorized(ticket.id, sessionId)) throw new Error('Launch authorization changed before worker delivery') },
+      () => { if (retried.note) this.host.sessions.bindWorker(ticket.id, sessionId, true) })
     this.host.engine.assignmentStarted(ticket.id, assignment.id)
   }
   /** Returns the stored ticket for `agent` when it is a worker session, or undefined otherwise. */
@@ -915,7 +916,7 @@ export class DshExecutor implements Executor {
         if (!(failure instanceof Later)) throw failure
         this.after(SLOT_WAIT_MS, go); return
       }
-      const sent = this.host.sessions.prompt(sessionId, `retry:${assignmentId}:${tries}`, text, 'queue')
+      const sent = this.host.sessions.retry(ticketId, sessionId, `retry:${assignmentId}:${tries}`, text)
       void this.background(sent.finally(() => { if (waking) this.slots.free(ticketId); this.resuming.delete(assignmentId) })
         .catch(failure => { this.failed(ticketId, String(failure)) }))
     }

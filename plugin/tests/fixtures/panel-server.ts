@@ -404,6 +404,9 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     groups: [{ id: 'worker-provider', name: 'Worker provider', models: [{ id: 'worker-model', name: 'Worker model',
       reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }] }) },
   'GET sessions/:id/meter': { answer: ({ params }) => server.meters[params.id] ?? refuse(404, 'Session not found') },
+  'GET tickets/:id/meter': { answer: () => refuse(404, 'Ticket meter not available in the panel fixture') },
+  'GET plans/:id/meter': { answer: () => refuse(404, 'Plan meter not available in the panel fixture') },
+  'GET project/meter': { answer: () => refuse(404, 'Project meter not available in the panel fixture') },
   'GET prompts': { query: ['revision', 'offset'], answer: () => server.prompts },
   'PUT prompts': { body: true, answer: ({ body }) => {
     const { revision } = server.prompts

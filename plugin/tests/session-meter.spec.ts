@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
 import { SessionMeter } from '../src/app/session-meter.ts'
 import { Store } from '../src/app/store.ts'
+import { KV } from '../src/kv.ts'
 
 const AT = Date.UTC(2026, 0, 1)
 const usageChunk = (usage: TokenUsage) => [{ type: 'chunk' as const, time: AT, chunk: { type: 'usage' as const, usage } }]
@@ -16,13 +17,13 @@ function fixture(id = 'meter-test', inherited = 0) {
   const directory = mkdtempSync(join(tmpdir(), 'session-meter-'))
   const file = join(directory, 'state.sqlite')
   const ctx = new Context()
-  const settled: SessionEvent[] = []
-  const pending: SessionEvent[] = []
-  const header = { id: SessionId(id), version: SESSION_FORMAT_VERSION, createdAt: AT, isSeeded: inherited > 0 }
+  let log = { createdAt: AT, inherited, settled: [] as SessionEvent[], pending: [] as SessionEvent[] }
   const closeHandle = vi.fn(async () => {})
-  const flush = vi.fn(async () => { settled.push(...pending.splice(0)) })
+  const flush = vi.fn(async () => { log.settled.push(...log.pending.splice(0)) })
   const open = vi.fn(async (sessionId: string) => {
     if (sessionId !== id) throw new SessionPersistenceNotFoundError(SessionId(sessionId))
+    const { createdAt, inherited, settled } = log
+    const header = { id: SessionId(id), version: SESSION_FORMAT_VERSION, createdAt, isSeeded: inherited > 0 }
     return {
       header, inheritedEventCount: SessionLogOffset(inherited),
       read: async (offset = 0, length = 512) => ({ events: settled.slice(offset, offset + length), eventState: 'detached' as const }),
@@ -32,14 +33,19 @@ function fixture(id = 'meter-test', inherited = 0) {
   ctx.reflect.provide('sessionPersistence', { flush, open })
   let store = new Store(file)
   const make = () => new SessionMeter({ context: ctx, store, lifetime: new AbortController().signal })
+  const useLog = (createdAt: number, inherited = 0, settled: SessionEvent[] = []) => {
+    log = { createdAt, inherited, settled, pending: [] }
+  }
   const emit = (type: string, data: unknown, staged = false) => {
-    const event = { type, seq: SessionSeq(settled.length + pending.length), time: AT + settled.length + pending.length + 1, data } as SessionEvent
+    const { createdAt, settled, pending } = log
+    const event = { type, seq: SessionSeq(settled.length + pending.length), time: createdAt + settled.length + pending.length + 1, data } as SessionEvent
     ;(staged ? pending : settled).push(event)
     return event
   }
   const restart = () => { store.close(); store = new Store(file); return make() }
   const stop = () => { store.close(); rmSync(directory, { recursive: true, force: true }) }
-  return { ctx, settled, pending, emit, make, restart, stop, flush, open, closeHandle }
+  return { ctx, get settled() { return log.settled }, get pending() { return log.pending }, get store() { return store },
+    emit, make, restart, stop, flush, open, closeHandle, useLog }
 }
 
 it('distinguishes an absent Session from corrupt persisted history and closes read handles', async () => {
@@ -82,7 +88,8 @@ it('uses only a fresh DSH context projection for estimated occupancy, never dura
     host.emit('assistant/message', { turn: 1, step: 1, message: { role: 'assistant', content: [] },
       stream: usageChunk({ inputTokens: 11, outputTokens: 3, totalTokens: 14 }),
       usage: { inputTokens: 11, outputTokens: 3, totalTokens: 14 } })
-    const session = Session.create(SessionId('meter-test'))
+    const id = SessionId('meter-test')
+    const session = Session.create(id, [], { id, version: SESSION_FORMAT_VERSION, createdAt: AT, isSeeded: false })
     const agents = new Map([[session.id, { id: session.id, session }]])
     host.ctx.reflect.provide('agents', agents as never)
     let projection: unknown = { asOfSeq: 1, values: { contextPressure: { projectedTokens: 128 } } }
@@ -94,6 +101,10 @@ it('uses only a fresh DSH context projection for estimated occupancy, never dura
     expect(fresh?.context).toMatchObject({ occupied_tokens: 128, quality: 'estimated', source: 'dsh-token-meter',
       last_input_tokens: 11, capacity_tokens: 8192 })
     expect(fresh?.usage).toMatchObject({ input_tokens: 11, output_tokens: 3, reported_total_tokens: 14, counted_calls: 1 })
+    const other = Session.create(id, [], { ...session.header, createdAt: AT + 1 })
+    agents.set(id, { id, session: other })
+    expect((await meter.read('meter-test'))?.context.occupied_tokens).toBeNull()
+    agents.set(id, { id, session })
     projection = { asOfSeq: 0, values: { contextPressure: { projectedTokens: 900 } } }
     expect((await meter.read('meter-test'))?.context).toMatchObject({ occupied_tokens: null, quality: 'unknown', source: 'session-events' })
     projection = { asOfSeq: 1, values: { contextPressure: { projectedTokens: Number.POSITIVE_INFINITY } } }
@@ -277,6 +288,152 @@ it('excludes a real fork-inherited prefix, then survives replay, restart, and co
     expect(updated?.usage.reported_total_tokens).toBe(12)
     expect(same?.usage.counted_calls).toBe(2)
     expect((await resumed.read(id))?.usage.reported_total_tokens).toBe(12)
+  } finally { host.stop() }
+})
+
+it('counts both same-name logs from their own boundaries without double-counting overlapping reads or replay', async () => {
+  const host = fixture()
+  const id = 'meter-test', recreatedAt = AT + 1000
+  try {
+    host.emit('request/context', { provider: 'old-provider', model: 'old-model', contextWindow: 8192 })
+    host.emit('assistant/message', { usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 } })
+    host.emit('assistant/attempt', { stream: [] })
+    host.emit('step/end', { turn: 1, step: 1 })
+    const oldLog = host.settled
+    const meter = host.make()
+    expect(await meter.read(id)).toMatchObject({ cursor: 4, usage: { counted_calls: 1, reported_total_tokens: 10 } })
+
+    host.useLog(recreatedAt, 2)
+    host.emit('request/context', { provider: 'new-provider', model: 'new-model', contextWindow: 16384 })
+    host.emit('assistant/message', { usage: { inputTokens: 90, outputTokens: 10, totalTokens: 100 } })
+    host.emit('assistant/message', { usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 } })
+    host.flush.mockImplementationOnce(async () => {}).mockRejectedValueOnce(new Error('recreated log durability failed'))
+    await expect(meter.read(id)).rejects.toThrow('recreated log durability failed')
+    const expected = { inherited_events: 2, cursor: 3,
+      context: { provider: 'new-provider', model: 'new-model', last_input_tokens: 3, range: { from: 2, through: 3 } },
+      usage: { input_tokens: 10, output_tokens: 5, counted_calls: 2, reported_total_calls: 2, reported_total_tokens: 15,
+        total_complete: false, quality: 'partial', range: { from: 2, through: 3 }, in_flight: null, missing: [],
+        logs: [
+          { created_at: new Date(AT).toISOString(), sampled_at: new Date(AT + 4).toISOString(), status: 'unavailable',
+            range: { from: 0, through: 4 }, missing: [{ from: 2, through: 3, reason: 'no-usage' }], in_flight: null },
+          { created_at: new Date(recreatedAt).toISOString(), sampled_at: new Date(recreatedAt + 3).toISOString(), status: 'current',
+            range: { from: 2, through: 3 }, missing: [], in_flight: null },
+        ] } }
+    expect(await Promise.all([meter.read(id), host.make().read(id)])).toMatchObject([expected, expected])
+    const newLog = host.settled
+    const restarted = host.restart()
+    expect(await restarted.read(id)).toMatchObject(expected)
+    host.useLog(AT, 0, oldLog)
+    expect(await restarted.read(id)).toMatchObject(expected)
+    host.useLog(recreatedAt, 2, newLog)
+    expect(await restarted.read(id)).toMatchObject(expected)
+  } finally { host.stop() }
+})
+
+it('adds a late old-handle observation without replacing the newer log context', async () => {
+  const host = fixture()
+  const id = 'meter-test', recreatedAt = AT + 1000
+  try {
+    const meter = host.make()
+    host.emit('assistant/message', { usage: { inputTokens: 6, outputTokens: 4, totalTokens: 10 } })
+    expect(await meter.read(id)).toMatchObject({ cursor: 1, usage: { reported_total_tokens: 10 } })
+    host.emit('assistant/attempt', { stream: usageChunk({ inputTokens: 3, outputTokens: 1, totalTokens: 4 }) })
+
+    const open = host.open.getMockImplementation()!
+    const opened = Promise.withResolvers<void>(), resumed = Promise.withResolvers<void>()
+    host.open.mockImplementationOnce(async sessionId => {
+      const handle = await open(sessionId)
+      opened.resolve()
+      await resumed.promise
+      return handle
+    })
+    const late = meter.read(id)
+    await opened.promise
+    let oldHandleView: Awaited<typeof late>
+    try {
+      host.useLog(recreatedAt)
+      host.emit('assistant/message', { usage: { inputTokens: 4, outputTokens: 1, totalTokens: 5 } })
+      expect(await host.make().read(id)).toMatchObject({ cursor: 1, usage: { counted_calls: 2, reported_total_tokens: 15 } })
+    } finally {
+      resumed.resolve()
+      oldHandleView = await late
+    }
+    const expected = { cursor: 1, context: { last_input_tokens: 4 }, usage: {
+      counted_calls: 3, reported_total_tokens: 19, in_flight: null,
+      logs: [
+        { status: 'unavailable', range: { from: 0, through: 2 }, in_flight: { from: 1, through: 2 } },
+        { status: 'current', range: { from: 0, through: 1 }, in_flight: null },
+      ] } }
+    expect(oldHandleView).toMatchObject(expected)
+    expect(await host.restart().read(id)).toMatchObject(expected)
+  } finally { host.stop() }
+})
+
+it('rejects a changed fork cut for the same log identity without advancing its cursor', async () => {
+  const host = fixture()
+  try {
+    const id = 'meter-test', meter = host.make()
+    host.emit('assistant/message', { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } })
+    expect(await meter.read(id)).toMatchObject({ cursor: 1, usage: { reported_total_tokens: 2 } })
+    const log = host.settled
+    host.useLog(AT, 1, log)
+    await expect(meter.read(id)).rejects.toThrow('fork cut changed')
+    host.useLog(AT, 0, log)
+    expect(await meter.read(id)).toMatchObject({ cursor: 1, usage: { counted_calls: 1, reported_total_tokens: 2 } })
+  } finally { host.stop() }
+})
+
+it('resumes a matching legacy cursor but refuses to assign it to a different observed prefix', async () => {
+  const host = fixture()
+  try {
+    const id = 'meter-test', meter = host.make()
+    host.emit('assistant/message', { usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } })
+    const first = await meter.read(id)
+    const legacy = { view: first!, compaction_from: null }
+    host.store.set(KV.meter.state(id), legacy)
+    const original = host.settled
+    host.useLog(AT - 1000) // Older clock cannot prove this different prefix belongs to a new log instance.
+    host.emit('assistant/message', { usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 } })
+    await expect(meter.read(id)).rejects.toThrow('legacy meter cursor')
+    host.useLog(AT, 0, original)
+    host.emit('assistant/message', { usage: { inputTokens: 3, outputTokens: 1, totalTokens: 4 } })
+    expect(await host.restart().read(id)).toMatchObject({ cursor: 2,
+      usage: { counted_calls: 2, reported_total_tokens: 7, total_complete: true } })
+  } finally { host.stop() }
+})
+
+it('archives a legacy prefix when the replacement log was created after its final sampled event', async () => {
+  const host = fixture()
+  try {
+    const id = 'meter-test', meter = host.make()
+    host.emit('assistant/message', { usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } })
+    const oldLog = host.settled
+    const view = (await meter.read(id))!
+    host.store.set(KV.meter.state(id), { view, compaction_from: null })
+    host.useLog(AT + 1000)
+    host.emit('assistant/message', { usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 } })
+    const reopened = await host.restart().read(id)
+    expect(reopened).toMatchObject({ cursor: 1, usage: { reported_total_tokens: 10, counted_calls: 2, total_complete: false,
+      logs: [{ status: 'unavailable', range: { from: 0, through: 1 } }, { status: 'current' }] } })
+    expect(reopened?.usage.logs?.[0]?.created_at).toBeUndefined()
+    host.useLog(AT, 0, oldLog)
+    await expect(host.make().read(id)).rejects.toThrow('legacy meter cursor')
+  } finally { host.stop() }
+})
+
+it('rejects a replaced log between scope admission and opening, without pricing its calls', async () => {
+  const host = fixture()
+  try {
+    const id = 'meter-test', meter = host.make()
+    host.emit('assistant/message', { usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } })
+    const original = host.settled
+    const verify = (header: SessionHeader) => header.createdAt === AT
+    expect(await meter.read(id, undefined, verify)).toMatchObject({ usage: { reported_total_tokens: 3 } })
+    host.useLog(AT + 1000)
+    host.emit('assistant/message', { usage: { inputTokens: 99, outputTokens: 1, totalTokens: 100 } })
+    await expect(meter.read(id, undefined, verify)).rejects.toThrow('does not match the verified identity')
+    host.useLog(AT, 0, original)
+    expect(await host.restart().read(id, undefined, verify)).toMatchObject({ usage: { reported_total_tokens: 3, total_complete: true } })
   } finally { host.stop() }
 })
 

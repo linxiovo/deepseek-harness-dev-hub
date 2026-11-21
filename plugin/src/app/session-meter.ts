@@ -1,15 +1,23 @@
 /** Durable, session-local token accounting. A request snapshot is not a billing receipt or a live context measurement. */
 import type { Context } from '@deepseek-ai/cordis'
 import { lastAssistantStreamChunk, type TokenUsage } from '@deepseek-ai/dsh-llm'
-import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
+import { SessionId, type Session, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
 import { SessionPersistenceNotFoundError, type SessionHandle } from '@deepseek-ai/dsh-session-persistence'
 import { KV } from '../kv.ts'
 import type { Store } from './store.ts'
 
 export type Range = { from: number; through: number }
 type Missing = Range & { reason: 'no-usage' | 'coverage-gap' }
+type LogCoverage = {
+  created_at?: string
+  sampled_at: string
+  status: 'current' | 'unavailable'
+  range: Range
+  missing: Missing[]
+  in_flight: Range | null
+}
 
-/** All ranges are half-open event sequence ranges; cursor is the next, exclusive sequence number. */
+/** All ranges are half-open event sequence ranges. Cursor and context refer to the currently read physical log. */
 export interface SessionMeterView {
   session_id: string
   inherited_events: number
@@ -40,9 +48,12 @@ export interface SessionMeterView {
     reported_total_calls: number
     total_complete: boolean
     counted_calls: number
+    /** Totals span logs; these unqualified coverage fields describe only the current log. */
     missing: Missing[]
     in_flight: Range | null
     range: Range
+    /** Per-log known prefixes. An unavailable log has no verified tail past its recorded range. */
+    logs?: LogCoverage[]
     sampled_at: string
     source: 'session-events'
     quality: 'measured' | 'partial' | 'unknown'
@@ -50,16 +61,21 @@ export interface SessionMeterView {
   }
 }
 
-/** Stored in a single KV record so the cursor and its projection commit in one transaction. */
-export interface SessionMeterState { view: SessionMeterView; compaction_from: number | null; awaiting_retry?: boolean }
+interface Projection { view: SessionMeterView; compaction_from: number | null; awaiting_retry?: boolean }
+interface PriorProjection extends Projection { createdAt?: number }
+interface LogProjection extends PriorProjection { createdAt: number }
+interface MeterLedger { latest: LogProjection; previous?: PriorProjection[] }
+
+/** One KV record commits each log's cursor with its usage. Older records have no identity yet. */
+export type SessionMeterState = Projection | MeterLedger
 
 const sampledAt = (time: number) => new Date(time).toISOString()
 const range = (from: number, through: number): Range => ({ from, through })
 
-function initial(sessionId: string, inherited: number, createdAt: number): SessionMeterState {
+function initial(sessionId: string, inherited: number, createdAt: number): LogProjection {
   const sampled_at = sampledAt(createdAt)
   const covered = range(inherited, inherited)
-  return { compaction_from: null, view: {
+  return { createdAt, compaction_from: null, view: {
     session_id: sessionId, inherited_events: inherited, cursor: inherited,
     context: { model: null, provider: null, capacity_tokens: null, occupied_tokens: null, quality: 'unknown', source: 'none',
       sampled_at, range: covered, last_input_tokens: null, last_input_at: null, last_input_range: null, stale: true },
@@ -73,6 +89,44 @@ function initial(sessionId: string, inherited: number, createdAt: number): Sessi
 /** Add only reported numeric components; null represents an entirely unreported bucket, not zero. */
 function add(known: number | null, value: number | undefined): number | null {
   return value === undefined ? known : (known ?? 0) + value
+}
+
+const TOKEN_FIELDS = ['input_tokens', 'cache_read_tokens', 'cache_write_tokens', 'output_tokens', 'reasoning_tokens',
+  'known_components_total_tokens', 'reported_total_tokens'] as const
+
+function logCoverage({ createdAt, view: { usage } }: PriorProjection, status: LogCoverage['status']): LogCoverage {
+  return { ...(createdAt === undefined ? {} : { created_at: sampledAt(createdAt) }), sampled_at: usage.sampled_at, status,
+    range: usage.range, missing: usage.missing, in_flight: usage.in_flight }
+}
+
+/** Also used for the project meter's cached-prefix fallback when the host log cannot be read. */
+export function sessionMeterView(state: SessionMeterState): SessionMeterView {
+  if ('view' in state) return state.view
+  const { latest, previous } = state
+  if (!previous?.length) return latest.view
+  const logs: LogCoverage[] = []
+  const usage = { ...latest.view.usage, logs }
+  for (const log of previous) {
+    const past = log.view.usage
+    for (const field of TOKEN_FIELDS) usage[field] = add(usage[field], past[field] ?? undefined)
+    usage.counted_calls += past.counted_calls
+    usage.reported_total_calls += past.reported_total_calls
+    logs.push(logCoverage(log, 'unavailable'))
+  }
+  usage.total_complete = false
+  usage.quality = usage.counted_calls ? 'partial' : 'unknown'
+  logs.push(logCoverage(latest, 'current'))
+  return { ...latest.view, usage }
+}
+
+function logProjection(state: SessionMeterState | undefined, createdAt: number): LogProjection | undefined {
+  if (!state || !('latest' in state)) return undefined
+  const log = state.latest.createdAt === createdAt ? state.latest : state.previous?.find(log => log.createdAt === createdAt)
+  return log?.createdAt === undefined ? undefined : log as LogProjection
+}
+
+function checkForkCut(projection: Projection | undefined, inherited: number, sessionId: string): void {
+  if (projection && projection.view.inherited_events !== inherited) throw new Error(`Session ${sessionId} fork cut changed`)
 }
 
 function account(view: SessionMeterView, usage: TokenUsage | undefined, event: SessionEvent, sampleInput: boolean): void {
@@ -141,7 +195,7 @@ function route(view: SessionMeterView, event: SessionEvent<'request/context' | '
   view.context.source = 'session-events'
 }
 
-function fold(state: SessionMeterState, event: SessionEvent): void {
+function fold(state: LogProjection, event: SessionEvent): void {
   const { view } = state
   const next = event.seq + 1
   const timestamp = sampledAt(event.time)
@@ -201,14 +255,14 @@ function fold(state: SessionMeterState, event: SessionEvent): void {
 }
 
 /** A live projection is read-time context only; it must never enter durable usage state. */
-function withOccupancy(ctx: Context, sessionId: string, view: SessionMeterView): SessionMeterView {
+function withOccupancy(ctx: Context, sessionId: string, createdAt: number, view: SessionMeterView): SessionMeterView {
   try {
     const projections = ctx.get('sessionProjections') as
       | { snapshot?: (session: Session, keys: readonly string[]) => unknown }
       | undefined
     if (typeof projections?.snapshot !== 'function') return view
     const session = ctx.agents?.get(SessionId(sessionId))?.session
-    if (!session) return view
+    if (!session || session.header.createdAt !== createdAt || session.inheritedEventCount !== view.inherited_events) return view
     const raw = projections.snapshot(session, ['contextPressure'])
     if (!raw || typeof raw !== 'object') return view
     const snapshot = raw as { asOfSeq?: unknown; values?: { contextPressure?: { projectedTokens?: unknown } } }
@@ -220,6 +274,9 @@ function withOccupancy(ctx: Context, sessionId: string, view: SessionMeterView):
       quality: 'estimated', source: 'dsh-token-meter' } }
   } catch { return view } // Optional host capability may be absent or unable to project this Session.
 }
+
+/** A scoped reader's checked identity did not match the opened log. */
+export class SessionMeterIdentityError extends Error {}
 
 /** Read only the durable log. Never price surface replacements, retries, or live event notifications as extra calls. */
 export class SessionMeter {
@@ -233,20 +290,33 @@ export class SessionMeter {
     this.lifetime = options.lifetime
   }
 
-  async read(sessionId: string, signal?: AbortSignal): Promise<SessionMeterView | undefined> {
+  async read(sessionId: string, signal?: AbortSignal, verify?: (header: SessionHeader) => boolean): Promise<SessionMeterView | undefined> {
     signal?.throwIfAborted()
     this.lifetime.throwIfAborted()
     await this.ctx.sessionPersistence.flush()
     signal?.throwIfAborted()
     this.lifetime.throwIfAborted()
+    const key = KV.meter.state(sessionId)
+    const saved = this.store.get(key)
+    const startedWith = saved && 'latest' in saved ? saved.latest.createdAt : undefined
     let handle: SessionHandle
     try { handle = await this.ctx.sessionPersistence.open(SessionId(sessionId), 'read', { signal }) }
     catch (error) { if (error instanceof SessionPersistenceNotFoundError) return undefined; throw error }
     await using owned = handle
+    if (verify && !verify(owned.header)) throw new SessionMeterIdentityError('Opened Session log does not match the verified identity')
     const inherited = owned.inheritedEventCount
-    const key = KV.meter.state(sessionId)
-    const prior = this.store.get(key)
-    if (prior && prior.view.inherited_events !== inherited) throw new Error(`Session ${sessionId} fork cut changed`)
+    const { createdAt } = owned.header
+    // An old record with no own events has no usage to migrate; read the route from scratch.
+    const untagged = saved && 'view' in saved && saved.view.cursor > saved.view.inherited_events ? saved : undefined
+    // A log created after the old cursor's final event cannot contain that same own-event prefix.
+    const retired = untagged && createdAt > Date.parse(untagged.view.usage.sampled_at) ? untagged : undefined
+    const legacy = retired ? undefined : untagged
+    if (saved && 'latest' in saved && !logProjection(saved, createdAt)
+      && saved.previous?.some(log => log.createdAt === undefined && createdAt <= Date.parse(log.view.usage.sampled_at))) {
+      throw new Error(`Session ${sessionId} legacy meter cursor cannot be safely identified`)
+    }
+    const prior = logProjection(saved, createdAt) ?? legacy
+    checkForkCut(prior, inherited, sessionId)
     const offset = prior?.view.cursor ?? 0
     const events: SessionEvent[] = []
     for (let start = offset; ;) {
@@ -262,32 +332,53 @@ export class SessionMeter {
     const readThrough = offset + events.length
     if (readThrough < inherited) throw new Error(`Session ${sessionId} fork cut exceeds its durable log`)
     // A prior cursor must still name a durable log prefix, even when there is no newer event to read.
-    if (prior && offset && !(await owned.read(offset - 1, 1, { signal })).events.length) {
-      throw new Error(`Session ${sessionId} durable log is shorter than its meter cursor`)
+    if (prior && offset) {
+      const tail = (await owned.read(offset - 1, 1, { signal })).events[0]
+      if (!tail || tail.seq !== offset - 1) throw new Error(`Session ${sessionId} durable log is shorter than its meter cursor`)
+      // The old schema only kept a cursor and the clock of its last own event.
+      if (legacy && sampledAt(tail.time) !== legacy.view.usage.sampled_at) {
+        throw new Error(`Session ${sessionId} legacy meter cursor does not match the durable log`)
+      }
     }
     // Reads can race with attached, accepted-but-not-flushed writes. Barrier again before recording their seqs in KV.
     if (events.length) await this.ctx.sessionPersistence.flush()
     signal?.throwIfAborted()
     this.lifetime.throwIfAborted()
-    const view = this.store.atomic(() => {
-      const current = this.store.get(key)
-      if (current && current.view.inherited_events !== inherited) throw new Error(`Session ${sessionId} fork cut changed`)
-      if (current && current.view.cursor > readThrough) return current.view
-      if (current && current.view.cursor < offset) throw new Error(`Session ${sessionId} meter cursor moved backwards`)
-      if (current && current.view.cursor === readThrough) return current.view
-      const state = current ?? initial(sessionId, inherited, owned.header.createdAt)
+    const ledger = this.store.atomic(() => {
+      const saved = this.store.get(key)
+      const current = saved && 'latest' in saved ? saved : undefined
+      const projected = logProjection(current, createdAt)
+      if (legacy && current && !projected) throw new Error(`Session ${sessionId} legacy meter cursor was bound to a different log`)
+      checkForkCut(projected, inherited, sessionId)
+      const state = projected ?? (legacy ? { ...legacy, createdAt } : initial(sessionId, inherited, createdAt))
+      if (state.view.cursor < offset) throw new Error(`Session ${sessionId} meter cursor moved backwards`)
+      if (current && projected && state.view.cursor >= readThrough) return current
       for (const event of events) {
         if (event.seq < inherited) {
           // Inherited events can advertise the route, but their clock and usage belong to the ancestor.
-          if (event.type === 'request/context' || event.type === 'request/header') route(state.view, event)
+          // A racing read may already have projected this prefix and newer own routing.
+          if (!projected && (event.type === 'request/context' || event.type === 'request/header')) route(state.view, event)
           continue
         }
         if (event.seq < state.view.cursor) continue
         fold(state, event)
       }
-      this.store.set(key, state)
-      return state.view
+      let next: MeterLedger
+      // A retired log may still be read by a handle opened before deletion. It may not replace the current context.
+      // For a first sighting racing another generation's commit, use creation time to break the tie.
+      if (current && (projected || (startedWith !== current.latest.createdAt && createdAt < current.latest.createdAt))) {
+        if (!projected) (current.previous ??= []).push(state)
+        next = current
+      } else if (current) {
+        const previous = current.previous ?? []
+        previous.push(current.latest)
+        next = { latest: state, previous }
+      } else {
+        next = retired ? { latest: state, previous: [retired] } : { latest: state }
+      }
+      this.store.set(key, next)
+      return next
     })
-    return withOccupancy(this.ctx, sessionId, view)
+    return withOccupancy(this.ctx, sessionId, ledger.latest.createdAt, sessionMeterView(ledger))
   }
 }

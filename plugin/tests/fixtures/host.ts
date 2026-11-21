@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { vi, type Mock } from 'vitest'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 import { Runtime } from '../../src/app/runtime.ts'
 import { Store } from '../../src/app/store.ts'
@@ -166,7 +166,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     [scoped]: `global\0credential.helper\n\0global\0credential.https://github.com.helper\n${credentialHelper(AGENT)}\0`,
   }
   /** A prepare command (`sh -c`) waits for this while it is set. */
-  const hooks: { prepare?: Promise<void> } = {}
+  const hooks: { prepare?: Promise<void>; openingLog?: (sessionId: string) => Promise<void> | undefined } = {}
   const subprocess = { spawn: vi.fn((spec: { argv: readonly string[]; cwd?: string; env?: Record<string, string> }) => {
     const argv = [...spec.argv]
     while (argv[0] === 'env' || /^[A-Z_]+=/.test(argv[0] ?? '')) argv.shift()
@@ -200,6 +200,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   /** One durable entry of a Session's log; controller-made messages carry no `time`, as their creation time is not an event. */
   type StoredEvent = { seq: number; time?: number; type: string; data: unknown }
   const sessionHistory = new Map<string, StoredEvent[]>()
+  const sessionHeaders = new Map<string, SessionHeader>()
   /** Fork-inherited prefix lengths, which a real persistence backend stores beside the log. */
   const inheritedEvents = new Map<string, number>()
   let directMessageSequence = 0
@@ -214,7 +215,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   let http!: HttpHandler
   const resolveDefault = async (id: string) => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }
   const controller = {
-    create: vi.fn(async ({ sessionId, workspaceId }: { sessionId: string; workspaceId: string }) => {
+    create: vi.fn(async ({ sessionId, workspaceId, agentPreset }: { sessionId: string; workspaceId: string; agentPreset?: string }) => {
       if (agents.has(sessionId)) return
       const agentCtx = new Context()
       const sessionTools = new Map<string, RegisteredTool>()
@@ -262,7 +263,9 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
       })
       const sessionEvents = sessionHistory.get(sessionId) ?? []
       sessionHistory.set(sessionId, sessionEvents)
-      const session = { id: sessionId, header: { cwd: workspaceId }, snapshotEvents: () => sessionEvents, requestHeader: () => undefined, append: vi.fn() }
+      const header: SessionHeader = { id: sessionId as SessionId, version: 4, createdAt: 0, isSeeded: false, cwd: workspaceId, agentPreset }
+      sessionHeaders.set(sessionId, header)
+      const session = { id: sessionId, header, inheritedEventCount: 0, snapshotEvents: () => sessionEvents, requestHeader: () => undefined, append: vi.fn() }
       let status = 'idle'
       const idle: (() => void)[] = []
       // A cancel drops the inbox unless kept, and the turn it stops ends a moment later, which DSH says.
@@ -293,14 +296,19 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     inspect: vi.fn(async () => ({ events: [] })),
   }
   // A real backend knows only created Sessions and keeps the fork cut beside the log; the meter must see the same answers.
-  const persistence = { flush: vi.fn(async () => {}), open: vi.fn(async (sessionId: string) => {
+  const persistence = { flush: vi.fn(async () => {}), stat: vi.fn(async (sessionId: string) => {
+    const header = sessionHeaders.get(sessionId)
+    return header ? { header, revision: 'fixture' } : undefined
+  }), open: vi.fn(async (sessionId: string) => {
+    const opening = hooks.openingLog?.(sessionId)
+    if (opening) await opening
     const id = sessionId as SessionId
     const events = sessionHistory.get(sessionId)
     if (!events) throw new SessionPersistenceNotFoundError(id)
     const inherited = inheritedEvents.get(sessionId) ?? 0
     return {
       id, access: 'read' as const, inheritedEventCount: inherited,
-      header: { id, version: 4, createdAt: 0, isSeeded: inherited > 0 },
+      header: sessionHeaders.get(sessionId) ?? { id, version: 4, createdAt: 0, isSeeded: inherited > 0 },
       read: async (offset = 0, count = 512) => ({ eventState: 'detached' as const, events: events.slice(offset, offset + count) }),
       close: async () => {},
       [Symbol.asyncDispose]: async () => {},
@@ -358,7 +366,8 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     return await tool.execute(args, { signal: new AbortController().signal }) as Record<string, unknown>
   }
   /** Create a real Cordis Agent boundary for a Worker descendant; authorization still runs through Sessions and DSH tools. */
-  async function reviewSubagent(parentId: string, axis: ReviewAxis, childId = `review-${++reviewChildSequence}`, loadReviewSkill = true) {
+  async function reviewSubagent(parentId: string, axis: ReviewAxis, childId = `review-${++reviewChildSequence}`, loadReviewSkill = true,
+    inherited: readonly Omit<StoredEvent, 'seq'>[] = []) {
     const parent = agents.get(parentId)
     if (!parent) throw new Error(`Session ${parentId} does not exist`)
     const agentCtx = new Context(), sessionTools = new Map<string, RegisteredTool>()
@@ -373,13 +382,21 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     const base = ticket.execution!.base!.sha, generation = ticket.assignments.at(-1)!.writer!.generation
     const candidate = localGit!.git('-C', ticket.execution!.directory, 'rev-parse', 'HEAD')
     const assignment = JSON.stringify({ axis, base, candidate, generation })
-    const reviewEvent = { type: 'user/message', data: { role: 'user', content: [{ type: 'text', text: `DSH_REVIEW_ASSIGNMENT: ${assignment}` }] } } as never
-    const loadedReviewSkill = { type: 'tool/call', data: { name: 'skill', arguments: JSON.stringify({ name: 'dsh-worker-code-review' }) } } as never
-    const session = { id: childId, header: { cwd: parentSession?.header?.cwd ?? '', parentSession: parentId, origin: 'subagent' },
-      snapshotEvents: () => [reviewEvent, ...(loadReviewSkill ? [loadedReviewSkill] : [])], requestHeader: () => undefined }
+    record(childId, inherited, inherited.length)
+    const header: SessionHeader = { id: childId as SessionId, version: 4, createdAt: 0, isSeeded: inherited.length > 0,
+      cwd: parentSession?.header?.cwd ?? '', parentSession: parentId as SessionId, origin: 'subagent' }
+    sessionHeaders.set(childId, header)
+    const session = { id: childId, header, inheritedEventCount: inherited.length,
+      snapshotEvents: () => sessionHistory.get(childId)!, requestHeader: () => undefined }
     const agent = { ...parent, id: childId, ctx: agentCtx, session, status: 'idle' } as never
     agents.set(childId, agent)
     ctx.emit('agent/created', { agent } as never)
+    record(childId, [
+      { type: 'subagent/descriptor', data: { version: 3, mode: 'one-shot', provider: 'fixture' } },
+      { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: `DSH_REVIEW_ASSIGNMENT: ${assignment}` }] } },
+      { type: 'tool/call', data: { turn: 1, step: 1, callId: 'review-skill', name: 'skill', arguments: JSON.stringify({ name: 'dsh-worker-code-review' }) } },
+      { type: 'tool/result', data: { turn: 1, step: 1, message: { role: 'tool', toolCallId: 'review-skill', isError: !loadReviewSkill, content: [] } } },
+    ])
     const { promise, resolve } = Promise.withResolvers<void>()
     setTimeout(resolve, 0)
     for (let tries = 0; tries < 20 && !sessionTools.has('orchestrator_review_submit'); tries++) await promise
@@ -404,6 +421,14 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
       log.push(stored)
       if (session) ctx.emit('session/event', session as never, stored as never)
     }
+  }
+  /** Switch only the backend's stored log generation; a loaded Agent still describes its original Session. */
+  const useStoredLog = (sessionId: string, createdAt: number, events: readonly Omit<StoredEvent, 'seq'>[]) => {
+    const header = sessionHeaders.get(sessionId), history = sessionHistory.get(sessionId)
+    if (!header || !history) throw new Error(`Missing stored Session ${sessionId}`)
+    sessionHeaders.set(sessionId, { ...header, createdAt })
+    sessionHistory.set(sessionId, events.map((event, seq) => ({ ...event, seq, time: event.time ?? createdAt + seq + 1 })))
+    return () => { sessionHeaders.set(sessionId, header); sessionHistory.set(sessionId, history) }
   }
   const idlePlanning = () => runtime.effects.idle('planning')
   const idleRelay = () => runtime.effects.idle('relay')
@@ -435,6 +460,6 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
   return { get runtime() { return runtime }, get ctx() { return ctx }, get toolLimits() { return toolLimits }, restart, idlePlanning, idleRelay, directory, localGit, agents, tools, deliveries, relays, candidates, runTool, sendUserMessage, record, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
-    jobs, subagents, reviewSubagent, step, claim }
+    jobs, subagents, reviewSubagent, useStoredLog, step, claim }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>

@@ -1,5 +1,6 @@
 /** Domain model of a proactive agent: the concepts and their invariants, independent of any source, policy, or executor. */
 import type { Reason } from './reasons.ts'
+import type { PlanRole } from './plan.ts'
 
 /** Actor identity in the source's own vocabulary; Policy decides which actors may originate work on that Source. */
 export interface ActorRef { source: string; id: string }
@@ -301,6 +302,7 @@ export type TicketEndBy = 'executor' | 'human'
 export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
 /** A question for a person; `triggerId` is the human message that raised it, whose conversation it goes back to. */
 export interface Attention { id: string; question: string; triggerId?: string }
+export interface PlanTicket { planId: string; nodeId: string; role: PlanRole }
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
   id: string
@@ -329,6 +331,8 @@ export interface Ticket {
   updatedAt: string
   /** The Triggers it was accepted from: the one that started it, and the batch its Eval held. */
   origin: { triggerId: string; triggerIds: string[] }
+  /** Present for Plan-dispatched Tickets; the Plan registry owns mutable dispatch state. */
+  plan?: PlanTicket
   /** What its Executor chose: its short name, directory and assignment text. */
   execution?: Execution
   /** The latest failed delivery of an Input to its worker, until a delivery succeeds. */

@@ -3,6 +3,37 @@ import { UserError } from './errors.ts'
 
 export const PLAN_ROLES = ['backend', 'frontend'] as const
 export const PLAN_FEATURE_KINDS = [...PLAN_ROLES, 'cross-end'] as const
+export type PlanRole = typeof PLAN_ROLES[number]
+export type PlanNodeExecutionStatus = 'claimed' | 'running' | 'awaiting-delivery' | 'delivered' | 'failed' | 'stopped'
+
+export interface PlanNodeClaim {
+  planId: string
+  nodeId: string
+  ticketId: string
+  assignmentId: string
+  session: string
+  role: PlanRole
+  pendingAction: 'launch' | 'resume' | null
+  claimedAt: string
+  startedAt?: string
+}
+
+/** A delivery-check record from the later delivery gate; a Worker report is not one. */
+export interface PlanDeliveryReceipt {
+  ticketId: string
+  assignmentId: string
+  receiptId: string
+  candidate: string
+  verifiedAt: string
+}
+
+export interface PlanNodeState {
+  planId: string
+  nodeId: string
+  status: PlanNodeExecutionStatus
+  claim: PlanNodeClaim
+  delivery?: PlanDeliveryReceipt
+}
 
 export interface PlanFeature {
   id: string
@@ -13,7 +44,7 @@ export interface PlanNode {
   id: string
   featureId: string
   title: string
-  role: typeof PLAN_ROLES[number]
+  role: PlanRole
   /** One-based indices into the immutable specification's acceptance block. */
   acceptance: number[]
   demonstration: string

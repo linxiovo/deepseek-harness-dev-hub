@@ -224,17 +224,17 @@ For live verification, use the private [isolated fixture PR](https://github.com/
 
 ### DshExecutor
 
-`DshExecutor` (`src/executor/dsh.ts`) provides one Session and one verified Git worktree per Ticket. `start` and `deliver` enqueue `launch` and `delivery` effects. `stop` cancels the turn through `Store.afterCommit`, so a rolled-back end does not stop the worker.
+`DshExecutor` (`src/executor/dsh.ts`) provides one Session and one verified Git worktree per Ticket. `start` and `deliver` enqueue `launch` and `delivery` effects. Plan dispatch uses `reserveLaunch` before its durable claim, then the same Ticket launch path; `stop` cancels the turn through `Store.afterCommit`, so a rolled-back end does not stop the worker.
 
 A launch first waits for the previous writer's turn, jobs and subagents to stop, then checks the repository and destination read-only. `validateRepositoryIdentity` (`src/executor/repository-identity.ts`) requires the clone's single local `remote.origin.url` to be a direct github.com HTTPS, SSH or Git URL for the GitHub Source's `owner/name`, refusing an unset target, a missing, ambiguous, lookalike or different origin. `validateWorktreeDestination` (`src/executor/worktree.ts`) refuses a Ticket directory or configured worktree root that resolves inside the clone's primary checkout, a linked worktree registered there or an unrelated Git checkout, including through symlink aliases. Neither guard writes, so a refusal fails the Ticket before any prepare command and leaves every file as it was. The launch then resolves the configured repository to its canonical main checkout and `executor.baseRef` to a pinned commit, and reserves the directory and branch for its Assignment, before any prepare command or Session exists. With an empty `prepare` it creates the linked worktree itself, and otherwise runs that command with the pinned variables. `inspectWorktree` then checks the result and `recordExecutionVerified` stores the canonical repository, worktree, branch and base; a refusal records `preparation.rejected` with its reason, starts no Session and removes nothing. `acquireExecutionWriter` binds the actual Session before it is prompted; `releaseExecutionWriter` only after the worker's turn, shell jobs and subagents are idle. Every claim carries its Assignment and generation, so a late callback cannot release or overwrite a newer writer.
 
 `prepare(ticket, outcome)` supplies the Engine's `prepareTicket` hook: short name, directory and `ticketExecution` assignment text. `workerSessionId(ticket.id)` derives the Session id.
 
-`WorkerSlots` reserves capacity before a launch or a delivery that wakes an idle worker. A human message can use one slot beyond `maxWorkers`, and wakes have priority over launches. `activeCount` supplies panel load.
+`WorkerSlots` reserves capacity before a launch or a delivery that wakes an idle worker. A Plan dispatch reserves the same launch key synchronously before its claim transaction; a human message can use one slot beyond `maxWorkers`, and wakes have priority over launches. `activeCount` supplies panel load.
 
 Transient provider and network failures get three retries. Launches use effect backoff; failed turns receive continuation messages after 15, 30 and 60 seconds. `inputMessage` renders each Input from current Ticket state, and `mandateInstructions` adds the matched-rule limits for inferred work.
 
-`install` subscribes to Session events; `dispose` unsubscribes. A turn end normally reports waiting, except after readiness or while human action is required. Errors report failed. At startup, `resume` reports interrupted Assignments through `assignmentInterrupted` and requeues pending launches that do not wait for a person, oldest Ticket first.
+`install` subscribes to Session events; `dispose` unsubscribes. A turn end normally reports waiting, except after readiness or while human action is required. Errors report failed. At startup, `resume` reports interrupted Assignments through `assignmentInterrupted` and requeues pending launches that do not wait for a person, oldest Ticket first. Plan Tickets reconstitute their persisted verified writer claim and reuse the stable Session delivery ID when a start receipt was interrupted.
 
 ### MasterAssessor
 
@@ -272,7 +272,7 @@ Each model request binds the Session to the current prompt revision. The revisio
 
 ### Plan handoff navigation
 
-The implementation path is summarized in the **Plan handoff change map** in `plugin/docs/009-handoff.md`: specification publication → the durable `Planning` splitting effect → a scoped splitter Session and its tools → the `Plans` registry → Hub `orchestrator_read` plan resources → no Worker Session or Ticket. Session restrictions are enforced as described in `plugin/docs/010-session-boundaries.md`; `tests/plans.spec.ts` covers the simulated-host path.
+The implementation path is summarized in the **Plan handoff change map** in `plugin/docs/009-handoff.md`: specification publication → durable Plan registration → Hub Frontier dispatch through `PlanDispatcher` → a Plan Ticket and the normal verified worktree/Worker Session → a formal delivery receipt before successor release. Registration itself still creates no executable Ticket, Worker Session, Assignment or worktree. Session restrictions are enforced as described in `plugin/docs/010-session-boundaries.md`; `tests/plans.spec.ts` covers the simulated-host path.
 
 ### Session metering
 
@@ -400,6 +400,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/topic-binding.ts` | Binds one observed Feishu destination to the selected project and accepts correlated answers from explicitly authorized senders; see `009-handoff.md` |
 | `src/app/planning.ts` | `Planning`: durable `planning` and `splitting` effects for the specification planner and the Plan DAG splitter |
 | `src/app/plans.ts` | `Plans`: validates and atomically registers authorized Plan DAGs; keeps plan background separate from node instructions |
+| `src/app/plan-dispatch.ts` | `PlanDispatcher`: validates Frontier predecessors, reserves a launch slot, atomically claims a node into a stable Ticket/Assignment, and rearms the same claim on restart |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
 | `src/app/settings.ts` | Settings |

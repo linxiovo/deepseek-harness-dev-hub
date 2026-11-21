@@ -33,7 +33,8 @@ import { TopicBinding } from './topic-binding.ts'
 import { Installation, projectDatabase, projectHubId } from './installation.ts'
 import { InstallationError } from './installation-api.ts'
 import { Planning } from './planning.ts'
-import { Plans } from './plans.ts'
+import { Plans, planDeliveryWriter } from './plans.ts'
+import { PlanDispatcher } from './plan-dispatch.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import { projectNavigationLink } from '../navigation.ts'
@@ -74,6 +75,7 @@ export class Runtime extends Service implements SourceHost {
   readonly handoffs: Handoffs
   readonly topicBinding?: TopicBinding
   readonly plans: Plans
+  readonly planDispatcher: PlanDispatcher
   readonly planning: Planning
   readonly sources: SourceRegistry
   readonly commands: Commands
@@ -234,6 +236,11 @@ export class Runtime extends Service implements SourceHost {
       const policy = () => settingsPolicy(store.settings(), sources)
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor, ...(project ? { projectId: project.id } : {}),
         outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
+          if (event.type === 'assignment.started') {
+            const ticket = store.tickets.get(event.data.ticketId)
+            plans.assignmentStarted(event.data.ticketId, event.data.assignmentId, ticket?.execution?.session ?? workerSessionId(event.data.ticketId))
+          }
+          if (event.type === 'ticket.ended') plans.assignmentEnded(event.data.ticketId)
           // Notify the main Session only about domain events it did not initiate itself.
           const notice = this.quiet ? undefined : eventNotice(event, id => store.tickets.get(id))
           if (notice) sessions.notify(...notice)
@@ -249,6 +256,8 @@ export class Runtime extends Service implements SourceHost {
             for (const message of pullEndNotices(ended, request, setup.deployment.repository)) outbox.send(message)
           }
         } })
+      this.planDispatcher = new PlanDispatcher({ store, plans, engine, executor })
+      const planDelivery = planDeliveryWriter(plans)
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
       const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
@@ -266,7 +275,7 @@ export class Runtime extends Service implements SourceHost {
           if (kind === FEISHU && this.topicBinding?.claims(trigger)) return this.receiveBoundFeishu(trigger)
           return passes.receive(trigger)
         } }
-      this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, settings: this.settings, assessor, resources, handoffs, plans, lifetime: this.lifetime,
+      this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, planDispatcher: this.planDispatcher, planDelivery, settings: this.settings, assessor, resources, handoffs, plans, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
@@ -401,6 +410,7 @@ export class Runtime extends Service implements SourceHost {
     for (const id of this.settings.syncable()) await this.settings.sync(id).catch(() => { /* sync() records its failure in health. */ })
     // If stop() was called while awaiting setup, session creation, or policy sync, do not start background loops.
     if (this.closing()) return
+    this.planDispatcher.resume()
     this.planning.resume()
     this.executor.resume()
     this.passes.start()

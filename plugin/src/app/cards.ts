@@ -1,9 +1,10 @@
 /** Compact, bounded model-facing projections of triggers, tickets, threads, and decisions; full texts stay behind readable resources. */
-import { latestReport, reasonText, threadKey, ticketStage, type Decision, type Mandate, type Thread, type Ticket, type TicketInput,
+import { latestAssignment, latestReport, reasonText, threadKey, ticketStage, type Decision, type Mandate, type Thread, type Ticket, type TicketInput,
   type Trigger, type TriggerDisposition } from '../core/index.ts'
 import { pullOf } from '../sources/github-pull.ts'
-import { batchLine, inputResource } from '../executor/dsh.ts'
+import { batchLine, inputResource, workerSessionId } from '../executor/dsh.ts'
 import { ticketExecution } from './views/records.ts'
+
 
 /** Collapses whitespace and truncates text for display previews while keeping code, angle brackets, and links intact for model readers. */
 export function preview(text: string): string { return text.replace(/\s+/g, ' ').slice(0, 160) }
@@ -29,8 +30,11 @@ export function ticketCard(ticket: Ticket) {
   const { attention } = ticket
   // Legacy directory-only executions have no verification to advertise on compact cards.
   const execution = ticket.execution?.preparation ? ticketExecution(ticket) : undefined
+  const assignment = latestAssignment(ticket)
+  const plan = ticket.plan ? { plan_id: ticket.plan.planId, node_id: ticket.plan.nodeId, role: ticket.plan.role,
+    session: execution?.session ?? workerSessionId(ticket.id), pending_action: assignment?.state === 'pending' ? 'launch' : null } : undefined
   return { ticket_id: ticket.id, title: ticket.title, state: cardState(ticket), strength: ticket.mandate.strength,
-    ...(pullOf(ticket) ? { pr_number: pullOf(ticket) } : {}), ...(ended ? { ended } : {}),
+    ...(plan ? { plan } : {}), ...(pullOf(ticket) ? { pr_number: pullOf(ticket) } : {}), ...(ended ? { ended } : {}),
     ...(attention ? { attention: { question: attention.question, ...attention.triggerId ? { trigger_id: attention.triggerId } : {} } } : {}),
     ...execution ? { execution } : {}, preview: preview(latestReport(ticket)?.summary ?? ''), read: `ticket/${ticket.id}` }
 }

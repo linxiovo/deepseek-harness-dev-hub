@@ -1,6 +1,7 @@
 /** Domain model of a proactive agent: the concepts and their invariants, independent of any source, policy, or executor. */
 import type { Reason } from './reasons.ts'
 import type { PlanRole } from './plan.ts'
+import type { DeliveryLedger } from './delivery-check.ts'
 
 /** Actor identity in the source's own vocabulary; Policy decides which actors may originate work on that Source. */
 export interface ActorRef { source: string; id: string }
@@ -225,6 +226,8 @@ export interface ReviewEvidence {
   reviewer_session: string
   generation: number
   basis: string[]
+  /** Original evidence this reviewer independently reaffirmed on a repaired candidate (delivery-check keys). */
+  reuses?: string[]
   base: string
   candidate: string
   conclusion: ReviewConclusion
@@ -316,6 +319,8 @@ export interface Ticket {
   /** Open question for a person; cleared by the executor or when the ticket ends. */
   attention?: Attention
   assignments: Assignment[]
+  /** Candidate evidence survives Assignment replacement; its observations are fenced by writer generation. */
+  deliveryCheck?: DeliveryLedger
   inputs: TicketInput[]
   /** Inputs not yet handed to a running assignment. */
   undelivered: string[]

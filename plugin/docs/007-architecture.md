@@ -375,6 +375,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/evals.ts` | `Evals`: the Evals of Threads and their Decisions |
 | `src/core/tickets.ts` | `Tickets`: the Ticket lifecycle, worktree ownership and writer lease, the Threads a Ticket follows, Subscriptions and Inputs |
 | `src/core/assignments.ts` | `Assignments`: the Executor's facts and its workers' Reports |
+| `src/core/delivery-check.ts` | Orders retro, acceptance and repair evidence; selects current or independently reaffirmed observations (`013-development-verification.md`, Delivery-check) |
 | `src/core/replies.ts` | `Replies`, with `ReplyRequest`, `Reply` and `TakeUp`: `reply` queues the Hub's answer, result and attention messages for a Channel; `acknowledgeAccepted` queues the acceptance acknowledgement from `Tickets.create`; `takeUpInternally` records a Worker's take-up on a Trigger's disposition |
 | `src/core/stage.ts` | `ticketStage` and `canRetry`: the Ticket stages of [003 Execution](003-execution.md) |
 | `src/core/errors.ts` | `UserError` and `USER_ERRORS` |
@@ -624,7 +625,7 @@ New main Sessions use `dsh-superagent-router` (`ROUTER_PRESET`), a read-only pre
 
 ### Executor tools
 
-Each Worker Executor has eight application tools. A Worker descendant used as an independent reviewer additionally receives the child-only `orchestrator_review_submit` tool; the parent Worker, Hub, Planner and Splitter do not.
+The active parent Worker has the application tools below. A marked independent review descendant receives only the child-only `orchestrator_review_submit` application tool; the parent Worker, Hub, Planner and Splitter cannot submit reviews.
 
 | Tool | Purpose |
 | --- | --- |
@@ -632,6 +633,7 @@ Each Worker Executor has eight application tools. A Worker descendant used as an
 | `orchestrator_ack` | Record the worker's internal take-up of a request; no message is queued for a person |
 | `orchestrator_doc_impact` | Collect candidate-bound documentation evidence; input and results are defined in `011-doc-tree-impact.md` |
 | `orchestrator_test_evidence` | Bind Worker-reported checks to the current candidate as described in `013-development-verification.md` |
+| `orchestrator_retro_evidence` | Record candidate-bound retro, acceptance and repairs as described in `013-development-verification.md` |
 | `orchestrator_report` | Report progress or an outcome, binding a pull request under the pull-request rules; it notifies the Hub only and queues no Channel message directly |
 | `orchestrator_thread_unrelated` | Drop an unrelated attached Thread, hand back its owned follow-ups and tell the main Session why |
 | `orchestrator_thread_follow` | Subscribe to a related Thread for context and tell the main Session |

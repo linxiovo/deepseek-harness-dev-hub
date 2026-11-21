@@ -1,11 +1,14 @@
 /** Serves paginated context resources to orchestrator_read so large bodies stay out of model prompts until requested. */
+import { createHash } from 'node:crypto'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
-import { UserError, key, latestReport, reached, reviewStatus, runningAssignment, threadKey, type Ticket, type Trigger } from '../core/index.ts'
+import { UserError, key, latestReport, reached, reviewStatus, runningAssignment, threadKey, viewDelivery, type Assignment, type Ticket,
+  type Trigger } from '../core/index.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
+import { inspectWorktree } from '../executor/worktree.ts'
 import { readGithub } from '../sources/github-read.ts'
-import { actionsEvidence } from '../sources/actions-evidence.ts'
-import { githubKind } from '../sources/github.ts'
+import { actionsEvidence, type ActionsEvidence } from '../sources/actions-evidence.ts'
+import { githubKind, type GithubConfig } from '../sources/github.ts'
 import { feishuReferences, feishuRead } from '../sources/feishu-read.ts'
 import { feishuRef } from '../sources/feishu.ts'
 import { feishuTriggerId } from '../sources/feishu-trigger.ts'
@@ -16,8 +19,9 @@ import { transcriptEntry } from './context.ts'
 import { builtInParts, defaultPrompts, SKILL_PREFIX } from './prompts.ts'
 import { bundledSkills, isBundledSkill } from './skill-files.ts'
 import type { Context } from '@deepseek-ai/cordis'
-import type { Commands } from '../infra/commands.ts'
+import { CliError, type Commands } from '../infra/commands.ts'
 import { sameDirectory } from '../infra/environment.ts'
+import { KV } from '../kv.ts'
 import type { Handoffs } from './handoffs.ts'
 import type { Plans } from './plans.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
@@ -43,6 +47,9 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
     + 'branch, base, worker Session and active writer when available; its trigger, decision and threads, latest assignments with the '
     + 'start of each report, and inputs, newest first', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
+  { name: 'ticket/<id>/delivery-check', holds: 'current candidate queue readiness and paginated canonical acceptance, ordered evidence and required CI; never formal delivery', executor: true },
+  { name: 'ticket/<id>/delivery-observation/<n>', holds: 'one durable delivery observation', executor: true },
+  { name: 'retro-followups', holds: 'optional retro backlog, independent of Plan delivery' },
   { name: 'ticket/<id>/reviews', holds: 'reviews', executor: true },
   { name: 'ticket/<id>/review/<id>', holds: 'one review', executor: true },
   { name: 'ticket/<id>/assignments', holds: 'assignment pages, newest first', executor: true },
@@ -71,12 +78,14 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'actions/<ticket|plan>/<id>/commit/<40 lowercase hex SHA>', holds: 'GitHub Actions jobs and artifacts for one owned ticket or handoff at exactly this commit; reports missing required checks, without CI logs' },
 ]
 export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(resource => !executor || resource.executor)
-  .map(resource => `${resource.name}: ${resource.holds}`).join('; ')
+  .map(({ name, holds }) => executor ? `${name}:` : `${name}: ${holds}`).join('; ')
 
 export interface ResourceHost {
   ownsSession?(id: string): boolean
   reviewGeneration?(ticketId: string): number | undefined
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
+  readonly handoffs?: Pick<Handoffs, 'spec'>
+  readonly plans?: Pick<Plans, 'get'>
   readonly pages: TextCache
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'skills' | 'defaultChanged'>
   readonly commands: Commands
@@ -93,8 +102,27 @@ export interface MainResourceHost extends ResourceHost {
   readonly sessions: Pick<Sessions, 'status' | 'modelRetry'>
   readonly settings: Pick<Settings, 'view' | 'block'>
   readonly handoffs: Pick<Handoffs, 'get' | 'spec'>
-  readonly plans: Pick<Plans, 'view' | 'node'>
+  readonly plans: Pick<Plans, 'get' | 'view' | 'node'>
 }
+
+/** Resolve only this Slice Ticket's registered acceptance, never criteria supplied with a report. */
+export function deliveryAcceptance(host: ResourceHost, ticket: Ticket): readonly { id: string; text: string }[] {
+  const binding = ticket.plan
+  if (!binding) return []
+  const plan = host.plans?.get(binding.planId)
+  if (!plan || plan.id !== binding.planId || plan.status !== 'registered') return []
+  const node = plan.nodes.find(node => node.id === binding.nodeId && node.role === binding.role)
+  const spec = host.handoffs?.spec(plan.handoffId)
+  if (!node || !spec || spec.id !== plan.specId || spec.handoffId !== plan.handoffId) return []
+  const criteria: { id: string; text: string }[] = []
+  for (const index of node.acceptance) {
+    const item = spec.acceptance[index - 1]
+    if (!item?.statement.trim() || !item.observable.trim()) return []
+    criteria.push({ id: String(index), text: `${item.statement}\nObservable: ${item.observable}` })
+  }
+  return criteria
+}
+
 interface Read {
   host: ResourceHost; resource: string; rest: string; offset: number; limit?: number
   sessionId: string; ticketId?: string; signal?: AbortSignal
@@ -134,7 +162,7 @@ async function sourcePage(read: Read, source: string, fetch: () => Promise<unkno
 const commitSha = z.string().regex(/^[0-9a-f]{40}$/)
 const pullEvidence = z.looseObject({
   head: z.looseObject({ sha: commitSha, repo: z.looseObject({ full_name: z.string() }).nullable() }),
-  base: z.looseObject({ sha: commitSha }), merge_commit_sha: commitSha.nullable(),
+  base: z.looseObject({ sha: commitSha }), merge_commit_sha: commitSha.nullable(), state: z.string().optional(),
 })
 /** A local commit belongs to work only when its checkout root and GitHub remote match the configured repository. */
 async function verifyCheckout(commands: Commands, directory: string | undefined, sha: string, kind: 'ticket' | 'plan'): Promise<void> {
@@ -152,6 +180,194 @@ async function verifyCheckout(commands: Commands, directory: string | undefined,
     throw new Error(refused, { cause: error })
   }
 }
+
+type RequiredChecks = readonly GithubConfig['requiredChecks'][number][]
+
+interface TicketPull { number: unknown; own: boolean }
+function ticketPull(host: ResourceHost, ticket: Ticket): TicketPull | undefined {
+  // Only a persisted association can supply the PR used to match Actions runs.
+  const ownPull = ticket.follows?.findLast(follow => follow.own && follow.thread.startsWith('github:'))
+  if (ownPull) return { number: Number(ownPull.thread.slice('github:'.length)), own: true }
+  const origin = host.store.triggers.get(ticket.origin.triggerId)
+  if (origin?.source === 'github' && origin.meta.isPr === true) return { number: origin.meta.number, own: false }
+}
+
+/** The delivery reader supplies its pinned base and already-verified worktree candidate, not a caller SHA. */
+async function ticketActions(commands: Commands, ticket: Ticket, sha: string, required: RequiredChecks,
+  associatedPull: TicketPull | undefined, base?: string): Promise<ActionsEvidence> {
+  const work = { kind: 'ticket', id: ticket.id } as const
+  if (!associatedPull || base !== undefined) await verifyCheckout(commands, ticket.execution?.directory, sha, 'ticket')
+  if (!associatedPull) return actionsEvidence(commands, work, sha, required)
+  const { number } = associatedPull
+  if (typeof number !== 'number' || !Number.isSafeInteger(number) || number <= 0) throw new Error('Ticket has no verifiable pull request')
+  const readPull = () => commands.api(pullEvidence, `pulls/${number}`)
+  const pull = await readPull()
+  if (pull.head.sha !== sha || !pull.head.repo || (associatedPull.own && pull.head.repo.full_name.toLowerCase() !== commands.repository.toLowerCase()) ||
+    (base !== undefined && (pull.base.sha !== base || pull.state !== 'open'))) throw new Error('Commit is not verified for this ticket')
+  const evidence = await actionsEvidence(commands, work, sha, required,
+    { number, baseSha: pull.base.sha, ...pull.merge_commit_sha ? { mergeSha: pull.merge_commit_sha } : {} })
+  if (base !== undefined) {
+    const current = await readPull()
+    if (current.state !== 'open' || current.head.sha !== pull.head.sha || current.base.sha !== pull.base.sha
+      || current.head.repo?.full_name !== pull.head.repo.full_name)
+      throw new Error('Pull request changed while checking delivery CI')
+  }
+  return evidence
+}
+
+interface DeliveryState {
+  ticket: Ticket
+  assignment: Assignment | undefined
+  generation: number | undefined
+  criteria: readonly { id: string; text: string }[]
+  paused: boolean
+  required: RequiredChecks
+  pull: TicketPull | undefined
+  stamp: string
+}
+
+function deliveryState(host: ResourceHost, id: string): DeliveryState {
+  const ticket = host.store.tickets.get(id)
+  if (!ticket) throw new UserError('unknownTicket')
+  const assignment = ticket.assignments.at(-1)
+  const criteria = deliveryAcceptance(host, ticket)
+  const generation = host.reviewGeneration?.(id)
+  const settings = host.store.settings()
+  const required = githubKind.schema.parse(settings.sources.github?.config ?? {}).requiredChecks
+  const pull = required.length ? ticketPull(host, ticket) : undefined
+  const stamp = createHash('sha256').update(JSON.stringify([host.store.get(KV.settings.revision), settings.paused,
+    settings.executor, settings.sources.github, ticket.plan, ticket.ended, ticket.execution, ticket.assignments, ticket.deliveryCheck, generation, criteria, pull])).digest('hex')
+  return { ticket, assignment, generation, criteria, paused: settings.paused, required, pull, stamp }
+}
+
+interface DeliveryCheckout {
+  worktree: string
+  base: string
+  baseRef: string
+  candidate: string
+  branch: string
+  clean: boolean
+}
+
+/** Read actual Git identities rather than using a previously reported candidate or PR status. */
+async function deliveryCheckout(commands: Commands, { ticket, assignment }: DeliveryState, signal?: AbortSignal): Promise<DeliveryCheckout | undefined> {
+  const { execution } = ticket
+  const ownership = execution?.ownership, session = assignment?.writer?.session
+  if (!execution || !ownership?.verified || !assignment || !session || execution.preparation?.state !== 'verified' ||
+    !sameDirectory(execution.directory, ownership.identity.worktree) || execution.base?.sha !== ownership.identity.base.sha ||
+    execution.base?.ref !== ownership.identity.base.ref) return undefined
+  const { identity } = ownership
+  try {
+    const checkout = await inspectWorktree(commands, { ...identity, directory: identity.worktree, ticket: ticket.id,
+      assignment: assignment.id, session, mode: 'reuse',
+      previous: { ...identity, ticket: ownership.ticket, assignment: assignment.id, generation: ownership.generation, verified: true } })
+    const clean = !(await commands.git(['status', '--porcelain=v1', '--untracked-files=all'], checkout.worktree)).trim()
+    if ((await commands.git(['rev-parse', '--verify', 'HEAD'], checkout.worktree)).trim() !== checkout.head) return undefined
+    return { worktree: checkout.worktree, base: checkout.base.sha, baseRef: checkout.base.ref, candidate: checkout.head,
+      branch: checkout.branch, clean }
+  } catch (error) {
+    signal?.throwIfAborted()
+    if (error instanceof Error && error.name === 'AbortError') throw error
+    return undefined
+  }
+}
+
+/** Compare the same ticket and checkout observations before and after remote evidence collection. */
+const deliveryStamp = (state: DeliveryState, checkout: DeliveryCheckout | undefined) => JSON.stringify([state.stamp, checkout])
+
+async function deliveryPage(read: Read, id: string) {
+  const { host, signal, offset } = read
+  const cacheKey = `${read.sessionId}:${read.resource}`
+  // Later pages are historical evidence from this Session's offset 0; they never announce queue readiness.
+  if (offset !== 0) {
+    const cached = host.pages.get(cacheKey)
+    if (!cached) throw new Error('Read this delivery-check from offset 0 first')
+    return text(read, cached)
+  }
+  const commands = host.commands.withSignal(signal)
+  let state = deliveryState(host, id)
+  let checkout = await deliveryCheckout(commands, state, signal)
+  signal?.throwIfAborted()
+  let latest = deliveryState(host, id)
+  let changed = state.stamp !== latest.stamp
+
+  const local = () => {
+    const { ticket, assignment, generation, criteria, paused } = state
+    const ownsLease = generation !== undefined && generation === assignment?.writer?.generation &&
+      generation === ticket.execution?.ownership?.generation
+    const target = checkout?.clean && ownsLease ? { base: checkout.base, candidate: checkout.candidate, generation } : undefined
+    const reviews = ticket.assignments.flatMap(item => item.reviews?.evidence ?? [])
+    const view = viewDelivery(ticket.deliveryCheck, target, reviews, criteria)
+    const missing = new Set(view.missing)
+    if (!view.ready && missing.size === 0) missing.add('delivery_evidence')
+    if (!criteria.length) missing.add('registered_acceptance')
+    if (!ownsLease) missing.add('assignment_lease')
+    if (!checkout) missing.add('verified_worktree')
+    else if (!checkout.clean) missing.add('clean_worktree')
+    if (changed) missing.add('delivery_target_changed')
+    if (paused) missing.add('project_paused')
+    const outcome = ticket.ended?.outcome, report = assignment?.report?.state
+    if (outcome || report === 'failed' || report === 'blocked' || report === 'dropped') {
+      missing.add('ticket_not_queueable')
+    }
+    return { view, missing, target }
+  }
+
+  if (changed) { state = latest; checkout = undefined }
+  let result = local()
+  let actions: ActionsEvidence | undefined
+  let ciFailure: { code?: number; exit_code?: number } | undefined
+  let ciStatus = state.required.length ? 'pending_local_gate' : 'required_checks_unconfigured'
+  if (result.target && result.view.ready && result.missing.size === 0 && state.required.length) {
+    const { base, candidate } = result.target
+    try {
+      if (!state.required.every(check => check.workflowId)) ciStatus = 'required_workflow_unconfigured'
+      else if (!commitSha.safeParse(candidate).success || !commitSha.safeParse(base).success) ciStatus = 'unsupported_revision'
+      else {
+        actions = await ticketActions(commands, state.ticket, candidate, state.required, state.pull, base)
+        ciStatus = actions.satisfied ? 'passed' : 'not_passed'
+      }
+    } catch (error) {
+      signal?.throwIfAborted()
+      if (error instanceof Error && error.name === 'AbortError') throw error
+      ciStatus = 'unavailable'
+      if (error instanceof CliError) ciFailure = { ...error.code === undefined ? {} : { code: error.code },
+        ...error.exitCode === undefined ? {} : { exit_code: error.exitCode } }
+    }
+    // An Actions response is only usable if the ticket, lease, settings and clean checkout are still the same.
+    const prior = deliveryStamp(state, checkout)
+    latest = deliveryState(host, id)
+    checkout = await deliveryCheckout(commands, latest, signal)
+    signal?.throwIfAborted()
+    state = deliveryState(host, id)
+    if (latest.stamp !== state.stamp) checkout = undefined
+    changed = prior !== deliveryStamp(state, checkout) || (actions !== undefined &&
+      actions.repository.toLowerCase() !== commands.repository.toLowerCase())
+    result = local()
+    if (changed) {
+      actions = undefined
+      ciFailure = undefined
+      ciStatus = 'stale'
+    }
+  }
+  if (ciStatus !== 'passed') result.missing.add('required_ci')
+  const missing = [...result.missing]
+  const ready = missing.length === 0
+  const header = { ticket_id: id, assignment_id: state.assignment?.id ?? null,
+    base: checkout?.base ?? state.ticket.execution?.base?.sha ?? null, candidate: checkout?.candidate ?? null,
+    generation: state.generation ?? null, clean: checkout?.clean ?? false, missing, ready, ci_status: ciStatus,
+    status: ready ? 'ready_to_queue' as const : 'return_for_recheck' as const, mainline: { status: 'pending_merge' as const } }
+  const body = JSON.stringify({ observed_at: new Date().toISOString(), ticket_id: id, assignment_id: header.assignment_id,
+    base: header.base, candidate: header.candidate, generation: header.generation, mainline: header.mainline,
+    criteria: state.criteria, local: result.view,
+    revisions: checkout ? { base: { worktree: checkout.worktree, sha: checkout.base, ref: checkout.baseRef },
+      candidate: { worktree: checkout.worktree, sha: checkout.candidate, ref: `refs/heads/${checkout.branch}` } } : null,
+    ci: { status: ciStatus, required: state.required, evidence: actions ?? null, ...ciFailure ? { failure: ciFailure } : {} } })
+  const page = text(read, body)
+  host.pages.set(cacheKey, body)
+  return { ...header, ...page }
+}
+
 const THREAD_DECISIONS = 5
 const triggerLine = (trigger: Trigger) => ({ trigger_id: trigger.id, actor: trigger.actor.id, human: trigger.human, at: trigger.at,
   preview: preview(trigger.text), chars: trigger.text.length, read: `trigger/${trigger.id}` })
@@ -164,6 +380,21 @@ const ROUTES: readonly Route[] = [
     const host = main(read), tickets = host.store.tickets.list()
     const card = (ticket: Ticket) => ({ ...ticketCard(ticket), ...host.sessions.modelRetry(runningAssignment(ticket) && workerSessionId(ticket.id)) })
     return list(read, (offset, count) => tickets.slice(offset, offset + count).map(card))
+  }],
+  ['retro-followups', read => {
+    const items = main(read).store.tickets.list().flatMap(ticket => {
+      const backlog = new Map<string, { id: string; ticket_id: string; summary: string; created_at: string; read: string }>()
+      for (const [index, event] of ticket.deliveryCheck?.events.entries() ?? []) {
+        if (event.kind !== 'first-retro' && event.kind !== 'final-retro') continue
+        for (const finding of event.findings) {
+          if (finding.category !== 'optional' || backlog.has(finding.id)) continue
+          backlog.set(finding.id, { id: key('retro-followup', ticket.id, finding.id), ticket_id: ticket.id,
+            summary: finding.summary, created_at: event.at, read: `ticket/${ticket.id}/delivery-observation/${index}` })
+        }
+      }
+      return [...backlog.values()]
+    }).sort((a, b) => b.created_at.localeCompare(a.created_at))
+    return list(read, (offset, count) => items.slice(offset, offset + count))
   }],
   ['triggers', read => {
     const { store } = main(read)
@@ -302,24 +533,10 @@ const ROUTES: readonly Route[] = [
     const handoff = kind === 'plan' ? host.handoffs.get(id) : undefined
     if (!ticket && !handoff) throw new Error('Unknown ticket or handoff')
     const commands = host.commands.withSignal(read.signal)
-    const { requiredChecks: required } = githubKind.schema.parse(host.store.settings().sources.github?.config ?? {})
+    const required = githubKind.schema.parse(host.store.settings().sources.github?.config ?? {}).requiredChecks
     return sourcePage(read, 'github', async () => {
-      if (ticket) {
-        const ownPull = ticket.follows?.findLast(follow => follow.own && follow.thread.startsWith('github:'))
-        const origin = ownPull ? undefined : host.store.triggers.get(ticket.origin.triggerId)
-        const fromPull = origin?.source === 'github' && origin.meta.isPr === true
-        if (ownPull || fromPull) {
-          const number = ownPull ? Number(ownPull.thread.slice('github:'.length)) : origin?.meta.number
-          if (typeof number !== 'number' || !Number.isSafeInteger(number) || number <= 0) throw new Error('Ticket has no verifiable pull request')
-          const pull = await commands.api(pullEvidence, `pulls/${number}`)
-          if (pull.head.sha !== sha || !pull.head.repo || (ownPull && pull.head.repo.full_name.toLowerCase() !== commands.repository.toLowerCase())) {
-            throw new Error('Commit is not verified for this ticket')
-          }
-          return actionsEvidence(commands, { kind, id }, sha, required,
-            { number, baseSha: pull.base.sha, ...pull.merge_commit_sha ? { mergeSha: pull.merge_commit_sha } : {} })
-        }
-        await verifyCheckout(commands, ticket.execution?.directory, sha, kind)
-      } else if (handoff) {
+      if (ticket) return ticketActions(commands, ticket, sha, required, ticketPull(host, ticket))
+      if (handoff) {
         if (handoff.project.repository.toLowerCase() !== commands.repository.toLowerCase()) throw new Error('Handoff repository differs from configured repository')
         await verifyCheckout(commands, handoff.project.workspace, sha, kind)
       }
@@ -369,7 +586,18 @@ const ROUTES: readonly Route[] = [
         ({ thread: key, ...context ? { context: true } : {}, ...bound.has(key) ? { bound: true } : {} })
       const threads = [...subscribed.map(thread => marked(thread.key, !!thread.context?.includes(id))),
         ...[...bound].filter(key => !subscribed.some(thread => thread.key === key)).map(key => marked(key, false))]
-      return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId), ...retry }
+      return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId), ...retry,
+        ...ticket.plan || ticket.deliveryCheck ? { delivery_check: { read: `ticket/${id}/delivery-check` } } : {} }
+    }
+    if (section === 'delivery-check') {
+      if (part !== undefined) throw new Error('Unknown context resource')
+      return deliveryPage(read, id)
+    }
+    if (section === 'delivery-observation') {
+      if (!part || !/^(?:0|[1-9]\d*)$/.test(part)) throw new Error('Unknown delivery observation')
+      const item = ticket.deliveryCheck?.events[Number(part)]
+      if (!item) throw new Error('Unknown delivery observation')
+      return text(read, JSON.stringify(item))
     }
     if (section === 'reviews' || section === 'review') {
       const assignment = ticket.assignments.at(-1)
@@ -441,13 +669,16 @@ const ROUTES: readonly Route[] = [
   }],
 ]
 
+/** Canonical name for both reads and evidence validation, including stored legacy references. */
+export const resourceName = (name: string) => name.replace(/^event\//, 'trigger/').replace(/^task\//, 'ticket/').replace(/^observation\//, 'decision/')
+
 /**
  * Read a paginated resource for the main Session or a ticket's worker Session.
  * Legacy prefixes (`event/`, `task/`, `observation/`) remain accepted so references in older Session history stay readable.
  */
 export async function readResource(host: ResourceHost, resource: string, offset: number, limit: number | undefined, ticketId?: string,
   signal?: AbortSignal) {
-  const name = resource.replace(/^event\//, 'trigger/').replace(/^task\//, 'ticket/').replace(/^observation\//, 'decision/')
+  const name = resourceName(resource)
   const route = ROUTES.find(([route]) => route.endsWith('/') ? name.startsWith(route) : name === route)
   if (!route) throw new Error('Unknown context resource')
   const sessionId = ticketId ? workerSessionId(ticketId) : host.masterId

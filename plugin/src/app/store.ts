@@ -265,8 +265,18 @@ export class Store implements Repositories {
         const a = before.identity, b = after?.identity
         if (!after || after.ticket !== before.ticket || after.generation < before.generation || before.verified && !after.verified
           || !b || a.repository !== b.repository || a.commonDir !== b.commonDir || a.worktree !== b.worktree
-          || a.branch !== b.branch || a.base.ref !== b.base.ref || a.base.sha !== b.base.sha) {
+          || a.branch !== b.branch || a.base.ref !== b.base.ref) {
           throw new Error('Ticket worktree ownership and its pinned base cannot be removed, reassigned or overwritten by a stale generation')
+        }
+        if (a.base.sha !== b.base.sha) {
+          const repair = ticket.inputs.at(-1), writer = stored.assignments.at(-1)?.writer
+          if (!before.verified || stored.ended || ticket.ended || stored.execution?.active_writer || ticket.execution?.active_writer
+            || writer?.state !== 'idle' || writer.generation !== before.generation || after.generation !== before.generation
+            || repair?.kind !== 'mainline-repair' || repair.generation !== before.generation || repair.ref !== a.base.ref
+            || repair.previousBase !== a.base.sha || repair.base !== b.base.sha || !ticket.undelivered.includes(repair.id)
+            || ticket.inputs.length !== stored.inputs.length + 1 || stored.inputs.some(input => input.id === repair.id)) {
+            throw new Error('Changing a verified base requires an atomic repair Input for the confirmed idle generation')
+          }
         }
       }
       for (const previous of stored?.assignments ?? []) {

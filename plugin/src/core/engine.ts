@@ -2,7 +2,7 @@
 import { UserError } from './errors.ts'
 import { key } from './ids.ts'
 import { isoTime, liveTicket } from './model.ts'
-import type { Decision, Execution, ExecutionClaim, ExecutionIdentity, ExecutionResult, PlanTicket, PolicyEffect, ReviewAxis, ReviewConclusion, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { Decision, Execution, ExecutionClaim, ExecutionIdentity, ExecutionResult, MainlineRepair, PlanTicket, PolicyEffect, ReviewAxis, ReviewConclusion, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { PlanNode } from './plan.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
@@ -215,6 +215,10 @@ export class Engine {
   recordExecutionVerified(claim: ExecutionClaim, identity: ExecutionIdentity): ExecutionResult<Execution> {
     return this.repo.atomic(() => this.tickets.recordExecutionVerified(claim, identity))
   }
+  /** Atomically re-pin the idle, inspected Assignment and persist a repair Input for its Worker. */
+  pinMainlineRepair(claim: ExecutionClaim, repair: MainlineRepair): void {
+    this.repo.atomic(() => this.tickets.pinMainlineRepair(claim, repair))
+  }
   /** Record a preparation failure; does not release the write lease. */
   rejectExecution(claim: ExecutionClaim, reason: string): boolean {
     return this.repo.atomic(() => this.tickets.rejectExecution(claim, reason))
@@ -360,5 +364,5 @@ export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
 export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
   | 'assignmentInterrupted' | 'report' | 'recordReview' | 'recordDeliveryEvidence' | 'markUnrelated' | 'handback' | 'followForContext' | 'takeUp'
-  | 'reserveExecution' | 'recordExecutionVerified' | 'rejectExecution' | 'acquireExecutionWriter' | 'releaseExecutionWriter'
+  | 'reserveExecution' | 'recordExecutionVerified' | 'pinMainlineRepair' | 'rejectExecution' | 'acquireExecutionWriter' | 'releaseExecutionWriter'
   | 'resumeVerifiedCredential'>

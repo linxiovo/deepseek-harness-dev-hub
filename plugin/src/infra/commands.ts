@@ -142,13 +142,32 @@ export class Commands {
   /**
    * @param resolved - returns the resolved deployment setup, or throws while setup is still pending.
    * @param environment - variables overriding `process.env` for every command (such as isolated git settings).
+   * @param isolatedGit - optional Git-only environment replacing all inherited Git controls.
    */
-  constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>, private readonly signal: AbortSignal) {}
+  constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>, private readonly signal: AbortSignal,
+    private readonly isolatedGit?: NodeJS.ProcessEnv) {}
   get deployment(): Deployment { return this.resolved() }
   get repository(): string { return this.deployment.repository }
-  withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
+  withSignal(signal?: AbortSignal): Commands {
+    return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal]), this.isolatedGit) : this
+  }
+  /** Use only the explicitly supplied Git controls, not inherited repository, config, trace or transport overrides. */
+  withIsolatedGit(environment: NodeJS.ProcessEnv): Commands {
+    return new Commands(this.resolved, this.environment, this.signal, { ...this.isolatedGit, ...environment })
+  }
   async run(program: string, args: string[], cwd?: string, input?: string): Promise<string> {
     const environment = { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' }
+    if (program === 'git' && this.isolatedGit) {
+      const isolated: NodeJS.ProcessEnv = {}
+      for (const [key, value] of Object.entries(environment)) {
+        if (!/^(?:GIT_|NETRC$|GH_DEBUG$)|(?:TOKEN|PASSWORD|SECRET)/i.test(key)) isolated[key] = value
+        if (key.toUpperCase() === 'HOME') isolated.DSH_MAINLINE_GH_HOME = value
+      }
+      return this.execute(program, args, cwd, { ...isolated, ...this.isolatedGit }, input)
+    }
+    return this.execute(program, args, cwd, environment, input)
+  }
+  private async execute(program: string, args: string[], cwd: string | undefined, environment: NodeJS.ProcessEnv, input?: string): Promise<string> {
     if (process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(program)) {
       try { return await runWindowsBatch(program, args, cwd, this.signal, environment, input) }
       catch (error) { if (error instanceof CliError || error instanceof Error && error.name === 'AbortError') throw error; throw commandError(error, program) }

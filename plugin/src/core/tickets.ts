@@ -2,7 +2,7 @@
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { latestAssignment, liveTicket, readUntil, runningAssignment, settled, threadKey, waitsForPerson } from './model.ts'
-import type { Assignment, ChannelRef, Evaluation, Execution, ExecutionClaim, ExecutionIdentity, ExecutionResult, Follow, Mandate, PolicyEffect,
+import type { Assignment, ChannelRef, Evaluation, Execution, ExecutionClaim, ExecutionIdentity, ExecutionResult, Follow, MainlineRepair, Mandate, PolicyEffect,
   ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome, Trigger, TriggerDisposition, PlanTicket } from './model.ts'
 import type { AssessmentOutcome } from './ports.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
@@ -114,6 +114,26 @@ export class Tickets extends EnginePart {
     execution.preparation = { state: 'verified' }
     ticket.updatedAt = this.now(); this.repo.tickets.save(ticket)
     return { ok: true, value: execution }
+  }
+
+  /** Change only the inspected idle writer's base. Saving the repair Input and queuing its delivery share this transaction. */
+  pinMainlineRepair(claim: ExecutionClaim, repair: MainlineRepair): void {
+    const current = this.executionAttempt(claim)
+    if (!current || !claim.verified || !current.execution.ownership!.verified || current.execution.preparation?.state !== 'verified'
+      || !current.ticket.plan || !liveTicket(current.ticket) || runningAssignment(current.ticket)?.id !== claim.assignment
+      || current.assignment.writer?.state !== 'idle' || current.execution.active_writer
+      || current.ticket.assignments.some(item => item.writer && item.writer.state !== 'idle')) {
+      throw new Error('Mainline repair requires the same verified Plan Assignment and a confirmed idle writer')
+    }
+    const { ticket, execution, assignment } = current
+    if (ticket.delivery || waitsForPerson(ticket)) throw new Error(ticket.delivery?.error ?? `The Worker is ${assignment.report?.state}`)
+    if (repair.assignment !== claim.assignment || repair.previousBase !== claim.base.sha || repair.ref !== claim.base.ref ||
+      repair.base === claim.base.sha || ticket.inputs.some(input => input.id === repair.id))
+      throw new Error('The repair changed target, repeated its base or collided with another Input')
+    execution.base = { ref: repair.ref, sha: repair.base }
+    execution.ownership!.identity = { ...execution.ownership!.identity, base: { ...execution.base } }
+    if (assignment.reviews) delete assignment.reviews.target
+    this.addInput(ticket, { ...repair, kind: 'mainline-repair', generation: claim.generation, at: this.now(), readAt: null })
   }
 
   /** Persist a visible reason without dropping ownership or pretending prepare/worker processes have stopped. */
@@ -229,6 +249,8 @@ export class Tickets extends EnginePart {
       if (!follow) continue
       follow.closed = { at, outcome }
       this.repo.tickets.save(ticket)
+      // A PR lifecycle event is not Plan delivery evidence and must not advance a Plan node.
+      if (ticket.plan) continue
       const done = this.followsDone(ticket)
       if (!done || this.unfinished(ticket, at)) continue
       // Work resumed after the close and finished ends now.
@@ -498,17 +520,11 @@ export class Tickets extends EnginePart {
     if (this.options.credentialBlocked?.(ticketId)) return
     const ticket = this.repo.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
     if (!ticket || !liveTicket(ticket) || !assignment || assignment.state === 'ended') return
-    // A merge observed during this Assignment is already a repository fact. Do not restart a merged writer, and do not issue formal delivery.
-    const merged = ticket.follows?.find(follow => follow.closed?.outcome === 'merged' && follow.closed.at >= assignment.createdAt)?.closed
-    if (merged) {
-      this.end(ticketId, 'executor', 'merged', merged.at)
-      return
-    }
     const id = key('input', ticketId, 'credential-verified', blockerId)
     if (!ticket.inputs.some(input => input.id === id)) {
       const at = this.now()
-      const unread = ticket.inputs.flatMap(input => input.kind === 'trigger' && input.readAt === null && input.deliveredTo === assignment.id
-        ? [input.id] : [])
+      const unread = ticket.inputs.flatMap(input => (input.kind === 'trigger' || input.kind === 'mainline-repair') &&
+        input.readAt === null && input.deliveredTo === assignment.id ? [input.id] : [])
       ticket.inputs.push({ id, kind: 'text', text: recoveryNote, at })
       assignment.recoveryInputId = id
       ticket.undelivered = [...new Set([id, ...unread, ...ticket.undelivered])]
@@ -521,11 +537,11 @@ export class Tickets extends EnginePart {
   }
 
   /**
-   * Put back Trigger Inputs already delivered that no step of the worker took: a cancel may have dropped them, or a step
-   * that claimed them was cut off. The Executor removes an inbox copy before replaying them.
+   * Put back Trigger and mainline-repair Inputs already delivered that no step of the worker took: a cancel may have
+   * dropped them, or a step that claimed them was cut off. The Executor removes an inbox copy before replaying them.
    */
   private requeueUntaken(ticket: Ticket, replaced: Assignment): void {
-    const untaken = ticket.inputs.filter(input => input.kind === 'trigger' && input.readAt === null && input.deliveredTo === replaced.id
+    const untaken = ticket.inputs.filter(input => (input.kind === 'trigger' || input.kind === 'mainline-repair') && input.readAt === null && input.deliveredTo === replaced.id
       && !ticket.undelivered.includes(input.id))
     ticket.undelivered.unshift(...untaken.map(input => input.id))
   }

@@ -5,7 +5,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { lstat, mkdir } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
-import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, ExecutionClaim, ExecutionIdentity, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
+import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, ExecutionClaim, ExecutionIdentity, Executor, MainlineRepair, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
 import { runAsWorker, sameDirectory, verifyDirectory } from '../infra/environment.ts'
@@ -27,6 +27,9 @@ import { validateRepositoryIdentity } from './repository-identity.ts'
 import { inspectRepository, inspectWorktree, validateWorktreeDestination, WorktreeRejected } from './worktree.ts'
 
 const recoveryNote = promptFile('worker-recovery')
+const repairInstructions = promptFile('mainline-repair')
+const fullCommit = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/
+const repairOf = (ticket: Ticket) => ticket.inputs.findLast(input => input.kind === 'mainline-repair')
 const credentialResumeNote = promptFile('worker-credential-resume')
 const now = (): string => new Date().toISOString()
 /** Returns the worker session ID (`worker-<ticketId>`) for a ticket. */
@@ -83,7 +86,7 @@ export interface ExecutorHost {
   /** Where the Executor reports what happened to Assignments and Inputs. */
   readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
     | 'assignmentInterrupted' | 'resumeVerifiedCredential' | 'report' | 'reserveExecution' | 'recordExecutionVerified' | 'rejectExecution'
-    | 'acquireExecutionWriter' | 'releaseExecutionWriter'>
+    | 'pinMainlineRepair' | 'acquireExecutionWriter' | 'releaseExecutionWriter'>
   readonly commands: Pick<Commands, 'git' | 'repository'>
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
   /** Durable effect queue through which launches and input deliveries run. */
@@ -184,6 +187,10 @@ export function inputMessage(input: TicketInput, trigger?: object): string | und
   if (input.kind === 'policy-changed') return policyMessage(input.effect)
   if (input.kind === 'resumed') return RESUMED
   if (input.kind === 'note') return `Note from the orchestrator, for context only: ${input.text}`
+  if (input.kind === 'mainline-repair') {
+    const { kind, id, base, candidate, ref } = input
+    return JSON.stringify({ kind, id, base, candidate, ref, instructions: repairInstructions.replace('{base}', base) })
+  }
   return input.kind === 'text' ? input.text : undefined
 }
 /**
@@ -255,6 +262,8 @@ export class DshExecutor implements Executor {
   private readonly stopping = new Map<string, Promise<void>>()
   /** Claims and in-flight preparations created by this executor instance; a restarted process never inherits permission to release a writer. */
   private readonly claims = new Map<string, ExecutionClaim>()
+  /** Restored claims can be cleaned up, but cannot authorize turns until Git is inspected in this process. */
+  private readonly restoredClaims = new Set<ExecutionClaim>()
   private readonly launching = new Map<string, Promise<void>>()
   /** The effect queue runs at most one delivery per ticket. A suspension joins an already admitted Session send. */
   private readonly delivering = new Map<string, Promise<void | typeof Park>>()
@@ -327,7 +336,7 @@ export class DshExecutor implements Executor {
       }
       const inspected = await inspectWorktree(this.host.commands, { repository: claim.repository, directory: workspace,
         branch: claim.branch, base: claim.base, ticket: ticket.id, assignment: assignment.id,
-        session: workerSessionId(ticket.id), mode: 'reuse', previous: claim })
+        session: workerSessionId(ticket.id), mode: 'reuse', previous: claim, repairCandidate: repairOf(ticket)?.candidate })
       await verifyDirectory(workspace, this.host.context.subprocess, this.host.lifetime)
       this.requireCredential(ticket.id)
       const verified = this.host.engine.recordExecutionVerified(claim, inspected)
@@ -342,12 +351,67 @@ export class DshExecutor implements Executor {
       throw error
     }
   }
-  /** Reconstitute a Plan worker's verified durable claim after a process restart; no new generation is issued. */
-  private persistedPlanClaim(ticket: Ticket, assignment: Assignment): ExecutionClaim | undefined {
+  /** Recover a durable Plan writer; only repair may inspect a claim whose writer is already idle. */
+  private persistedPlanClaim(ticket: Ticket, assignment: Assignment, includeIdle = false): ExecutionClaim | undefined {
     if (!ticket.plan) return undefined
     const execution = ticket.execution, ownership = execution?.ownership, writer = assignment.writer
-    if (!execution || !ownership || !writer || writer.state === 'idle' || ownership.ticket !== ticket.id || writer.generation !== ownership.generation) return undefined
+    if (!execution || !ownership || !writer || (!includeIdle && writer.state === 'idle') || ownership.ticket !== ticket.id || writer.generation !== ownership.generation) return undefined
     return { ...ownership.identity, ticket: ticket.id, assignment: assignment.id, generation: ownership.generation, verified: ownership.verified }
+  }
+  /** Accept one durable repair Input; neither inbox delivery nor the later Worker reconciliation is a merge receipt. */
+  async requestMainlineRepair(ticketId: string, repair: MainlineRepair): Promise<void> {
+    const { store, commands } = this.host
+    const session = workerSessionId(ticketId)
+    if (!repair.id.trim() || !fullCommit.test(repair.base) || !fullCommit.test(repair.candidate) || !repair.ref.startsWith('refs/heads/'))
+      throw new Error('Mainline repair requires a stable request ID, two full commit hashes and a target branch ref')
+    const receiver = () => {
+      this.host.lifetime.throwIfAborted()
+      this.requireCredential(ticketId)
+      const ticket = store.tickets.get(ticketId), assignment = ticket && runningAssignment(ticket)
+      if (!ticket?.plan || !liveTicket(ticket) || !assignment || assignment !== latestAssignment(ticket))
+        throw new Error('Mainline repair requires an open Plan ticket with its running Assignment')
+      if (assignment.id !== repair.assignment) throw new PrepareFailed('The queued repair belongs to a different Assignment')
+      if (waitsForPerson(ticket)) throw new Error(`Worker ${assignment.report!.state}: ${assignment.report!.summary}`)
+      if (ticket.delivery) throw new Error(`Worker Input delivery failed: ${ticket.delivery.error}`)
+      const saved = ticket.inputs.find(input => input.id === repair.id)
+      if (saved && (saved.kind !== 'mainline-repair' || saved.assignment !== repair.assignment || saved.previousBase !== repair.previousBase ||
+          saved.base !== repair.base || saved.candidate !== repair.candidate || saved.ref !== repair.ref))
+        throw new Error('The repair request ID already belongs to a different Input')
+      return { ticket, assignment, saved }
+    }
+    if (receiver().saved) return
+    // Startup reconciliation may be stopping the interrupted Plan writer. Never infer idle from the process restart.
+    await this.stopped(ticketId)
+    const { ticket, assignment, saved } = receiver()
+    if (saved) return
+    const execution = ticket.execution, previous = this.persistedPlanClaim(ticket, assignment, true)
+    const config = worktreePreparationConfig(store.settings().executor)
+    if (!config.ok) throw new PrepareFailed(config.reason)
+    if (!execution || !previous?.verified || execution.preparation?.state !== 'verified' || execution.session !== session
+      || assignment.writer?.session !== session || previous.branch !== `agent/${execution.name}`
+      || previous.base.ref !== repair.ref || config.baseRef !== repair.ref || previous.base.sha !== repair.previousBase || previous.base.sha === repair.base
+      || !sameDirectory(execution.directory, previous.worktree)) throw new PrepareFailed('Repair does not match the verified Worker, worktree or target base ref')
+    const configured = await inspectRepository(commands, config.repository)
+    if (!sameDirectory(configured.repository, previous.repository) || !sameDirectory(configured.commonDir, previous.commonDir))
+      throw new PrepareFailed('The configured repository no longer owns the repair worktree')
+    await validateRepositoryIdentity(commands, configured.repository, commands.repository)
+    const inspect = () => inspectWorktree(commands, { mode: 'reuse', previous, repository: previous.repository, directory: execution.directory,
+      branch: previous.branch, base: previous.base, ticket: ticketId, assignment: assignment.id, session })
+    if ((await inspect()).head !== repair.candidate) throw new PrepareFailed('The queued repair candidate is no longer the verified worktree HEAD')
+    await commands.git(['merge-base', '--is-ancestor', previous.base.sha, repair.base], previous.worktree)
+    if (receiver().saved) return
+    const local = this.claims.get(assignment.id)
+    if (local && (local.generation !== previous.generation || local.base.sha !== previous.base.sha))
+      throw new PrepareFailed('The inspected Worker generation was replaced before repair')
+    if (local) await this.releaseClaim(local, 'Mainline advanced; stop the previous writer before repair', true)
+    // Stop can overlap the last Worker operation. Prove the actual clean candidate again before recording the pin.
+    if ((await inspect()).head !== repair.candidate || (await commands.git(['status', '--porcelain=v1', '--untracked-files=all'], previous.worktree)).trim())
+      throw new PrepareFailed('The repair requires the unchanged clean queued candidate in its verified worktree')
+    if (receiver().saved) return
+    const settings = worktreePreparationConfig(store.settings().executor)
+    if (!settings.ok || settings.repository !== config.repository || settings.baseRef !== config.baseRef || this.host.paused())
+      throw new PrepareFailed('Mainline repair was paused or its configured target changed during inspection')
+    this.host.engine.pinMainlineRepair(previous, repair)
   }
   /** Enqueues a `launch` effect for an accepted or resumed assignment; launches start in queue order as worker slots free up. */
   start(ticket: Ticket, assignment: Assignment): void {
@@ -414,8 +478,15 @@ export class DshExecutor implements Executor {
         if (this.credentialHeld(ticketId)) return Park // Leave all remaining IDs in the durable input queue.
         const ticket = this.host.store.tickets.get(ticketId)
         const assignment = ticket && liveTicket(ticket) ? runningAssignment(ticket) : undefined
-        const inputId = ticket?.undelivered[0]
-        if (!ticket || !assignment || inputId === undefined) return
+        if (!ticket || !assignment) return
+        let inputId = ticket.undelivered[0]
+        if (inputId === undefined) return
+        let input = ticket.inputs.find(item => item.id === inputId)
+        if (input?.kind === 'mainline-repair' && waitsForPerson(ticket)) {
+          inputId = ticket.undelivered.find(id => fromPerson(ticket.inputs.find(item => item.id === id)))
+          if (inputId === undefined) throw new Later()
+          input = ticket.inputs.find(item => item.id === inputId)
+        }
         // Waking an idle worker reserves a slot (including the extra slot reserved for human follow-ups).
         const sessionId = workerSessionId(ticketId)
         if (!woken && !this.running(ticket)) {
@@ -424,7 +495,6 @@ export class DshExecutor implements Executor {
           this.slots.reserve(ticketId, person ? 'person' : 'wake')
           woken = true
         }
-        const input = ticket.inputs.find(item => item.id === inputId)
         try {
           const loaded = this.host.context.agents.get(sessionId as SessionId)
           if (ticket.plan && loaded && !matchesWorker(ticket, loaded)) throw new PrepareFailed('The loaded Session is not the Plan ticket Worker')
@@ -460,7 +530,7 @@ export class DshExecutor implements Executor {
               }
             }
             for (const waiting of ticket.inputs) {
-              if (waiting.kind === 'trigger' && waiting.readAt === null && waiting.deliveredTo === assignment.id) {
+              if ((waiting.kind === 'trigger' || waiting.kind === 'mainline-repair') && waiting.readAt === null && waiting.deliveredTo === assignment.id) {
                 agent?.inbox.remove(this.host.sessions.promptedId(waiting.id))
               }
             }
@@ -485,6 +555,7 @@ export class DshExecutor implements Executor {
       this.requireCredential(ticket.id)
       const current = this.host.store.tickets.get(ticket.id)
       if (!current || !liveTicket(current) || runningAssignment(current)?.id !== assignment.id) throw new Error('The ticket ended or another Assignment took it over')
+      if (input.kind === 'mainline-repair' && waitsForPerson(current)) throw new Later('Worker repair is blocked')
       if (!this.writerAuthorized(ticket.id, workerSessionId(ticket.id))) {
         throw new PrepareFailed('The worker writer grant ended before Input delivery')
       }
@@ -665,6 +736,7 @@ export class DshExecutor implements Executor {
       throw new Error(`The writer of ticket ${claim.ticket} could not be released for its matching Session`)
     }
     this.claims.delete(claim.assignment)
+    this.restoredClaims.delete(claim)
   }
   /** A stop of the ticket's background work, which a launch or delivery waits for. */
   private track(ticketId: string, stop: Promise<void>): void {
@@ -678,13 +750,18 @@ export class DshExecutor implements Executor {
     const stopping = this.stopping.get(ticketId)
     if (stopping) await until(stopping, this.host.lifetime)
   }
+  /** Queue recovery may use its already approved pair only after the previous Worker is proved idle or live again. */
+  async settleMainlineWriter(ticketId: string): Promise<void> {
+    await this.stopped(ticketId)
+    this.host.lifetime.throwIfAborted()
+  }
   /** Only a grant from this running executor instance authorizes a worker turn; persisted leases alone do not. */
   writerAuthorized(ticketId: string, sessionId: string): boolean {
     if (this.credentialHeld(ticketId)) return false
     const ticket = this.host.store.tickets.get(ticketId)
     const assignment = ticket && latestAssignment(ticket)
     const claim = assignment && this.claims.get(assignment.id)
-    return !!ticket && liveTicket(ticket) && !!assignment && !!claim && claim.ticket === ticketId
+    return !!ticket && liveTicket(ticket) && !!assignment && !!claim && !this.restoredClaims.has(claim) && claim.ticket === ticketId
       && sessionId === workerSessionId(ticketId) && ticket.execution?.preparation?.state === 'verified'
       && ticket.execution.ownership?.generation === claim.generation
       && ticket.execution.active_writer?.assignment === assignment.id && ticket.execution.active_writer.session === sessionId
@@ -722,8 +799,9 @@ export class DshExecutor implements Executor {
     const { worktree, head, base } = await inspect()
     if (candidate !== head) throw new Error(`${purpose} candidate must match the ticket worktree HEAD`)
     authorize()
-    if (repair && repair !== candidate) {
-      try { await commands.git(['merge-base', '--is-ancestor', repair, candidate], worktree) }
+    const queuedCandidate = repairOf(store.tickets.get(ticketId)!)?.candidate
+    for (const ancestor of new Set([repair, queuedCandidate])) if (ancestor && ancestor !== candidate) {
+      try { await commands.git(['merge-base', '--is-ancestor', ancestor, candidate], worktree) }
       catch (error) { throw new Error('Candidate must retain the recorded repair lineage', { cause: error }) }
     }
     const checked = await collect(worktree, base.sha, stopped)
@@ -906,7 +984,7 @@ export class DshExecutor implements Executor {
     let fresh: boolean
     try { await lstat(workspace); fresh = false }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; fresh = true }
-    if (fresh && persisted?.verified) throw new PrepareFailed('The previously verified Plan worktree no longer exists; refusing to create a replacement')
+    if (fresh && (persisted?.verified || repairOf(ticket))) throw new PrepareFailed('The previously verified Plan worktree no longer exists; refusing to create a replacement')
     if (fresh) {
       await validateWorktreeDestination(this.host.commands, claim.repository, workspace)
       if (!current()) throw new PrepareFailed('The ticket ended before its directory was prepared')
@@ -915,7 +993,7 @@ export class DshExecutor implements Executor {
     // Existing paths, including retries and recovered Plan claims, must pass Git inspection; never infer ownership from a directory.
     const inspected = await inspectWorktree(this.host.commands, { repository: claim.repository, directory: workspace,
       branch: claim.branch, base: claim.base, ticket: ticket.id, assignment: assignment.id, session: workerSessionId(ticket.id),
-      ...fresh ? { mode: 'fresh' as const } : { mode: 'reuse' as const, previous: claim } })
+      ...fresh ? { mode: 'fresh' as const } : { mode: 'reuse' as const, previous: claim, repairCandidate: repairOf(ticket)?.candidate } })
     await verifyDirectory(workspace, this.host.context.subprocess, this.host.lifetime)
     const writer = this.host.store.tickets.get(ticket.id)?.assignments.find(item => item.id === assignment.id)?.writer
     const active = writer?.state === 'active' && writer.session === workerSessionId(ticket.id)
@@ -930,6 +1008,7 @@ export class DshExecutor implements Executor {
         throw new PrepareFailed('The worker writer grant was refused; the Session was not started')
       }
     }
+    this.restoredClaims.delete(claim)
     if (!current()) throw new PrepareFailed('The ticket ended before its worker Session was created')
     const sessionId = workerSessionId(ticket.id)
     const source = sourceTrigger(this.host, ticket)
@@ -1007,7 +1086,7 @@ export class DshExecutor implements Executor {
       if (event.type !== 'user/message' || ticketId === undefined || event.data.source.kind !== 'dsh-superagent' || this.host.closing()) return
       const message = event.data
       void this.background(Promise.resolve().then(() => {
-        const read = this.host.store.tickets.get(ticketId)?.inputs.filter(input => input.kind === 'trigger' && !input.readAt
+        const read = this.host.store.tickets.get(ticketId)?.inputs.filter(input => (input.kind === 'trigger' || input.kind === 'mainline-repair') && !input.readAt
           && this.host.sessions.promptedId(input.id) === message.id).map(input => input.id) ?? []
         if (read.length) this.host.engine.inputsRead(ticketId, read)
       }))
@@ -1036,7 +1115,10 @@ export class DshExecutor implements Executor {
       const running = runningAssignment(ticket), latest = latestAssignment(ticket)
       if (latest && !this.claims.has(latest.id)) {
         const persisted = this.persistedPlanClaim(ticket, latest)
-        if (persisted) this.claims.set(latest.id, persisted)
+        if (persisted) {
+          this.claims.set(latest.id, persisted)
+          this.restoredClaims.add(persisted)
+        }
       }
       if (this.host.credentialBlocked?.(ticket.id)) {
         this.suspendForCredential(ticket.id)

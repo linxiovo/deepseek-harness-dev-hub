@@ -13,12 +13,14 @@ import type {} from '@deepseek-ai/dsh-subprocess'
 import { existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
-import { Engine, latestAssignment, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
+import { Engine, key, latestAssignment, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { settingsPolicy, SettingsSchema } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
 import { workerProbe, type Deployment, type Machine } from '../deployment.ts'
 import { sameDirectory } from '../infra/environment.ts'
+import { fill } from '../infra/text.ts'
+import { promptFile } from './skill-files.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
 import { DshExecutor, sourceTrigger, workerSessionId } from '../executor/dsh.ts'
@@ -36,6 +38,8 @@ import { Planning } from './planning.ts'
 import { Plans } from './plans.ts'
 import { ScopedAttention } from './scoped-attention.ts'
 import { PlanDispatcher } from './plan-dispatch.ts'
+import { MainlineQueue } from './mainline-queue.ts'
+import { advanceMainline, precedes, prepareMainline, readMainline } from '../executor/mainline-git.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import { projectNavigationLink } from '../navigation.ts'
@@ -55,7 +59,7 @@ import { restoreReviewBindings } from './meter-recovery.ts'
 import { PLANNER_PRESET, ROUTER_PRESET, Sessions, splitterSessionId, WORKER_PRESET } from './sessions.ts'
 import { Settings } from './settings.ts'
 import { sourceContextOf, type SourceContextDeps } from './source-context.ts'
-import type { ResourceHost } from './resources.ts'
+import { approveMainline, authorizeMainline, type ResourceHost } from './resources.ts'
 import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { plannerTools, type PlannerToolsHost } from './tools/planner.ts'
 import { splitterTools, type SplitterToolsHost } from './tools/splitter.ts'
@@ -192,6 +196,7 @@ export class Runtime extends Service implements SourceHost {
       const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx,
         meter: { read: (id, signal) => this.readScopedMeter(id, signal) }, plans, handoffs,
         reviewGeneration: ticketId => runtime.executor?.reviewGeneration(ticketId),
+        credentialBlocked: ticketId => attention.blocked(ticketId),
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
       const sessions = this.sessions = new Sessions({ context: ctx, store, projectMeter, prompts, effects, health: board.claim('models'), masterId,
@@ -286,6 +291,24 @@ export class Runtime extends Service implements SourceHost {
           }
         } })
       this.planDispatcher = new PlanDispatcher({ store, plans, engine, executor, attention, bindWorker: (ticket, id) => sessions.bindWorker(ticket, id) })
+      const mainline = new MainlineQueue({ store, effects, lifetime: this.lifetime,
+        available: () => this.configured() && !this.closing(), paused: () => this.paused(),
+        approve: async (id, candidate, signal, replay) => {
+          if (replay) await executor.settleMainlineWriter(id)
+          return approveMainline(resources, id, candidate, signal, replay)
+        },
+        authorize: (id, approval) => {
+          if (!this.configured() || this.closing()) throw new Error('The project is not available for mainline writes')
+          authorizeMainline(resources, id, approval)
+        },
+        read: target => readMainline(commands, target),
+        precedes: (target, ancestor, descendant) => precedes(commands, target, ancestor, descendant),
+        prepare: (target, candidate, intent, queuedAt) => prepareMainline(commands, target, candidate, intent, queuedAt),
+        advance: (target, base, candidate, authorize) => advanceMainline(commands, target, base, candidate, authorize),
+        repair: (id, repair) => executor.requestMainlineRepair(id, repair),
+        changed: intent => sessions.relay(key('mainline', intent.id), fill(promptFile('mainline-relay'),
+          { status: intent.status, resource: `ticket/${intent.ticket_id}/mainline` })),
+      })
       // Reconcile historical dispatch receipts before serving even paused/setup-pending reads. This grants no tools or writer lease.
       this.planDispatcher.restoreBindings()
       for (const ticket of store.tickets.list()) {
@@ -312,7 +335,7 @@ export class Runtime extends Service implements SourceHost {
           if (kind === FEISHU && this.topicBinding?.claims(trigger)) return this.receiveBoundFeishu(trigger)
           return passes.receive(trigger)
         } }
-      this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, planDispatcher: this.planDispatcher, settings: this.settings,
+      this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, mainline, planDispatcher: this.planDispatcher, settings: this.settings,
         assessor, resources, projectMeter, attention, handoffs, plans, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,
@@ -464,7 +487,7 @@ export class Runtime extends Service implements SourceHost {
     try {
       await recoverPulls(source, this.lifetime)
       for (const ticket of this.store.tickets.open()) {
-        if (this.attention.blocked(ticket.id)) continue
+        if (ticket.plan || this.attention.blocked(ticket.id)) continue // A Plan resumes from durable Git intent, not a closed PR.
         const assignment = latestAssignment(ticket)
         if (assignment?.state !== 'running' && assignment?.state !== 'pending') continue
         // An observed merge is durable. Another restart must not resume the same Assignment if the PR's head can no longer be found.

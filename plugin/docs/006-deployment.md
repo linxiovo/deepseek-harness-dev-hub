@@ -238,7 +238,7 @@ Setup must succeed before polling or work starts. Overview lists missing require
    The clone's origin must identify the GitHub Source's repository: exactly one `origin` URL, over direct github.com HTTPS, SSH or Git, for that `owner/name`. Keep the worktree root outside the clone's main checkout, every worktree registered in it, and any other Git checkout; a symlink alias counts as its resolved path. A Ticket whose clone origin or destination crosses these boundaries is refused before its prepare command runs, with the reason on the Ticket, and no file is created or changed.
 
    List personal CLIs, such as one signed in to your own account, as blocked commands. A blocked name fails only when called by that name; an absolute path still runs.
-5. **Prompts.** Set the team sections: the GitHub disclosure line, review bots, the commit author and the auto-merge condition.
+5. **Prompts.** Set the team sections: the GitHub disclosure line, review bots and the commit author.
 
 ### Management API
 
@@ -317,6 +317,22 @@ The process environment that setup writes:
 - **git configuration** in the mounted state directory's `worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
 
 A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
+
+### Mainline write permissions
+
+The Plan merge queue uses the configured GitHub account to fast-forward the configured `refs/heads/...` directly, not to merge a PR. Configure branch rules that allow the intended fast-forward write, deny branch deletion and force pushes, and disable any independent auto-merge for the protected target. A server rejection leaves the attempt waiting; the plugin does not fall back to PR merge or silently override a rule.
+
+Mainline CI or branch rules that demand signatures or checks on the integration commit itself may reject this write. The queue does not synthesize signatures or rerun candidate checks as if they had run on the integration commit. Remove direct-merge advice from any saved team prompt overrides; they cannot grant merge authority.
+
+The packaged Worker tools and ordinary `gh` command cannot start an alternate merge. This deployment runs the host and Worker shell under the same OS user and account, so it cannot prevent an arbitrary Worker shell with usable credentials from writing remotely. Enforcing queue-only writes against untrusted shell commands requires isolation of the merge identity from Workers and GitHub rules granting the target write only to that identity; the default deployment is a cooperative workflow, not that security boundary.
+
+#### Verify queue-only writes on GitHub
+
+Use an operator-authorized disposable GitHub repository and an isolated profile, with the same branch protections and identity separation as the intended deployment. Use a test branch as the configured mainline; keep write probes off the deployment's real branch. Register and dispatch a Plan Ticket for that target. Configure GitHub Source `requiredChecks` with the disposable repository's workflow IDs and job names, and verify the workflows run for the test branch. See [Merging](003-execution.md#merging) for the candidate contract.
+
+1. **Inspect without writing.** Record the repository, full target ref and tip SHA. In GitHub, inspect the target's effective rulesets and branch protection, including push restrictions and bypass actors. Review enabled workflows and apps that can advance the branch or enroll a PR in auto-merge. Confirm that the configured queue identity can advance the target, that its credentials are unavailable to Workers, and that the Worker identity can publish a candidate branch but cannot advance the target. Record identity names or IDs, never credentials. A shared identity does not satisfy this prerequisite.
+2. **Verify GitHub refuses the Worker identity.** Publish a harmless fast-forward candidate from the Ticket's worktree and open its test PR. Satisfy its delivery checks and the PR's normal merge requirements so the probe isolates permission. As the operator, confirm both Git transport and the PR request use the recorded Worker identity, not a personal or substitute account. Attempt both a direct push to the disposable target and a merge of that PR. Require GitHub to deny both for lack of permission or an applicable branch rule, with the target SHA unchanged. A local shim refusal, conflict, unmet required check, network error or sign-in failure does not prove server enforcement. Stop if either probe advances the target.
+3. **Verify the queue identity succeeds.** Queue that same candidate through the Hub. Find the returned intent ID in `ticket/<id>/mainline` and independently read the target tip from GitHub. Require the expected target, base and candidate, plus `verified` with `integration` and `actual` both matching that tip. Record the intent ID, SHAs and evidence for both outcomes. Mark unexecuted checks **not run** if a prerequisite is unavailable; local Git fixtures do not substitute for this check.
 
 ## Try it
 

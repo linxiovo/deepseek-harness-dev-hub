@@ -69,8 +69,8 @@ Callers receive only their role's `Pick` of the Engine: `EngineForSources`, `Eng
 | Role | Method | Effect |
 | --- | --- | --- |
 | Sources | `receive(trigger)` | Stores a Trigger once and answers `stored`, `duplicate`, or `filtered` when no Source receives it; fans it out to the Tickets subscribed to its Threads, where a person's message resumes an ended Ticket at once unless processing is paused, and queues it for Eval on its primary Thread, unless it is a person's message that reached a Ticket, which stays that Ticket's |
-| Sources | `bindThread(ticketId, thread, own)` | Makes an open Ticket follow one of the Source's Threads, such as a pull request's, `own` when the Ticket opened it; a closed Thread bound again is open again. The Threads' closes, not a `ready` Report, end the Ticket |
-| Sources | `threadClosed(thread, outcome, at)` | A Thread closed: each open Ticket that follows it records the close, and ends once it is done with the Threads it follows (`followsDone`): no Thread it opened is open, or, when it opened none, every Thread it follows closed. It ends `merged` or `closed` as the latest of those closes did, unless work resumed after the close has not reported `ready`, or its Executor took up or answered a person's follow-up it decides after its latest Report other than `progress`, or the end of its last turn; a `dropped` Report then ends it as the close did |
+| Sources | `bindThread(ticketId, thread, own)` | Makes an open Ticket follow a Source Thread, marking it `own` if the Ticket opened it. Binding a closed Thread again reopens that follow. |
+| Sources | `threadClosed(thread, outcome, at)` | Records a followed Thread's close for standalone Tickets and applies the standalone completion rule in [003 Execution](003-execution.md). It never merges or ends a Plan Ticket. |
 | Main Session | `candidate(triggerId)` | The Eval that holds a Trigger, as its assessor sees it |
 | Main Session | `candidateDelivered(evalId)` | The Eval's candidate reached the main Session: its deadline counts from now |
 | Main Session | `decide(triggerId, outcome)` | Records an Eval Decision, or a direct Decision for an explicit request. Accept creates the Ticket, Mandate, Assignment and Subscriptions, and queues the acceptance acknowledgement, atomically. An inferred candidate ignored from its card records `ignoredFromCard` before the supplied reason. While `followupOwners` still owns a human follow-up, only stop is allowed |
@@ -330,9 +330,10 @@ Validation: `tests/session-meter.spec.ts` covers the read seam (absent vs corrup
   | State | Writer |
   | --- | --- |
   | Triggers, Threads, Decisions, Tickets, Assignments | Engine |
-  | A Ticket's worktree ownership and write access (`execution.ownership`, `execution.active_writer`) | `Tickets`, through `reserveExecution`, `recordExecutionVerified`, `rejectExecution`, `acquireExecutionWriter` and `releaseExecutionWriter`; the Executor supplies the Git verification and confirms the previous writer idle |
+  | A Ticket's worktree ownership and write access (`execution.ownership`, `execution.active_writer`) | `Tickets`; the Executor inspects Git and confirms the previous writer idle. `pinMainlineRepair` changes the base only with the idle fenced writer and the durable repair Input in the same transaction. |
   | Confirmed handoffs and immutable specifications | `Handoffs` |
   | Plan DAGs, root background, and addressed node instructions | `Plans` |
+  | Mainline FIFOs and integration observations | `MainlineQueue` |
   | Project Session attribution and business parentage | `ProjectMeter`, through `bind` at a trusted delegation seam |
   | A Source's read positions, and the meta it keeps on its Threads (`label`, `url`, `facts` and its own keys) | That Source, through `SourceContext` |
   | Settings and their history | Settings |
@@ -406,6 +407,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/planning.ts` | `Planning`: durable `planning` and `splitting` effects for the specification planner and the Plan DAG splitter |
 | `src/app/plans.ts` | `Plans`: validates and atomically registers authorized Plan DAGs; keeps plan background separate from node instructions |
 | `src/app/plan-dispatch.ts` | `PlanDispatcher`: validates Frontier predecessors, reserves a launch slot, atomically claims a node into a stable Ticket/Assignment, and rearms the same claim on restart |
+| `src/app/mainline-queue.ts` | Durable per-target FIFO, Ticket attempts, Worker repair handoff, and actual Git verification before recording merge evidence |
 | `src/app/scoped-attention.ts` | `ScopedAttention`: durable Plan Ticket credential blockers, deduplicated Hub relays, shared management and Hub projections, and verified continuation; contract in `plugin/docs/015-scoped-attention.md` |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
@@ -443,8 +445,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
 | `src/executor/dsh.ts` | The DshExecutor, its worktree preparation and writer-claim flow, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents` (descendant cleanup per `010-session-boundaries.md`), `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
-| `src/executor/worktree.ts` | `inspectRepository`, `inspectWorktree` and `validateWorktreeDestination`, read-only Git checks through `Commands.git`: the configured repository must be a clone's main checkout, a Ticket's `worktree` must be its canonical linked secondary worktree with the same common git directory, `--show-toplevel`, branch, pinned base (exact on a fresh path, an ancestor for reuse) and, on reuse, a previously verified `ExecutionClaim` of the same ticket and assignment, and a Ticket destination or worktree root must lie outside the clone's checkouts and any unrelated Git checkout; refusals are `WorktreeRejected` with a `WorktreeRejectionCode`, and it never creates, repairs or deletes |
+| `src/executor/worktree.ts` | Read-only inspection of the canonical clone, linked worktrees, branch, base and destination. On repair, Worker reclaim accepts the last queued candidate as a temporary lineage anchor, but evidence still requires the new base. |
 | `src/executor/repository-identity.ts` | `validateRepositoryIdentity` reads the clone's local `remote.origin.url` without modifying it or contacting GitHub; it accepts one direct github.com HTTPS, SSH or Git URL for the configured owner/name, case-insensitively and with an optional `.git` suffix, and refuses missing, ambiguous, unsupported or mismatched origins with `WorktreeRejected` |
+| `src/executor/mainline-git.ts` | Isolated GitHub branch observation, reproducible integration commits, and lease-checked fast-forward writes; never changes the checkout refs |
 | `src/executor/doc-tree.ts` | Candidate-bound Doc Tree structure and changed-path evidence; see `011-doc-tree-impact.md` |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. Supports native Windows batch wrappers and process-tree cancellation. `CliError` carries the code reported by the CLI, such as a GitHub HTTP status; when nothing is printed, the error describes how the command ended without exposing its arguments. `validItems` skips and counts malformed list items |
 | `src/infra/environment.ts` | The agent's process environment: platform-specific command shims, the git configuration and credential helper, `runAsWorker` through the DeepSeek Harness subprocess interface, and the checks of the environment and of a Ticket's directory |
@@ -521,6 +524,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/worktree-inspector.spec.ts` | `inspectRepository`, `inspectWorktree` and `validateWorktreeDestination` on temporary Git repositories: a canonical clone and linked worktree accepted, while an ordinary folder, a foreign repository or worktree, a wrong branch or base, and an alias path are refused without changing the tree; destination isolation refuses the primary checkout, registered worktrees, symlink aliases and unrelated Git checkouts without creating paths; reuse requires a previously verified claim |
 | `tests/doc-tree.spec.ts` | Doc Tree structure and committed-candidate evidence in real Git repositories |
 | `tests/repository-identity.spec.ts` | Real Git clones: the fixture's matching origin, GitHub HTTPS/SSH/Git variants, and refusals of wrong owner or repository, missing or duplicate origins, and disguised or unsupported URLs without modifying the clone |
+| `tests/mainline-git.spec.ts` | Real Git mainline fetches, strict ancestry and atomic lease rejection on a temporary bare transport |
 | `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the worker, read-only router and planner presets it defines |
 | `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown |
 | `tests/passes.spec.ts` | Passes: one at a time, the ones asked for during a pass run as one after it, and the runtime health a failed pass reports |
@@ -533,6 +537,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
 | `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |
+| `tests/mainline-queue.spec.ts` | Hub queue admission, versioned CI, same-target serialization, crash-boundary restart, real code/Doc Tree conflicts in the Worker worktree and fresh verification without Frontier release |
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
 | `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, review evidence and child-only review submission, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
@@ -594,6 +599,7 @@ A generated column is computed from its row's JSON and is empty outside its set,
 | Main Session | `master-id` |
 | Session prompt history | `session-prompts:<session id>` |
 | Session meter | `session-meter:<session id>`: the durable meter state, whose `cursor` is the exclusive upper bound of the folded own events and the next read's first seq |
+| Mainline intent | `mainline-ticket:<ticket id>` versioned attempts and `mainline-pending:<target>` pending Ticket order; effect rows are committed alongside the relevant queue or repair transition |
 | Source state | Read positions such as `github-cursor:<number>`, PR CI fingerprints and seen Feishu-topic messages; keys begin with the kind or `thread-` plus a Thread key |
 | Display names | `source-labels:<source id>` |
 

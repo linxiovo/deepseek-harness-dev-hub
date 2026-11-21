@@ -112,6 +112,8 @@ The dispatch transaction reserves the existing `DshExecutor` launch slot synchro
 
 `plan/<id>` and `plan/<id>/node/<node-id>` join the immutable graph with the durable node state: `claimed`, `running`, `awaiting-delivery`, `delivered`, `failed` or `stopped`. A formal delivery receipt must name the exact claimed Ticket and Assignment plus its receipt, candidate and verification timestamp. On restart, the dispatcher rearms the same pending Assignment and the Executor adopts a persisted Plan writer claim without issuing a new generation. Stable `assignment:<ticket>` delivery IDs prevent a second Worker message; a missing start receipt is completed when the existing Session is found and the Assignment start is recorded.
 
+`awaiting-delivery` is not delivery. A ready report can put an open Plan Ticket in that state without ending it; a baseline repair returns it to running until the Worker reports ready again. A verified mainline result also waits for the separate formal receipt.
+
 A credential pause keeps the claim and does not add a node status. `plan/<id>/node/<node-id>` and a dispatch replay include `attention` only while the claimed Ticket has a current credential blocker. The Hub can read `plan/<id>/attention` for the Plan summary. Verifying the credential resumes the existing Assignment; it is not a formal delivery receipt and does not unlock a successor. See `015-scoped-attention.md`.
 
 ## Optional Feishu entry

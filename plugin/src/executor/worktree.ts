@@ -26,7 +26,9 @@ export type WorktreeInspection = {
   ticket: string
   assignment: string
   session: string
-} & ({ mode: 'fresh'; previous?: never } | { mode: 'reuse'; previous: ExecutionClaim | null | undefined })
+} & ({ mode: 'fresh'; previous?: never } | { mode: 'reuse'; previous: ExecutionClaim | null | undefined
+  /** Writer admission only: a durable repair's inspected candidate is the required ancestor before its Worker merges the new base. */
+  repairCandidate?: string })
 
 export type WorktreeRejectionCode = 'invalid-target' | 'missing-worktree' | 'not-worktree' | 'wrong-repository'
   | 'wrong-branch' | 'wrong-base' | 'missing-ownership' | 'wrong-ownership'
@@ -239,11 +241,13 @@ export async function inspectWorktree(commands: Pick<Commands, 'git'>, input: Wo
   if (input.mode === 'fresh' && head.toLowerCase() !== sha) {
     throw new WorktreeRejected('wrong-base', `Ticket worktree ${directory} starts at ${head}, not the pinned ${base.ref} base ${sha}.`)
   }
-  if (input.mode === 'reuse' && head.toLowerCase() !== sha) {
-    try { await commands.git(['merge-base', '--is-ancestor', sha, head], worktree) }
+  const ancestor = input.mode === 'reuse' ? input.repairCandidate ?? sha : sha
+  if (!/^(?:[a-f\d]{40}|[a-f\d]{64})$/.test(ancestor)) throw new WorktreeRejected('wrong-base', 'Invalid pinned worktree ancestor')
+  if (input.mode === 'reuse' && head.toLowerCase() !== ancestor) {
+    try { await commands.git(['merge-base', '--is-ancestor', ancestor, head], worktree) }
     catch (error) {
       if (error instanceof CliError && error.exitCode === 1) {
-        throw new WorktreeRejected('wrong-base', `Ticket worktree ${directory} no longer descends from its pinned ${base.ref} base ${sha}.`)
+        throw new WorktreeRejected('wrong-base', `Ticket worktree ${directory} no longer descends from its pinned ${base.ref} ${input.repairCandidate ? 'repair candidate' : 'base'} ${ancestor}.`)
       }
       throw error
     }

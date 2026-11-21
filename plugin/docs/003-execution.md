@@ -125,23 +125,25 @@ These wrappers and directories establish defaults, not a security boundary. A wo
 
 ## Merging
 
-Auto-merge is governed by the **Delivery requirements** prompt. The host has no merge-specific decision logic.
+Only the Hub can call `orchestrator_queue_merge({ticket_id, candidate})` for a registered Plan Ticket. `candidate` is the full lowercase SHA. The host requires the verified clean worktree and its pinned base, current delivery-check evidence including required CI, and the configured target `refs/heads/...`. A PR used for CI must still be open and point to that candidate and target. The queue never requests a GitHub PR merge or enables auto-merge.
 
-By default, the Executor never enables auto-merge as the agent account: GitHub attributes the merge to whoever enabled it. Delivery requirements must name another account's CLI for merging. Without one, people merge the pull request.
+The host persists the intent and FIFO position before starting Git. One write at a time runs for a GitHub repository and branch. The queue creates an intent-specific `integration` commit whose only parent is the reviewed candidate and whose tree is identical. The host persists its SHA before advancing the actual remote branch from the exact reviewed base. Ticket detail (`GET tickets/:id` and `orchestrator_read ticket/<id>`) shows `mainline` once queued; `ticket/<id>/mainline` pages attempts newest first. Each attempt names `id`, `status`, `target`, `candidate`, the reviewed `base`, the prepared `integration`, and `actual` once observed. A `verified` attempt means the integration commit was observed on the target, which is **not** formal delivery or permission to dispatch successors.
 
-The default instructions allow auto-merge only for a pull request opened for the Ticket, when it is ready, the required approvals cover the head commit, and additions plus deletions total fewer than 200 lines. Before pushing another revision, the Executor withdraws auto-merge.
+If the target moved forward before the candidate could be applied, the intent records `repair` and the host sends a durable input to that Ticket's Worker with the new pinned base. Resolve code and Doc Tree conflicts in the Ticket worktree, preserve the earlier candidate's lineage, and obtain fresh dual review, acceptance, test, Doc Tree and CI evidence on the new pair. The Hub queues the new candidate; failed or unavailable repair and recheck remain visible. A rewritten target, a candidate already on the branch before the queued write, or a rejected Git write without matching verification is `waiting`, not success.
 
-Reviews without a body, such as approvals, also arrive as Triggers and can wake an Executor waiting for review. These instructions govern the agent, not GitHub's merge rules. To enforce approvals, require them in branch protection and dismiss stale approvals. Omit the merge CLI or remove the auto-merge paragraph to require manual merging.
+After interruption, a queued intent can continue at the original base if the exact pair still passes the gate and the previous Worker is confirmed idle or still holds the valid lease. An `applying` intent checks actual Git before authorizing any write: if its integration commit is present, it records the missing observation without pushing again. A branch containing only the candidate, not the intent-specific commit, does not prove a queue write. Processing pause prevents new writes but does not erase a completed write. See `006-deployment.md` for repository permissions.
+
+A current Plan credential blocker prevents a new mainline write or a new repair dispatch for that Ticket. It does not erase an integration already observed on the target.
 
 ## How a Ticket ends
 
-- **Ready without a pull request:** a `ready` Report ends the Ticket as completed.
+- **Standalone ready without a pull request:** a `ready` Report ends a non-Plan Ticket as completed. Plan ready reports remain open.
 - **Nothing to do:** an Executor that finds no work for a person to act on, such as a request that does not reproduce or is superseded, reports `dropped`. The Ticket ends without a message, unless a matched rule asks for one, and a person's later message on its Threads resumes it.
 ### Pull requests
 
 A Ticket follows the pull request it started from once its Executor reports it. It also follows each pull request opened from its branch once reported by the Executor or found by the GitHub Source. Reopened pull requests are followed again.
 
-The Ticket is done when none of the pull requests it opened remain open. If it opened none, all pull requests it follows must be closed. It then ends with the outcome of the last relevant close and keeps its Subscriptions, allowing a later human comment to resume it.
+A standalone Ticket is done when none of the pull requests it opened remain open. If it opened none, all pull requests it follows must be closed. It then ends with the outcome of the last relevant close and keeps its Subscriptions, allowing a later human comment to resume it. For Plan Tickets, PR close or merge facts do not end the Ticket or establish mainline verification.
 
 A close does not end the Ticket while resumed, retried or recovered work is unfinished. It also waits if the Executor took up a follow-up it owns (by recording it internally) or answered it but has not since made a non-progress Report or ended a turn after reading that message. A later `ready` Report ends the Ticket once the same pull-request completion rule is satisfied.
 

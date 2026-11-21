@@ -104,6 +104,36 @@ it('displays verified worktree identity and actual writer, then names a rejected
   expect(rows().map(([label]) => label)).not.toContain(en.executionBaseSha)
 })
 
+it('shows the observed mainline separately from the reviewed baseline and preserves queue integration across intent states', async () => {
+  const base = 'a'.repeat(40), candidate = 'b'.repeat(40), actual = 'c'.repeat(40), integration = 'd'.repeat(40)
+  const atTime = '2026-09-22T00:00:00Z'
+  server.ticketDetails.t1!.mainline = { id: 'intent-1', ticket_id: 't1', status: 'verified', queued_at: atTime,
+    target: { repository: '/srv/widgets', slug: 'acme/widgets', ref: 'refs/heads/main' },
+    assignment: 'a1', generation: 1, base, candidate, actual, integration,
+    verification: { status: 'passed', method: 'integration_on_target', at: atTime } }
+  at({ page: 'execution', id: 't1' })
+  await mount()
+  expect(text()).toContain(zh['mainline.verified'])
+  expect(all('.dt-kv > div').map(row => row.textContent)).toEqual(expect.arrayContaining([
+    `${zh.executionBaseSha}${base}`, `${zh.mainlineCandidate}${candidate}`, `${zh.mainlineActual}${actual}`,
+    `${zh.mainlineIntegration}${integration}`,
+  ]))
+
+  const withoutActual = { ...server.ticketDetails.t1!.mainline! }
+  delete withoutActual.actual
+  server.ticketDetails.t1!.mainline = { ...withoutActual, status: 'applying' }
+  await remount()
+  expect(all('.dt-kv > div').map(row => row.textContent)).toContain(`${zh.mainlineActual}${zh.empty}`)
+  expect(all('.dt-kv > div').map(row => row.textContent)).toContain(`${zh.mainlineIntegration}${integration}`)
+
+  server.ticketDetails.t1!.mainline = { ...withoutActual, status: 'waiting', actual: candidate }
+  delete server.ticketDetails.t1!.mainline.integration
+  await remount(en)
+  expect(all('.dt-kv > div').map(row => row.textContent)).toContain(`${en.mainlineActual}${candidate}`)
+  expect(all('.dt-kv > div').map(row => row.textContent)).toContain(`${en.mainlineIntegration}${en.empty}`)
+  expect(all('.dt-kv > div').map(row => row.textContent)).not.toContain(`${en.mainlineIntegration}${candidate}`)
+})
+
 it('marks an old directory-only Ticket unverified without guessing repository, branch, or writer', async () => {
   const t1 = server.ticketDetails.t1!
   server.ticketDetails.t1 = { ...t1, execution: { name: 'old-ticket', directory: '/w/t1', preparation: { state: 'unverified' } } }

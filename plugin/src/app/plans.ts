@@ -2,11 +2,13 @@ import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 import { UserError } from '../core/errors.ts'
 import { key } from '../core/ids.ts'
+import { latestAssignment } from '../core/model.ts'
 import { PLAN_FEATURE_KINDS, PLAN_ROLES, validatePlanDraft, type Plan, type PlanDeliveryReceipt, type PlanDraft, type PlanMessage, type PlanNode,
   type PlanNodeClaim, type PlanNodeState, type PlanTarget } from '../core/plan.ts'
 import { KV } from '../kv.ts'
 import type { Effects } from './effects.ts'
 import type { Handoffs } from './handoffs.ts'
+import { mainlineIntent } from './mainline-queue.ts'
 import type { Store } from './store.ts'
 
 const SlugSchema = z.string().max(80).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Expected a lowercase slug')
@@ -90,7 +92,17 @@ export class Plans {
     if (!result.success || result.data.planId !== id || result.data.nodeId !== nodeId || result.data.claim.planId !== id || result.data.claim.nodeId !== nodeId) {
       throw new UserError('invalidPlan', { detail: `Node state ${id}/${nodeId} is malformed or belongs to another Plan` })
     }
-    return result.data
+    const state = result.data
+    if (state.status === 'running' || state.status === 'awaiting-delivery') {
+      const ticket = this.store.tickets.get(state.claim.ticketId), assignment = ticket && latestAssignment(ticket)
+      if (ticket && !ticket.ended && assignment?.id === state.claim.assignmentId) {
+        const merged = mainlineIntent(this.store, ticket.id)
+        const repair = ticket.inputs.findLast(input => input.kind === 'mainline-repair')
+        const ready = assignment.report?.state === 'ready' && (!repair || assignment.report.at > repair.at)
+        state.status = ready || merged?.status === 'verified' ? 'awaiting-delivery' : 'running'
+      }
+    }
+    return state
   }
 
   private requireNode(id: string, nodeId: string): { plan: Plan; node: PlanNode } {

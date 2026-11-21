@@ -28,6 +28,7 @@ export async function recoverPulls(ctx: SourceContext, signal: AbortSignal): Pro
     return pull
   }
   for (const ticket of ctx.tickets.open()) {
+    if (ticket.plan) continue // A Plan resumes from durable claims and Git intent, not PR discovery.
     const tracked = pullsOf(ticket, true).filter(number => Number.isSafeInteger(number) && number > 0)
     const identity = ticket.execution?.ownership?.identity
     if (identity) {

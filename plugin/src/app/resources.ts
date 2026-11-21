@@ -24,6 +24,7 @@ import { sameDirectory } from '../infra/environment.ts'
 import { KV } from '../kv.ts'
 import type { Handoffs } from './handoffs.ts'
 import type { Plans } from './plans.ts'
+import { mainlineAttempts, mainlineIntent, type MainlineIntent, type MergeApproval } from './mainline-queue.ts'
 import type { ProjectMeter } from './project-meter.ts'
 import type { ScopedAttention } from './scoped-attention.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
@@ -47,6 +48,7 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'plan/<id>/node/<node-id>', holds: 'node claim or waiting reason, delivery and instructions' },
   { name: 'plan/<id>/attention', holds: 'Plan status counts and credential actions' },
   { name: 'ticket/<id>', holds: 'ticket, claim, worktree, active writer and work history', executor: true },
+  { name: 'ticket/<id>/mainline', holds: 'mainline attempts and actual Git verification, not delivery', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
   { name: 'ticket/<id>/delivery-check', holds: 'current candidate queue readiness and paginated canonical acceptance, ordered evidence and required CI; never formal delivery', executor: true },
   { name: 'ticket/<id>/delivery-observation/<n>', holds: 'one durable delivery observation', executor: true },
@@ -87,6 +89,7 @@ export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(r
 export interface ResourceHost {
   ownsSession?(id: string): boolean | Promise<boolean>
   reviewGeneration?(ticketId: string): number | undefined
+  credentialBlocked?(ticketId: string): boolean
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
   readonly handoffs?: Pick<Handoffs, 'spec'>
   readonly plans?: Pick<Plans, 'get'>
@@ -181,8 +184,9 @@ async function sourcePage(read: Read, source: string, fetch: () => Promise<unkno
 
 const commitSha = z.string().regex(/^[0-9a-f]{40}$/)
 const pullEvidence = z.looseObject({
-  head: z.looseObject({ sha: commitSha, repo: z.looseObject({ full_name: z.string() }).nullable() }),
-  base: z.looseObject({ sha: commitSha }), merge_commit_sha: commitSha.nullable(), state: z.string().optional(),
+  head: z.looseObject({ sha: commitSha, ref: z.string().optional(), repo: z.looseObject({ full_name: z.string() }).nullable() }),
+  base: z.looseObject({ sha: commitSha, ref: z.string().optional(), repo: z.looseObject({ full_name: z.string() }).nullable().optional() }),
+  merge_commit_sha: commitSha.nullable(), state: z.string().optional(),
 })
 /** A local commit belongs to work only when its checkout root and GitHub remote match the configured repository. */
 async function verifyCheckout(commands: Commands, directory: string | undefined, sha: string, kind: 'ticket' | 'plan'): Promise<void> {
@@ -214,22 +218,25 @@ function ticketPull(host: ResourceHost, ticket: Ticket): TicketPull | undefined 
 
 /** The delivery reader supplies its pinned base and already-verified worktree candidate, not a caller SHA. */
 async function ticketActions(commands: Commands, ticket: Ticket, sha: string, required: RequiredChecks,
-  associatedPull: TicketPull | undefined, base?: string): Promise<ActionsEvidence> {
+  associatedPull: TicketPull | undefined, base?: string, checkout?: DeliveryCheckout): Promise<ActionsEvidence> {
   const work = { kind: 'ticket', id: ticket.id } as const
   if (!associatedPull || base !== undefined) await verifyCheckout(commands, ticket.execution?.directory, sha, 'ticket')
-  if (!associatedPull) return actionsEvidence(commands, work, sha, required)
+  if (!associatedPull) return actionsEvidence(commands, work, sha, required, undefined, checkout?.branch)
   const { number } = associatedPull
   if (typeof number !== 'number' || !Number.isSafeInteger(number) || number <= 0) throw new Error('Ticket has no verifiable pull request')
   const readPull = () => commands.api(pullEvidence, `pulls/${number}`)
+  const matchesTarget = (pr: z.infer<typeof pullEvidence>) => !checkout || (
+    `refs/heads/${pr.base.ref}` === checkout.baseRef && pr.base.repo?.full_name.toLowerCase() === commands.repository.toLowerCase() &&
+    associatedPull.own && pr.head.ref === checkout.branch)
   const pull = await readPull()
   if (pull.head.sha !== sha || !pull.head.repo || (associatedPull.own && pull.head.repo.full_name.toLowerCase() !== commands.repository.toLowerCase()) ||
-    (base !== undefined && (pull.base.sha !== base || pull.state !== 'open'))) throw new Error('Commit is not verified for this ticket')
+    (base !== undefined && (pull.base.sha !== base || pull.state !== 'open' || !matchesTarget(pull)))) throw new Error('Commit is not verified for this ticket')
   const evidence = await actionsEvidence(commands, work, sha, required,
     { number, baseSha: pull.base.sha, ...pull.merge_commit_sha ? { mergeSha: pull.merge_commit_sha } : {} })
   if (base !== undefined) {
     const current = await readPull()
     if (current.state !== 'open' || current.head.sha !== pull.head.sha || current.base.sha !== pull.base.sha
-      || current.head.repo?.full_name !== pull.head.repo.full_name)
+      || current.head.repo?.full_name !== pull.head.repo.full_name || !matchesTarget(current))
       throw new Error('Pull request changed while checking delivery CI')
   }
   return evidence
@@ -241,6 +248,7 @@ interface DeliveryState {
   generation: number | undefined
   criteria: readonly { id: string; text: string }[]
   paused: boolean
+  credentialBlocked: boolean
   required: RequiredChecks
   pull: TicketPull | undefined
   stamp: string
@@ -252,12 +260,13 @@ function deliveryState(host: ResourceHost, id: string): DeliveryState {
   const assignment = ticket.assignments.at(-1)
   const criteria = deliveryAcceptance(host, ticket)
   const generation = host.reviewGeneration?.(id)
+  const credentialBlocked = host.credentialBlocked?.(id) === true
   const settings = host.store.settings()
   const required = githubKind.schema.parse(settings.sources.github?.config ?? {}).requiredChecks
   const pull = required.length ? ticketPull(host, ticket) : undefined
-  const stamp = createHash('sha256').update(JSON.stringify([host.store.get(KV.settings.revision), settings.paused,
+  const stamp = createHash('sha256').update(JSON.stringify([host.store.get(KV.settings.revision), settings.paused, credentialBlocked,
     settings.executor, settings.sources.github, ticket.plan, ticket.ended, ticket.execution, ticket.assignments, ticket.deliveryCheck, generation, criteria, pull])).digest('hex')
-  return { ticket, assignment, generation, criteria, paused: settings.paused, required, pull, stamp }
+  return { ticket, assignment, generation, criteria, paused: settings.paused, credentialBlocked, required, pull, stamp }
 }
 
 interface DeliveryCheckout {
@@ -295,15 +304,7 @@ async function deliveryCheckout(commands: Commands, { ticket, assignment }: Deli
 /** Compare the same ticket and checkout observations before and after remote evidence collection. */
 const deliveryStamp = (state: DeliveryState, checkout: DeliveryCheckout | undefined) => JSON.stringify([state.stamp, checkout])
 
-async function deliveryPage(read: Read, id: string) {
-  const { host, signal, offset } = read
-  const cacheKey = `${read.sessionId}:${read.resource}`
-  // Later pages are historical evidence from this Session's offset 0; they never announce queue readiness.
-  if (offset !== 0) {
-    const cached = host.pages.get(cacheKey)
-    if (!cached) throw new Error('Read this delivery-check from offset 0 first')
-    return text(read, cached)
-  }
+async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSignal, replay?: MainlineIntent) {
   const commands = host.commands.withSignal(signal)
   let state = deliveryState(host, id)
   let checkout = await deliveryCheckout(commands, state, signal)
@@ -315,17 +316,31 @@ async function deliveryPage(read: Read, id: string) {
     const { ticket, assignment, generation, criteria, paused } = state
     const ownsLease = generation !== undefined && generation === assignment?.writer?.generation &&
       generation === ticket.execution?.ownership?.generation
-    const target = checkout?.clean && ownsLease ? { base: checkout.base, candidate: checkout.candidate, generation } : undefined
+    // For an existing queued intent only, the exact originally approved pair can resume after the same writer was
+    // confirmed idle. A held or replaced lease cannot stand in for a live generation.
+    const idleReplay = replay && assignment?.id === replay.assignment && checkout?.base === replay.base &&
+      checkout.candidate === replay.candidate && assignment.writer?.state === 'idle' && !ticket.execution?.active_writer &&
+      assignment.writer.generation === replay.generation && ticket.execution?.ownership?.generation === replay.generation
+    const approvedGeneration = ownsLease ? generation : idleReplay ? replay.generation : undefined
+    const target = checkout?.clean && approvedGeneration !== undefined ?
+      { base: checkout.base, candidate: checkout.candidate, generation: approvedGeneration } : undefined
     const reviews = ticket.assignments.flatMap(item => item.reviews?.evidence ?? [])
     const view = viewDelivery(ticket.deliveryCheck, target, reviews, criteria)
     const missing = new Set(view.missing)
     if (!view.ready && missing.size === 0) missing.add('delivery_evidence')
     if (!criteria.length) missing.add('registered_acceptance')
-    if (!ownsLease) missing.add('assignment_lease')
+    if (approvedGeneration === undefined) missing.add('assignment_lease')
     if (!checkout) missing.add('verified_worktree')
     else if (!checkout.clean) missing.add('clean_worktree')
+    if (checkout && ticket.plan) {
+      const { baseRef, repository } = host.store.settings().executor
+      const pinnedHome = ticket.execution?.ownership?.identity.repository
+      if (!checkout.baseRef.startsWith('refs/heads/') || checkout.baseRef !== baseRef?.trim() ||
+          !repository?.trim() || !pinnedHome || !sameDirectory(pinnedHome, repository)) missing.add('mainline_target')
+    }
     if (changed) missing.add('delivery_target_changed')
     if (paused) missing.add('project_paused')
+    if (state.credentialBlocked) missing.add('credential_blocked')
     const outcome = ticket.ended?.outcome, report = assignment?.report?.state
     if (outcome || report === 'failed' || report === 'blocked' || report === 'dropped') {
       missing.add('ticket_not_queueable')
@@ -344,7 +359,7 @@ async function deliveryPage(read: Read, id: string) {
       if (!state.required.every(check => check.workflowId)) ciStatus = 'required_workflow_unconfigured'
       else if (!commitSha.safeParse(candidate).success || !commitSha.safeParse(base).success) ciStatus = 'unsupported_revision'
       else {
-        actions = await ticketActions(commands, state.ticket, candidate, state.required, state.pull, base)
+        actions = await ticketActions(commands, state.ticket, candidate, state.required, state.pull, base, checkout)
         ciStatus = actions.satisfied ? 'passed' : 'not_passed'
       }
     } catch (error) {
@@ -371,15 +386,50 @@ async function deliveryPage(read: Read, id: string) {
     }
   }
   if (ciStatus !== 'passed') result.missing.add('required_ci')
-  const missing = [...result.missing]
+  return { state, checkout, local: result.view, revision: result.target, missing: [...result.missing], actions, ciStatus, ciFailure }
+}
+
+/** Obtain the actual queue authorization from fresh, version-matched evidence, never from a read page or Worker report. */
+export async function approveMainline(host: ResourceHost, id: string, candidate: string, signal?: AbortSignal,
+  replay?: MainlineIntent): Promise<MergeApproval> {
+  const initial = deliveryState(host, id)
+  if (!initial.ticket.plan) throw new UserError('mainlineRefused', { reason: 'Only candidates of registered Plan Tickets may enter the mainline queue' })
+  const { state, checkout, revision, missing } = await inspectDelivery(host, id, signal, replay)
+  const identity = state.ticket.execution?.ownership?.identity
+  if (!checkout || !identity || !revision || !state.assignment || checkout.candidate !== candidate || missing.length) {
+    throw new UserError('mainlineNotReady', { missing: missing.join(', ') || 'candidate changed' })
+  }
+  return { target: { repository: identity.repository, slug: host.commands.repository, ref: checkout.baseRef },
+    base: checkout.base, candidate, generation: revision.generation, assignment: state.assignment.id, stamp: state.stamp }
+}
+
+/** Recheck non-Git authorization synchronously at the point that starts the Git write. */
+export function authorizeMainline(host: ResourceHost, id: string, approval: MergeApproval): void {
+  const state = deliveryState(host, id)
+  if (state.stamp !== approval.stamp || host.commands.repository.toLowerCase() !== approval.target.slug.toLowerCase()) {
+    throw new UserError('mainlineRefused', { reason: 'Mainline approval changed before the write' })
+  }
+}
+
+async function deliveryPage(read: Read, id: string) {
+  const { host, signal, offset } = read
+  const cacheKey = `${read.sessionId}:${read.resource}`
+  // Later pages are historical evidence from this Session's offset 0; they never announce queue readiness.
+  if (offset !== 0) {
+    const cached = host.pages.get(cacheKey)
+    if (!cached) throw new Error('Read this delivery-check from offset 0 first')
+    return text(read, cached)
+  }
+  const { state, checkout, local, missing, actions, ciStatus, ciFailure } = await inspectDelivery(host, id, signal)
+  const mainline = mainlineIntent(host.store, id) ?? { status: 'pending_merge' as const }
   const ready = missing.length === 0
   const header = { ticket_id: id, assignment_id: state.assignment?.id ?? null,
     base: checkout?.base ?? state.ticket.execution?.base?.sha ?? null, candidate: checkout?.candidate ?? null,
     generation: state.generation ?? null, clean: checkout?.clean ?? false, missing, ready, ci_status: ciStatus,
-    status: ready ? 'ready_to_queue' as const : 'return_for_recheck' as const, mainline: { status: 'pending_merge' as const } }
+    status: ready ? 'ready_to_queue' as const : 'return_for_recheck' as const, mainline }
   const body = JSON.stringify({ observed_at: new Date().toISOString(), ticket_id: id, assignment_id: header.assignment_id,
     base: header.base, candidate: header.candidate, generation: header.generation, mainline: header.mainline,
-    criteria: state.criteria, local: result.view,
+    criteria: state.criteria, local,
     revisions: checkout ? { base: { worktree: checkout.worktree, sha: checkout.base, ref: checkout.baseRef },
       candidate: { worktree: checkout.worktree, sha: checkout.candidate, ref: `refs/heads/${checkout.branch}` } } : null,
     ci: { status: ciStatus, required: state.required, evidence: actions ?? null, ...ciFailure ? { failure: ciFailure } : {} } })
@@ -615,12 +665,18 @@ const ROUTES: readonly Route[] = [
         ({ thread: key, ...context ? { context: true } : {}, ...bound.has(key) ? { bound: true } : {} })
       const threads = [...subscribed.map(thread => marked(thread.key, !!thread.context?.includes(id))),
         ...[...bound].filter(key => !subscribed.some(thread => thread.key === key)).map(key => marked(key, false))]
+      const mainline = mainlineIntent(host.store, id)
       return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId), ...retry,
+        ...mainline ? { mainline } : {},
         ...ticket.plan || ticket.deliveryCheck ? { delivery_check: { read: `ticket/${id}/delivery-check` } } : {} }
     }
     if (section === 'delivery-check') {
       if (part !== undefined) throw new Error('Unknown context resource')
       return deliveryPage(read, id)
+    }
+    if (section === 'mainline' && part === undefined) {
+      const attempts = mainlineAttempts(host.store, id)
+      return list(read, (offset, count) => attempts.slice().reverse().slice(offset, offset + count))
     }
     if (section === 'delivery-observation') {
       if (!part || !/^(?:0|[1-9]\d*)$/.test(part)) throw new Error('Unknown delivery observation')

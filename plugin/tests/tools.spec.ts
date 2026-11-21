@@ -285,11 +285,12 @@ it('reacquires changed evidence after the final retro and only queues with curre
   vi.spyOn(Commands.prototype, 'gh').mockImplementation(async ([, request]) => {
     if (request?.includes('/pulls?')) return []
     if (request?.endsWith('/pulls/29')) return { state: 'open', html_url: 'https://github.com/acme/widgets/pull/29', user: { login: 'agent-bot' },
-      head: { sha: remoteHead, ref: branch, repo: { full_name: 'acme/widgets' } }, base: { sha: base }, merge_commit_sha: null }
+      head: { sha: remoteHead, ref: branch, repo: { full_name: 'acme/widgets' } }, base: { sha: base, ref: 'main', repo: { full_name: 'acme/widgets' } }, merge_commit_sha: null }
     if (request?.includes(`/actions/runs?head_sha=${candidate}`)) {
       if (holdCi) { querying.resolve(); await releaseCi.promise }
       return { total_count: 1, workflow_runs: [
         { id: 21, workflow_id: 4, run_number: 1, head_sha: workflowSha, run_attempt: 1, status: 'completed', conclusion: 'success', html_url: url,
+          event: 'push', head_branch: branch,
           pull_requests: [{ number: 29, head: { sha: candidate }, base: { sha: base } }] },
       ] }
     }
@@ -445,7 +446,7 @@ test('trims a displayed label', () => assert.equal(label('  alert  '), 'alert'))
   await h.runtime.idle()
   expect(await read(`ticket/${ticket.id}/result`)).toMatchObject({ text: summary })
   await expect(evidence()).rejects.toThrow(/HEAD/i)
-})
+}, 45_000) // Repeated native Git checks and a runtime restart exceeded 20 s on Windows CI.
 
 it('reads configured GitHub Actions evidence for a ticket at its complete commit SHA', async () => {
   const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))

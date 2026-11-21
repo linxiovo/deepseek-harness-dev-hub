@@ -6,15 +6,19 @@ Start with the ticket's acceptance criteria and prerequisites. Follow the reposi
 
 Before dispatching implementation slices, select their focused checks from this table and name the commands in the handoff. For recovery or retry work, name the exact interruption point before dispatch and the observable result on each side of it; cover an external side effect completed before its local receipt was recorded. The integration owner runs the union from `plugin/` as soon as each affected surface is runnable. On Windows, use one `pnpm test` runner for overlapping checks across independent checkouts; the wrapper serializes them through a named pipe shared by the current Windows account.
 
+Set the command timeout using the most recent duration for that check on the platform, with room for slower runs. Count a red only when the runner reaches the expected failing assertion; a compile or setup failure means the seam has not run.
+
 | Change | Existing checks |
 | --- | --- |
 | New class or source module | Run `pnpm test tests/class-docs.spec.ts tests/docs.spec.ts` before the full check. Fix missing class JSDoc and missing module or test index entries before proceeding. |
 | Source imports or import boundary gate | `pnpm check:imports` on the current sources; when changing the gate itself, also run `pnpm test tests/import-boundaries.spec.ts`. |
 | Session tool, resource or model-facing schema | Run `pnpm test:session-tools` as soon as the first changed tool or prompt is callable, then before the full check. It exercises public behavior, role boundaries, response and prompt budgets, and prompt contracts. |
+| Management HTTP route, Ticket detail or shared view | `pnpm test tests/http.spec.ts`; include affected panel checks for visible changes. For `mainline` in the Ticket response, also run the Mainline queue check below. |
 | Bundled skill or prompt registration | `tests/prompts.spec.ts`, `tests/model-surface.spec.ts`, `tests/tools.spec.ts` and `tests/panel-prompts.spec.tsx` for role scope, resource inventory and settings labels |
 | Prompt text or built-in delivery guidance | `tests/cards.spec.ts` for prompt contracts and budgets, plus the registration checks above when the mounted surface changes |
 | Doc Tree routes, numbered documents or committed-candidate inspection | `tests/docs.spec.ts` for navigation and source/test indexing; also `tests/doc-tree.spec.ts` when changing the candidate checker |
 | Pause, retry or recovery | Run `pnpm test:recovery` for Plan, runtime-concurrency and runtime-crash behavior; for a deployed headless host, record the [live connection smoke check](006-deployment.md#live-headless-connection-smoke-check) separately. |
+| Mainline queue or write permissions | `pnpm test tests/mainline-queue.spec.ts tests/mainline-git.spec.ts`; verify live server enforcement separately with [Verify queue-only writes on GitHub](006-deployment.md#verify-queue-only-writes-on-github). |
 
 Run `pnpm check` once at the end. Vitest still limits concurrent Git fixtures within a Windows run. Local verification and CI use the same command and test coverage.
 
@@ -76,7 +80,7 @@ The seed command in [scripts/worker-smoke.mjs](../scripts/worker-smoke.mjs) crea
 
 ### Run through a real Worker (manual)
 
-Use the Web profile from [deployment](006-deployment.md), isolated from normal Sessions, with a working model, Git and Node in the Worker environment, and a disposable GitHub repository per case. The operator needs authorization to create those repositories or seed their default branch, submit implementation Tickets via normal Hub intake, and read the Worker Sessions in the profile. The host's GitHub identity needs the disposable repository permissions described in deployment for normal Ticket execution and PRs. Keep [manual merging](003-execution.md#merging) enabled. Only an authorized operator publishes the seed; the script never contacts a service, pushes, opens a PR, or starts the host. Mark unavailable steps **not run**.
+Use the Web profile from [deployment](006-deployment.md), isolated from normal Sessions, with a working model, Git and Node in the Worker environment, and a disposable GitHub repository per case. The operator needs authorization to create those repositories or seed their default branch, submit implementation Tickets via normal Hub intake, and read the Worker Sessions in the profile. The host's GitHub identity needs the disposable repository permissions described in deployment for normal Ticket execution and PRs. Do not queue the candidate during this smoke check. Only an authorized operator publishes the seed; the script never contacts a service, pushes, opens a PR, or starts the host. Mark unavailable steps **not run**.
 
 1. Publish the selected seed unchanged as the disposable repository's default branch and bind it to the isolated project. Submit the behavior change through the Hub. Keep a record of the exact project, Ticket ID (not the GitHub issue number), Worker Session, pinned base, worktree and PR. Do not grant a Session extra tools or writer rights to make the smoke pass.
 2. For the exportable run, use the foreground `bash` or `pwsh` command printed by `seed`, with explicit `workdir` set to the absolute Ticket worktree. These wrappers preserve the Node runner's exit and print it into the recorded shell result; they exit the shell, so do not use them with persistent shell tools. Watch the Worker load all three Worker skills, reproduce the named assertion on the untouched seed base, then make the change. A dirty green feedback run is fine but does not substitute for rerunning on the clean committed candidate. Use the exact same wrapper for the pinned green check. Keep the fixture tests and revision stamp unchanged.
@@ -105,6 +109,8 @@ The output keeps skill names and call/result sequence references, fixture assert
 4. Inspect the aggregate in `ticket/<id>/reviews` after both submissions. The first-slice review is a focused gate before broader checks. Repeat both lanes for the complete candidate after committing it and recording the selected local verification and doc impact, providing a fresh concise name-status index and necessary evidence references. A blocked review stops the gate; correct the blocker and dispatch both lanes on the new pair. Keep each candidate fixed during its review round; a moved candidate or restart invalidates stale reviews and requires new independent reviews on the actual pair. Unrelated branch work may continue without changing the pinned candidate.
 
    When the change concerns worktree ownership or recovery, review the actual runtime paths. Passing static checks alone does not establish who may reuse a worktree or what happens after interruption.
+
+   For replay of an external write, the spec lane checks attribution on the first runnable slice: what distinguishes this intent's result from the same outcome caused by another writer? Test both a lost receipt after this intent's write and an interruption followed by an outside write. Require recovery to recognize its own result without writing twice and to withhold proof for the outside result.
 5. Begin the first retro only after both independent submissions pass for the same live base, candidate and writer generation. Start another matching review round whenever a repair changes the candidate. A prior approval is not approval of the new pair.
 
 ## Delivery-check
@@ -138,7 +144,9 @@ The Hub and the Ticket's active Worker can read `ticket/<id>/delivery-check`. Fo
 
 Required CI is separate from local evidence. Configure the required workflow IDs and jobs; an empty or incomplete configuration does not verify CI. The package includes the version-scoped Actions result and available run, job and artifact references. An associated PR must still match the pinned base and candidate after querying Actions. A failed, cancelled, pending, missing or wrong-version required run does not pass. See [CI build and commit evidence](006-deployment.md#ci-build-and-commit-evidence).
 
-`ready_to_queue` is candidate readiness; `return_for_recheck` lists unmet gates. `mainline.status: pending_merge` means this package does not verify the result on mainline. It does not release a version, close a Ticket, record formal delivery or unlock a successor; those effects do not follow from a Worker report or PR closure. See [Frontier dispatch and claims](009-handoff.md#frontier-dispatch-and-claims) for the separate receipt boundary.
+Without an associated PR, the delivery gate accepts only `push` or `workflow_dispatch` runs from the verified candidate branch at the exact candidate SHA. A PR run from a different branch or base does not substitute for it.
+
+`ready_to_queue` is candidate readiness; `return_for_recheck` lists unmet gates. `mainline` is the independent queue observation described in [Merging](003-execution.md#merging), or `pending_merge` when there has been no attempt. Candidate readiness, a Worker report, PR closure and mainline verification each fall short of formal delivery. See [Frontier dispatch and claims](009-handoff.md#frontier-dispatch-and-claims) for the separate receipt boundary.
 
 ## Handoff evidence
 

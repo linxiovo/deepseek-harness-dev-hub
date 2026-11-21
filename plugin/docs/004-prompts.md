@@ -10,7 +10,7 @@ A team can edit three team sections, add skills, and override every built-in sys
 | --- | --- |
 | Communication | When to message people, how messages read, the line that begins every GitHub message (`This is by an automated agent, not a human` by default), how to handle reviews, and which ordinary accounts are review bots |
 | Ticket scope | When a Ticket goes on and when it stops with a draft |
-| Delivery requirements | Evidence in pull requests, the auto-merge condition with its line threshold, and the commit author; without one, the Executor commits as the agent account's no-reply address |
+| Delivery requirements | Evidence in pull requests and the commit author; without one, the Executor commits as the agent account's no-reply address |
 | Team skills | Knowledge the agents load when they need it, such as an `identities` skill that says which Feishu user is which GitHub account |
 
 The built-in text covers the roles, tool usage, host mechanics, authorization rules, Source skills and role-specific workflow skills. It refers to the team sections by their headings instead of repeating them.
@@ -32,6 +32,8 @@ Overrides use these keys:
 The worker guards load `prompts/worker-ticket-ended.md`, `prompts/worker-writer-required.md`, and `prompts/worker-ancestry-pending.md` as fixed tool responses, not editable system-prompt parts.
 
 The Executor loads `prompts/worker-recovery.md` as the recovery message sent to the original Worker Session for an interrupted Assignment.
+
+The mainline queue uses `prompts/queue-merge-tool.md` for its Hub tool, `prompts/mainline-relay.md` for its durable Hub status relay, and `prompts/mainline-repair.md` for the Worker's exact-baseline repair input. Team prompt overrides cannot grant a merge tool to Workers.
 
 `prompts/worker-credential-report.md` describes the Worker tool for a missing Plan credential. `prompts/credential-action.md` supplies the Hub relay request. `prompts/worker-credential-resume.md` supplies the continuation for the Worker after verification. These are fixed assets, not editable system-prompt parts.
 

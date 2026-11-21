@@ -5,6 +5,7 @@
 import type { Handoff, ProjectRef, Spec } from './core/handoff.ts'
 import type { Plan, PlanMessage, PlanNodeState } from './core/plan.ts'
 import type { PromptVersion } from './app/prompts.ts'
+import type { MainlineIntent } from './app/mainline-queue.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { SessionMeterState } from './app/session-meter.ts'
 import type { MeterSessionBinding } from './app/project-meter.ts'
@@ -82,6 +83,9 @@ export const KV = {
       (id, nodeId) => JSON.stringify([id, nodeId])),
     receipt: family<string, [id: string, sessionId: string, messageId: string]>('plan-message-receipt:',
       (id, sessionId, messageId) => JSON.stringify([id, sessionId, messageId])) },
+  /** Mainline: versioned Ticket attempts and the FIFO per GitHub repo/ref. */
+  mainline: { ticket: family<MainlineIntent[], [ticketId: string]>('mainline-ticket:'),
+    pending: family<string[], [target: string]>('mainline-pending:') },
   /** Scoped attention: durable action receipts and at most one active credential blocker per Ticket. */
   attention: { credential: family<CredentialBlocker>('credential-action:'), active: family<string>('active-credential-action:') },
 }

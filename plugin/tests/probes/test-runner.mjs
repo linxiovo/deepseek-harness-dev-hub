@@ -3,7 +3,7 @@
 // is invoked: no alternate lock namespace, platform override, or skip-lock flag.
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { copyFile, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -11,6 +11,11 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
 
 const runner = new URL('../../scripts/test.mjs', import.meta.url)
+async function publishOffset(path, value) {
+  const temporary = `${path}.${process.pid}.tmp`
+  await writeFile(temporary, String(value), { flag: 'wx' })
+  await rename(temporary, path)
+}
 const args = ['tests/a file.spec.ts', '-t', 'a & b', '--lock-dir', 'not a runner option', '--no-lock']
 const windows = process.platform === 'win32'
 
@@ -127,23 +132,25 @@ for (const interrupt of [false, true]) {
         const offsetFile = ${JSON.stringify(clock)}
         const now = performance.now.bind(performance)
         Object.defineProperty(performance, 'now', { value: () => {
-          let offset = 0
-          try { if (existsSync(offsetFile)) offset = Number(readFileSync(offsetFile, 'utf8')) } catch {}
-          return now() + (Number.isFinite(offset) ? offset : 0)
+          if (!existsSync(offsetFile)) return now()
+          const text = readFileSync(offsetFile, 'utf8')
+          if (!/^(?:0|[1-9]\\d*)$/.test(text)) throw new Error('Invalid probe clock offset')
+          const offset = Number(text)
+          if (!Number.isSafeInteger(offset)) throw new Error('Invalid probe clock offset')
+          return now() + offset
         } })
       `)
       const waiter = start(b, holder.pid, ['--import', pathToFileURL(preload).href])
       runs.push(waiter)
       await observeWait(waiter)
-      await writeFile(clock, String(61_000))
+      await publishOffset(clock, 61_000)
       await observe(waiter, () => stderrLines(waiter).some(line => line.includes('Still waiting for the Windows Vitest gate')))
       const progress = stderrLines(waiter).find(line => line.includes('Still waiting for the Windows Vitest gate'))
-      assert.match(progress, gatePattern)
-      assert.match(progress, new RegExp(`waiter pid=${waiter.child.pid}(?!\\d)`))
-      assert.ok(Number(progress.match(/waited=([\d.]+)s/)[1]) >= 60)
+      const waited = assertWaiter(progress, waiter)
+      assert.ok(waited >= 60)
       assert.match(progress, /Vitest has not started/)
       assert.equal(waiter.stdout, '')
-      await writeFile(clock, String(30 * 60_000 + 1_000))
+      await publishOffset(clock, 30 * 60_000 + 1_000)
       await observe(waiter, () => waiter.closed)
       assert.equal(waiter.stdout, '')
       const timedOut = await waiter.exit
@@ -154,9 +161,7 @@ for (const interrupt of [false, true]) {
         assert.ok(!waiter.stderr.includes(checkoutPath), `timeout stderr named the temporary checkout path: ${checkoutPath}`)
       }
       const timeout = stderrLines(waiter).find(line => line.startsWith('[test] Timed out waiting for the Windows Vitest gate'))
-      assert.ok(timeout, waiter.stderr)
-      assertWaiter(timeout, waiter)
-      assert.ok(Number(timeout.match(/waited=([\d.]+)s/)[1]) >= 1_800)
+      assert.ok(assertWaiter(timeout, waiter) >= 1_800)
       assert.match(timeout, /Vitest was not started/)
       assert.match(timeout, /only that another test run for this Windows account holds the gate/)
       assert.match(timeout, /named-pipe API does not identify its owner process/)
@@ -181,10 +186,8 @@ for (const interrupt of [false, true]) {
     if (interrupt) assert.ok(exit.signal || exit.code !== 0)
     else assert.deepEqual(exit, { code: 23, signal: null })
 
-    // A runner that starts after waiting must keep its own nonzero exit status,
-    // after a normal holder exit or a hard kill; it must not inherit the
-    // holder's outcome.
-    const secondExit = 23
+    // A runner that starts after waiting preserves its own independent exit code.
+    const secondExit = interrupt ? 23 : 0
     if (windows) {
       const entry = await entered(second, b)
       assert.equal(entry.previousAlive, false)
@@ -192,7 +195,7 @@ for (const interrupt of [false, true]) {
     second.child.stdin.end(String(secondExit))
     await observe(second, () => second.closed)
     const secondResult = await second.exit
-    assert.notEqual(secondResult.code, 0)
+    if (interrupt) assert.notEqual(secondResult.code, 0)
     assert.equal(secondResult.signal, null)
     assert.equal(secondResult.code, secondExit)
     assert.match(second.stderr, /probe stderr/)

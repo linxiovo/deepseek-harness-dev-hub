@@ -392,7 +392,8 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     record(childId, [
       { type: 'subagent/descriptor', data: { version: 3, mode: 'one-shot', provider: 'fixture' } },
       { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: `DSH_REVIEW_ASSIGNMENT: ${assignment}` }] } },
-      ...(loadReviewSkill ? [{ type: 'tool/call', data: { name: 'skill', arguments: JSON.stringify({ name: 'dsh-worker-code-review' }) } }] : []),
+      { type: 'tool/call', data: { turn: 1, step: 1, callId: 'review-skill', name: 'skill', arguments: JSON.stringify({ name: 'dsh-worker-code-review' }) } },
+      { type: 'tool/result', data: { turn: 1, step: 1, message: { role: 'tool', toolCallId: 'review-skill', isError: !loadReviewSkill, content: [] } } },
     ])
     const { promise, resolve } = Promise.withResolvers<void>()
     setTimeout(resolve, 0)

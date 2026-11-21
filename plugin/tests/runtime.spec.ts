@@ -10,6 +10,8 @@ import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'v
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { Runtime } from '../src/app/runtime.ts'
+import { restoreReviewBindings } from '../src/app/meter-recovery.ts'
+import { ProjectMeter } from '../src/app/project-meter.ts'
 import { ROUTER_PRESET, WORKER_PRESET } from '../src/app/sessions.ts'
 import { jobRegistry } from './fixtures/host.ts'
 import { gitEnv, gitRepository, type GitRepository } from './fixtures/git.ts'
@@ -250,7 +252,7 @@ beforeEach(async () => {
         : agentPreset === WORKER_PRESET ? presets.get(WORKER_PRESET)! : presets.get('standard')!
       const modelEvents: { type: string; data: unknown }[] = []
       const agent = { id: sessionId, status: 'idle', inject: vi.fn(),
-        session: { id: sessionId, header: { agentPreset, cwd: workspaceId }, snapshotEvents: () => modelEvents, requestHeader: () => undefined,
+        session: { id: sessionId, header: { id: sessionId, isSeeded: false, agentPreset, cwd: workspaceId }, snapshotEvents: () => modelEvents, requestHeader: () => undefined,
           append: vi.fn((type: string, data: unknown) => { modelEvents.push({ type, data }) }) },
         cancel: vi.fn(() => finishSessionTurn(sessionId)),
         whenIdle: () => {
@@ -2021,6 +2023,76 @@ test('slugify("  Worker Boundary!  ") returns "worker-boundary"', () => {
   expect(denied.isError).toBe(true)
   expect(resultText(denied)).toContain('Ticket ended; new work needs a new authorized ticket')
   expect(readFileSync(modulePath, 'utf8')).toBe(moduleSource)
+})
+
+it('recovers only detached reviewer receipts with verified direct business parents, without starting Sessions', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  const { store, projectMeter } = runtime
+  const native = (id: string, parentSession = sessionId) => ({ id, origin: 'subagent', parentSession, title: 'Code review' })
+  const headers: Partial<Record<string, { id: string; origin?: string; parentSession: string; title: string }>> = {
+    'direct-review': native('direct-review'),
+    'nested-review': native('nested-review', 'bound-parent'),
+    'bound-parent': native('bound-parent'),
+    'already-bound': native('already-bound'),
+    'manual-fork': { id: 'manual-fork', parentSession: sessionId, title: 'Code review' },
+    'foreign-review': native('foreign-review', 'foreign-worker'),
+    'unbound-lineage': native('unbound-lineage', 'unbound-parent'),
+    'unbound-parent': native('unbound-parent'),
+    'marker-only': native('marker-only'),
+  }
+  const reviewers = ['direct-review', 'nested-review', 'already-bound', 'manual-fork', 'foreign-review',
+    'unbound-lineage', 'unreadable-review', 'missing-review', 'direct-review']
+  const base = ticket.execution!.base!.sha
+  reviewers.forEach((id, index) => runtime.engine.recordReview(ticket.id, id, {
+    axis: 'standards', base, candidate: (index + 1).toString(16).repeat(40), basis: ['Ticket specification'],
+    conclusion: 'passed', blockers: [], summary: 'Checked.',
+  }))
+  projectMeter.bind({ session_id: 'bound-parent', ticket_id: ticket.id, parent_session_id: sessionId, role: 'implementation' })
+  projectMeter.bind({ session_id: 'already-bound', ticket_id: ticket.id, parent_session_id: 'bound-parent', role: 'implementation' })
+  runtime.engine.stopTicket(ticket.id)
+  await runtime.idle()
+
+  const stat = vi.fn(async (id: string, _options: { signal: AbortSignal }) => {
+    if (id === 'unreadable-review') throw new Error('cannot read session log')
+    const header = headers[id]
+    return header && { header }
+  })
+  const open = vi.fn()
+  const ctx = new Context()
+  ctx.reflect.provide('sessionPersistence', { stat, open })
+  ctx.reflect.provide('sessionController', controller)
+  controller.create.mockClear(); controller.resolveAgent.mockClear(); controller.inspect.mockClear()
+  const binding = (id: string) => store.get(KV.projectMeter.binding(id))
+  const priorChild = binding('already-bound')
+  const signal = new AbortController().signal
+  await restoreReviewBindings(ctx, store, projectMeter, signal)
+  expect(binding('direct-review')).toMatchObject({ roles: ['review'], ticket_id: ticket.id, parent_session_id: sessionId })
+  expect(binding('nested-review')).toMatchObject({ roles: ['review'], ticket_id: ticket.id, parent_session_id: 'bound-parent' })
+  expect(stat.mock.calls.filter(([id]) => id === 'direct-review')).toHaveLength(1)
+  expect(stat).toHaveBeenCalledWith('direct-review', { signal })
+  expect(stat).not.toHaveBeenCalledWith('already-bound', { signal })
+  expect(binding('already-bound')).toEqual(priorChild)
+  for (const id of ['manual-fork', 'foreign-review', 'unbound-lineage', 'unreadable-review', 'missing-review', 'marker-only']) {
+    expect(binding(id), id).toBeUndefined()
+  }
+
+  const priorWorker = binding(sessionId)
+  const rotated = new ProjectMeter({ store, meter: runtime.meter, masterId: 'rotated-recovery-hub' })
+  const keys = store.keys(KV.projectMeter.binding).sort()
+  stat.mockClear()
+  await restoreReviewBindings(ctx, store, rotated, signal)
+  expect(store.keys(KV.projectMeter.binding).sort()).toEqual(keys)
+  expect(binding(sessionId)).toEqual(priorWorker)
+  expect(binding('already-bound')).toEqual(priorChild)
+  expect(binding('direct-review')?.parent_session_id).toBe(sessionId)
+  expect(binding('nested-review')?.parent_session_id).toBe('bound-parent')
+  for (const id of ['already-bound', 'direct-review', 'nested-review', 'marker-only', 'unbound-parent']) {
+    expect(stat).not.toHaveBeenCalledWith(id, { signal })
+  }
+  expect(open).not.toHaveBeenCalled()
+  expect(controller.create).not.toHaveBeenCalled()
+  expect(controller.resolveAgent).not.toHaveBeenCalled()
+  expect(controller.inspect).not.toHaveBeenCalled()
 })
 
 it('withholds a reloaded worker child\'s work tools while its stored ancestry is being inspected', async () => {

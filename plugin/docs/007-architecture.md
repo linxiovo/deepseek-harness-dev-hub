@@ -297,10 +297,12 @@ Its fields, grouped by object:
    last_input_tokens, last_input_at, last_input_range, stale},
  usage: {input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
    known_components_total_tokens, reported_total_tokens, reported_total_calls, total_complete,
-   counted_calls, missing, in_flight, range, sampled_at, source, quality, billing_status}}
+   counted_calls, missing, in_flight, range, sampled_at, source, quality, billing_status, logs?}}
 ```
 
 Each `range`, including one in `missing`, is `{from, through}`; a `missing` entry adds `reason` (`no-usage` or `coverage-gap`). `context.source` is `dsh-token-meter`, `session-events` or `none`; `usage.source` is `session-events`. `context.quality` is `measured`, `estimated` or `unknown`; `usage.quality` is `measured`, `partial` or `unknown`. A token field whose evidence is absent is `null`, not zero, and `billing_status` is always `not-final`.
+
+For a reused ID, `usage.logs` separates physical log instances by `created_at`. Entries include `sampled_at`, `range`, `missing`, `in_flight` and `status` (`current` or `unavailable`). The top-level context, cursor and untagged ranges still refer to the current instance, while cumulative token counts include the prior known prefix. See the scoped coverage contract in `plugin/docs/014-project-metering.md`.
 
 Validation: `tests/session-meter.spec.ts` covers the read seam (absent vs corrupt logs, capacity present and absent, stale input samples after tool results and compaction, fresh vs absent or stale DSH `contextPressure.projectedTokens` projections, one settlement across message and stream, attempts and compaction summaries without treating `shadowedTokenCount` as usage or occupancy, failed attempts kept `in_flight` until close without fabricating gaps, unsettled retries as `coverage-gap`, `no-usage` ranges, the four buckets against authoritative totals, fork prefixes with child `createdAt` sampling on empty own ranges, and cursor replay and durability flushes across restarts and concurrent reads); `tests/http.spec.ts` covers the route's statuses and parameters; `tests/tools.spec.ts` covers the Hub resource, its main-Session restriction and equality with the HTTP read.
 
@@ -413,6 +415,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/sessions.ts` | Sessions |
 | `src/app/session-meter.ts` | `SessionMeter`: one Session's context snapshot and cumulative usage from its durable event log, with provenance, missing and in-flight ranges, and the persisted exclusive cursor; forked prefixes are excluded |
 | `src/app/project-meter.ts` | `ProjectMeter`: project-local Session bindings and deduplicated scoped usage; contract in `plugin/docs/014-project-metering.md` |
+| `src/app/meter-recovery.ts` | Restores detached review attribution from durable review receipts and verified Session parent metadata |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
@@ -680,6 +683,7 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 | `prompts`, `prompts/<revision>`, `prompts/current`, `prompts/defaults`, `prompt-preview/<id>` | Prompt configurations and composed text |
 | `models`, `models/<provider>` | Available models |
 | `session/<id>` | The `SessionMeterView` of one Session: its `context` snapshot and cumulative `usage`, with provenance, quality, sampled ranges and missing ranges; main Session only |
+| `project/meter`, `plan/<id>/meter`, `ticket/<id>/meter` | Hub-only scoped usage, shared overhead, and per-Session samples; contract in `plugin/docs/014-project-metering.md` |
 | `feishu/<trigger id>/…`, `github/…` | Original Source records, described in the Source skills |
 | `actions/<ticket\|plan>/<id>/commit/<40 lowercase hex SHA>` | GitHub Actions evidence for one owned commit, main Session only |
 

@@ -1,7 +1,7 @@
 /** Business attribution over SessionMeter's durable, session-local usage. */
 import { KV } from '../kv.ts'
 import type { Plan } from '../core/plan.ts'
-import type { Range, SessionMeter, SessionMeterView } from './session-meter.ts'
+import { sessionMeterView, type Range, type SessionMeter, type SessionMeterView } from './session-meter.ts'
 import type { Store } from './store.ts'
 
 const ROLES = ['hub', 'implementation', 'review', 'retro', 'retry', 'inspection', 'planner', 'splitter'] as const
@@ -27,16 +27,16 @@ type Scope = 'project' | 'plan' | 'ticket'
 type Usage = SessionMeterView['usage']
 const TOKEN_FIELDS = ['input_tokens', 'cache_read_tokens', 'cache_write_tokens', 'output_tokens', 'reasoning_tokens',
   'known_components_total_tokens', 'reported_total_tokens'] as const
-type SessionRange = Range & { session_id: string }
-type UsageUnknown = {
-  session_id: string
-  reason: 'log-not-found' | 'log-unavailable' | 'no-observed-usage' | 'unreported-total'
+type LogRef = { session_id: string; created_at?: string }
+type SessionRange = Range & LogRef
+type UsageUnknown = LogRef & {
+  reason: 'log-not-found' | 'log-unavailable' | 'log-unverified' | 'no-observed-usage' | 'unreported-total'
   range: Range | null
 }
 export interface MeterSubtotal extends Pick<Usage, typeof TOKEN_FIELDS[number] | 'counted_calls' | 'reported_total_calls'
   | 'total_complete' | 'billing_status' | 'quality'> {
   range: SessionRange[]
-  missing: (Usage['missing'][number] & { session_id: string })[]
+  missing: (Usage['missing'][number] & LogRef)[]
   in_flight: SessionRange[]
   unknown: UsageUnknown[]
   /** Latest contributing usage sample, not wall clock at query time. Ranges remain per Session. */
@@ -44,7 +44,8 @@ export interface MeterSubtotal extends Pick<Usage, typeof TOKEN_FIELDS[number] |
   source: Usage['source'] | 'none'
 }
 
-type LogStatus = 'available' | 'not-found' | 'unavailable'
+type LogStatus = 'available' | 'not-found' | 'unavailable' | 'unverified'
+export type MeterLogAccess = 'read' | 'unavailable' | 'unverified'
 interface MeterSessionView extends MeterSessionBinding {
   log_status: LogStatus
   cursor: number | null
@@ -73,6 +74,12 @@ interface Sample {
 
 const shared = (binding: MeterSessionBinding): boolean => binding.ticket_id === null && binding.plan_id === null
 
+function recordCoverage(result: MeterSubtotal, ref: LogRef, scope: Pick<Usage, 'range' | 'missing' | 'in_flight'>): void {
+  result.range.push({ ...ref, ...scope.range })
+  for (const missing of scope.missing) result.missing.push({ ...ref, ...missing })
+  if (scope.in_flight) result.in_flight.push({ ...ref, ...scope.in_flight })
+}
+
 function subtotal(samples: Iterable<Sample>): MeterSubtotal {
   const result: MeterSubtotal = { input_tokens: null, cache_read_tokens: null, cache_write_tokens: null, output_tokens: null,
     reasoning_tokens: null, known_components_total_tokens: null, reported_total_tokens: null, counted_calls: 0,
@@ -86,7 +93,7 @@ function subtotal(samples: Iterable<Sample>): MeterSubtotal {
     allMeasured &&= usage?.quality === 'measured'
     if (log_status !== 'available') {
       // The unobserved tail's end is not known; the durable prefix is reported separately in `range`.
-      result.unknown.push({ session_id, reason: log_status === 'not-found' ? 'log-not-found' : 'log-unavailable', range: null })
+      result.unknown.push({ session_id, reason: `log-${log_status}`, range: null })
     }
     if (!usage) continue
     let sessionTokens = false
@@ -99,9 +106,13 @@ function subtotal(samples: Iterable<Sample>): MeterSubtotal {
     anyTokens ||= sessionTokens
     result.counted_calls += usage.counted_calls
     result.reported_total_calls += usage.reported_total_calls
-    result.range.push({ session_id, ...usage.range })
-    for (const missing of usage.missing) result.missing.push({ session_id, ...missing })
-    if (usage.in_flight) result.in_flight.push({ session_id, ...usage.in_flight })
+    if (usage.logs) {
+      for (const log of usage.logs) {
+        const ref = { session_id, created_at: log.created_at }
+        recordCoverage(result, ref, log)
+        if (log.status === 'unavailable') result.unknown.push({ ...ref, reason: 'log-unavailable', range: null })
+      }
+    } else recordCoverage(result, { session_id }, usage)
     if (!sessionTokens) result.unknown.push({ session_id, reason: 'no-observed-usage', range: usage.range })
     if (usage.reported_total_calls < usage.counted_calls) {
       result.unknown.push({ session_id, reason: 'unreported-total', range: usage.range })
@@ -133,11 +144,11 @@ function* subtree(root: Sample, children: ReadonlyMap<string, Sample[]>): Iterab
 export class ProjectMeter {
   private readonly store: MeterStore
   private readonly meter: Pick<SessionMeter, 'read'>
-  private readonly canSample: ((binding: MeterSessionBinding) => boolean | Promise<boolean>) | undefined
+  private readonly canSample: ((binding: MeterSessionBinding) => MeterLogAccess | Promise<MeterLogAccess>) | undefined
 
   constructor(options: { store: MeterStore; meter: Pick<SessionMeter, 'read'>; masterId: string;
     /** Runtime may require independent proof of log identity after reserving a business binding. */
-    canSample?: (binding: MeterSessionBinding) => boolean | Promise<boolean> }) {
+    canSample?: (binding: MeterSessionBinding) => MeterLogAccess | Promise<MeterLogAccess> }) {
     this.store = options.store
     this.meter = options.meter
     this.canSample = options.canSample
@@ -240,14 +251,12 @@ export class ProjectMeter {
   }
 
   private async sample(binding: MeterSessionBinding, signal?: AbortSignal): Promise<Sample> {
-    if (this.canSample) {
-      const allowed = await this.canSample(binding)
-      signal?.throwIfAborted()
-      if (!allowed) return { binding, log_status: 'unavailable', view: undefined }
-    }
-    let log_status: LogStatus = 'not-found'
+    const access = this.canSample ? await this.canSample(binding) : 'read'
+    signal?.throwIfAborted()
+    if (access === 'unverified') return { binding, log_status: access, view: undefined }
+    let log_status: LogStatus = access === 'unavailable' ? access : 'not-found'
     try {
-      const view = await this.meter.read(binding.session_id, signal)
+      const view = access === 'read' ? await this.meter.read(binding.session_id, signal) : undefined
       signal?.throwIfAborted()
       if (view) return { binding, view, log_status: 'available' }
     } catch (error) {
@@ -256,7 +265,8 @@ export class ProjectMeter {
       log_status = 'unavailable'
     }
     // Retain independently committed usage if the host log disappeared or cannot be read. It is only a known prefix.
-    const view = this.store.get(KV.meter.state(binding.session_id))?.view
+    const state = this.store.get(KV.meter.state(binding.session_id))
+    const view = state ? sessionMeterView(state) : undefined
     return { binding, view, log_status: view ? 'unavailable' : log_status }
   }
 }

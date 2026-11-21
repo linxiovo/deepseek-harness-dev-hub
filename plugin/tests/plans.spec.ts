@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, it } from 'vitest'
 import { z } from 'zod'
 import { resolve } from 'node:path'
+import { KV } from '../src/kv.ts'
 import { startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host
@@ -285,11 +286,17 @@ it('counts a forked review once and keeps one Hub call across two active Tickets
   expect(await h.api('GET', 'tickets/unknown/meter')).toMatchObject({ status: 404 })
   await expect(h.runTool(catalog.session, 'orchestrator_read', { resource: `ticket/${catalog.ticketId}/meter` })).rejects.toThrow()
 
-  // Detach the real business child before reloading Runtime; its attribution must not depend on a live Agent.
+  // Reopen with a new Hub identity and the business child unloaded, while all old logs stay durable.
   h.agents.delete(review)
+  h.runtime.store.set(KV.runtime.masterId, 'rotated-hub')
   await h.restart()
+  expect(h.runtime.masterId).toBe('rotated-hub')
   const after = await h.api('GET', 'project/meter')
-  expect(after).toMatchObject({ status: 200, body: expected })
+  expect(after).toMatchObject({ status: 200, body: { ...expected, sessions: expect.arrayContaining([
+    expect.objectContaining({ session_id: master, roles: ['hub'] }),
+    expect.objectContaining({ session_id: 'rotated-hub', roles: ['hub'] }),
+    expect.objectContaining({ session_id: catalog.session, parent_session_id: master }),
+  ]) } })
   expect(await h.api('GET', `sessions/${review}/meter`)).toMatchObject({ status: 200, body: { inherited_events: 2,
     usage: { reported_total_tokens: 6, counted_calls: 1 } } })
 })

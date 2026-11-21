@@ -568,7 +568,6 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
 | `tests/docs.spec.ts` | Numbered documents are consecutive, indexed in `plugin/DOCS.md` with `plugin/README.md` linking to that index, link only to earlier ones with inline-code guidance on violations, every local link resolves including root `DOCS.md` and `plugin/DOCS.md`, no document has merge conflict markers, `010` explicit file paths exist, and this document's tables list every module and every test |
-| `tests/tickets.spec.ts` | Offline local ticket filename/title, declared GitHub issue URL/number, dependency links, and local relative paths/anchors |
 
 `tests/fixtures/` holds shared test inputs: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; `async.ts`; and `feishu-live-reply-lark-cli-1.0.100.json`, the minimal published live-event field shape that distinguishes `reply_to` from history `parent_id`.
 

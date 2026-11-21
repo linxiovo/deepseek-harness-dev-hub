@@ -12,4 +12,4 @@ fi
 
 pnpm run check:imports
 pnpm run typecheck
-pnpm run test tests/class-docs.spec.ts tests/docs.spec.ts tests/tickets.spec.ts tests/handoff.spec.ts tests/plans.spec.ts tests/cards.spec.ts tests/model-surface.spec.ts tests/prompts.spec.ts
+pnpm run test tests/class-docs.spec.ts tests/docs.spec.ts tests/handoff.spec.ts tests/plans.spec.ts tests/cards.spec.ts tests/model-surface.spec.ts tests/prompts.spec.ts

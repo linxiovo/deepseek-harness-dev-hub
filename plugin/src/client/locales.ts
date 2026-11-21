@@ -485,6 +485,7 @@ const TEXT = {
   'promptPart.skill/worker/implement': ['实现技能', 'Implement skill'],
   'promptPart.skill/worker/tdd': ['测试驱动开发技能', 'TDD skill'],
   'promptPart.skill/worker/test-scope': ['测试范围技能', 'Test scope skill'],
+  'promptPart.skill/worker/code-review': ['独立代码审查技能', 'Independent code-review skill'],
   'promptPart.skill/splitter/to-tickets': ['拆票技能', 'To-tickets skill'],
   'promptPart.runtime/environment': ['执行环境', 'Execution environment'],
   promptViewEdit: ['编辑', 'Edit'],

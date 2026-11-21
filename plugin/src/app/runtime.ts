@@ -164,6 +164,7 @@ export class Runtime extends Service implements SourceHost {
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
       const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx, meter,
         ownsSession: id => this.ownsSession(id),
+        reviewGeneration: ticketId => runtime.executor?.reviewGeneration(ticketId),
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
       const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
@@ -176,9 +177,10 @@ export class Runtime extends Service implements SourceHost {
           return handoff?.id === id && handoff.status === 'specified' && handoff.spec?.handoffId === id ? project?.workspace ?? handoff.project.workspace : undefined
         },
         workerAuthorized: (ticketId, sessionId) => !this.closing() && this.configured() && runtime.executor?.writerAuthorized(ticketId, sessionId) === true,
+        authorizeReviewSession: (ticketId, sessionId, axis, candidate) => this.sessions.authorizeReviewSession(ticketId, sessionId, axis, candidate),
         tools: (agent, ticket, role) => role === 'planner' ? plannerTools(this.toolHost, agent)
           : role === 'splitter' ? splitterTools(this.toolHost, agent)
-          : ticket ? executorTools(this.toolHost, ticket, agent.id) : mainTools(this.toolHost, agent) })
+          : ticket ? executorTools(this.toolHost, ticket, agent.id, role === 'review') : mainTools(this.toolHost, agent) })
       const verifyProjectBinding = installation.validateWorkspace.bind(installation)
       this.planning = new Planning({ handoffs, plans, effects, sessions, verifyProjectBinding,
         paused: () => this.paused(), closing: () => this.closing() })

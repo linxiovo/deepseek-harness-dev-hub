@@ -12,11 +12,11 @@ import type { Sessions } from '../sessions.ts'
 import { readTool, tool, type Tool } from './tool.ts'
 
 export interface ExecutorToolsHost {
-  readonly engine: Pick<EngineForExecutor, 'report' | 'takeUp' | 'markUnrelated' | 'handback' | 'followForContext'>
+  readonly engine: Pick<EngineForExecutor, 'report' | 'recordReview' | 'takeUp' | 'markUnrelated' | 'handback' | 'followForContext'>
   readonly store: Pick<Store, 'tickets' | 'atomic'>
-  readonly sessions: Pick<Sessions, 'relay' | 'notify'>
+  readonly sessions: Pick<Sessions, 'relay' | 'notify' | 'authorizeReviewSession'>
   readonly resources: ResourceHost
-  readonly executor: Pick<DshExecutor, 'inspectDocImpact' | 'inspectTestEvidence'>
+  readonly executor: Pick<DshExecutor, 'inspectDocImpact' | 'inspectTestEvidence' | 'inspectReviewCandidate'>
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
 }
@@ -48,12 +48,32 @@ const testEvidenceSchema = z.strictObject({
   checks: z.array(z.strictObject({ ...runEvidence, status: z.enum(['passed', 'failed', 'not_run', 'pending', 'cancelled']) })).max(50),
   red: z.array(z.strictObject({ ...runEvidence, revision: commitHash })).max(50).nullable(),
 })
+const reviewSubmitSchema = z.strictObject({
+  candidate: commitHash,
+  axis: z.enum(['standards', 'spec']),
+  basis: z.array(z.string().trim().min(1).max(1000)).min(1).max(50),
+  conclusion: z.enum(['passed', 'blocked']),
+  summary: z.string().trim().min(1).max(4000),
+  blockers: z.array(z.string().trim().min(1).max(1000)).max(50),
+})
 
-export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId: string): Tool[] {
+export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId: string, reviewOnly = false): Tool[] {
   const ticketId = ticket.id
-  return [
+  const tools: Tool[] = [
     readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
+    tool({
+      name: 'orchestrator_review_submit',
+      description: 'Submit your independent standards or specification review of the exact clean current ticket candidate. Cite concrete repository documents or ticket/spec evidence in basis; report blockers explicitly.',
+      schema: reviewSubmitSchema,
+      execute: async (args, signal) => {
+        if (!await host.sessions.authorizeReviewSession?.(ticketId, sessionId, args.axis, args.candidate))
+          throw new Error('Review submission requires an active code-review descendant assigned to this axis')
+        const revision = await host.executor.inspectReviewCandidate(ticketId, sessionId, args.candidate, signal)
+        const recorded = host.engine.recordReview(ticketId, sessionId, { ...args, base: revision.base })
+        return { evidence: recorded.evidence, aggregate: recorded.status }
+      },
+    }),
     tool({
       name: 'orchestrator_doc_impact',
       description: 'Check candidate Doc Tree impact as the doc-tree skill says.',
@@ -168,4 +188,5 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId
       },
     }),
   ]
+  return reviewOnly ? tools.filter(item => item.name === 'orchestrator_review_submit') : tools.filter(item => item.name !== 'orchestrator_review_submit')
 }

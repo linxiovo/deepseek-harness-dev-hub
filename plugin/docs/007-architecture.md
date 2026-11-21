@@ -33,6 +33,7 @@ flowchart TB
 Startup registers management routes, initializes the installation binding and runs Setup. After setup resolves, it installs Session and Executor hooks, ensures the main Session exists, syncs Policy, resumes handoffs and interrupted Assignments, and starts passes and effects. `Runtime.ready` marks completion of startup; the installation API can answer before that promise resolves.
 
 Source plugins inject Runtime as the `orchestrator` service through the narrow `SourceHost` interface.
+Ticket review evidence is submitted only by a Worker descendant through `orchestrator_review_submit`; `Sessions` binds the real descendant Session ID, `DshExecutor` verifies the clean current worktree HEAD against the pinned base, and the Engine atomically records evidence on the current Assignment and writer generation. `ticket/<id>/reviews` returns current-generation evidence and pending when the live Worker lease, worktree HEAD or cleanliness no longer matches; `ticket/<id>/review/<review-id>` reads one persisted review.
 
 | Part | Module | Does |
 | --- | --- | --- |
@@ -523,7 +524,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
 | `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
-| `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
+| `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, review evidence and child-only review submission, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
 | `tests/topic-binding.spec.ts` | Uses a mounted project and normalized Feishu events to verify topic isolation, answer provenance and idempotent outbound delivery |
 | `tests/plans.spec.ts` | Automatic spec continuation, idempotent restart and registration, graph and role queries, invalid graph refusal, and root/node message isolation through the public Session tools |
@@ -623,7 +624,7 @@ New main Sessions use `dsh-superagent-router` (`ROUTER_PRESET`), a read-only pre
 
 ### Executor tools
 
-Each Executor has eight application tools.
+Each Worker Executor has eight application tools. A Worker descendant used as an independent reviewer additionally receives the child-only `orchestrator_review_submit` tool; the parent Worker, Hub, Planner and Splitter do not.
 
 | Tool | Purpose |
 | --- | --- |
@@ -636,9 +637,11 @@ Each Executor has eight application tools.
 | `orchestrator_thread_follow` | Subscribe to a related Thread for context and tell the main Session |
 | `orchestrator_trigger_handback` | Hand back a message once, with a reason carried by its candidate |
 
+Only a live Worker descendant whose first user message carries a valid `DSH_REVIEW_ASSIGNMENT` marker and whose Session history contains a `skill` call loading `dsh-worker-code-review` can call `orchestrator_review_submit`. The marker binds axis, pinned base, candidate and writer generation; the runtime supplies the actual reviewer Session ID. Submission rechecks the clean current candidate. The Engine persists evidence on the Assignment and aggregates only the active generation; the parent Worker cannot submit a review for itself.
+
 A hand-back returns `queued: false` if another Ticket still owns the message, or this Ticket never owned it. For example, a bot message went to Eval independently.
 
-The worker preset is defined in `cordis.patch.yml` and selected through `WORKER_PRESET`. `WORK_TOOLS` in `src/app/sessions.ts` retains available file, search, shell, job, web, skill, todo and subagent tools. Workers do not receive tools for asking or presenting to a person, changing the profile, scheduling work outside worker slots, starting or messaging other Sessions, or editing external documents. Tool calls are refused once the Ticket ends, and while no live verified writer grant authorizes the worker, for the worker and for every subagent at any depth below it.
+Ordinary Worker descendants retain the `WORK_TOOLS` surface described in `010-session-boundaries.md`; only a valid marked review child receives the narrower `REVIEW_TOOLS` surface and review tool.
 
 ### Result shapes and assessment context
 
@@ -669,7 +672,7 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 | `thread/<key>` | Label, Tickets, recent Decisions and a page of Triggers |
 | `trigger/<id>` | Message text, replied-to Trigger and neighboring messages, excluding CI runs |
 | `ticket/<id>` | Related ids, source-batch Triggers, Threads, and first pages of Assignments and Inputs |
-| Ticket subresources | `/assignments`, `/inputs`, `/assignment`, `/result`, `/report/<assignment id>`, `/transcript`, `/message/<n>`, `/input/<id>` |
+| Ticket subresources | `/assignments`, `/inputs`, `/assignment`, `/reviews`, `/review/<review id>`, `/result`, `/report/<assignment id>`, `/transcript`, `/message/<n>`, `/input/<id>` |
 | `settings`, `settings/<block>` | Revisions and summaries, or a complete block ready to save |
 | `prompts`, `prompts/<revision>`, `prompts/current`, `prompts/defaults`, `prompt-preview/<id>` | Prompt configurations and composed text |
 | `models`, `models/<provider>` | Available models |
@@ -678,6 +681,8 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 | `actions/<ticket\|plan>/<id>/commit/<40 lowercase hex SHA>` | GitHub Actions evidence for one owned commit, main Session only |
 
 Ticket Threads are marked `context` for context-only follows and `bound` for Source bindings. Assignment pages are newest first and include report previews. Continue lists with `next_offset`. `/input/<id>` accepts an Input's name or id. `settings` includes small blocks in full and summarizes Policy and Source blocks.
+
+`ticket/<id>/reviews` returns `{ticket_id, assignment_id, base, candidate, generation, clean, stale, aggregate, standards, spec, history, next_offset}`. `aggregate` is `pending`, `blocked` or `passed`; it is pending whenever the observed HEAD/cleanliness or the in-process Worker lease generation does not match the recorded target. `standards` and `spec` contain only current-generation evidence. Each evidence item has `{id, axis, reviewer_session, generation, basis, base, candidate, conclusion, blockers, summary, at}`. `history` is newest first and paged with `offset`/`limit` (up to 50), with `next_offset` and a `read` pointer for each row. `/review/<review id>` returns one retained item plus the observed current base/candidate and whether it is stale; stale history never changes the aggregate.
 
 Source resources include message neighborhoods, `github/pulls/<n>/thread/<comment id>` and `github/commits/<sha>/checks`.
 

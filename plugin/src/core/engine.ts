@@ -2,7 +2,7 @@
 import { UserError } from './errors.ts'
 import { key } from './ids.ts'
 import { isoTime, liveTicket } from './model.ts'
-import type { Decision, Execution, ExecutionClaim, ExecutionIdentity, ExecutionResult, PlanTicket, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { Decision, Execution, ExecutionClaim, ExecutionIdentity, ExecutionResult, PlanTicket, PolicyEffect, ReviewAxis, ReviewConclusion, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { PlanNode } from './plan.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
@@ -300,6 +300,11 @@ export class Engine {
    * answer, or a question or answer that names a message that is not a person's or did not reach the ticket.
    */
   report(ticketId: string, report: WorkerReport): Ticket { return this.repo.atomic(() => this.assignments.report(ticketId, report)) }
+  /** Persist one review through the Engine's single-write transaction boundary. */
+  recordReview(ticketId: string, reviewerSession: string, input: { axis: ReviewAxis; basis: string[]; base: string; candidate: string;
+    conclusion: ReviewConclusion; blockers: string[]; summary: string }) {
+    return this.repo.atomic(() => this.assignments.review(ticketId, reviewerSession, input))
+  }
   /**
    * Handles an assignment that was running when the host stopped: restarts it with a recovery note unless its latest report is
    * `waiting`, `ready`, `blocked`, or `failed` and no Input reached its worker after that report, in which case it keeps its
@@ -330,5 +335,5 @@ export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reeva
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
 export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
-  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'takeUp'
+  | 'assignmentInterrupted' | 'report' | 'recordReview' | 'markUnrelated' | 'handback' | 'followForContext' | 'takeUp'
   | 'reserveExecution' | 'recordExecutionVerified' | 'rejectExecution' | 'acquireExecutionWriter' | 'releaseExecutionWriter'>

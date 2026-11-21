@@ -26,7 +26,7 @@ Overrides use these keys:
 | Handoff instructions | `runtime/handoff/orchestrator`, `runtime/handoff/worker` |
 | Source skills | `skill/feishu`, `skill/github` |
 | Planning skills | `skill/to-spec`, `skill/splitter/to-tickets` |
-| Worker skills | `skill/doc-tree`, `skill/worker/implement`, `skill/worker/tdd`, `skill/worker/test-scope` |
+| Worker skills | `skill/doc-tree`, `skill/worker/implement`, `skill/worker/tdd`, `skill/worker/test-scope`, `skill/worker/code-review` |
 | Generated sections | `runtime/environment`, `runtime/policy`, `runtime/policy/none` |
 
 The worker guards load `prompts/worker-ticket-ended.md`, `prompts/worker-writer-required.md`, and `prompts/worker-ancestry-pending.md` as fixed tool responses, not editable system-prompt parts.
@@ -70,7 +70,7 @@ Executors also read DeepSeek Harness's coding prompt and the repository's `AGENT
 
 Only Worker Sessions mount `dsh-superagent-doc-tree` (`plugin/skills/dsh-superagent-doc-tree/SKILL.md`). `prompts/work.md` directs Workers to load it for documentation impact and committed-candidate evidence before readiness; the skill leaves semantic approval to independent review. The short name `doc-tree` is reserved. A same-name team skill in an older revision is not mounted and must be renamed or removed before saving that configuration.
 
-Only Worker Sessions mount `dsh-worker-implement`, `dsh-worker-tdd` and `dsh-worker-test-scope`. The `dsh-worker-` runtime namespace lets teams keep their own `implement`, `tdd` and `test-scope` skills. See `013-development-verification.md` for the Worker procedure.
+Only Worker Sessions mount `dsh-worker-implement`, `dsh-worker-tdd`, `dsh-worker-test-scope` and `dsh-worker-code-review`. Their `dsh-worker-` runtime namespace lets teams keep their own `implement`, `tdd`, `test-scope` and `code-review` skills; the review skill is Worker-only and is not mounted by the Hub, Planner or Splitter. See `013-development-verification.md` for the two-lane Worker review procedure.
 
 Executors work unattended. Their tools exclude those that ask a person, present UI to them or change the profile, such as `ask_user_question`, `present` and `plugin_manager`.
 

@@ -7,7 +7,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import { realpathSync } from 'node:fs'
 import { dirname, isAbsolute, relative } from 'node:path'
 import { z } from 'zod'
-import { key, liveTicket, type Ticket } from '../core/index.ts'
+import { key, latestAssignment, liveTicket, type ReviewAxis, type Ticket } from '../core/index.ts'
 import { mandateInstructions, ticketOfSession, workerSessionId } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { physicalPath } from '../infra/paths.ts'
@@ -45,8 +45,9 @@ export interface SessionsHost {
   splitterWorkspace(handoffId: string): string | undefined
   /** In-process writer grant; a stored lease cannot authorize worker turns after a restart. */
   workerAuthorized?(ticketId: string, sessionId: string): boolean
-  /** Handoff roles receive only their own tools, rather than the Hub's or a worker ticket's. */
-  tools(agent: Agent, ticket?: Ticket, role?: 'planner' | 'splitter'): Tool[]
+  authorizeReviewSession?(ticketId: string, sessionId: string, axis: ReviewAxis, candidate: string): Promise<boolean>
+  /** Handoff and review-subagent roles receive only their own tools, rather than Hub or Worker tools. */
+  tools(agent: Agent, ticket?: Ticket, role?: 'planner' | 'splitter' | 'review'): Tool[]
 }
 
 /**
@@ -57,6 +58,8 @@ interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: 
   role?: PromptRole; subagent?: true; ready?: Promise<void> }
 
 /** The agent presets Executor, planner and main Sessions are created with, which the bundle's patch defines. */
+const ReviewAssignmentSchema = z.strictObject({ axis: z.enum(['standards', 'spec']), base: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/),
+  candidate: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/), generation: z.number().int().positive() })
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router', PLANNER_PRESET = 'dsh-superagent-planner'
 const plannerHandoffId = (sessionId: string): string | undefined =>
   sessionId.startsWith('planner-') && sessionId.length > 'planner-'.length ? sessionId.slice('planner-'.length) : undefined
@@ -96,6 +99,8 @@ const WORKER_ANCESTRY_PENDING = promptFile('worker-ancestry-pending')
 const WORK_TOOLS = ['read', 'write', 'edit', 'apply_patch', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list',
   'job_kill', 'web_search', 'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents',
   'interrupt_agent']
+/** Review descendants inspect Git and documentation and submit evidence; they do not receive file-write, job or delegation tools. */
+const REVIEW_TOOLS = ['read', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'web_search', 'web_fetch', 'skill']
 /**
  * The MCP tools an Executor Session may use, by the exact `mcp__<server>__<tool>` names Context7 registers: its read-only
  * documentation lookups. Messaging and other MCP servers stay out, so a Worker cannot send a person a message directly and
@@ -399,10 +404,10 @@ export class Sessions {
    * a verified live writer grant. Read inherited tools through the parent scope, which includes the preset's tools;
    * the global view misses preset tools and the agent's own view also includes local tools that `restrict` refuses to name.
    */
-  private workOnly(agent: Agent, ticketId: string): (() => void)[] {
+  private workOnly(agent: Agent, ticketId: string, toolNames: readonly string[] = WORK_TOOLS): (() => void)[] {
     const store = this.host.store
     const parent = scopeParentOf(agent)
-    const allow = [...WORK_TOOLS, ...DEV_MCP_TOOLS].filter(name => agent.ctx.tools.get(name, parent))
+    const allow = [...toolNames, ...DEV_MCP_TOOLS].filter(name => agent.ctx.tools.get(name, parent))
     return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
       const current = store.tickets.get(ticketId)
       if (!current || !liveTicket(current)) return WORKER_TICKET_ENDED
@@ -430,10 +435,44 @@ export class Sessions {
     return undefined
   }
   /**
-   * A subagent of an Executor Session, or of one of its subagents, which runs under DSH's `standard` preset with the worker's
-   * permissions, gets the same work tools as the worker, and none once the worker's ticket ended. Any other agent is left as
-   * it is.
+   * Ordinary Worker descendants inherit the ticket work tools. A marked code-review descendant is limited to `REVIEW_TOOLS`
+   * and a single submission tool. Both remain guarded by the owning Worker's live writer lease.
    */
+  /** Read a review assignment from a real DSH subagent that loaded the packaged review Skill. */
+  private reviewAssignment(agent: Agent) {
+    if (agent.session.header.origin !== 'subagent') return undefined
+    const events = agent.session.snapshotEvents()
+    const loaded = events.some(event => {
+      if (event.type !== 'tool/call' || event.data.name !== 'skill') return false
+      try {
+        const args: unknown = JSON.parse(event.data.arguments)
+        return !!args && typeof args === 'object' && 'name' in args && args.name === 'dsh-worker-code-review'
+      } catch { return false }
+    })
+    if (!loaded) return undefined
+    const initial = events.find(event => event.type === 'user/message')
+    if (!initial) return undefined
+    const text = initial.data.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
+    const marker = /^DSH_REVIEW_ASSIGNMENT: (\{[^\n]+\})$/m.exec(text)?.[1]
+    if (!marker) return undefined
+    try {
+      const parsed: unknown = JSON.parse(marker)
+      const result = ReviewAssignmentSchema.safeParse(parsed)
+      return result.success ? result.data : undefined
+    } catch { return undefined }
+  }
+  /** A live descendant may submit only its assigned review lane for this ticket's current pinned candidate and writer generation. */
+  async authorizeReviewSession(ticketId: string, sessionId: string, axis: ReviewAxis, candidate: string): Promise<boolean> {
+    const agent = this.ctx.agents.get(sessionId as SessionId)
+    if (!agent || agent.id !== sessionId || agent.session.header.parentSession === undefined
+      || this.host.closing() || this.host.workerAuthorized?.(ticketId, workerSessionId(ticketId)) !== true) return false
+    const current = this.host.store.tickets.get(ticketId)
+    const assignment = current && latestAssignment(current)
+    const grant = this.reviewAssignment(agent)
+    if (!current || !liveTicket(current) || !assignment || !grant || grant.axis !== axis || grant.candidate !== candidate
+      || grant.base !== current.execution?.base?.sha || grant.generation !== assignment.writer?.generation) return false
+    return await this.owningTicket(agent) === ticketId
+  }
   private async limitSubagent(agent: Agent): Promise<void> {
     if (agent.session.header.parentSession === undefined) return
     // A live Session reloaded on startup can invoke tools while persistence resolves an unloaded parent.
@@ -443,8 +482,15 @@ export class Sessions {
     if (this.bindings.get(agent) !== pending || this.host.closing()) return
     if (ticketId === undefined) { this.release(agent); return }
     // Install the ticket guard before lifting the temporary one; an inspection error leaves the latter in place.
-    pending.disposers.push(...this.workOnly(agent, ticketId))
+    const review = this.reviewAssignment(agent)
+    pending.disposers.push(...this.workOnly(agent, ticketId, review ? REVIEW_TOOLS : WORK_TOOLS))
     pending.disposers.shift()!()
+    const ticket = this.host.store.tickets.get(ticketId)
+    if (!ticket || !review) return
+    const register = this.registerTool(agent, pending)
+    for (const tool of this.host.tools(agent, ticket, 'review')) {
+      if (tool.name === 'orchestrator_review_submit') register(tool.name, tool.description, tool.schema, tool.execute)
+    }
   }
   /** Register the skills of a prompt version in the agent's skill scope, in place of an earlier version's. */
   private bindSkills(binding: SessionBinding, version: PromptVersion): void {

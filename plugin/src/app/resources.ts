@@ -1,7 +1,7 @@
 /** Serves paginated context resources to orchestrator_read so large bodies stay out of model prompts until requested. */
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
-import { UserError, key, latestReport, reached, runningAssignment, threadKey, type Ticket, type Trigger } from '../core/index.ts'
+import { UserError, key, latestReport, reached, reviewStatus, runningAssignment, threadKey, type Ticket, type Trigger } from '../core/index.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { readGithub } from '../sources/github-read.ts'
 import { actionsEvidence } from '../sources/actions-evidence.ts'
@@ -43,7 +43,9 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
     + 'branch, base, worker Session and active writer when available; its trigger, decision and threads, latest assignments with the '
     + 'start of each report, and inputs, newest first', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
-  { name: 'ticket/<id>/assignments', holds: 'its assignments, newest first, with the start of each report', executor: true },
+  { name: 'ticket/<id>/reviews', holds: 'reviews', executor: true },
+  { name: 'ticket/<id>/review/<id>', holds: 'one review', executor: true },
+  { name: 'ticket/<id>/assignments', holds: 'assignment pages, newest first', executor: true },
   { name: 'ticket/<id>/inputs', holds: 'its inputs, newest first', executor: true },
   { name: 'ticket/<id>/result', holds: 'its latest report', executor: true },
   { name: 'ticket/<id>/report/<id>', holds: 'the report of one of its assignments', executor: true },
@@ -73,6 +75,7 @@ export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(r
 
 export interface ResourceHost {
   ownsSession?(id: string): boolean
+  reviewGeneration?(ticketId: string): number | undefined
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
   readonly pages: TextCache
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'skills' | 'defaultChanged'>
@@ -367,6 +370,35 @@ const ROUTES: readonly Route[] = [
       const threads = [...subscribed.map(thread => marked(thread.key, !!thread.context?.includes(id))),
         ...[...bound].filter(key => !subscribed.some(thread => thread.key === key)).map(key => marked(key, false))]
       return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId), ...retry }
+    }
+    if (section === 'reviews' || section === 'review') {
+      const assignment = ticket.assignments.at(-1)
+      const reviews = assignment?.reviews
+      if (section === 'review' && !part || section === 'reviews' && part !== undefined) throw new Error('Unknown context resource')
+      const item = section === 'review' ? assignment?.reviews?.evidence.find(review => review.id === part) : undefined
+      if (section === 'review' && !item) throw new Error('Unknown ticket review')
+      let currentHead: string | undefined
+      let clean = false
+      if (ticket.execution?.directory) {
+        currentHead = (await host.commands.git(['rev-parse', '--verify', 'HEAD'], ticket.execution.directory)).trim()
+        clean = !(await host.commands.git(['status', '--porcelain=v1', '--untracked-files=all'], ticket.execution.directory)).trim()
+      }
+      const base = ticket.execution?.base?.sha ?? reviews?.target?.base ?? null
+      const candidate = currentHead ?? reviews?.target?.candidate ?? null
+      const generation = host.reviewGeneration?.(id) ?? null
+      const matches = !!reviews?.target && reviews.target.base === base && reviews.target.candidate === candidate
+        && reviews.target.generation === generation && clean
+      const evidence = reviews?.evidence ?? []
+      const active = matches ? evidence.filter(review => review.base === base && review.candidate === candidate && review.generation === generation) : []
+      const aggregate = !clean || !currentHead || !reviews?.target || reviews.target.base !== base || reviews.target.candidate !== candidate
+        || reviews.target.generation !== generation ? 'pending' : reviewStatus(assignment!)
+      if (section === 'review') return { ...item, current_base: base, current_candidate: candidate,
+        stale: !matches, aggregate: matches ? aggregate : 'pending' }
+      const history = list(read, (offset, count) => evidence.slice().reverse().slice(offset, offset + count).map(review => ({ ...review,
+        read: `ticket/${id}/review/${review.id}` })))
+      return { ticket_id: id, assignment_id: assignment?.id ?? null, base, candidate, generation, clean, stale: !matches,
+        aggregate: matches ? aggregate : 'pending', standards: active.filter(review => review.axis === 'standards'),
+        spec: active.filter(review => review.axis === 'spec'), history: history.items, next_offset: history.next_offset }
     }
     if (section === 'assignments' || section === 'inputs') {
       if (part !== undefined) throw new Error('Unknown context resource')

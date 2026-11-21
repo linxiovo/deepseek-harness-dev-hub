@@ -13,6 +13,7 @@ export const workerSkills = {
   'worker/implement': load('implement', 'dsh-worker'),
   'worker/tdd': load('tdd', 'dsh-worker'),
   'worker/test-scope': load('test-scope', 'dsh-worker'),
+  'worker/code-review': load('code-review', 'dsh-worker'),
 }
 
 /** Packaged skill definitions by preview key. */

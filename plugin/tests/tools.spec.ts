@@ -59,7 +59,7 @@ it('reads the lists, a ticket, a decision, the settings, the prompts and the mod
   expect(JSON.parse((await read('settings/policy') as { text: string }).text).value.sources.feishu.allowed).toEqual([{ id: 'ou_alice', name: 'Alice' }])
   await expect(read('settings/source:retired')).rejects.toThrow('Unknown settings block')
   const skills = { built_in: ['dsh-superagent-feishu', 'dsh-superagent-github', 'dsh-superagent-doc-tree',
-    'dsh-worker-implement', 'dsh-worker-tdd', 'dsh-worker-test-scope'], team: [] }
+    'dsh-worker-implement', 'dsh-worker-tdd', 'dsh-worker-test-scope', 'dsh-worker-code-review'], team: [] }
   expect(await read('prompts')).toMatchObject({ revision: 0, read: 'prompts/0', skills, items: [expect.objectContaining({ revision: 0 })], next_offset: null })
   const { body: promptSettings } = await h.api('GET', 'prompts')
   expect(promptSettings.builtin).toEqual(['feishu', 'github', 'to-spec', 'doc-tree'])
@@ -104,6 +104,57 @@ it('reads verified worktree ownership, actual worker Session, active writer, and
   const rejectedPage = (await h.api('GET', `tickets/${ticket.id}`)).body
   expect(rejectedPage).toMatchObject({ execution: shownRejected })
   expect(rejectedPage).not.toHaveProperty('execution.ownership')
+})
+
+it('exposes review submission only to actual Worker descendants and restores independent evidence through ticket resources', async () => {
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot review the work'))
+  expect(h.tools.get(sessionId)?.has('orchestrator_review_submit')).toBe(false)
+  await expect(h.runTool(sessionId, 'orchestrator_review_submit', { candidate: h.localGit!.base.sha, axis: 'standards',
+    basis: ['plugin/docs/007-architecture.md'], conclusion: 'passed', summary: 'Reviewed.', blockers: [] })).rejects.toThrow(/not registered/i)
+  const standardsSession = await h.reviewSubagent(sessionId, 'standards')
+  const specSession = await h.reviewSubagent(sessionId, 'spec')
+  expect(h.tools.get(standardsSession)?.has('orchestrator_review_submit')).toBe(true)
+  expect(h.tools.get(specSession)?.has('orchestrator_review_submit')).toBe(true)
+  const unqualified = await h.reviewSubagent(sessionId, 'standards', undefined, false)
+  expect(h.tools.get(unqualified)?.has('orchestrator_review_submit')).toBe(false)
+  await expect(h.runTool(unqualified, 'orchestrator_review_submit', { candidate: h.localGit!.base.sha, axis: 'standards',
+    basis: ['fake reviewer'], conclusion: 'passed', summary: 'Not a reviewer.', blockers: [] })).rejects.toThrow(/not registered/i)
+  for (const reviewer of [standardsSession, specSession]) {
+    const allowed = h.toolLimits.get(reviewer)!
+    expect(allowed.has('bash')).toBe(true)
+    expect(allowed.has('write')).toBe(false)
+    expect(allowed.has('edit')).toBe(false)
+    expect(allowed.has('subagent')).toBe(false)
+  }
+  const candidate = h.localGit!.git('-C', ticket.execution!.directory, 'rev-parse', 'HEAD')
+  const other = await h.acceptedTicket(feishu('2', '@bot another ticket'))
+  const foreignReviewer = await h.reviewSubagent(other.sessionId, 'spec')
+  const foreign = await h.runTool(foreignReviewer, 'orchestrator_review_submit', { candidate, axis: 'spec',
+    basis: ['another ticket'], conclusion: 'passed', summary: 'Cross-ticket review.', blockers: [] })
+  expect(foreign.aggregate).toBe('pending')
+  await expect(h.runTool(standardsSession, 'orchestrator_review_submit', { candidate, axis: 'spec',
+    basis: ['plugin/docs/007-architecture.md'], conclusion: 'passed', summary: 'Wrong lane.', blockers: [] })).rejects.toThrow(/code-review descendant assigned to this axis/)
+  const submit = (reviewer: string, axis: 'standards' | 'spec') => h.runTool(reviewer, 'orchestrator_review_submit', {
+    candidate, axis, basis: ['plugin/docs/007-architecture.md'], conclusion: 'passed', summary: `${axis} checked.`, blockers: [],
+  })
+  await expect(h.runTool(standardsSession, 'orchestrator_review_submit', { candidate, axis: 'standards', reviewer_session: 'worker-forged',
+    basis: ['plugin/docs/007-architecture.md'], conclusion: 'passed', summary: 'Reviewed.', blockers: [] })).rejects.toThrow()
+  const first = await submit(standardsSession, 'standards')
+  expect(first.aggregate).toBe('pending')
+  const reviewsRead = () => read(`ticket/${ticket.id}/reviews`)
+  expect(await reviewsRead()).toMatchObject({ aggregate: 'pending', candidate, standards: [expect.objectContaining({ reviewer_session: standardsSession,
+    axis: 'standards', basis: ['plugin/docs/007-architecture.md'] })], spec: [] })
+  const second = await submit(specSession, 'spec')
+  expect(second.aggregate).toBe('passed')
+  expect(await reviewsRead()).toMatchObject({ aggregate: 'passed', standards: [expect.objectContaining({ reviewer_session: standardsSession })],
+    spec: [expect.objectContaining({ reviewer_session: specSession, axis: 'spec' })] })
+  const evidence = second.evidence
+  if (!evidence || typeof evidence !== 'object' || !('id' in evidence) || typeof evidence.id !== 'string') throw new Error('Review evidence has no id')
+  expect(await read(`ticket/${ticket.id}/review/${evidence.id}`)).toMatchObject({ reviewer_session: specSession,
+    base: ticket.execution!.base!.sha, candidate, aggregate: 'passed' })
+  await h.restart()
+  expect(await read(`ticket/${ticket.id}/reviews`, { limit: 1 })).toMatchObject({ history: [expect.any(Object)], next_offset: 1 })
+  expect(await reviewsRead()).toMatchObject({ aggregate: 'pending', standards: [], spec: [], history: expect.arrayContaining([expect.any(Object)]) })
 })
 
 it('checks documentation impact in the active worker candidate and never approves its semantics', async () => {

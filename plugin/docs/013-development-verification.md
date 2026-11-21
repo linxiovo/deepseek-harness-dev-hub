@@ -18,6 +18,8 @@ Run focused checks from `plugin/` as soon as the change is runnable. Pass the re
 
 Run `pnpm check` once at the end. On Windows the Vitest configuration limits concurrent Git fixtures; local verification and CI use the same command and test coverage.
 
+In recovery tests that use real Git worktrees, wait for the controlled teardown to start and for the Runtime to become idle after release; assert delivery without a separate short polling deadline.
+
 ## Worker implementation and test evidence
 
 For an authorized implementation Ticket, the Worker loads `dsh-worker-implement` before editing. Read `ticket/<id>` with `orchestrator_read` to confirm the verified worktree and pinned base. Keep edits and checks in that worktree.

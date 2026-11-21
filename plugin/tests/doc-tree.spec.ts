@@ -10,7 +10,7 @@ let fixture: string | undefined
 
 afterEach(() => {
   if (!fixture) return
-  rmSync(fixture, { recursive: true, force: true })
+  rmSync(fixture, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
   fixture = undefined
 })
 

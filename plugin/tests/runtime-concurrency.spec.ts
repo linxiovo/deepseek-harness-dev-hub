@@ -537,8 +537,12 @@ describe('a worker whose work runs in the background', () => {
     await vi.waitFor(() => expect(latestAssignment(ticket())?.report?.state).toBe('waiting'))
     // A subagent still runs, whose release is slow; one Input waits in the Session's inbox, another in the ticket.
     h.subagents.spawn(one.sessionId)
-    const gate = deferred(), drain = h.subagents.service.drainChildren.getMockImplementation()!
-    h.subagents.service.drainChildren.mockImplementationOnce(async (parent, ids) => { await gate.promise; await drain(parent, ids) })
+    const gate = deferred(), draining = deferred(), drain = h.subagents.service.drainChildren.getMockImplementation()!
+    h.subagents.service.drainChildren.mockImplementationOnce(async (parent, ids) => {
+      draining.resolve()
+      await gate.promise
+      await drain(parent, ids)
+    })
     agent.inbox.nextStep.push({ id: 'taken-later', role: 'user', content: [{ type: 'text', text: 'Handed over' }], source: { kind: 'user' } } as never)
     const stored = ticket()
     stored.inputs.push({ id: 'input-late', kind: 'text', text: 'One more thing', at: new Date().toISOString() })
@@ -546,17 +550,18 @@ describe('a worker whose work runs in the background', () => {
     h.runtime.store.tickets.save(stored)
     // The delivery waits for the release, so the effects are not idle until it ends.
     h.runtime.executor.resume()
-    await new Promise(resolve => setTimeout(resolve, 20))
+    await draining.promise
     const late = expect.objectContaining({ sessionId: one.sessionId, text: expect.stringContaining('One more thing') })
-    expect(h.deliveries).not.toHaveBeenCalledWith(late)
+    try { expect(h.deliveries).not.toHaveBeenCalledWith(late) }
+    finally { gate.resolve() }
     const reports = () => h.relays(h.runtime.masterId).filter(item => item.kind === 'worker_report').length
     const reported = reports()
-    gate.resolve()
-    await vi.waitFor(() => expect(h.deliveries).toHaveBeenCalledWith(late))
+    // The recovered writer revalidates its Git worktree before the queued Input can be delivered.
+    await h.runtime.idle()
+    expect(h.deliveries).toHaveBeenCalledWith(late)
     expect(agent.cancel).not.toHaveBeenCalledWith({ kind: 'user' }, { keepInbox: false })
     expect(agent.inbox.nextStep.map(message => message.id)).toContain('taken-later')
     // The turn the subagent's end woke and the release cancelled reports nothing.
-    await h.runtime.idle()
     expect(reports()).toBe(reported)
   })
   it('collects the end of a job left to a person until dsh-superagent stopped its workers', async () => {

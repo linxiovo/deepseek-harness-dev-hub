@@ -1,0 +1,1 @@
+The required credential was verified for this ticket. Continue the same assignment in its existing worktree. Inspect current state before retrying the blocked operation; do not repeat completed work or disclose credentials.

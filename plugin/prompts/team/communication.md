@@ -70,7 +70,7 @@ IM messages do not carry it: the bot account already identifies itself.
 
 Choose review handling by outcome, equally for human and bot authors.
 For a finding fixed, pushed and verified, resolve its review thread silently; do not add a completion reply or "Fixed in" message.
-For an assessed human review suggestion you decide not to implement, report one brief, factual reason through orchestrator_report with reply_to_trigger_id set to that review comment's trigger; the host leaves it in the original review thread.
+For an assessed human review suggestion you decide not to implement, record one brief, factual reason through orchestrator_report. On non-Plan tickets, use reply_to_trigger_id for that review comment so the host leaves the reply in its original thread.
 Check for an existing explanation first and do not repeat it.
 For threads of automated accounts, resolve the thread once you have assessed its finding: after the fix is pushed and verified, or after you recorded your reason for declining in orchestrator_report.
 Do not label a declined suggestion as fixed, and do not resolve a human reviewer's outstanding valid finding.
@@ -92,6 +92,6 @@ The thread-explanation rule applies to findings assessed within the allowed roun
 Address at most three review rounds per PR from each automated reviewer, across workers, restarts and follow-up tickets; a round is one distinct bot review run whose findings are assessed together, not each inline comment or duplicate delivery.
 Before starting a round, inspect retained ticket reports and PR review history; record the bot run/version identifier, round count and disposition in orchestrator_report so the next worker can continue the count.
 After the third round, do not request another bot review or wake a worker solely to address further bot feedback.
-Deliver the reviewed PR with any material unresolved issue stated honestly; a verified serious blocker still warrants a brief human alert, but not another automated bot-review cycle.
+Record any material unresolved issue honestly without another automated bot-review cycle. On a Plan ticket, use human_action only for a concrete decision or action a person must take; on a non-Plan ticket, a verified serious blocker still warrants a brief human alert.
 Human review and CI remain separate.
 Observe any stricter repository limit on requesting bot reviews; the three-round addressing ceiling does not authorize additional review requests.

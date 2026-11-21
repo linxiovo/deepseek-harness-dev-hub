@@ -9,6 +9,7 @@ import type { SettingsVersion } from './app/store.ts'
 import type { SessionMeterState } from './app/session-meter.ts'
 import type { MeterSessionBinding } from './app/project-meter.ts'
 import type { TopicBindingRecord } from './app/topic-binding.ts'
+import type { CredentialBlocker } from './app/scoped-attention.ts'
 import type { SettingsSave } from './policy.ts'
 import type { Retry } from './sources/github.ts'
 
@@ -81,4 +82,6 @@ export const KV = {
       (id, nodeId) => JSON.stringify([id, nodeId])),
     receipt: family<string, [id: string, sessionId: string, messageId: string]>('plan-message-receipt:',
       (id, sessionId, messageId) => JSON.stringify([id, sessionId, messageId])) },
+  /** Scoped attention: durable action receipts and at most one active credential blocker per Ticket. */
+  attention: { credential: family<CredentialBlocker>('credential-action:'), active: family<string>('active-credential-action:') },
 }

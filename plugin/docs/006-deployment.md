@@ -144,8 +144,9 @@ Copy [examples/profile.cordis.patch.yml](../examples/profile.cordis.patch.yml) t
 | `stateDir` | yes | Absolute installation path (a drive or UNC path on Windows). Holds the lock, project catalog and project state; keep it outside project checkouts and back it up before upgrades |
 | `runtimeMode` | no | `desktop` (default) or `headless`. Reports how the DSH instance is deployed; both modes mount at most one active project and use the same loopback management API |
 | `promptMaxChars`, `admissionContextMaxPages`, `admissionContextTimeoutMs` | no | The largest saved prompt configuration, and how many Thread pages one assessment reads within what time |
+| `credentialChecks` | no | Project-scoped trusted test-account verifiers, empty by default; see `015-scoped-attention.md` for the entry schema and deployment example |
 
-After the first start, edit volatile machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Limits apply without restart. Set `stateDir` and `runtimeMode` in the profile configuration; they are not volatile. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
+After the first start, edit volatile machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Limits apply without restart. Set `stateDir`, `runtimeMode` and `credentialChecks` in the profile configuration; they are not volatile. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
 
 ## Start and stop
 
@@ -254,6 +255,7 @@ Agents may rely on these routes and fields. The other routes in `src/app/api.ts`
 | `GET state` | Host startup and mounted-project health: `setup`, with `problem` and `feishuProblem`, each `null` or a setup problem with `place`, `code`, `values` and `detail`, and `accounts` once setup resolved them; `health`, an entry per part, below, with `state` (`starting`, `ready`, `paused` or `error`), `detail` and `at`; `load`, the Executor Sessions `running`, the Tickets `queued` and `maxWorkers`; `paused`; and `masterId` |
 | `GET settings` | `blocks`: `policy`, `eval` and `executor`, each with its `value` and its `revision`; `sources`: the Source instances, each with `id`, `kind`, `installed`, its block's `value`, `{"enabled": …, "config": {…}}`, and `revision`, its kind's form, and its setup `problem` when it has one; `policyVersion`; and `environment`, the execution environment's `root` and `variables` |
 | `GET topic-binding`, `POST topic-binding`, `POST topic-binding/unbind` | Inspect, bind or disconnect the selected project's Feishu destination. These routes always require the mounted project scope; `009-handoff.md` describes the request, participant grants and reply format. |
+| `GET attention/summary`, `GET attention/credentials/<id>`, `POST attention/credentials/<id>/verify` | Read scoped Plan attention and invoke a trusted test-account verification. All three require the mounted project header; verification accepts only `{}`. See `015-scoped-attention.md`. |
 | `GET sources` | Each Source's status: `state` (`missing`, `off`, `error`, `setup`, `starting`, `paused` or `ready`), the `health` of its parts, its setup `problem`, the last day's `stats`, the Triggers it `filtered` in that day, and the messages it `dropped` in that day, newest drop first, each with its `channel`, `preview`, `ticket` (`id` and `title`) when it was for one, its `thread` when the store has it, and `dropped.at` and `dropped.reason`, `channelGone` or `channelIgnored` |
 | `GET tickets/<id>` | The Ticket page: stage and actions, Mandate, Inputs, Threads and Assignments, and its `execution` with `name`, `directory`, `repository`, `worktree`, `branch`, `base` (`ref` and `sha`), `session`, `active_writer` and `preparation` with its `reason`. A legacy Ticket omits the facts it never recorded |
 | `PUT settings/<block>` with `{"value": …, "revision": n}` | Saves one block: `saved`, the block's new `revision`, `policy_changed` and `restarting`. `value` is the whole block, as `GET settings` holds it; a missing key takes its default |
@@ -361,6 +363,8 @@ To run directly inside WSL, use a clone on the distribution's native Linux files
 7. Let the splitter register the Plan through `orchestrator_plan_register`. Invoke/read `plan/<handoff-id>` again and verify the registered DAG is visible and the splitting continuation has disappeared. Registration must still leave no Worker Session or Ticket.
 
 This is an operator-run real-model check, separate from automated tests and CI; do not report `pnpm check` or CI as covering it.
+
+For a real-host Plan credential pause and verification, use the separate operator smoke check in `015-scoped-attention.md`.
 
 ## Troubleshooting
 

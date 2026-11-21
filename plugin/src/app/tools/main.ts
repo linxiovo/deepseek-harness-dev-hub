@@ -8,7 +8,8 @@ import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
 import type { Handoffs } from '../handoffs.ts'
 import { InstallationError } from '../installation-api.ts'
-import { PlanTargetSchema, type Plans } from '../plans.ts'
+import { PlanDeliveryReceiptSchema, PlanTargetSchema, type PlanDeliveryWriter, type Plans } from '../plans.ts'
+import type { PlanDispatcher } from '../plan-dispatch.ts'
 import { ticketCard } from '../cards.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
@@ -72,6 +73,8 @@ export interface MainToolsHost {
   readonly resources: ResourceHost
   readonly handoffs: Pick<Handoffs, 'confirm' | 'answer' | 'get' | 'spec'>
   readonly plans: Pick<Plans, 'view' | 'node' | 'append'>
+  readonly planDelivery: PlanDeliveryWriter
+  readonly planDispatcher: Pick<PlanDispatcher, 'dispatch'>
   assertNewWork?(): void
   verifyProjectBinding?(): Promise<string | undefined>
   /** Schedules a pass to carry out work queued by an Engine command (such as an Eval or ticket resume). */
@@ -263,6 +266,25 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         const { planId, target, text } = PlanMessageSchema.parse(value)
         host.plans.append(planId, target, { sessionId: agent.id, messageId, text })
         return { read: target.kind === 'node' ? `plan/${planId}/node/${target.nodeId}` : `plan/${planId}` }
+      },
+    }),
+    tool({
+      name: 'orchestrator_plan_dispatch',
+      description: 'Dispatch a Frontier node after formal predecessor delivery; persist its claim before launch.',
+      schema: z.object({ planId: z.string().trim().min(1), nodeId: z.string().trim().min(1) }).strict(),
+      execute: async ({ planId, nodeId }) => {
+        if (agent.id !== host.resources.masterId) throw new Error('Only the Hub may dispatch Plan nodes')
+        host.assertNewWork?.()
+        return host.planDispatcher.dispatch(planId, nodeId)
+      },
+    }),
+    tool({
+      name: 'orchestrator_plan_deliver',
+      description: 'Record formal delivery from an exact delivery-check receipt; ready, failure, stop or closed is insufficient.',
+      schema: z.object({ planId: z.string().trim().min(1), nodeId: z.string().trim().min(1), receipt: PlanDeliveryReceiptSchema }).strict(),
+      execute: async ({ planId, nodeId, receipt }) => {
+        if (agent.id !== host.resources.masterId) throw new Error('Only the Hub may record formal Plan delivery')
+        return host.planDelivery.deliver(planId, nodeId, receipt)
       },
     }),
     routeTool(host),

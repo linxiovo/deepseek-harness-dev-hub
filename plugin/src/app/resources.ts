@@ -37,9 +37,9 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'decision/<id>', holds: 'one decision with its audit' },
   { name: 'handoff/<id>', holds: 'the persisted, explicitly confirmed project and product intent, including planner questions and answers' },
   { name: 'spec/<id>', holds: 'the published specification for this handoff, with observable acceptance and test interfaces; pending until publication' },
-  { name: 'plan/<id>', holds: 'the handoff’s Plan DAG, roles, dependencies, per-role progress and root background' },
-  { name: 'plan/<id>/node/<node-id>', holds: 'one Slice Ticket and its addressed instructions' },
-  { name: 'ticket/<id>', holds: 'a ticket\'s card, recorded preparation status and rejection reason, verified repository, worktree, '
+  { name: 'plan/<id>', holds: 'the handoff’s Plan DAG, roles, dependencies, Frontier, node claims and formal delivery progress, plus root background' },
+  { name: 'plan/<id>/node/<node-id>', holds: 'one Slice Ticket with its role, waiting reason or claim/session/action state, delivery receipt and addressed instructions' },
+  { name: 'ticket/<id>', holds: 'a ticket\'s card, Plan role/node claim when applicable, recorded preparation status and rejection reason, verified repository, worktree, '
     + 'branch, base, worker Session and active writer when available; its trigger, decision and threads, latest assignments with the '
     + 'start of each report, and inputs, newest first', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },

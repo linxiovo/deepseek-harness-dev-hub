@@ -6,7 +6,9 @@ import { Commands } from '../src/infra/commands.ts'
 import { githubKind } from '../src/sources/github.ts'
 import { observePull } from '../src/sources/github-pull.ts'
 import { feishu, startRuntime, type Host } from './fixtures/host.ts'
+import { KV } from '../src/kv.ts'
 import type { MainlineRepair } from '../src/core/model.ts'
+import type { MainlineIntent } from '../src/app/mainline-queue.ts'
 
 let h: Host
 beforeEach(async () => { h = await startRuntime() })
@@ -178,9 +180,81 @@ function actionsHost() {
     stopDiscovery: () => { discoveryAvailable = false },
     setPull: (value: Pull) => { pull = value; return pullResponse(value) } }
 }
+/** Move a real Plan Ticket's durable queue projection into repair without adding a test-only production hook. */
+function repairIntent(ticketId: string): MainlineIntent {
+  const ticket = h.runtime.store.tickets.get(ticketId)!
+  const assignment = ticket.assignments.at(-1)!
+  const base = h.localGit!.base.sha
+  return { id: `repair-${ticketId}`, ticket_id: ticketId, queued_at: new Date().toISOString(), status: 'repair',
+    target: { repository: h.localGit!.repository, slug, ref: targetRef }, base, candidate: base,
+    assignment: assignment.id, generation: assignment.writer!.generation, actual: base,
+    reason: 'Worker repair request has not succeeded: dispatch failed once' }
+}
 
+it('clears a failed durable repair reason after a restart resumes the same repair intent', async () => {
+  const { id: planId, a } = await registerPlan()
+  const intent = repairIntent(a.ticketId)
+  h.runtime.store.set(KV.mainline.ticket(a.ticketId), [intent])
+  const calls: { ticketId: string; repairId: string }[] = []
   vi.spyOn(Object.getPrototypeOf(h.runtime.executor), 'requestMainlineRepair').mockImplementation(async function (...args: unknown[]) {
     const [ticketId, repair] = args as [string, MainlineRepair]
+    calls.push({ ticketId, repairId: repair.id })
+    if (calls.length === 1) throw new Error('dispatch failed once')
+  })
+  h.runtime.effects.enqueue('mainlineRepair', intent.id, { ticketId: a.ticketId })
+  await h.runtime.effects.idle('mainlineRepair')
+
+  const first = await read(`ticket/${a.ticketId}`)
+  expect(first.mainline).toMatchObject({ id: intent.id, status: 'repair', reason: 'Worker repair request has not succeeded: dispatch failed once' })
+  expect(first.mainline).not.toHaveProperty('verification')
+  expect(await read(`plan/${planId}/node/trim`)).not.toHaveProperty('delivery')
+
+  await h.restart()
+  const retry = Promise.withResolvers<void>()
+  setTimeout(retry.resolve, 2_100)
+  await retry.promise
+  await h.runtime.effects.idle('mainlineRepair')
+  const ticket = await read(`ticket/${a.ticketId}`)
+  expect(ticket.mainline).toMatchObject({ id: intent.id, status: 'repair', repair_requested: true })
+  expect(ticket.mainline).not.toHaveProperty('reason')
+  expect(ticket.mainline).not.toHaveProperty('verification')
+  const served = await h.api('GET', `tickets/${a.ticketId}`)
+  expect(served.status).toBe(200)
+  expect(served.body.mainline).toEqual(ticket.mainline)
+  expect(await read(`plan/${planId}/node/trim`)).not.toHaveProperty('delivery')
+  expect(calls).toEqual([{ ticketId: a.ticketId, repairId: intent.id }, { ticketId: a.ticketId, repairId: intent.id }])
+}, 90_000)
+
+it('does not let a repair callback clear failure state for a different ticket or superseded intent', async () => {
+  const { a, b } = await registerPlan()
+  const intent = repairIntent(a.ticketId)
+  h.runtime.store.set(KV.mainline.ticket(a.ticketId), [intent])
+  const entered = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>()
+  const repair = vi.spyOn(h.runtime.executor, 'requestMainlineRepair').mockImplementation(async () => {
+    entered.resolve()
+    await finish.promise
+  })
+
+  h.runtime.effects.enqueue('mainlineRepair', intent.id, { ticketId: b.ticketId })
+  await h.runtime.effects.idle('mainlineRepair')
+  expect(repair).not.toHaveBeenCalled()
+
+  h.runtime.effects.enqueue('mainlineRepair', intent.id, { ticketId: a.ticketId })
+  const idle = h.runtime.effects.idle('mainlineRepair')
+  await entered.promise
+  const superseding = { ...intent, id: `replacement-${intent.id}` }
+  h.runtime.store.set(KV.mainline.ticket(a.ticketId), [intent, superseding])
+  finish.resolve()
+  await idle
+
+  const ticket = await read(`ticket/${a.ticketId}`)
+  expect(repair).toHaveBeenCalledOnce()
+  expect(ticket.mainline).toMatchObject({ id: superseding.id, status: 'repair',
+    reason: 'Worker repair request has not succeeded: dispatch failed once' })
+  expect(ticket.mainline).not.toHaveProperty('repair_requested')
+  expect(ticket.mainline).not.toHaveProperty('verification')
+})
+
 it('serializes two reviewed Plan candidates, then verifies a conflict repair only with fresh evidence', async () => {
   const { repository, git } = h.localGit!
   mkdirSync(join(repository, 'docs'))

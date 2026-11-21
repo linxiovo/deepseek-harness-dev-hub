@@ -296,6 +296,7 @@ const TEXT = {
   mainlineIntent: ['合入意图', 'Merge intent'],
   mainlineCandidate: ['候选提交', 'Candidate commit'],
   mainlineActual: ['实际主干提交', 'Observed mainline commit'],
+  mainlineIntegration: ['队列集成提交', 'Queue integration commit'],
   'mainline.queued': ['排队合入', 'Queued to merge'],
   'mainline.applying': ['正在合入或核对结果', 'Applying or checking result'],
   'mainline.waiting': ['等待重新核验', 'Waiting for recheck'],

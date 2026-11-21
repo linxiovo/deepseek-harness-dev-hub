@@ -119,7 +119,7 @@ export class MainlineQueue {
     try {
       await this.host.repair(ticketId, { id, assignment: intent.assignment, previousBase: intent.base, base: intent.actual,
         candidate: intent.candidate, ref: intent.target.ref })
-      if (mainlineIntent(this.host.store, ticketId)?.id === id) this.update(intent, 'repair', { repair_requested: true })
+      if (mainlineIntent(this.host.store, ticketId)?.id === id) this.update(intent, 'repair', { repair_requested: true, reason: undefined })
     } catch (error) {
       this.host.lifetime.throwIfAborted()
       if (mainlineIntent(this.host.store, ticketId)?.id === id) {

@@ -193,6 +193,7 @@ export function TicketPage({ id }: { id: string }) {
         [t('mainlineCandidate'), <span className="dt-mono">{data.mainline.candidate}</span>],
         [t('executionBaseSha'), <span className="dt-mono">{data.mainline.base}</span>],
         [t('mainlineActual'), <span className="dt-mono">{data.mainline.actual ?? t('empty')}</span>],
+        [t('mainlineIntegration'), <span className="dt-mono">{data.mainline.integration ?? t('empty')}</span>],
       ]} />
       {data.mainline.reason && <Hint>{data.mainline.reason}</Hint>}
     </Section>}

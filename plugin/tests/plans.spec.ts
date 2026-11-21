@@ -301,6 +301,44 @@ it('counts a forked review once and keeps one Hub call across two active Tickets
     usage: { reported_total_tokens: 6, counted_calls: 1 } } })
 })
 
+it.each(['HTTP', 'Hub'] as const)('does not mix physical log generations in a %s meter read', async entry => {
+  const { id } = await registeredFanIn()
+  const { session, ticketId } = (await dispatchPlan(id, 'catalog')).claim!
+  await h.runtime.idle()
+  const query = async () => {
+    if (entry === 'Hub') return read(`ticket/${ticketId}/meter`)
+    const response = await h.api('GET', `tickets/${ticketId}/meter`)
+    expect(response.status).toBe(200)
+    return response.body
+  }
+  const message = (inputTokens: number, outputTokens: number, totalTokens: number) => ({ type: 'assistant/message',
+    data: { turn: 1, step: 1, usage: { inputTokens, outputTokens, totalTokens }, stream: [], message: { role: 'assistant', content: [] } } })
+  h.record(session, [message(8, 2, 10)])
+  expect(await query()).toMatchObject({ attributed: { reported_total_tokens: 10, counted_calls: 1 } })
+
+  const opening = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+  h.hooks.openingLog = id => {
+    if (id !== session) return undefined
+    opening.resolve()
+    return release.promise
+  }
+  const pending = query()
+  let restore: (() => void) | undefined
+  try {
+    await Promise.race([opening.promise, pending.then(() => { throw new Error('The meter did not open the Worker log') })])
+    restore = h.useStoredLog(session, Date.now(), [message(3, 1, 4)])
+    release.resolve()
+    expect(await pending).toMatchObject({ attributed: { reported_total_tokens: null, counted_calls: 0 },
+      sessions: expect.arrayContaining([expect.objectContaining({ session_id: session, log_status: 'unverified', context: null })]) })
+  } finally {
+    release.resolve()
+    delete h.hooks.openingLog
+    restore?.()
+  }
+  h.record(session, [message(5, 1, 6)])
+  expect(await query()).toMatchObject({ attributed: { reported_total_tokens: 16, counted_calls: 2 } })
+})
+
 it('claims only frontier nodes, records role/session/action before start, and deduplicates a node claim', async () => {
   const { id } = await registeredFanIn()
   const settings = h.runtime.store.settings()

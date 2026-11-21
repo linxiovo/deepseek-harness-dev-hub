@@ -166,7 +166,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     [scoped]: `global\0credential.helper\n\0global\0credential.https://github.com.helper\n${credentialHelper(AGENT)}\0`,
   }
   /** A prepare command (`sh -c`) waits for this while it is set. */
-  const hooks: { prepare?: Promise<void> } = {}
+  const hooks: { prepare?: Promise<void>; openingLog?: (sessionId: string) => Promise<void> | undefined } = {}
   const subprocess = { spawn: vi.fn((spec: { argv: readonly string[]; cwd?: string; env?: Record<string, string> }) => {
     const argv = [...spec.argv]
     while (argv[0] === 'env' || /^[A-Z_]+=/.test(argv[0] ?? '')) argv.shift()
@@ -300,6 +300,8 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     const header = sessionHeaders.get(sessionId)
     return header ? { header, revision: 'fixture' } : undefined
   }), open: vi.fn(async (sessionId: string) => {
+    const opening = hooks.openingLog?.(sessionId)
+    if (opening) await opening
     const id = sessionId as SessionId
     const events = sessionHistory.get(sessionId)
     if (!events) throw new SessionPersistenceNotFoundError(id)
@@ -420,6 +422,14 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
       if (session) ctx.emit('session/event', session as never, stored as never)
     }
   }
+  /** Switch only the backend's stored log generation; a loaded Agent still describes its original Session. */
+  const useStoredLog = (sessionId: string, createdAt: number, events: readonly Omit<StoredEvent, 'seq'>[]) => {
+    const header = sessionHeaders.get(sessionId), history = sessionHistory.get(sessionId)
+    if (!header || !history) throw new Error(`Missing stored Session ${sessionId}`)
+    sessionHeaders.set(sessionId, { ...header, createdAt })
+    sessionHistory.set(sessionId, events.map((event, seq) => ({ ...event, seq, time: event.time ?? createdAt + seq + 1 })))
+    return () => { sessionHeaders.set(sessionId, header); sessionHistory.set(sessionId, history) }
+  }
   const idlePlanning = () => runtime.effects.idle('planning')
   const idleRelay = () => runtime.effects.idle('relay')
   /** Route one decision with the main Session's orchestrator_route, answering its result; a refused one throws its reason. */
@@ -450,6 +460,6 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
   return { get runtime() { return runtime }, get ctx() { return ctx }, get toolLimits() { return toolLimits }, restart, idlePlanning, idleRelay, directory, localGit, agents, tools, deliveries, relays, candidates, runTool, sendUserMessage, record, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
-    jobs, subagents, reviewSubagent, step, claim }
+    jobs, subagents, reviewSubagent, useStoredLog, step, claim }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>

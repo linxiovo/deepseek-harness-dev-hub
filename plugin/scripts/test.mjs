@@ -30,7 +30,7 @@ async function holdWindowsGate() {
       await once(server, 'listening')
       server.unref() // Hold for this PID's lifetime without keeping Vitest alive.
       if (announced) console.error(`[test] Acquired the Windows Vitest gate (${state(performance.now() - startedAt)}); starting Vitest.`)
-      return
+      return true
     } catch (error) {
       if (error.code !== 'EADDRINUSE') throw error
     }
@@ -45,20 +45,24 @@ async function holdWindowsGate() {
     }
     await delay(1000)
   } while (performance.now() < deadline)
-  // Emit the diagnostic before throwing so it reaches stderr even when the
-  // unhandled rejection ends the process.
+  // A timed-out waiter returns a bounded result instead of throwing: the
+  // diagnostic stays on stderr, with no exception stack naming a checkout or
+  // account path. The caller exits nonzero before Vitest is imported.
   const timeout = `Timed out waiting for the Windows Vitest gate (${state(performance.now() - startedAt)}). Vitest was not started. This indicates only that another test run for this Windows account holds the gate; the named-pipe API does not identify its owner process.`
   console.error(`[test] ${timeout}`)
-  throw new Error(timeout)
+  server.close()
+  return false
 }
 
 process.chdir(fileURLToPath(new URL('../', import.meta.url)))
-if (process.platform === 'win32') await holdWindowsGate()
-
-// Run the installed CLI in the lock owner, not in a child that could outlive
-// a killed wrapper. Keep its stdio, signal handling and exit status intact.
-const require = createRequire(import.meta.url)
-const manifest = require.resolve('vitest/package.json')
-const cli = resolve(dirname(manifest), require(manifest).bin.vitest)
-process.argv.splice(1, 1, cli, 'run')
-await import(pathToFileURL(cli).href)
+if (process.platform === 'win32' && !(await holdWindowsGate())) {
+  process.exitCode = 1
+} else {
+  // Run the installed CLI in the lock owner, not in a child that could outlive
+  // a killed wrapper. Keep its stdio, signal handling and exit status intact.
+  const require = createRequire(import.meta.url)
+  const manifest = require.resolve('vitest/package.json')
+  const cli = resolve(dirname(manifest), require(manifest).bin.vitest)
+  process.argv.splice(1, 1, cli, 'run')
+  await import(pathToFileURL(cli).href)
+}

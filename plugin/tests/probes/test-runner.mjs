@@ -146,7 +146,13 @@ for (const interrupt of [false, true]) {
       await writeFile(clock, String(30 * 60_000 + 1_000))
       await observe(waiter, () => waiter.closed)
       assert.equal(waiter.stdout, '')
-      assert.notEqual((await waiter.exit).code, 0)
+      const timedOut = await waiter.exit
+      assert.notEqual(timedOut.code, 0)
+      assert.equal(timedOut.signal, null)
+      assert.ok(!waiter.stderr.includes('probe stderr'), 'timeout waiter entered Vitest')
+      for (const checkoutPath of [root, root.replaceAll('\\', '/'), pathToFileURL(root).href]) {
+        assert.ok(!waiter.stderr.includes(checkoutPath), `timeout stderr named the temporary checkout path: ${checkoutPath}`)
+      }
       const timeout = stderrLines(waiter).find(line => line.startsWith('[test] Timed out waiting for the Windows Vitest gate'))
       assert.ok(timeout, waiter.stderr)
       assertWaiter(timeout, waiter)
@@ -175,15 +181,20 @@ for (const interrupt of [false, true]) {
     if (interrupt) assert.ok(exit.signal || exit.code !== 0)
     else assert.deepEqual(exit, { code: 23, signal: null })
 
-    // A runner that starts after waiting must keep its own nonzero exit status.
-    const secondExit = interrupt ? 0 : 23
+    // A runner that starts after waiting must keep its own nonzero exit status,
+    // after a normal holder exit or a hard kill; it must not inherit the
+    // holder's outcome.
+    const secondExit = 23
     if (windows) {
       const entry = await entered(second, b)
       assert.equal(entry.previousAlive, false)
     }
     second.child.stdin.end(String(secondExit))
     await observe(second, () => second.closed)
-    assert.deepEqual(await second.exit, { code: secondExit, signal: null })
+    const secondResult = await second.exit
+    assert.notEqual(secondResult.code, 0)
+    assert.equal(secondResult.signal, null)
+    assert.equal(secondResult.code, secondExit)
     assert.match(second.stderr, /probe stderr/)
     if (windows) assert.match(second.stderr, /Acquired the Windows Vitest gate/)
   })

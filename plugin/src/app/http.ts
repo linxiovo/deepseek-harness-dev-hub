@@ -20,6 +20,7 @@ import type { Health } from '../sources/host.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import type { Sessions } from './sessions.ts'
 import type { ProjectMeter } from './project-meter.ts'
+import type { ScopedAttention } from './scoped-attention.ts'
 import type { SessionMeter } from './session-meter.ts'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
@@ -52,6 +53,7 @@ export interface HttpHost {
   /** Session context snapshots and cumulative usage, shared with the Hub's `session/<id>` resource. */
   readonly meter: Pick<SessionMeter, 'read'>
   readonly projectMeter: Pick<ProjectMeter, 'read'>
+  readonly attention: Pick<ScopedAttention, 'summary' | 'entry' | 'verify'>
   readonly health: Record<string, Health>
   readonly machine: Machine
   readonly masterId: string
@@ -82,6 +84,11 @@ async function readBody(req: IncomingMessage, maxBytes = 128 * 1024): Promise<un
   }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown }
   catch { throw new RouteError(400, 'The request body is not JSON') }
+}
+function isEmptyJsonObject(value: unknown): boolean {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  for (const key in value) if (Object.hasOwn(value, key)) return false
+  return true
 }
 function json(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }); res.end(JSON.stringify(value))
@@ -219,6 +226,13 @@ function installationFailure(error: unknown): [number, Record<string, unknown>] 
   return [500, { error: 'Installation operation failed.' }]
 }
 
+function attentionFailure(error: unknown): [number, Record<string, unknown>] {
+  if (error instanceof RouteError) return failure(error)
+  if (error instanceof InstallationError) return failure(new InstallationError(error.status, error.code))
+  if (error instanceof UserError && error.code === 'unknownPlan') return failure(error)
+  return [500, { error: 'Attention operation failed.' }]
+}
+
 function runtimeView({ mode, status, reason, projectId, resumedFrom }: RuntimeView): RuntimeView {
   if (!resumedFrom) return { mode, status, reason, projectId, resumedFrom: null }
   const { reason: via, at, recoverable: { assignments, handoffs, effects } } = resumedFrom
@@ -234,6 +248,10 @@ const topicBindingRoutes: Partial<Record<keyof Api, true>> = {
 
 const projectMeterRoutes: Partial<Record<keyof Api, true>> = {
   'GET project/meter': true, 'GET plans/:id/meter': true, 'GET tickets/:id/meter': true,
+}
+
+const attentionRoutes: Partial<Record<keyof Api, true>> = {
+  'GET attention/summary': true, 'GET attention/credentials/:id': true, 'POST attention/credentials/:id/verify': true,
 }
 
 function assertProjectScope(active: string | null, requested: string | string[] | undefined,
@@ -283,6 +301,20 @@ function routes(runtime: HttpHost): Routes {
       return write(() => topicBindingOf(runtime).bind(triggerId, allowedActors), verifyBinding)
     },
     'POST topic-binding/unbind': ({ write }) => write(() => topicBindingOf(runtime).unbind()),
+    'GET attention/summary': ({ query }) => runtime.attention.summary(query.planId),
+    'GET attention/credentials/:id': ({ params }) => {
+      const entry = runtime.attention.entry(params.id)
+      if (!entry) throw new RouteError(404, 'Credential action not found')
+      return entry
+    },
+    'POST attention/credentials/:id/verify': async ({ params, body, write }) => {
+      if (!isEmptyJsonObject(await body())) throw new RouteError(400, 'Expected an empty JSON object')
+      return write(async () => {
+        const entry = await runtime.attention.verify(params.id)
+        if (!entry) throw new RouteError(404, 'Credential action not found')
+        return entry
+      })
+    },
     'GET state': () => stateView(runtime),
     'GET overview': () => overview(views(runtime), runtime.health, policyVersion(store.settings()),
       executorLoad(store, runtime.executor.activeCount()), runtime.setupProblem ?? runtime.feishuProblem),
@@ -402,7 +434,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
     verify?: () => Promise<void>): Promise<T> {
     if (retiring) throw new InstallationError(409, 'switching')
     const installationRoute = installationRoutes.has(route)
-    const requirement = topicBindingRoutes[route] ? 'required' : 'when-active'
+    const requirement = topicBindingRoutes[route] || attentionRoutes[route] ? 'required' : 'when-active'
     const { installation } = runtime
     if (!installationRoute || scope !== undefined) {
       assertProjectScope(installation?.projects().activeProjectId ?? null, scope, requirement)
@@ -430,19 +462,29 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
       if (!url.pathname.startsWith('/orchestrator/api/')) { res.writeHead(404); res.end(); return }
       if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
       let installationRoute = false
+      let attentionRoute = false
       try {
         const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
         if (!route) throw new RouteError(404, 'Unknown operation')
         installationRoute = installationRoutes.has(route.key)
+        attentionRoute = attentionRoutes[route.key] === true
         if (!installationRoute) await runtime.ready
         const scope = req.headers[PROJECT_SCOPE_HEADER]
-        const meterRoute = projectMeterRoutes[route.key]
-        const mounted = meterRoute ? readableMount(scope, 'optional') : undefined
+        const mountedRoute = attentionRoute || projectMeterRoutes[route.key]
+        const requirement = attentionRoute ? 'required' : 'optional'
+        const mounted = mountedRoute ? readableMount(scope, requirement) : undefined
         if (route.key === 'GET topic-binding') readableMount(scope, 'required')
-        else if (!meterRoute && !installationRoute && scope !== undefined && (route.key.startsWith('GET ') || route.key === 'POST prompts/preview')) {
+        else if (!mountedRoute && !installationRoute && scope !== undefined && (route.key.startsWith('GET ') || route.key === 'POST prompts/preview')) {
           assertProjectScope(runtime.installation?.projects().activeProjectId ?? null, scope, 'optional')
         }
         const query = Object.fromEntries(url.searchParams)
+        if (attentionRoute && (route.key === 'GET attention/summary'
+          ? [...url.searchParams.keys()].some(key => key !== 'planId') || url.searchParams.getAll('planId').length > 1
+          : url.searchParams.size !== 0)) throw new RouteError(400, 'Invalid attention query')
+        if (route.key === 'POST attention/credentials/:id/verify'
+          && req.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') {
+          throw new RouteError(400, 'Expected Content-Type: application/json')
+        }
         let result: unknown
         try {
           result = await route.run({ params: route.params as never, query, body: async maxBytes => {
@@ -451,11 +493,14 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
             return body
           }, write: (operation, verify) => write(route.key, scope, operation, verify) })
         } finally {
-          // Sampling awaits the host. Never deliver an old mount's sample after selection or shutdown has begun.
-          if (meterRoute && readableMount(scope, 'optional') !== mounted) throw new InstallationError(409, 'staleProject')
+          // Do not deliver a sample or credential receipt from a retiring or replaced mount.
+          if (mountedRoute && readableMount(scope, requirement) !== mounted) throw new InstallationError(409, 'staleProject')
         }
         json(res, 200, result)
-      } catch (error) { json(res, ...(installationRoute ? installationFailure(error) : failure(error))) }
+      } catch (error) {
+        const respond = attentionRoute ? attentionFailure : installationRoute ? installationFailure : failure
+        json(res, ...respond(error))
+      }
     } })]
   return async () => {
     retiring = true

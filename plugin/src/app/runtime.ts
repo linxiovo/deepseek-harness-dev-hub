@@ -34,6 +34,7 @@ import { Installation, projectDatabase, projectHubId } from './installation.ts'
 import { InstallationError } from './installation-api.ts'
 import { Planning } from './planning.ts'
 import { Plans } from './plans.ts'
+import { ScopedAttention } from './scoped-attention.ts'
 import { PlanDispatcher } from './plan-dispatch.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
@@ -78,6 +79,7 @@ export class Runtime extends Service implements SourceHost {
   readonly topicBinding?: TopicBinding
   readonly plans: Plans
   readonly planDispatcher: PlanDispatcher
+  readonly attention: ScopedAttention
   readonly planning: Planning
   readonly sources: SourceRegistry
   readonly commands: Commands
@@ -156,6 +158,27 @@ export class Runtime extends Service implements SourceHost {
       const handoffs = this.handoffs = new Handoffs(store, effects, project, () => installation.assertNewWork(),
         handoff => this.topicBinding?.changed(handoff))
       const plans = this.plans = new Plans(store, handoffs, effects)
+      const credentialChecks = new Map(projectMachine.credentialChecks?.filter(check => check.projectId === project?.id)
+        .map(check => [check.id, check]))
+      const attention = this.attention = new ScopedAttention({ store, plans, projectId: project?.id,
+        available: () => this.configured() && !this.closing(), verifier: id => credentialChecks.get(id),
+        check: async id => {
+          const check = credentialChecks.get(id)
+          if (!check) return false
+          const signal = AbortSignal.any([this.lifetime, AbortSignal.timeout(30_000)])
+          try {
+            const handle = ctx.subprocess.spawn({ argv: [check.executable, ...check.args], cwd: machine.stateDir, signal,
+              graceMs: 2000, stdio: { stdin: 'ignore', stdout: { maxBytes: 1024 }, stderr: { maxBytes: 1024 } } })
+            const outcome = await handle.done
+            return !signal.aborted && outcome.exitCode === 0 && outcome.signal === null
+          } catch { return false } // A verifier's output and errors are private, even on failure.
+        },
+        writerAuthorized: (ticketId, sessionId) => this.executor.writerAuthorized(ticketId, sessionId),
+        relay: message => this.sessions.relay(message.id, message.text),
+        suspend: ticketId => this.executor.suspendForCredential(ticketId),
+        drained: ticketId => this.executor.drainedForCredential(ticketId),
+        resume: (ticketId, blockerId) => this.executor.resumeAfterCredential(ticketId, blockerId),
+      })
       const projectMeter = this.projectMeter = new ProjectMeter({ store, meter, masterId, canSample: binding => this.canSample(binding) })
       const sources = this.sources = new SourceRegistry(() => store.settings(), board, kind => {
         // Sync source member lists once startup completes when a source plugin loads dynamically.
@@ -181,6 +204,7 @@ export class Runtime extends Service implements SourceHost {
           return handoff?.id === id && handoff.status === 'specified' && handoff.spec?.handoffId === id ? project?.workspace ?? handoff.project.workspace : undefined
         },
         workerAuthorized: (ticketId, sessionId) => !this.closing() && this.configured() && runtime.executor?.writerAuthorized(ticketId, sessionId) === true,
+        credentialBlocked: ticketId => attention.blocked(ticketId),
         tools: (agent, ticket, role) => role === 'planner' ? plannerTools(this.toolHost, agent)
           : role === 'splitter' ? splitterTools(this.toolHost, agent)
           : ticket ? executorTools(this.toolHost, ticket, agent.id, role === 'review') : mainTools(this.toolHost, agent) })
@@ -200,6 +224,7 @@ export class Runtime extends Service implements SourceHost {
         } })
       this.executor = new DshExecutor({ context: ctx, commands, get engine() { return runtime.engine }, store, effects,
         health: board.claim('worker'), machine: projectMachine, lifetime: this.lifetime, sessions, closing: () => this.closing(),
+        credentialBlocked: ticketId => attention.blocked(ticketId),
         paused: () => this.paused(), environment, sourceLink: link,
         repliedTo: trigger => repliedTo({ store, sources }, trigger) })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
@@ -238,6 +263,7 @@ export class Runtime extends Service implements SourceHost {
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor, ...(project ? { projectId: project.id } : {}),
+        credentialBlocked: ticketId => attention.blocked(ticketId),
         outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
           if (event.type === 'assignment.started') {
             const ticket = store.tickets.get(event.data.ticketId)
@@ -254,12 +280,12 @@ export class Runtime extends Service implements SourceHost {
           if (followup) sessions.relay(followup.id, followup.text)
           // Notify the ticket's conversations whenever it ends via a pull request.
           const ended = event.type === 'ticket.ended' ? store.tickets.get(event.data.ticketId) : undefined
-          if (ended && setup.configured()) {
+          if (ended && !ended.plan && setup.configured()) {
             const request = store.triggers.get(ended.origin.triggerId)?.text ?? ''
             for (const message of pullEndNotices(ended, request, setup.deployment.repository)) outbox.send(message)
           }
         } })
-      this.planDispatcher = new PlanDispatcher({ store, plans, engine, executor, bindWorker: (ticket, id) => sessions.bindWorker(ticket, id) })
+      this.planDispatcher = new PlanDispatcher({ store, plans, engine, executor, attention, bindWorker: (ticket, id) => sessions.bindWorker(ticket, id) })
       // Reconcile historical dispatch receipts before serving even paused/setup-pending reads. This grants no tools or writer lease.
       this.planDispatcher.restoreBindings()
       for (const ticket of store.tickets.list()) {
@@ -286,7 +312,8 @@ export class Runtime extends Service implements SourceHost {
           if (kind === FEISHU && this.topicBinding?.claims(trigger)) return this.receiveBoundFeishu(trigger)
           return passes.receive(trigger)
         } }
-      this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, planDispatcher: this.planDispatcher, settings: this.settings, assessor, resources, projectMeter, handoffs, plans, lifetime: this.lifetime,
+      this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, planDispatcher: this.planDispatcher, settings: this.settings,
+        assessor, resources, projectMeter, attention, handoffs, plans, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
@@ -394,6 +421,7 @@ export class Runtime extends Service implements SourceHost {
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposeHttp = registerHttp(this.ctx, this.httpHost())
+    this.executor.recoverCredentialPauses()
     await this.installation.initialize()
     if (this.closing()) return
     const project = this.installation.project
@@ -436,6 +464,7 @@ export class Runtime extends Service implements SourceHost {
     try {
       await recoverPulls(source, this.lifetime)
       for (const ticket of this.store.tickets.open()) {
+        if (this.attention.blocked(ticket.id)) continue
         const assignment = latestAssignment(ticket)
         if (assignment?.state !== 'running' && assignment?.state !== 'pending') continue
         // An observed merge is durable. Another restart must not resume the same Assignment if the PR's head can no longer be found.
@@ -460,6 +489,7 @@ export class Runtime extends Service implements SourceHost {
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, setup, passes, installation,
       projectMeter } = this
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, projectMeter, installation,
+      attention: this.attention,
       meter: { read: (id, signal) => this.readScopedMeter(id, signal) },
       topicBinding: this.topicBinding, verifyTopicBinding: () => this.verifyTopicBinding(),
       get ready() { return runtime.ready }, assertNewWork: () => installation.assertNewWork(),

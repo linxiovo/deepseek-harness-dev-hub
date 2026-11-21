@@ -47,6 +47,7 @@ export interface SessionsHost {
   splitterWorkspace(handoffId: string): string | undefined
   /** In-process writer grant; a stored lease cannot authorize worker turns after a restart. */
   workerAuthorized(ticketId: string, sessionId: string): boolean
+  credentialBlocked?(ticketId: string): boolean
   /** Handoff and review-subagent roles receive only their own tools, rather than Hub or Worker tools. */
   tools(agent: Agent, ticket?: Ticket, role?: 'planner' | 'splitter' | 'review'): Tool[]
 }
@@ -487,9 +488,11 @@ export class Sessions {
     const store = this.host.store
     const parent = scopeParentOf(agent)
     const allow = [...toolNames, ...DEV_MCP_TOOLS].filter(name => agent.ctx.tools.get(name, parent))
-    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
+    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(({ name }) => {
       const current = store.tickets.get(ticketId)
       if (!current || !liveTicket(current)) return WORKER_TICKET_ENDED
+      if (name === 'orchestrator_credential_blocked' && agent.id === workerSessionId(ticketId)
+        && agent.session.header.parentSession === undefined && this.host.credentialBlocked?.(ticketId)) return undefined
       if (!this.host.workerAuthorized(ticketId, workerSessionId(ticketId))) return WORKER_WRITER_REQUIRED
       return undefined
     })]

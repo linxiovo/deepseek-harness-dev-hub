@@ -12,6 +12,7 @@ import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import type { SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 import { Runtime } from '../../src/app/runtime.ts'
+import type { Machine } from '../../src/deployment.ts'
 import { Store } from '../../src/app/store.ts'
 import { SettingsSchema } from '../../src/policy.ts'
 import { feishuKind, feishuTrigger } from '../../src/sources/feishu.ts'
@@ -141,15 +142,19 @@ export function subagentRuntime(agents: Map<string, FakeAgent>) {
 }
 
 /** Seed the database before opening; opt out of real Git or Feishu for unconfigured-executor and source tests. */
-export async function startRuntime(seed?: (store: Store) => void, options: { withFeishu?: boolean; realGit?: boolean } = {}) {
+export async function startRuntime(seed?: (store: Store) => void, options: { withFeishu?: boolean; realGit?: boolean; separateCheckout?: boolean } = {}) {
   const directory = mkdtempSync(join(realpathSync.native(tmpdir()), 'orchestrator-host-'))
   // Keep the default fixture clone separate from tests that create their own repository under `directory`.
-  const gitRoot = join(directory, 'fixture-git')
-  if (options?.realGit !== false) mkdirSync(gitRoot)
+  const gitRoot = options.separateCheckout ? mkdtempSync(join(realpathSync.native(tmpdir()), 'orchestrator-checkout-')) : join(directory, 'fixture-git')
+  if (options.realGit !== false && !options.separateCheckout) mkdirSync(gitRoot)
   const localGit = options?.realGit === false ? undefined : gitRepository(gitRoot)
   const AGENT = join(directory, 'agent-gh'), BOT = join(directory, 'lark-bot')
   const repository = { default_branch: 'master', permissions: { push: true } }
-  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : repository)
+  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => {
+    if (args[1] === 'user') return { login: 'agent-bot' }
+    if (args[1]?.includes('/pulls?state=all&head=')) return []
+    return repository
+  })
   vi.spyOn(Commands.prototype, 'lark').mockResolvedValue({ users: [{ member_id: MEMBER, name: 'Alice' }], has_more: false })
   const git = vi.spyOn(Commands.prototype, 'git')
   if (localGit) git.mockImplementation(async (args, cwd) => execFileSync('git', args, { cwd, env: gitEnv(), encoding: 'utf8' }))
@@ -166,12 +171,17 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     [scoped]: `global\0credential.helper\n\0global\0credential.https://github.com.helper\n${credentialHelper(AGENT)}\0`,
   }
   /** A prepare command (`sh -c`) waits for this while it is set. */
-  const hooks: { prepare?: Promise<void>; openingLog?: (sessionId: string) => Promise<void> | undefined } = {}
+  const hooks: { prepare?: Promise<void>; openingLog?: (sessionId: string) => Promise<void> | undefined;
+    credentialCheck?: () => boolean | Promise<boolean> } = {}
   const subprocess = { spawn: vi.fn((spec: { argv: readonly string[]; cwd?: string; env?: Record<string, string> }) => {
     const argv = [...spec.argv]
     while (argv[0] === 'env' || /^[A-Z_]+=/.test(argv[0] ?? '')) argv.shift()
     const reader = (text: () => string) => ({ readFrom: () => { const value = text(); return { text: value, nextOffset: value.length, lossy: false } } })
     const exited = { exitCode: 0, signal: null }
+    if (argv[0] === process.execPath && argv[1] === '--fixture-check-test-account') {
+      const done = Promise.resolve(hooks.credentialCheck?.()).then(ok => ({ ...exited, exitCode: ok ? 0 : 1 }))
+      return { done, collected: { stdout: reader(() => ''), stderr: reader(() => 'fixture-secret-from-verifier') } }
+    }
     if (localGit && argv[0] === 'sh') {
       let stderr = ''
       const done = Promise.resolve().then(async () => {
@@ -343,13 +353,15 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
       ...(options.withFeishu === false ? {} : { feishu: { enabled: true, config: { cli: BOT, chats: [{ chatId: CHAT, listen: 'all' }], directMessages: true } } }) } })
   deliveries.mockClear()
 
-  async function restart() {
+  let machineOverrides: Partial<Machine> = {}
+  async function restart(overrides?: Partial<Machine>) {
+    if (overrides) machineOverrides = overrides
     await runtime.stop()
     agents.clear()
     tools.clear()
     ctx = new Context()
     for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
-    runtime = new Runtime(ctx, testMachine({ stateDir: directory }), vi.fn())
+    runtime = new Runtime(ctx, testMachine({ stateDir: directory, ...machineOverrides }), vi.fn())
     await runtime.ready
     if (options.withFeishu !== false) runtime.sources.register(feishuKind)
     runtime.sources.register(githubKind)
@@ -450,11 +462,17 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     let status = 0, text = ''
     const chunks = json === undefined ? [] : [Buffer.from(JSON.stringify(json))]
     const req = { method, url: `/orchestrator/api/${path}`, headers: { host: '127.0.0.1:3082', 'x-orchestrator-request': '1',
+      ...(json !== undefined && { 'content-type': 'application/json' }),
       ...(projectId && { 'x-orchestrator-project-id': projectId }) }, async *[Symbol.asyncIterator]() { yield* chunks } }
     await http(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
     return { status, body: JSON.parse(text) as Record<string, unknown> }
   }
-  async function stop() { await runtime.stop(); vi.restoreAllMocks(); rmSync(directory, { recursive: true, force: true }) }
+  async function stop() {
+    await runtime.stop()
+    vi.restoreAllMocks()
+    rmSync(directory, { recursive: true, force: true })
+    if (options.separateCheckout) rmSync(gitRoot, { recursive: true, force: true })
+  }
   /** The Session's model takes its next step, which takes the messages steered in since its last. */
   const step = (sessionId: string) => { steps.get(sessionId)!() }
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */

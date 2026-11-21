@@ -12,6 +12,14 @@ import { SetupError } from './setup.ts'
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error)
 const absolute = (description: string) =>
   s.string().pattern(process.platform === 'win32' ? /^(?:[A-Za-z]:[\\/]|[\\/])/ : /^\//).description(`${description} Absolute path.`)
+export const credentialIdPattern = /^[a-z][a-z0-9-]{0,63}$/
+const CredentialCheckConfig: s<Partial<CredentialCheck>, CredentialCheck> = s.object({
+  projectId: s.string().pattern(/^[a-f0-9]{32}$/).required(),
+  id: s.string().pattern(credentialIdPattern).required(),
+  executable: absolute('Trusted test-account verifier executable.').required(),
+  args: s.array(s.string()).default([]),
+  providerUrl: s.string().description('Optional HTTPS configuration page, without embedded credentials, query or fragment.'),
+})
 /** Plugin configuration of the dsh-superagent entry. Volatile fields apply without a restart because dsh-superagent reads them on each use; changing `stateDir` remounts the plugin. */
 export const Config = s.object({
   stateDir: absolute('Directory for the database, locks, worker shims, the agent\'s git configuration and, by default, the ticket directories.').required(),
@@ -22,12 +30,17 @@ export const Config = s.object({
     .description('Pages of thread context one assessment may read.').volatile(),
   admissionContextTimeoutMs: s.number().min(LIMITS.admissionContextTimeoutMs.min).max(LIMITS.admissionContextTimeoutMs.max).step(1)
     .default(15000).description('Time limit of one context read during an assessment, in milliseconds.').volatile(),
+  credentialChecks: s.array(CredentialCheckConfig).default([]).description('Project test-account checks. Credentials must not appear in arguments.'),
 })
 export type DeploymentConfig = ReturnType<typeof Config>
 export type RuntimeMode = 'desktop' | 'headless'
+
+/** Operator-controlled check for a named project credential; command input contains no credential values. */
+export interface CredentialCheck { projectId: string; id: string; executable: string; args: string[]; providerUrl?: string }
 export interface Machine {
   stateDir: string
   runtimeMode?: RuntimeMode
+  credentialChecks?: readonly CredentialCheck[]
   promptMaxChars: Volatile<number>
   admissionContextMaxPages: Volatile<number>
   admissionContextTimeoutMs: Volatile<number>
@@ -42,8 +55,18 @@ const MOVED: Record<string, string> = {
 export function machineOf(config: DeploymentConfig): Machine {
   const unknown = Object.keys(config).filter(key => !(key in (Config.dict ?? {})))
   if (unknown.length) throw new Error(`dsh-superagent configuration has keys it does not use: ${unknown.map(key => MOVED[key] ? `${key} (now ${MOVED[key]})` : key).join(', ')}; docs/006-deployment.md lists the keys`)
-  const { stateDir, runtimeMode, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs } = config
-  return { stateDir, runtimeMode: runtimeMode ?? 'desktop', promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs }
+  const { stateDir, runtimeMode, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, credentialChecks } = config
+  if (new Set(credentialChecks.map(check => `${check.projectId}:${check.id}`)).size !== credentialChecks.length) {
+    throw new Error('Duplicate credential check for the same project and credential ID')
+  }
+  for (const { providerUrl } of credentialChecks) if (providerUrl !== undefined) {
+    const url = URL.parse(providerUrl)
+    if (!url || url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) {
+      throw new Error('Credential provider URL must be HTTPS without credentials, a query or a fragment')
+    }
+  }
+  return { stateDir, runtimeMode: runtimeMode ?? 'desktop', promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs,
+    ...(credentialChecks.length ? { credentialChecks } : {}) }
 }
 
 const RepositoryName = z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, 'owner/name')

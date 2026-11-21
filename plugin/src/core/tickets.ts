@@ -219,7 +219,8 @@ export class Tickets extends EnginePart {
   }
   /**
    * Record that a Thread open tickets follow closed, and end each one done with its Threads (see `followsDone`), unless its
-   * work has not finished (see `unfinished`); such work ends the ticket once it reports ready.
+   * work has not finished (see `unfinished`) or it awaits credential verification. The recorded close still counts when the
+   * worker reports ready after the deferred close.
    */
   threadClosed(thread: ThreadRef, outcome: 'merged' | 'closed', at: string): void {
     const closed = threadKey(thread)
@@ -299,6 +300,20 @@ export class Tickets extends EnginePart {
     if (!liveTicket(ticket) || runningAssignment(ticket)?.report?.state !== 'waiting') return false
     this.addInput(ticket, { id: `status:${ticketId}:${ticket.updatedAt}`, kind: 'text', text: STATUS_REQUEST, at: this.now() })
     return true
+  }
+
+  /** Record one proven direct Hub answer to the current question, without changing the Ticket's Mandate. */
+  answerPlanQuestion(ticketId: string, questionId: string, answer: string, sessionId: string, messageId: string): string {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    if (!ticket.plan) throw new UserError('invalidPlan', { detail: 'Only Plan Tickets accept direct Hub answers' })
+    if (ticket.attention?.id !== questionId) throw new UserError('notAttention')
+    const id = key('input', ticket.id, 'plan-answer', questionId, sessionId, messageId)
+    if (ticket.inputs.some(input => input.id === id)) throw new UserError('notAttention')
+    delete ticket.attention
+    this.replies.withdrawAttention(questionId)
+    this.addInput(ticket, { id, kind: 'text', text: answer, at: this.now() })
+    return id
   }
   /**
    * Stops a ticket on behalf of a human, ending any active assignments.
@@ -386,7 +401,8 @@ export class Tickets extends EnginePart {
     const held = liveTicket(ticket) && automatic(input) && waitsForPerson(ticket)
     if (!held) ticket.undelivered.push(input.id)
     this.repo.tickets.save(ticket)
-    if (!liveTicket(ticket) || held) return
+    // Verification rearms delivery (or launch) for the queued inputs; an ordinary input cannot lift the pause.
+    if (!liveTicket(ticket) || held || this.options.credentialBlocked?.(ticket.id)) return
     const running = runningAssignment(ticket), latest = latestAssignment(ticket)
     if (running) this.options.executor.deliver(ticket, running)
     else if (latest?.state === 'pending' && !waitsForPerson(ticket)) this.options.executor.start(ticket, latest)
@@ -476,6 +492,34 @@ export class Tickets extends EnginePart {
     this.repo.tickets.save(ticket)
     this.options.executor.deliver(ticket, running)
   }
+
+  /** After trusted verification, persist one recovery input and rearm the same Assignment. */
+  resumeVerifiedCredential(ticketId: string, blockerId: string, recoveryNote: string): void {
+    if (this.options.credentialBlocked?.(ticketId)) return
+    const ticket = this.repo.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
+    if (!ticket || !liveTicket(ticket) || !assignment || assignment.state === 'ended') return
+    // A merge observed during this Assignment is already a repository fact. Do not restart a merged writer, and do not issue formal delivery.
+    const merged = ticket.follows?.find(follow => follow.closed?.outcome === 'merged' && follow.closed.at >= assignment.createdAt)?.closed
+    if (merged) {
+      this.end(ticketId, 'executor', 'merged', merged.at)
+      return
+    }
+    const id = key('input', ticketId, 'credential-verified', blockerId)
+    if (!ticket.inputs.some(input => input.id === id)) {
+      const at = this.now()
+      const unread = ticket.inputs.flatMap(input => input.kind === 'trigger' && input.readAt === null && input.deliveredTo === assignment.id
+        ? [input.id] : [])
+      ticket.inputs.push({ id, kind: 'text', text: recoveryNote, at })
+      assignment.recoveryInputId = id
+      ticket.undelivered = [...new Set([id, ...unread, ...ticket.undelivered])]
+      ticket.updatedAt = at
+      this.repo.tickets.save(ticket)
+    }
+    if (!ticket.undelivered.length) return
+    if (assignment.state === 'running') this.options.executor.deliver(ticket, assignment)
+    else if (assignment.state === 'pending') this.options.executor.start(ticket, assignment)
+  }
+
   /**
    * Put back Trigger Inputs already delivered that no step of the worker took: a cancel may have dropped them, or a step
    * that claimed them was cut off. The Executor removes an inbox copy before replaying them.
@@ -495,6 +539,8 @@ export class Tickets extends EnginePart {
   end(ticketId: string, by: TicketEndBy, outcome: TicketOutcome, at = this.now(), reason?: string): void {
     const ticket = this.require(ticketId)
     if (!liveTicket(ticket)) return
+    // An external close is still a fact, but it cannot stop a credential-paused Ticket. Human STOP can.
+    if (by !== 'human' && this.options.credentialBlocked?.(ticketId)) return
     const stopping = ticket.assignments.filter(assignment => assignment.state !== 'ended')
     const why = reason && reason !== outcome ? { reason } : {}
     const until = readUntil(ticket)

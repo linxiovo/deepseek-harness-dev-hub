@@ -22,6 +22,10 @@ export interface EffectPayloads {
   splitting: { handoffId: string; specId: string; pass?: number }
   /** Hand a ticket's waiting Inputs to its running Assignment; the key is the Ticket ID. */
   delivery: { ticketId: string }
+  /** Process one target's persistent FIFO; the key is its GitHub repository and branch ref. */
+  mainline: Record<string, never>
+  /** Hand a changed baseline to the Ticket's fenced Worker; the key is the merge intent. */
+  mainlineRepair: { ticketId: string }
   /** Steer a report or a candidate into the main Session; the key is the request ID. */
   relay: { text: string }
   /** Inject a notice into the main Session without waking it; the key names what it reports, such as `prompts`. */

@@ -185,6 +185,17 @@ export function TicketPage({ id }: { id: string }) {
     {showPreparationReason && <p className="dt-banner dt-danger dt-mono">
       <span className="dt-banner-label">{t('preparationRejectedPrefix')}</span>{preparationReason}
     </p>}
+    {data.mainline && <Section title={t('mainlineTitle')} icon="pull">
+      <KeyValues rows={[
+        [t('mainlineStatus'), t(`mainline.${data.mainline.status}`)],
+        [t('mainlineIntent'), <span className="dt-mono">{data.mainline.id}</span>],
+        [t('executionBaseRef'), <span className="dt-mono">{data.mainline.target.slug} · {data.mainline.target.ref}</span>],
+        [t('mainlineCandidate'), <span className="dt-mono">{data.mainline.candidate}</span>],
+        [t('executionBaseSha'), <span className="dt-mono">{data.mainline.base}</span>],
+        [t('mainlineActual'), <span className="dt-mono">{data.mainline.actual ?? t('empty')}</span>],
+      ]} />
+      {data.mainline.reason && <Hint>{data.mainline.reason}</Hint>}
+    </Section>}
     <MandateDetails ticket={data} actor={actor} />
     {undelivered.length > 0 && <Section title={t('undeliveredInputs')} count={undelivered.length}>
       <Hint>{data.deliveryError ? t('inputRetryHint') : data.paused ? t('inputPausedHint') : t('inputWaitingHint')}</Hint>

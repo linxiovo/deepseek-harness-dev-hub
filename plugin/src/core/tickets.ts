@@ -2,7 +2,7 @@
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { latestAssignment, liveTicket, readUntil, runningAssignment, settled, threadKey, waitsForPerson } from './model.ts'
-import type { Assignment, ChannelRef, Evaluation, Execution, ExecutionClaim, ExecutionIdentity, ExecutionResult, Follow, Mandate, PolicyEffect,
+import type { Assignment, ChannelRef, Evaluation, Execution, ExecutionClaim, ExecutionIdentity, ExecutionResult, Follow, MainlineRepair, Mandate, PolicyEffect,
   ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome, Trigger, TriggerDisposition, PlanTicket } from './model.ts'
 import type { AssessmentOutcome } from './ports.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
@@ -116,6 +116,26 @@ export class Tickets extends EnginePart {
     return { ok: true, value: execution }
   }
 
+  /** Change only the inspected idle writer's base. Saving the repair Input and queuing its delivery share this transaction. */
+  pinMainlineRepair(claim: ExecutionClaim, repair: MainlineRepair): void {
+    const current = this.executionAttempt(claim)
+    if (!current || !claim.verified || !current.execution.ownership!.verified || current.execution.preparation?.state !== 'verified'
+      || !current.ticket.plan || !liveTicket(current.ticket) || runningAssignment(current.ticket)?.id !== claim.assignment
+      || current.assignment.writer?.state !== 'idle' || current.execution.active_writer
+      || current.ticket.assignments.some(item => item.writer && item.writer.state !== 'idle')) {
+      throw new Error('Mainline repair requires the same verified Plan Assignment and a confirmed idle writer')
+    }
+    const { ticket, execution, assignment } = current
+    if (ticket.delivery || waitsForPerson(ticket)) throw new Error(ticket.delivery?.error ?? `The Worker is ${assignment.report?.state}`)
+    if (repair.assignment !== claim.assignment || repair.previousBase !== claim.base.sha || repair.ref !== claim.base.ref ||
+      repair.base === claim.base.sha || ticket.inputs.some(input => input.id === repair.id))
+      throw new Error('The repair changed target, repeated its base or collided with another Input')
+    execution.base = { ref: repair.ref, sha: repair.base }
+    execution.ownership!.identity = { ...execution.ownership!.identity, base: { ...execution.base } }
+    if (assignment.reviews) delete assignment.reviews.target
+    this.addInput(ticket, { ...repair, kind: 'mainline-repair', generation: claim.generation, at: this.now(), readAt: null })
+  }
+
   /** Persist a visible reason without dropping ownership or pretending prepare/worker processes have stopped. */
   rejectExecution(claim: ExecutionClaim, reason: string): boolean {
     const current = this.executionAttempt(claim)
@@ -224,6 +244,8 @@ export class Tickets extends EnginePart {
   threadClosed(thread: ThreadRef, outcome: 'merged' | 'closed', at: string): void {
     const closed = threadKey(thread)
     for (const ticket of this.repo.tickets.open()) {
+      // A PR lifecycle event is not Plan delivery evidence and must not end or otherwise advance a Plan node.
+      if (ticket.plan) continue
       const follow = ticket.follows?.find(item => item.thread === closed && !item.closed)
       if (!follow) continue
       follow.closed = { at, outcome }
@@ -477,11 +499,11 @@ export class Tickets extends EnginePart {
     this.options.executor.deliver(ticket, running)
   }
   /**
-   * Put back Trigger Inputs already delivered that no step of the worker took: a cancel may have dropped them, or a step
-   * that claimed them was cut off. The Executor removes an inbox copy before replaying them.
+   * Put back Trigger and mainline-repair Inputs already delivered that no step of the worker took: a cancel may have
+   * dropped them, or a step that claimed them was cut off. The Executor removes an inbox copy before replaying them.
    */
   private requeueUntaken(ticket: Ticket, replaced: Assignment): void {
-    const untaken = ticket.inputs.filter(input => input.kind === 'trigger' && input.readAt === null && input.deliveredTo === replaced.id
+    const untaken = ticket.inputs.filter(input => (input.kind === 'trigger' || input.kind === 'mainline-repair') && input.readAt === null && input.deliveredTo === replaced.id
       && !ticket.undelivered.includes(input.id))
     ticket.undelivered.unshift(...untaken.map(input => input.id))
   }

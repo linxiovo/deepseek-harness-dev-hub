@@ -1,0 +1,1 @@
+Queue one registered Plan Ticket for its exact candidate SHA after `ticket/<id>/delivery-check` is ready. The host rechecks evidence, serializes writes to the configured branch, and requests Worker repair if the target moved. Read `ticket/<id>/mainline` for the result. This never closes the Ticket or releases dependencies.

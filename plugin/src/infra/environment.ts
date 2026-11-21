@@ -100,7 +100,7 @@ import { fileURLToPath } from 'node:url'
 
 const [program, cli, ...args] = process.argv.slice(2)
 const refuse = () => {
-  console.error('dsh-superagent: Worker Sessions report through orchestrator_report; direct channel sends are disabled.')
+  console.error('dsh-superagent: Worker direct channel sends are disabled; report through orchestrator_report. Mainline merges go through the Hub queue.')
   process.exit(1)
 }
 /** Positional command words, skipping options and values of options that take one. */
@@ -117,11 +117,11 @@ const pathOf = (argv, valueFlags) => {
   return { top, sub, third, target }
 }
 let inspectedStdin
-/** GitHub's human-facing comments and reviews, by command path or by api write. */
+/** GitHub channel writes and alternate merge operations, by command path or by API write. */
 const ghRefuses = () => {
   const { top, sub, target } = pathOf(args, ['-R', '--repo', '--hostname'])
   if (top === 'issue' && sub === 'comment') return true
-  if (top === 'pr' && (sub === 'comment' || sub === 'review')) return true
+  if (top === 'pr' && (sub === 'comment' || sub === 'review' || sub === 'merge')) return true
   if ((top === 'issue' || top === 'pr') && (sub === 'close' || sub === 'reopen')) {
     return args.some(arg => arg.startsWith('-c') || arg === '--comment' || arg.startsWith('--comment='))
   }
@@ -160,6 +160,8 @@ const ghRefuses = () => {
   if (!method && field) method = 'POST'
   if (!/^(?:POST|PUT|PATCH|DELETE)$/i.test(method)) return false
   const clean = path.split('?')[0].replace(/\/+$/, '')
+  // Reject REST merge and merge-queue writes, while allowing read-only inspection.
+  if (/(?:^|\/)merge-queue(?:\/|$)/i.test(clean) || /(?:^|\/)pulls\/\d+\/merge$/i.test(clean) || /\/merges(?:\/|$)/i.test(clean)) return true
   if (clean === 'graphql' || clean.endsWith('/graphql')) {
     const inspectFile = file => {
       if (file === '-') {
@@ -176,7 +178,7 @@ const ghRefuses = () => {
         texts.push(payload.query)
       }
       if (path.includes('?')) texts.push(...new URLSearchParams(path.slice(path.indexOf('?') + 1)).getAll('query'))
-      return texts.some(query => /\bmutation\b[\s\S]*\b(?:addComment|addPullRequestReview(?:Comment|Thread(?:Reply)?)?|submitPullRequestReview|addDiscussionComment|addDiscussionReply)\b/.test(query))
+      return texts.some(query => /\bmutation\b[\s\S]*\b(?:addComment|addPullRequestReview(?:Comment|Thread(?:Reply)?)?|submitPullRequestReview|addDiscussionComment|addDiscussionReply|mergePullRequest|enablePullRequestAutoMerge|disablePullRequestAutoMerge|enqueuePullRequest|dequeuePullRequest)\b/.test(query))
     } catch { return true } // Never send an uninspected GraphQL body; do not print files or credentials.
   }
   return /(?:^|\/)(?:comments|reviews|replies)(?:\/|$)/.test(clean)

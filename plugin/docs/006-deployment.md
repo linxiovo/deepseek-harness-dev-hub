@@ -237,7 +237,7 @@ Setup must succeed before polling or work starts. Overview lists missing require
    The clone's origin must identify the GitHub Source's repository: exactly one `origin` URL, over direct github.com HTTPS, SSH or Git, for that `owner/name`. Keep the worktree root outside the clone's main checkout, every worktree registered in it, and any other Git checkout; a symlink alias counts as its resolved path. A Ticket whose clone origin or destination crosses these boundaries is refused before its prepare command runs, with the reason on the Ticket, and no file is created or changed.
 
    List personal CLIs, such as one signed in to your own account, as blocked commands. A blocked name fails only when called by that name; an absolute path still runs.
-5. **Prompts.** Set the team sections: the GitHub disclosure line, review bots, the commit author and the auto-merge condition.
+5. **Prompts.** Set the team sections: the GitHub disclosure line, review bots and the commit author.
 
 ### Management API
 
@@ -315,6 +315,14 @@ The process environment that setup writes:
 - **git configuration** in the mounted state directory's `worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
 
 A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
+
+### Mainline write permissions
+
+The Plan merge queue uses the configured GitHub account to fast-forward the configured `refs/heads/...` directly, not to merge a PR. Configure branch rules that allow the intended fast-forward write, deny branch deletion and force pushes, and disable any independent auto-merge for the protected target. A server rejection leaves the attempt waiting; the plugin does not fall back to PR merge or silently override a rule.
+
+Mainline CI or branch rules that demand signatures or checks on the integration commit itself may reject this write. The queue does not synthesize signatures or rerun candidate checks as if they had run on the integration commit. Remove direct-merge advice from any saved team prompt overrides; they cannot grant merge authority.
+
+The packaged Worker tools and ordinary `gh` command cannot start an alternate merge. This deployment runs the host and Worker shell under the same OS user and account, so it cannot prevent an arbitrary Worker shell with usable credentials from writing remotely. Enforcing queue-only writes against untrusted shell commands requires isolation of the merge identity from Workers and GitHub rules granting the target write only to that identity; the default deployment is a cooperative workflow, not that security boundary.
 
 ## Try it
 

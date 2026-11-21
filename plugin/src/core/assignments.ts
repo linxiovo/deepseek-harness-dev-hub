@@ -51,7 +51,9 @@ export class Assignments extends EnginePart {
     ticket.undelivered = ticket.undelivered.filter(id => !inputIds.includes(id)); ticket.updatedAt = this.now()
     runningAssignment(ticket)!.deliveredAt = ticket.updatedAt
     for (const input of ticket.inputs) {
-      if (input.kind === 'trigger' && inputIds.includes(input.id)) { input.readAt ??= null; input.deliveredTo = assignmentId }
+      if ((input.kind === 'trigger' || input.kind === 'mainline-repair') && inputIds.includes(input.id)) {
+        input.readAt ??= null; input.deliveredTo = assignmentId
+      }
     }
     delete ticket.delivery
     this.repo.tickets.save(ticket)
@@ -60,7 +62,7 @@ export class Assignments extends EnginePart {
   read(ticketId: string, inputIds: string[]): void {
     const ticket = this.require(ticketId)
     if (!liveTicket(ticket)) return
-    for (const input of ticket.inputs) if (input.kind === 'trigger' && inputIds.includes(input.id)) input.readAt ||= this.now()
+    for (const input of ticket.inputs) if ((input.kind === 'trigger' || input.kind === 'mainline-repair') && inputIds.includes(input.id)) input.readAt ||= this.now()
     this.repo.tickets.save(ticket)
   }
   turnEnded(ticketId: string, assignmentId: string): void {
@@ -125,10 +127,12 @@ export class Assignments extends EnginePart {
     if (report.answers) this.takeUp(ticketId, report.answers)
     if (report.state === 'blocked' || report.state === 'failed') ticket.undelivered = ticket.undelivered.filter(id => !automatic(ticket.inputs.find(input => input.id === id)))
     this.repo.tickets.save(ticket)
-    // A ticket that follows Threads ends with them: a ready report ends it only once followsDone holds, with that outcome.
+    // Standalone tickets retain their Source-Thread completion behavior; Plan tickets use formal delivery instead.
     const ready = !ticket.follows?.length ? 'completed' : this.tickets.followsDone(ticket)?.outcome
-    // A dropped report after a close the ticket deferred ends it as the close did, which its final notice tells.
-    const outcome = report.state === 'dropped' ? this.tickets.followsDone(ticket)?.outcome ?? 'dropped' : report.state === 'ready' ? ready : undefined
+    // A Plan node's Worker report is never a delivery receipt; only its registered delivery flow can complete the node.
+    // An explicit dropped report remains a non-success terminal outcome, independent of any PR state.
+    const outcome = ticket.plan ? report.state === 'dropped' ? 'dropped' : undefined
+      : report.state === 'dropped' ? this.tickets.followsDone(ticket)?.outcome ?? 'dropped' : report.state === 'ready' ? ready : undefined
     if (outcome) this.tickets.end(ticketId, 'executor', outcome, at)
     return this.require(ticketId)
   }

@@ -112,6 +112,8 @@ The dispatch transaction reserves the existing `DshExecutor` launch slot synchro
 
 `plan/<id>` and `plan/<id>/node/<node-id>` join the immutable graph with the durable node state: `claimed`, `running`, `awaiting-delivery`, `delivered`, `failed` or `stopped`. A formal delivery receipt must name the exact claimed Ticket and Assignment plus its receipt, candidate and verification timestamp. On restart, the dispatcher rearms the same pending Assignment and the Executor adopts a persisted Plan writer claim without issuing a new generation. Stable `assignment:<ticket>` delivery IDs prevent a second Worker message; a missing start receipt is completed when the existing Session is found and the Assignment start is recorded.
 
+`awaiting-delivery` is not delivery. A ready report can put an open Plan Ticket in that state without ending it; a baseline repair returns it to running until the Worker reports ready again. A verified mainline result also waits for the separate formal receipt.
+
 ## Optional Feishu entry
 
 A selected, registered project can use one Feishu private chat or group topic as a second entrance. This does not create a second Hub or change a Worker's tools. Harness confirmation, questions, and specification reads do not require a binding.

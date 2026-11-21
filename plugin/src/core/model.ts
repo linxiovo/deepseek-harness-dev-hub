@@ -264,6 +264,9 @@ export interface Assignment {
   reviews?: AssignmentReviews
 }
 
+/** Stable request from the mainline queue for the existing candidate to incorporate an observed branch advance. */
+export interface MainlineRepair { id: string; assignment: string; previousBase: string; base: string; candidate: string; ref: string }
+
 export type TicketInput =
   /** A Trigger on one of its Threads, or attached to it; `human` when a person wrote it. */
   | { id: string; kind: 'trigger'; triggerId: string; at: string; note?: string; human?: true
@@ -285,6 +288,8 @@ export type TicketInput =
   /** A human's message on one of its Threads resumed the ended ticket under its unchanged Mandate. */
   | { id: string; kind: 'resumed'; triggerId: string; at: string }
   | { id: string; kind: 'text'; text: string; at: string }
+  /** An inspected repair survives a crash before delivery; the original candidate remains the writer's lineage anchor. */
+  | (MainlineRepair & { kind: 'mainline-repair'; at: string; generation: number; deliveredTo?: string; readAt: string | null })
   /** A fact the main Session gave the ticket from other work: context, which asks for nothing and grants nothing. */
   | { id: string; kind: 'note'; text: string; at: string }
 

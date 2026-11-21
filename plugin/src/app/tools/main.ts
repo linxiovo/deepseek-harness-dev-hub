@@ -10,6 +10,7 @@ import type { Handoffs } from '../handoffs.ts'
 import { InstallationError } from '../installation-api.ts'
 import { PlanTargetSchema, type Plans } from '../plans.ts'
 import type { PlanDispatcher } from '../plan-dispatch.ts'
+import type { MainlineQueue } from '../mainline-queue.ts'
 import type { ProjectMeter } from '../project-meter.ts'
 import { ticketCard } from '../cards.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
@@ -76,6 +77,7 @@ export interface MainToolsHost {
   readonly handoffs: Pick<Handoffs, 'confirm' | 'answer' | 'get' | 'spec'>
   readonly plans: Pick<Plans, 'get' | 'view' | 'node' | 'append'>
   readonly planDispatcher: Pick<PlanDispatcher, 'dispatch'>
+  readonly mainline: Pick<MainlineQueue, 'enqueue'>
   assertNewWork?(): void
   verifyProjectBinding?(): Promise<string | undefined>
   /** Schedules a pass to carry out work queued by an Engine command (such as an Eval or ticket resume). */
@@ -278,6 +280,16 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         if (agent.id !== host.resources.masterId) throw new Error('Only the Hub may dispatch Plan nodes')
         host.assertNewWork?.()
         return host.planDispatcher.dispatch(planId, nodeId)
+      },
+    }),
+    tool({
+      name: 'orchestrator_queue_merge',
+      description: promptFile('queue-merge-tool'),
+      schema: z.object({ ticket_id: z.string().trim().min(1), candidate: z.string().regex(/^[0-9a-f]{40}$/) }).strict(),
+      execute: async ({ ticket_id, candidate }, signal) => {
+        if (agent.id !== host.resources.masterId) throw new UserError('mainlineRefused', { reason: 'Only the Hub may queue a mainline merge' })
+        host.assertNewWork?.()
+        return host.mainline.enqueue(ticket_id, candidate, signal)
       },
     }),
     routeTool(host),

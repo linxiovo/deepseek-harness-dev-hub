@@ -279,13 +279,12 @@ describe('worker shims', () => {
 
       await worker('gh', ['pr', 'view', '1', '--json', 'number'])
       expect(requests).toHaveLength(5)
-      // Authorized development still runs: a PR, a merge, checks, a review-thread resolution and a GET are not human messages.
+      // Workers may inspect PRs and checks, but cannot merge or mutate the merge queue.
       await worker('gh', ['pr', 'create', '--title', 't', '--body', 'b'])
-      await worker('gh', ['pr', 'merge', '1', '--merge'])
       await worker('gh', ['pr', 'checks', '1'])
       await worker('gh', ['api', 'graphql', '-f', 'query=mutation { resolveReviewThread(input:{threadId:"t"}) { thread { id } } }'])
       await worker('gh', ['api', '-X', 'GET', 'repos/acme/widgets/issues/1/comments'])
-      expect(requests).toHaveLength(10)
+      expect(requests).toHaveLength(9)
       for (const args of [
         ['issue', 'comment', '1', '--body', 'hello'],
         ['pr', 'comment', '1', '--body', 'hello'],
@@ -303,17 +302,25 @@ describe('worker shims', () => {
         ['api', 'graphql', '-f', 'query=mutation { addPullRequestReviewThreadReply(input:{body:"hello"}) { clientMutationId } }'],
         ['api', 'repos/acme/widgets/issues/1/comments', '-fbody=hello'],
         ['api', 'graphql', '-F', `query=@${mutationFile}`],
+        ['pr', 'merge', '1', '--merge'],
+        ['api', '--method', 'PUT', 'repos/acme/widgets/pulls/1/merge'],
+        ['api', 'repos/acme/widgets/merges', '-f', 'base=main', '-f', 'head=agent/labels'],
+        ['api', '-XPOST', 'repos/acme/widgets/merge-queue/entries'],
+        ['api', 'graphql', '-f', 'query=mutation { mergePullRequest(input:{pullRequestId:"p"}) { pullRequest { id } } }'],
+        ['api', 'graphql', '-f', 'query=mutation { enablePullRequestAutoMerge(input:{pullRequestId:"p",mergeMethod:MERGE}) { pullRequest { id } } }'],
+        ['api', 'graphql', '-f', 'query=mutation { enqueuePullRequest(input:{pullRequestId:"p"}) { clientMutationId } }'],
+        ['api', 'graphql', '-f', 'query=mutation { dequeuePullRequest(input:{pullRequestId:"p"}) { clientMutationId } }'],
         ['pr', 'close', '1', '--comment', 'hello'],
       ]) await refused('gh', args)
-      expect(requests).toHaveLength(10)
+      expect(requests).toHaveLength(9)
       // The host's Commands use the absolute CLIs, outside the Worker shims, so Hub replies still send.
       const commands = new Commands(() => deployment, hostShell(url, hook), new AbortController().signal)
       await expect(sendFeishu({ commands }, { id: 'reply-1', channel: { source: 'feishu', thread: 'feishu:oc_team:om_1',
         address: { chatId: 'oc_team', messageId: 'om_1' } }, text: 'Routed answer', kind: 'reply' })).resolves.toBe('sent')
       await commands.api(z.unknown(), 'issues/1/comments', '--method', 'POST', '-f', 'body=host')
-      expect(requests).toHaveLength(12)
-      expect(requests[10]!.args).toEqual(expect.arrayContaining(['im', '+messages-reply', '--as', 'bot']))
-      expect(requests[11]!.args).toEqual(expect.arrayContaining(['api', 'repos/acme/widgets/issues/1/comments', '--method', 'POST']))
+      expect(requests).toHaveLength(11)
+      expect(requests[9]!.args).toEqual(expect.arrayContaining(['im', '+messages-reply', '--as', 'bot']))
+      expect(requests[10]!.args).toEqual(expect.arrayContaining(['api', 'repos/acme/widgets/issues/1/comments', '--method', 'POST']))
     } finally {
       await close()
     }

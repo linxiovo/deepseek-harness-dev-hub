@@ -104,6 +104,21 @@ it('displays verified worktree identity and actual writer, then names a rejected
   expect(rows().map(([label]) => label)).not.toContain(en.executionBaseSha)
 })
 
+it('shows the observed mainline separately from the reviewed baseline', async () => {
+  const base = 'a'.repeat(40), candidate = 'b'.repeat(40), actual = 'c'.repeat(40)
+  const atTime = '2026-09-22T00:00:00Z'
+  server.ticketDetails.t1!.mainline = { id: 'intent-1', ticket_id: 't1', status: 'verified', queued_at: atTime,
+    target: { repository: '/srv/widgets', slug: 'acme/widgets', ref: 'refs/heads/main' },
+    assignment: 'a1', generation: 1, base, candidate, actual, integration: actual,
+    verification: { status: 'passed', method: 'integration_on_target', at: atTime } }
+  at({ page: 'execution', id: 't1' })
+  await mount()
+  expect(text()).toContain(zh['mainline.verified'])
+  expect(all('.dt-kv > div').map(row => row.textContent)).toEqual(expect.arrayContaining([
+    `${zh.executionBaseSha}${base}`, `${zh.mainlineCandidate}${candidate}`, `${zh.mainlineActual}${actual}`,
+  ]))
+})
+
 it('marks an old directory-only Ticket unverified without guessing repository, branch, or writer', async () => {
   const t1 = server.ticketDetails.t1!
   server.ticketDetails.t1 = { ...t1, execution: { name: 'old-ticket', directory: '/w/t1', preparation: { state: 'unverified' } } }

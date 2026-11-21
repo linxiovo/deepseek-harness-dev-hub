@@ -818,6 +818,29 @@ describe('worker reports', () => {
     expect(outcome('failed', false)).toMatchObject({ attention: { question: 'Merge it?' } })
     expect(outcome('failed', false)).not.toHaveProperty('ended')
   })
+  it('keeps Plan tickets open on ready reports and ignores PR close or merge as delivery evidence', () => {
+    const h = harness()
+    const ticketId = h.engine.createPlanTicket('plan-1', { id: 'node-1', featureId: 'feature-1', title: 'Implement slice', role: 'backend',
+      acceptance: [1], demonstration: 'show the result', blockedBy: [] }).id
+    h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-1' }, true)
+    h.engine.report(ticketId, { state: 'ready', summary: 'PR is ready' })
+    expect(h.repo.tickets.get(ticketId)).not.toHaveProperty('ended')
+    h.engine.threadClosed({ source: 'gh', id: 'pr-1' }, 'merged', '2026-09-23T00:00:01Z')
+    expect(h.repo.tickets.get(ticketId)).toMatchObject({ plan: { planId: 'plan-1', nodeId: 'node-1' }, assignments: [
+      expect.objectContaining({ report: { state: 'ready', summary: 'PR is ready', at: expect.any(String) } })] })
+    expect(h.repo.tickets.get(ticketId)).not.toHaveProperty('ended')
+    h.engine.report(ticketId, { state: 'ready', summary: 'PR was closed externally' })
+    expect(h.repo.tickets.get(ticketId)).not.toHaveProperty('ended')
+  })
+  it('keeps an explicit Plan drop non-successful, regardless of a merged PR', () => {
+    const h = harness()
+    const ticketId = h.engine.createPlanTicket('plan-2', { id: 'node-2', featureId: 'feature-2', title: 'Implement slice', role: 'frontend',
+      acceptance: [1], demonstration: 'show the result', blockedBy: [] }).id
+    h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-2' }, true)
+    h.engine.threadClosed({ source: 'gh', id: 'pr-2' }, 'merged', '2026-09-23T00:00:01Z')
+    h.engine.report(ticketId, { state: 'dropped', summary: 'Cannot continue' })
+    expect(h.repo.tickets.get(ticketId)).toMatchObject({ ended: { by: 'executor', outcome: 'dropped' } })
+  })
   it('refuses a question with a result or an answer, and questions or answers that name no person\'s message of the ticket', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!

@@ -52,6 +52,7 @@ interface AttentionHost {
   suspend(ticketId: string): void
   drained(ticketId: string): Promise<boolean>
   resume(ticketId: string, blockerId: string): void
+  quotaBlocked?(ticketId: string): boolean
 }
 
 /** Commits ticket pauses with deduplicated Hub relays, and only clears a current pause after trusted verification. */
@@ -96,7 +97,7 @@ export class ScopedAttention {
       if (blocker || ticket.attention) {
         awaitingHuman++
         if (blocker) actions.push(blocker)
-      } else {
+      } else if (!this.host.quotaBlocked?.(ticket.id)) {
         const assignment = latestAssignment(ticket)
         const status = assignment?.report?.state
         if (assignment?.state === 'running' && status !== 'blocked' && status !== 'failed' && status !== 'ready') running++

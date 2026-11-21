@@ -196,6 +196,7 @@ export class Engine {
   retryTicket(ticketId: string): Ticket {
     return this.repo.atomic(() => {
       if (this.options.credentialBlocked?.(ticketId)) throw new UserError('credentialBlocked')
+      if (this.options.quotaBlocked?.(ticketId)) throw new UserError('quotaPaused')
       return this.tickets.retry(ticketId)
     })
   }

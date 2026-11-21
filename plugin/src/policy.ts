@@ -86,6 +86,26 @@ export const EvalConfigSchema = z.object({
   timeoutSeconds: z.number().int().min(LIMITS.evalTimeoutSeconds.min).max(LIMITS.evalTimeoutSeconds.max).default(120),
   model: RoleModelSchema.nullable().default(null),
 }).strict()
+const RUN_LIMIT_DEFAULTS = Object.freeze({
+  maxWorkers: 3,
+  projectTokens: null,
+  ticketTokens: null,
+  stagnation: Object.freeze({ maxAttemptsWithoutProgress: 3, idleSeconds: 900 }),
+})
+const TokenCapSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable()
+const RunLimitIdSchema = z.string().min(1).max(200).regex(/^[^\s/\x00-\x1f\x7f]+$/, 'Expected an ID without whitespace, slashes or control characters')
+const TicketOverrideSchema = z.strictObject({ planId: RunLimitIdSchema, nodeId: RunLimitIdSchema, tokens: TokenCapSchema })
+const RunLimitsSchema = z.strictObject({
+  projectTokens: TokenCapSchema.optional(),
+  ticketTokens: TokenCapSchema.optional(),
+  ticketOverrides: z.array(TicketOverrideSchema).max(256).refine(items =>
+    new Set(items.map(item => JSON.stringify([item.planId, item.nodeId]))).size === items.length, 'Duplicate ticket overrides').optional(),
+  stagnation: z.strictObject({
+    maxAttemptsWithoutProgress: z.number().int().min(1).max(100).optional(),
+    idleSeconds: z.number().int().min(1).max(86_400).optional(),
+  }).optional(),
+})
+
 const CommandNameSchema = z.string().regex(/^[A-Za-z0-9._-]+$/).refine(name => name !== '.' && name !== '..', 'Not a command name')
   .refine(name => !WORKER_COMMANDS.includes(name), `${WORKER_COMMANDS.join(', ')} cannot be blocked`)
 /** Accept POSIX roots and complete Windows drive or UNC roots without treating drive-relative or root-relative paths as absolute. */
@@ -96,7 +116,8 @@ const absoluteFilesystemPath = (value: string): boolean => posix.isAbsolute(valu
  * Optional/empty values keep previously saved settings readable; they never authorize an empty-directory fallback. */
 export const ExecutorConfigSchema = z.object({
   model: RoleModelSchema.nullable().default(null),
-  maxWorkers: z.number().int().min(LIMITS.maxWorkers.min).max(LIMITS.maxWorkers.max).default(3),
+  maxWorkers: z.number().int().min(LIMITS.maxWorkers.min).max(LIMITS.maxWorkers.max).default(RUN_LIMIT_DEFAULTS.maxWorkers),
+  runLimits: RunLimitsSchema.optional(),
   directory: z.string().trim().refine(path => path === '' || absoluteFilesystemPath(path), 'An absolute POSIX, drive, or UNC path, or empty for <stateDir>/work').default(''),
   repository: z.string().trim().refine(path => path === '' || (absoluteFilesystemPath(path) && !/[\0\r\n]/.test(path)), 'An absolute local repository path, or empty until configured').optional(),
   baseRef: z.string().trim().max(256).refine(ref => ref === '' || (!ref.startsWith('-') && !/[\s\0-\x1f\x7f]/.test(ref)), 'A Git base ref without whitespace or a leading dash, or empty until configured').optional(),
@@ -112,6 +133,34 @@ export const SettingsSchema = z.object({
   executor: ExecutorConfigSchema.default(() => ExecutorConfigSchema.parse({})),
 }).strict()
 export type Settings = z.infer<typeof SettingsSchema>
+
+export interface EffectiveRunLimits {
+  preset: 'default'
+  defaults: typeof RUN_LIMIT_DEFAULTS
+  overrides: { maxWorkers: number } & z.infer<typeof RunLimitsSchema>
+  effective: {
+    maxWorkers: number
+    projectTokens: z.infer<typeof TokenCapSchema>
+    ticketTokens: z.infer<typeof TokenCapSchema>
+    ticketOverrides: z.infer<typeof TicketOverrideSchema>[]
+    stagnation: { maxAttemptsWithoutProgress: number; idleSeconds: number }
+  }
+}
+
+/** Resolve operator overrides without turning missing settings into caps; null explicitly leaves a pool uncapped. */
+export function effectiveRunLimits(executor: Settings['executor']): EffectiveRunLimits {
+  const defaults = RUN_LIMIT_DEFAULTS
+  const { maxWorkers, runLimits } = executor
+  const { projectTokens = defaults.projectTokens, ticketTokens = defaults.ticketTokens, ticketOverrides = [], stagnation } = runLimits ?? {}
+  return { preset: 'default', defaults, overrides: { maxWorkers, ...runLimits }, effective: {
+    maxWorkers, projectTokens, ticketTokens, ticketOverrides,
+    stagnation: {
+      maxAttemptsWithoutProgress: stagnation?.maxAttemptsWithoutProgress ?? defaults.stagnation.maxAttemptsWithoutProgress,
+      idleSeconds: stagnation?.idleSeconds ?? defaults.stagnation.idleSeconds,
+    },
+  } }
+}
+
 /** Keep legacy settings loadable, but do not let a new ticket fall back to an unconfigured or empty directory. */
 export function worktreePreparationConfig(executor: Settings['executor']):
   | { ok: true; repository: string; baseRef: string }

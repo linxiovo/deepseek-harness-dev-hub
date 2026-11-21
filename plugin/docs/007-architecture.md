@@ -419,6 +419,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/sessions.ts` | Sessions |
 | `src/app/session-meter.ts` | `SessionMeter`: one Session's context snapshot and cumulative usage from its durable event log, with provenance, missing and in-flight ranges, and the persisted exclusive cursor; forked prefixes are excluded |
 | `src/app/project-meter.ts` | `ProjectMeter`: project-local Session bindings and deduplicated scoped usage; contract in `plugin/docs/014-project-metering.md` |
+| `src/app/run-limits.ts` | Mounted project and Ticket budget reservations, authoritative settlements and scoped hold notifications; contract in `016-run-limits.md` |
+| `src/app/model-admission.ts` | Pre-provider DSH stream admission and once-per-attempt usage receipt |
 | `src/app/meter-recovery.ts` | Restores detached review attribution from durable review receipts and verified Session parent metadata |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
@@ -542,7 +544,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, review evidence and child-only review submission, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
 | `tests/topic-binding.spec.ts` | Uses a mounted project and normalized Feishu events to verify topic isolation, answer provenance and idempotent outbound delivery |
-| `tests/plans.spec.ts` | Automatic spec continuation, restart and registration, graph and role queries, invalid graph refusal, root/node message isolation, scoped usage, and credential pause, verification and claim replay through public Session tools and HTTP |
+| `tests/plans.spec.ts` | Automatic spec continuation, graph and role queries, invalid graph refusal, root/node message isolation, usage, credential and quota pauses, concurrent model admission and claim replay through public Session tools, DSH streams and HTTP |
 | `tests/credential-smoke.spec.ts` | Credential smoke CLI against loopback HTTP: request scope, explicit verification and safe results; not a live account check |
 | `tests/runtime-concurrency.spec.ts` | Overlapping Triggers, deliveries and launches; Worker inbox recovery after restart, checked after the runtime drains launch and delivery effects against real Git worktrees |
 | `tests/http.spec.ts` | Management request bounds; ticket worktree and writer projections; meter status, ID decoding, same-origin protection and project switch races |

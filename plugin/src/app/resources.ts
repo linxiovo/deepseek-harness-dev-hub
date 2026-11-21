@@ -26,6 +26,7 @@ import type { Handoffs } from './handoffs.ts'
 import type { Plans } from './plans.ts'
 import { mainlineAttempts, mainlineIntent, type MainlineIntent, type MergeApproval } from './mainline-queue.ts'
 import type { ProjectMeter } from './project-meter.ts'
+import type { RunLimitStatus } from './run-limits.ts'
 import type { ScopedAttention } from './scoped-attention.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
 import type { SessionMeter } from './session-meter.ts'
@@ -76,9 +77,11 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'models/<provider>', holds: 'one provider\'s models' },
   { name: 'session/<id>', holds: 'context window sample and cumulative token buckets, including coverage gaps; not a bill' },
   { name: 'project/meter', holds: 'deduplicated usage including shared overhead and Session details' },
+  { name: 'project/run-limits', holds: 'effective run limits and project token budget status' },
   { name: 'project/attention', holds: 'project Plan status counts and credential actions' },
   { name: 'plan/<id>/meter', holds: 'Plan usage with shared overhead separate' },
   { name: 'ticket/<id>/meter', holds: 'Ticket usage with shared overhead separate' },
+  { name: 'ticket/<id>/run-limits', holds: 'effective run limits and Ticket and project token budget status' },
   { name: 'feishu/<trigger-id>/…', holds: 'a Feishu original, as the dsh-superagent-feishu skill describes', executor: true },
   { name: 'github/…', holds: 'a GitHub original, as the dsh-superagent-github skill describes', executor: true },
   { name: 'actions/<ticket|plan>/<id>/commit/<40 lowercase hex SHA>', holds: 'GitHub Actions jobs and artifacts for one owned ticket or handoff at exactly this commit; reports missing required checks, without CI logs' },
@@ -90,6 +93,7 @@ export interface ResourceHost {
   ownsSession?(id: string): boolean | Promise<boolean>
   reviewGeneration?(ticketId: string): number | undefined
   credentialBlocked?(ticketId: string): boolean
+  quotaBlocked?(ticketId: string): boolean
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
   readonly handoffs?: Pick<Handoffs, 'spec'>
   readonly plans?: Pick<Plans, 'get'>
@@ -107,6 +111,7 @@ export interface ResourceHost {
 }
 export interface MainResourceHost extends ResourceHost {
   readonly projectMeter: Pick<ProjectMeter, 'read'>
+  readonly runLimits?: { view(ticketId?: string): RunLimitStatus | undefined }
   readonly attention: Pick<ScopedAttention, 'summary' | 'forTicket'>
   readonly sessions: Pick<Sessions, 'status' | 'modelRetry'>
   readonly settings: Pick<Settings, 'view' | 'block'>
@@ -163,6 +168,18 @@ async function projectMeter(read: Read, scope: 'project' | 'plan' | 'ticket', id
   if (read.offset === 0 && end >= view.sessions.length) return view
   return { ...view, sessions: view.sessions.slice(read.offset, end), next_offset: end < view.sessions.length ? end : null }
 }
+
+function runLimitStatus(read: Read, id?: string): RunLimitStatus {
+  const limits = main(read).runLimits
+  if (!limits) throw new Error('Run limits are not available')
+  const view = limits.view(id)
+  if (!view) {
+    if (id !== undefined) throw new UserError('unknownTicket')
+    throw new Error('Unknown project')
+  }
+  return view
+}
+
 /** Check whether a worker session's ticket is authorized to read a trigger (via delivery, ticket origin, or followed thread). */
 const readable = (host: ResourceHost, ticket: Ticket, trigger: Trigger): boolean => reached(ticket, trigger, key => host.store.threads.get(key))
   || ticket.origin.triggerIds.includes(trigger.id) || trigger.threads.some(ref => ticket.follows?.some(follow => follow.thread === threadKey(ref)))
@@ -249,6 +266,7 @@ interface DeliveryState {
   criteria: readonly { id: string; text: string }[]
   paused: boolean
   credentialBlocked: boolean
+  quotaBlocked: boolean
   required: RequiredChecks
   pull: TicketPull | undefined
   stamp: string
@@ -261,12 +279,13 @@ function deliveryState(host: ResourceHost, id: string): DeliveryState {
   const criteria = deliveryAcceptance(host, ticket)
   const generation = host.reviewGeneration?.(id)
   const credentialBlocked = host.credentialBlocked?.(id) === true
+  const quotaBlocked = host.quotaBlocked?.(id) === true
   const settings = host.store.settings()
   const required = githubKind.schema.parse(settings.sources.github?.config ?? {}).requiredChecks
   const pull = required.length ? ticketPull(host, ticket) : undefined
-  const stamp = createHash('sha256').update(JSON.stringify([host.store.get(KV.settings.revision), settings.paused, credentialBlocked,
+  const stamp = createHash('sha256').update(JSON.stringify([host.store.get(KV.settings.revision), settings.paused, credentialBlocked, quotaBlocked,
     settings.executor, settings.sources.github, ticket.plan, ticket.ended, ticket.execution, ticket.assignments, ticket.deliveryCheck, generation, criteria, pull])).digest('hex')
-  return { ticket, assignment, generation, criteria, paused: settings.paused, credentialBlocked, required, pull, stamp }
+  return { ticket, assignment, generation, criteria, paused: settings.paused, credentialBlocked, quotaBlocked, required, pull, stamp }
 }
 
 interface DeliveryCheckout {
@@ -341,6 +360,7 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
     if (changed) missing.add('delivery_target_changed')
     if (paused) missing.add('project_paused')
     if (state.credentialBlocked) missing.add('credential_blocked')
+    if (state.quotaBlocked) missing.add('quota_paused')
     const outcome = ticket.ended?.outcome, report = assignment?.report?.state
     if (outcome || report === 'failed' || report === 'blocked' || report === 'dropped') {
       missing.add('ticket_not_queueable')
@@ -593,6 +613,7 @@ const ROUTES: readonly Route[] = [
     return view
   }],
   ['project/meter', read => projectMeter(read, 'project')],
+  ['project/run-limits', read => runLimitStatus(read)],
   ['project/attention', read => main(read).attention.summary()],
   ['feishu/', async read => {
     const source = trigger(read.host, read.rest.split('/')[0]!, read.ticketId)
@@ -652,6 +673,7 @@ const ROUTES: readonly Route[] = [
     const [id, section, part, ...more] = rest.split('/')
     if (!id || more.length) throw new Error('Unknown context resource')
     if (section === 'meter' && part === undefined) return projectMeter(read, 'ticket', id)
+    if (section === 'run-limits' && part === undefined) return runLimitStatus(read, id)
     if (ticketId && ticketId !== id) throw new Error('Ticket does not belong to this worker')
     const ticket = host.store.tickets.get(id)
     if (!ticket) throw new UserError('unknownTicket')

@@ -17,6 +17,7 @@ import type { Store } from '../app/store.ts'
 import { Later, Park, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
 import type { Sessions } from '../app/sessions.ts'
+import { RUN_LIMIT_REFUSAL } from '../app/model-admission.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
 import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
@@ -102,6 +103,7 @@ export interface ExecutorHost {
   paused(): boolean
   /** Live read of this ticket's durable credential blocker, including inside the verification transaction. */
   credentialBlocked?(ticketId: string): boolean
+  quota?: { blocked(ticketId: string): boolean; inFlight(ticketId: string): boolean }
   /** Execution environment variables for `ticket`, passed to its workspace prepare command. */
   environment(ticket: Ticket): Variable[]
   sourceLink(trigger: Trigger, signal?: AbortSignal): Promise<{ source_url?: string; source_url_read?: string }>
@@ -230,7 +232,7 @@ export class WorkerSlots {
 }
 
 /** Local fence between a committed credential blocker, actual shutdown of its writer, and verified resumption. */
-interface CredentialHold { drain: Promise<void>; drained: boolean; slot: boolean }
+interface WorkHold { drain: Promise<void>; drained: boolean; slot: boolean; resumeAfterQuota: boolean; resuming?: boolean }
 interface TurnRetry { timer?: NodeJS.Timeout; sending?: Promise<void> }
 
 /** A restored Agent must be the ticket's root Worker, not another Session returned by a stale binding. */
@@ -267,7 +269,7 @@ export class DshExecutor implements Executor {
   private readonly launching = new Map<string, Promise<void>>()
   /** The effect queue runs at most one delivery per ticket. A suspension joins an already admitted Session send. */
   private readonly delivering = new Map<string, Promise<void | typeof Park>>()
-  private readonly credentialHolds = new Map<string, CredentialHold>()
+  private readonly holds = new Map<string, WorkHold>()
   /** Short failed/blocked handoffs; runtime idle waits for their writer-release decision, not for long-running jobs. */
   private readonly handoffs = new Set<Promise<void>>()
   /** The jobs workers left to a person when they handed off, by ticket, and the collecting of their ends. */
@@ -298,7 +300,7 @@ export class DshExecutor implements Executor {
   private async prepareDirectory(ticket: Ticket, claim: ExecutionClaim): Promise<void> {
     const directory = ticket.execution!.directory
     await mkdir(dirname(directory), { recursive: true })
-    this.requireCredential(ticket.id)
+    this.requireWorkAllowed(ticket.id)
     const command = this.host.store.settings().executor.prepare.trim()
     if (!command) {
       await this.host.commands.git(['worktree', 'add', '-b', claim.branch, directory, claim.base.sha], claim.repository)
@@ -321,7 +323,7 @@ export class DshExecutor implements Executor {
     const repository = await inspectRepository(this.host.commands, saved.identity.repository)
     const identity: ExecutionIdentity = { ...repository, worktree: saved.identity.worktree,
       branch: saved.identity.branch, base: saved.identity.base }
-    this.requireCredential(ticket.id)
+    this.requireWorkAllowed(ticket.id)
     const reserved = this.host.engine.reserveExecution(ticket.id, assignment.id, identity)
     if (!reserved.ok) throw new PrepareFailed(reserved.reason)
     const claim = reserved.value
@@ -338,14 +340,14 @@ export class DshExecutor implements Executor {
         branch: claim.branch, base: claim.base, ticket: ticket.id, assignment: assignment.id,
         session: workerSessionId(ticket.id), mode: 'reuse', previous: claim, repairCandidate: repairOf(ticket)?.candidate })
       await verifyDirectory(workspace, this.host.context.subprocess, this.host.lifetime)
-      this.requireCredential(ticket.id)
+      this.requireWorkAllowed(ticket.id)
       const verified = this.host.engine.recordExecutionVerified(claim, inspected)
       if (!verified.ok) throw new PrepareFailed(verified.reason)
       if (!this.host.engine.acquireExecutionWriter(claim, workerSessionId(ticket.id))) {
         throw new PrepareFailed('The running worker could not reacquire its verified writer grant')
       }
     } catch (error) {
-      if (this.credentialHeld(ticket.id)) throw error // Suspension owns the drain and release.
+      if (this.workHeld(ticket.id)) throw error // Suspension owns the drain and release.
       this.host.engine.rejectExecution(claim, String(error))
       await this.releaseClaim(claim, `Reclaim failed: ${String(error)}`, true)
       throw error
@@ -366,7 +368,7 @@ export class DshExecutor implements Executor {
       throw new Error('Mainline repair requires a stable request ID, two full commit hashes and a target branch ref')
     const receiver = () => {
       this.host.lifetime.throwIfAborted()
-      this.requireCredential(ticketId)
+      this.requireWorkAllowed(ticketId)
       const ticket = store.tickets.get(ticketId), assignment = ticket && runningAssignment(ticket)
       if (!ticket?.plan || !liveTicket(ticket) || !assignment || assignment !== latestAssignment(ticket))
         throw new Error('Mainline repair requires an open Plan ticket with its running Assignment')
@@ -419,7 +421,7 @@ export class DshExecutor implements Executor {
   }
   /** Reserve a launch slot synchronously before a Plan claim is committed; the effect handler reuses this reservation. */
   reserveLaunch(ticketId: string): boolean {
-    if (this.credentialHeld(ticketId)) return false
+    if (this.workHeld(ticketId)) return false
     try { this.slots.reserve(ticketId, 'launch'); return true }
     catch (error) { if (error instanceof Later) return false; throw error }
   }
@@ -432,13 +434,13 @@ export class DshExecutor implements Executor {
     const ticket = this.host.store.tickets.get(ticketId)
     const assignment = ticket && latestAssignment(ticket)
     if (!ticket || !liveTicket(ticket) || assignment?.id !== assignmentId || assignment.state !== 'pending') return
-    if (this.credentialHeld(ticketId)) { this.slots.free(ticketId); return Park }
+    if (this.workHeld(ticketId)) { this.slots.free(ticketId); return Park }
     this.slots.reserve(ticketId, 'launch')
     const attempt = this.launch(ticket, assignment)
     this.launching.set(assignmentId, attempt)
     try { await attempt; this.transient.delete(`launch:${assignmentId}`) }
     catch (failure) {
-      if (this.credentialHeld(ticketId)) return Park // Verification rearms the same pending Assignment.
+      if (this.workHeld(ticketId)) return Park // Clearing the hold rearms the same pending Assignment.
       let error: unknown = failure
       const claim = this.claims.get(assignmentId)
       if (claim) {
@@ -460,7 +462,7 @@ export class DshExecutor implements Executor {
    * stops immediately if the ticket ended or another assignment took over.
    */
   private async deliverQueued(ticketId: string): Promise<void | typeof Park> {
-    if (this.credentialHeld(ticketId)) return Park
+    if (this.workHeld(ticketId)) return Park
     // A prior writer must really stop before this worker's Inputs can wake it.
     try { await this.stopped(ticketId) }
     catch (error) {
@@ -475,7 +477,7 @@ export class DshExecutor implements Executor {
     let woken = false
     try {
       for (;;) {
-        if (this.credentialHeld(ticketId)) return Park // Leave all remaining IDs in the durable input queue.
+        if (this.workHeld(ticketId)) return Park // Leave all remaining IDs in the durable input queue.
         const ticket = this.host.store.tickets.get(ticketId)
         const assignment = ticket && liveTicket(ticket) ? runningAssignment(ticket) : undefined
         if (!ticket || !assignment) return
@@ -505,7 +507,7 @@ export class DshExecutor implements Executor {
             try { await attempt }
             finally { if (this.launching.get(assignment.id) === attempt) this.launching.delete(assignment.id) }
           }
-          if (this.credentialHeld(ticketId)) return Park
+          if (this.workHeld(ticketId)) return Park
           if (!this.host.context.agents.get(sessionId as SessionId)) {
             await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker')
           }
@@ -516,7 +518,7 @@ export class DshExecutor implements Executor {
             if (agent?.status === 'idle') {
               agent.inbox.remove(this.host.sessions.promptedId(inputId))
               if (await this.host.sessions.holds(sessionId, inputId)) {
-                this.requireCredential(ticketId)
+                this.requireWorkAllowed(ticketId)
                 if (!this.writerAuthorized(ticketId, sessionId) || this.host.context.agents.get(sessionId as SessionId) !== agent) {
                   throw new Later('The worker changed while reconciling its recovery message')
                 }
@@ -537,14 +539,14 @@ export class DshExecutor implements Executor {
           }
           if (input) await this.deliverInput(ticket, assignment, input)
         } catch (error) {
-          if (this.credentialHeld(ticketId)) return Park
+          if (this.workHeld(ticketId)) return Park
           if (this.host.closing() || error instanceof Later) throw error
           const current = this.host.store.tickets.get(ticketId)
           if (!current || !liveTicket(current) || runningAssignment(current)?.id !== assignment.id) return
           this.host.engine.deliveryFailed(ticketId, assignment.id, String(error))
           throw error
         }
-        if (this.credentialHeld(ticketId)) return Park
+        if (this.workHeld(ticketId)) return Park
         this.host.engine.inputsDelivered(ticketId, assignment.id, [inputId])
       }
     } finally { if (woken) this.slots.free(ticketId) }
@@ -552,7 +554,7 @@ export class DshExecutor implements Executor {
   private async deliverInput(ticket: Ticket, assignment: Assignment, input: TicketInput): Promise<void> {
     // Re-check right before session delivery because the ticket may have ended while awaiting `sourceLink`.
     const live = () => {
-      this.requireCredential(ticket.id)
+      this.requireWorkAllowed(ticket.id)
       const current = this.host.store.tickets.get(ticket.id)
       if (!current || !liveTicket(current) || runningAssignment(current)?.id !== assignment.id) throw new Error('The ticket ended or another Assignment took it over')
       if (input.kind === 'mainline-repair' && waitsForPerson(current)) throw new Later('Worker repair is blocked')
@@ -577,11 +579,11 @@ export class DshExecutor implements Executor {
     const seen = parent && (parent.id === ticket.origin.triggerId || ticket.inputs.some(item => item.kind === 'trigger' && item.triggerId === parent.id))
     return triggerMessage(trigger, await this.host.sourceLink(trigger), note, seen ? undefined : parent)
   }
-  private credentialHeld(ticketId: string): boolean {
-    return this.credentialHolds.has(ticketId) || this.host.credentialBlocked?.(ticketId) === true
+  private workHeld(ticketId: string): boolean {
+    return this.holds.has(ticketId) || this.host.credentialBlocked?.(ticketId) === true || this.host.quota?.blocked(ticketId) === true
   }
-  private requireCredential(ticketId: string): void {
-    if (this.credentialHeld(ticketId)) throw new Later('Ticket is suspended for credential verification')
+  private requireWorkAllowed(ticketId: string): void {
+    if (this.workHeld(ticketId)) throw new Later('Ticket work is suspended')
   }
   /** Install the local fences and start cleanup even if normal startup reconciliation will be skipped. */
   recoverCredentialPauses(): void {
@@ -592,15 +594,44 @@ export class DshExecutor implements Executor {
   /** Called after the trusted report commits. Revoke tool authority immediately. Never join the reporting turn here. */
   suspendForCredential(ticketId: string): void {
     if (this.host.credentialBlocked && !this.host.credentialBlocked(ticketId)) return // A delayed report after verification.
-    if (this.credentialHolds.has(ticketId)) return
+    this.suspend(ticketId, 'credential')
+  }
+
+  /** Pause only affected Tickets. Already admitted model streams can settle before the drain. */
+  reconcileQuotaPauses(): void {
+    const { quota, store, engine } = this.host
+    if (!quota || this.host.closing()) return
+    for (const ticket of store.tickets.open()) {
+      const { id } = ticket
+      if (quota.blocked(id)) {
+        if (!quota.inFlight(id)) this.suspend(id, 'quota')
+        continue
+      }
+      const hold = this.holds.get(id)
+      if (!hold?.resumeAfterQuota || hold.resuming || this.host.credentialBlocked?.(id)) continue
+      hold.resuming = true
+      void this.background(hold.drain.then(() => {
+        if (!hold.drained || this.host.closing() || this.holds.get(id) !== hold || quota.blocked(id) || this.host.credentialBlocked?.(id)) return
+        this.holds.delete(id)
+        const current = store.tickets.get(id)
+        if (!current || !liveTicket(current)) return
+        const assignment = latestAssignment(current)
+        if (assignment?.state === 'running') engine.assignmentInterrupted(id, assignment.id, recoveryNote)
+        else if (assignment?.state === 'pending') this.start(current, assignment)
+      }).finally(() => { hold.resuming = false }))
+    }
+  }
+
+  private suspend(ticketId: string, cause: 'credential' | 'quota'): void {
+    if (this.holds.has(ticketId)) return
     const ticket = this.host.store.tickets.get(ticketId)
     if (!ticket || !liveTicket(ticket)) return
     const assignment = latestAssignment(ticket), sessionId = workerSessionId(ticketId)
     const agent = this.host.context.agents.get(sessionId as SessionId)
-    const reason = 'Ticket suspended for credential verification'
+    const reason = cause === 'credential' ? 'Ticket suspended for credential verification' : 'Ticket suspended by its run limits'
     const prior = this.stopping.get(ticketId), launch = assignment && this.launching.get(assignment.id)
     const delivery = this.delivering.get(ticketId)
-    const stop = () => stopBackground(this.host.context, sessionId, reason, true, 'credential-suspension')
+    const stop = () => stopBackground(this.host.context, sessionId, reason, true, cause === 'credential' ? 'credential-suspension' : undefined)
     const slot = this.running(ticket) || runningJobs(this.host.context, sessionId).length > 0
     // Runtime can reconcile a loaded blocked Worker before the ordinary startup recovery pass.
     if (assignment && !this.claims.has(assignment.id)) {
@@ -629,16 +660,16 @@ export class DshExecutor implements Executor {
       }
       await stop()
       const current = this.host.store.tickets.get(ticketId), latest = current && latestAssignment(current)
-      if (!assignment || latest?.id !== assignment.id || current?.execution?.session !== sessionId || latest.writer?.session !== sessionId) {
+      if (cause === 'credential' && (!assignment || latest?.id !== assignment.id || current?.execution?.session !== sessionId || latest.writer?.session !== sessionId)) {
         throw new Error(`Cannot confirm the suspended writer of ticket ${ticketId}`)
       }
-      const claim = this.claims.get(assignment.id)
+      const claim = assignment && this.claims.get(assignment.id)
       if (claim) await this.releaseClaim(claim, reason, true, true)
-      if (!this.credentialWriterIdle(ticketId)) throw new Error(`The suspended writer of ticket ${ticketId} is not idle`)
+      if (cause === 'credential' && !this.credentialWriterIdle(ticketId)) throw new Error(`The suspended writer of ticket ${ticketId} is not idle`)
       hold.drained = true
     })
-    const hold: CredentialHold = { drain, drained: false, slot }
-    this.credentialHolds.set(ticketId, hold)
+    const hold: WorkHold = { drain, drained: false, slot, resumeAfterQuota: cause === 'quota' }
+    this.holds.set(ticketId, hold)
     this.track(ticketId, drain)
   }
   private credentialWriterIdle(ticketId: string): boolean {
@@ -650,11 +681,11 @@ export class DshExecutor implements Executor {
   }
   /** Fail closed on a missing, failed, timed-out or superseded drain. Does not initiate a new stop. */
   async drainedForCredential(ticketId: string): Promise<boolean> {
-    const hold = this.credentialHolds.get(ticketId)
+    const hold = this.holds.get(ticketId)
     if (!hold || this.host.closing()) return false
     try {
       return await until(hold.drain, this.host.lifetime, CREDENTIAL_DRAIN_WAIT_MS) !== false
-        && !this.host.closing() && this.credentialHolds.get(ticketId) === hold && hold.drained && this.credentialWriterIdle(ticketId)
+        && !this.host.closing() && this.holds.get(ticketId) === hold && hold.drained && this.credentialWriterIdle(ticketId)
     } catch { return false } // The tracked drain reports its stop failure to worker health.
   }
   /** Called synchronously INSIDE the transaction that cleared this exact blocker. No external work precedes commit. */
@@ -662,10 +693,13 @@ export class DshExecutor implements Executor {
     const { store } = this.host
     store.atomic(() => {
       if (this.host.credentialBlocked?.(ticketId)) return
-      const hold = this.credentialHolds.get(ticketId)
+      const hold = this.holds.get(ticketId)
       if (!hold?.drained || !this.credentialWriterIdle(ticketId)) throw new Error('The credential suspension has not drained')
       this.host.engine.resumeVerifiedCredential(ticketId, blockerId, credentialResumeNote)
-      store.afterCommit(() => { this.credentialHolds.delete(ticketId) })
+      store.afterCommit(() => {
+        if (this.host.quota?.blocked(ticketId)) hold.resumeAfterQuota = true
+        else this.holds.delete(ticketId)
+      })
     })
   }
   /**
@@ -718,7 +752,7 @@ export class DshExecutor implements Executor {
       }
       agent = resolved.agent
       agent.cancel({ kind: 'user' }, { keepInbox })
-      await stopBackground(this.host.context, sessionId, reason, keepInbox, this.credentialHolds.has(claim.ticket) ? 'credential-suspension' : undefined)
+      await stopBackground(this.host.context, sessionId, reason, keepInbox, this.host.credentialBlocked?.(claim.ticket) ? 'credential-suspension' : undefined)
     }
     if (!stopped) {
       agent?.cancel({ kind: 'user' }, { keepInbox })
@@ -757,7 +791,7 @@ export class DshExecutor implements Executor {
   }
   /** Only a grant from this running executor instance authorizes a worker turn; persisted leases alone do not. */
   writerAuthorized(ticketId: string, sessionId: string): boolean {
-    if (this.credentialHeld(ticketId)) return false
+    if (this.workHeld(ticketId)) return false
     const ticket = this.host.store.tickets.get(ticketId)
     const assignment = ticket && latestAssignment(ticket)
     const claim = assignment && this.claims.get(assignment.id)
@@ -894,10 +928,10 @@ export class DshExecutor implements Executor {
     const running = agents.filter(agent => agent.status !== 'idle')
     for (const agent of running) agent.cancel({ kind: 'user' }, { keepInbox: true })
     await Promise.allSettled(running.map(agent => agent.whenIdle()))
-    await Promise.allSettled([...sends, ...[...this.credentialHolds.values()].map(hold => hold.drain)])
+    await Promise.allSettled([...sends, ...[...this.holds.values()].map(hold => hold.drain)])
     const claims = [...this.claims.values()]
     const releases = await Promise.allSettled(claims.map(async claim => {
-      if (this.credentialHolds.get(claim.ticket)?.drained === false) throw new Error('Credential suspension could not confirm idle')
+      if (this.holds.get(claim.ticket)?.drained === false) throw new Error('Ticket suspension could not confirm idle')
       await this.launching.get(claim.assignment)?.catch(() => {})
       await this.releaseClaim(claim, 'dsh-superagent stopped', true, true)
     }))
@@ -912,7 +946,7 @@ export class DshExecutor implements Executor {
   /** Whether a ticket's worker holds a worker slot: its turn runs, or its shell jobs or subagents do after its turn ended. */
   private running(ticket: Ticket): boolean {
     if (!runningAssignment(ticket)) return false
-    const held = this.credentialHolds.get(ticket.id)
+    const held = this.holds.get(ticket.id)
     if (held?.slot && !held.drained) return true
     return this.host.context.agents.get(workerSessionId(ticket.id) as SessionId)?.status === 'running' || this.settling.has(ticket.id)
   }
@@ -932,7 +966,7 @@ export class DshExecutor implements Executor {
   private relay({ id, text }: { id: string; text: string }): void { this.host.sessions.relay(id, text) }
   private async launch(ticket: Ticket, assignment: Assignment): Promise<void> {
     const current = () => {
-      this.requireCredential(ticket.id)
+      this.requireWorkAllowed(ticket.id)
       if (this.host.closing()) throw new Error('dsh-superagent is stopping')
       if (this.host.paused()) throw new Later('Processing is paused')
       const stored = this.host.store.tickets.get(ticket.id)
@@ -1049,12 +1083,12 @@ export class DshExecutor implements Executor {
     const ctx = this.host.context
     this.disposers.push(ctx.on('agent/pre-step', async ({ agent }, next) => {
       const id = ticketOfSession(agent.id)
-      return id !== undefined && this.credentialHeld(id) ? { kind: 'reject' } : next()
+      return id !== undefined && this.workHeld(id) ? { kind: 'reject' } : next()
     }))
     this.disposers.push(ctx.on('agent/status', ({ agent, status }) => {
       // A turn that starts ends the look at its worker's background work; the turn's own idle looks afresh.
       const id = ticketOfSession(agent.id)
-      if (id !== undefined && this.credentialHeld(id)) {
+      if (id !== undefined && this.workHeld(id)) {
         if (status === 'running') agent.cancel({ kind: 'user' }, { keepInbox: true })
         else cancelled.delete(agent)
         return
@@ -1094,9 +1128,10 @@ export class DshExecutor implements Executor {
     this.disposers.push(ctx.on('agent/error', ({ agent, error }) => {
       const ticket = this.ticketOf(agent)
       const assignment = ticket && runningAssignment(ticket)
-      if (!ticket || !assignment || !liveTicket(ticket) || this.host.closing() || this.credentialHeld(ticket.id)) return
+      if (!ticket || !assignment || !liveTicket(ticket) || this.host.closing() || this.workHeld(ticket.id)
+        || (error instanceof Error && 'code' in error && error.code === RUN_LIMIT_REFUSAL)) return
       if (this.retries(assignment.id, error)) { this.resumeAfter(ticket.id, assignment.id, error); return }
-      void this.background(Promise.resolve().then(() => { if (!this.credentialHeld(ticket.id)) this.failed(ticket.id, String(error)) }))
+      void this.background(Promise.resolve().then(() => { if (!this.workHeld(ticket.id)) this.failed(ticket.id, String(error)) }))
     }))
   }
   /** Unsubscribes from host agent events and clears any pending transient-retry timers. */
@@ -1124,7 +1159,7 @@ export class DshExecutor implements Executor {
         this.suspendForCredential(ticket.id)
         continue // No interruption note, retry or launch while the durable blocker is active.
       }
-      if (this.credentialHolds.has(ticket.id)) continue
+      if (this.workHeld(ticket.id)) continue
       if (running) {
         // A restart within this process left DSH's Sessions, jobs and subagents running: they stop first. The inbox keeps an
         // Input that was handed over but not yet taken.
@@ -1169,7 +1204,7 @@ export class DshExecutor implements Executor {
     }
     const go = () => {
       delete retry.timer
-      if (this.host.closing() || !retries.has(retry) || this.credentialHeld(ticketId)) { finish(); return }
+      if (this.host.closing() || !retries.has(retry) || this.workHeld(ticketId)) { finish(); return }
       const ticket = this.host.store.tickets.get(ticketId)
       if (!ticket || !liveTicket(ticket) || runningAssignment(ticket)?.id !== assignmentId) { finish(); return }
       // Wait while processing is paused or no wake slot is free.
@@ -1184,7 +1219,7 @@ export class DshExecutor implements Executor {
       retry.sending = Promise.resolve().then(async () => {
         if (retries.has(retry)) await this.host.sessions.retry(ticketId, sessionId, `retry:${assignmentId}:${tries}`, text)
       }).catch(failure => {
-        if (retries.has(retry) && !this.host.closing() && !this.credentialHeld(ticketId)) this.failed(ticketId, String(failure))
+        if (retries.has(retry) && !this.host.closing() && !this.workHeld(ticketId)) this.failed(ticketId, String(failure))
       }).finally(() => {
         if (waking) this.slots.free(ticketId)
         finish()
@@ -1218,7 +1253,7 @@ export class DshExecutor implements Executor {
     for (const job of runningJobs(this.host.context, agent.id, left.jobs)) {
       left.jobs.add(job.id)
       void this.background(collectJob(this.host.context, agent.id, job, left.collect.signal).then(async ended => {
-        if (!ended || left.collect.signal.aborted || this.credentialHeld(ticketId)) return
+        if (!ended || left.collect.signal.aborted || this.workHeld(ticketId)) return
         const note = `Your background job ${ended.name} ended: ${ended.status}.`
         await this.host.sessions.prompt(agent.id, `ended:${job.id}`, note, { inject: 'Background job ended' })
       }))
@@ -1232,7 +1267,7 @@ export class DshExecutor implements Executor {
     this.transient.delete(idle.id)
     // The ticket while the Assignment that went idle runs it.
     const live = () => {
-      if (this.credentialHeld(ticket.id)) return undefined
+      if (this.workHeld(ticket.id)) return undefined
       const stored = this.host.store.tickets.get(ticket.id)
       return stored && liveTicket(stored) && runningAssignment(stored)?.id === idle.id ? stored : undefined
     }

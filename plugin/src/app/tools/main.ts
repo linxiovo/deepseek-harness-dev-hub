@@ -15,6 +15,7 @@ import type { ProjectMeter } from '../project-meter.ts'
 import { ticketCard } from '../cards.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
+import type { RunLimitStatus } from '../run-limits.ts'
 import type { ScopedAttention } from '../scoped-attention.ts'
 import type { Sessions } from '../sessions.ts'
 import type { Settings } from '../settings.ts'
@@ -80,6 +81,7 @@ export interface MainToolsHost {
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
   readonly projectMeter: Pick<ProjectMeter, 'read'>
+  readonly runLimits?: { view(ticketId?: string): RunLimitStatus | undefined }
   readonly attention: Pick<ScopedAttention, 'summary' | 'forTicket'>
   readonly handoffs: Pick<Handoffs, 'confirm' | 'answer' | 'get' | 'spec'>
   readonly plans: Pick<Plans, 'get' | 'view' | 'node' | 'append'>
@@ -217,7 +219,7 @@ function routeTool(host: MainToolsHost): Tool {
 /** Builds the main Session's tools; `agent` scopes prompt preview resources to that Session. */
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings,
-    handoffs: host.handoffs, plans: host.plans, projectMeter: host.projectMeter, attention: host.attention }
+    handoffs: host.handoffs, plans: host.plans, projectMeter: host.projectMeter, runLimits: host.runLimits, attention: host.attention }
   return [
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),

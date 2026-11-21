@@ -208,6 +208,18 @@ export class Sessions {
       if (status === 'idle' && !this.host.closing()) { this.retryHealth.clear(agent.id); this.updateModelHealth() }
     })
   }
+  /** A child of managed work cannot bypass admission while its own business binding is being verified. */
+  hasManagedAncestry(id: string): boolean {
+    const seen = new Set<string>([id])
+    let parent = this.ctx.agents.get(id as SessionId)?.session.header.parentSession
+    while (parent !== undefined && !seen.has(parent)) {
+      if (this.host.projectMeter.owns(parent)) return true
+      seen.add(parent)
+      parent = this.ctx.agents.get(parent)?.session.header.parentSession
+    }
+    const agent = this.ctx.agents.get(id as SessionId)
+    return agent !== undefined && this.bindings.get(agent)?.subagent === true
+  }
   /** Resolves or creates a role session in `cwd`, sets its preset and model, decorates it, and renames it to `title`. */
   async ensure(id: string, cwd: string, title: string, role: PromptRole): Promise<Agent> {
     const plannerId = role === 'planner' ? plannerHandoffId(id) : undefined

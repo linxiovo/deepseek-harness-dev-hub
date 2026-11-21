@@ -20,6 +20,7 @@ import type { Health } from '../sources/host.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import type { Sessions } from './sessions.ts'
 import type { ProjectMeter } from './project-meter.ts'
+import type { RunLimitStatus } from './run-limits.ts'
 import type { ScopedAttention } from './scoped-attention.ts'
 import type { SessionMeter } from './session-meter.ts'
 import type { Store } from './store.ts'
@@ -53,6 +54,7 @@ export interface HttpHost {
   /** Session context snapshots and cumulative usage, shared with the Hub's `session/<id>` resource. */
   readonly meter: Pick<SessionMeter, 'read'>
   readonly projectMeter: Pick<ProjectMeter, 'read'>
+  readonly runLimits?: { view(ticketId?: string): RunLimitStatus | undefined }
   readonly attention: Pick<ScopedAttention, 'summary' | 'entry' | 'verify'>
   readonly health: Record<string, Health>
   readonly machine: Machine
@@ -250,6 +252,10 @@ const projectMeterRoutes: Partial<Record<keyof Api, true>> = {
   'GET project/meter': true, 'GET plans/:id/meter': true, 'GET tickets/:id/meter': true,
 }
 
+const runLimitRoutes: Partial<Record<keyof Api, true>> = {
+  'GET project/run-limits': true, 'GET tickets/:id/run-limits': true,
+}
+
 const attentionRoutes: Partial<Record<keyof Api, true>> = {
   'GET attention/summary': true, 'GET attention/credentials/:id': true, 'POST attention/credentials/:id/verify': true,
 }
@@ -269,6 +275,12 @@ function routes(runtime: HttpHost): Routes {
   const meter = async (scope: 'project' | 'plan' | 'ticket', id?: string) => {
     const view = await runtime.projectMeter.read(scope, id)
     if (!view) throw new RouteError(404, `${scope === 'plan' ? 'Plan' : scope === 'ticket' ? 'Ticket' : 'Project'} not found`)
+    return view
+  }
+  const runLimitStatus = (id?: string) => {
+    if (!runtime.runLimits) throw new RouteError(404, 'Run limits are not available')
+    const view = runtime.runLimits.view(id)
+    if (!view) throw new RouteError(404, id === undefined ? 'Project not found' : 'Ticket not found')
     return view
   }
   return {
@@ -391,6 +403,8 @@ function routes(runtime: HttpHost): Routes {
     'GET project/meter': () => meter('project'),
     'GET plans/:id/meter': ({ params }) => meter('plan', params.id),
     'GET tickets/:id/meter': ({ params }) => meter('ticket', params.id),
+    'GET project/run-limits': () => runLimitStatus(),
+    'GET tickets/:id/run-limits': ({ params }) => runLimitStatus(params.id),
     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
     'PUT prompts': async input => {
       const request = z.object({ config: z.unknown(), baseRevision: z.number().int().nonnegative() }).parse(await promptBody(input))
@@ -470,8 +484,9 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         attentionRoute = attentionRoutes[route.key] === true
         if (!installationRoute) await runtime.ready
         const scope = req.headers[PROJECT_SCOPE_HEADER]
-        const mountedRoute = attentionRoute || projectMeterRoutes[route.key]
-        const requirement = attentionRoute ? 'required' : 'optional'
+        const runLimitRoute = runLimitRoutes[route.key] === true
+        const mountedRoute = attentionRoute || runLimitRoute || projectMeterRoutes[route.key]
+        const requirement = attentionRoute || runLimitRoute ? 'required' : 'optional'
         const mounted = mountedRoute ? readableMount(scope, requirement) : undefined
         if (route.key === 'GET topic-binding') readableMount(scope, 'required')
         else if (!mountedRoute && !installationRoute && scope !== undefined && (route.key.startsWith('GET ') || route.key === 'POST prompts/preview')) {
@@ -481,6 +496,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         if (attentionRoute && (route.key === 'GET attention/summary'
           ? [...url.searchParams.keys()].some(key => key !== 'planId') || url.searchParams.getAll('planId').length > 1
           : url.searchParams.size !== 0)) throw new RouteError(400, 'Invalid attention query')
+        if (runLimitRoute && url.searchParams.size !== 0) throw new RouteError(400, 'Invalid run limits query')
         if (route.key === 'POST attention/credentials/:id/verify'
           && req.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') {
           throw new RouteError(400, 'Expected Content-Type: application/json')

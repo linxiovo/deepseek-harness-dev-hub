@@ -55,6 +55,8 @@ import { feishuSettings, SOURCE as FEISHU } from '../sources/feishu.ts'
 import { health, type FeishuTopic, type Health, type SourceContext, type SourceHost } from '../sources/host.ts'
 import { SessionMeter, SessionMeterIdentityError } from './session-meter.ts'
 import { matchesMeterHeader, ProjectMeter, type MeterLogAccess, type MeterSessionBinding } from './project-meter.ts'
+import { RunLimits } from './run-limits.ts'
+import { installModelAdmission } from './model-admission.ts'
 import { restoreReviewBindings } from './meter-recovery.ts'
 import { PLANNER_PRESET, ROUTER_PRESET, Sessions, splitterSessionId, WORKER_PRESET } from './sessions.ts'
 import { Settings } from './settings.ts'
@@ -89,6 +91,7 @@ export class Runtime extends Service implements SourceHost {
   readonly commands: Commands
   readonly meter: SessionMeter
   readonly projectMeter: ProjectMeter
+  readonly runLimits: RunLimits
   readonly sessions: Sessions
   readonly settings: Settings
   readonly executor: DshExecutor
@@ -104,6 +107,7 @@ export class Runtime extends Service implements SourceHost {
   private readonly sourceLinks = new TextCache(200_000)
   private readonly stopped = new AbortController()
   private disposeHttp?: () => Promise<void>
+  private disposeAdmission?: () => void
   private releaseLock?: () => Promise<void>
   private closingFlag = false
   private recoveryPending = false
@@ -180,10 +184,13 @@ export class Runtime extends Service implements SourceHost {
         writerAuthorized: (ticketId, sessionId) => this.executor.writerAuthorized(ticketId, sessionId),
         relay: message => this.sessions.relay(message.id, message.text),
         suspend: ticketId => this.executor.suspendForCredential(ticketId),
+        quotaBlocked: ticketId => this.runLimits.blocked(ticketId),
         drained: ticketId => this.executor.drainedForCredential(ticketId),
         resume: (ticketId, blockerId) => this.executor.resumeAfterCredential(ticketId, blockerId),
       })
       const projectMeter = this.projectMeter = new ProjectMeter({ store, meter, masterId, canSample: binding => this.canSample(binding) })
+      const runLimits = this.runLimits = new RunLimits({ store, relay: message => this.sessions.relay(message.id, message.text),
+        changed: () => { if (!this.closing()) this.executor.reconcileQuotaPauses() } })
       const sources = this.sources = new SourceRegistry(() => store.settings(), board, kind => {
         // Sync source member lists once startup completes when a source plugin loads dynamically.
         if (kind.policy?.sync) void this.ready?.then(() => this.settings.syncable().includes(kind.kind) ? this.settings.sync(kind.kind) : undefined)
@@ -197,6 +204,7 @@ export class Runtime extends Service implements SourceHost {
         meter: { read: (id, signal) => this.readScopedMeter(id, signal) }, plans, handoffs,
         reviewGeneration: ticketId => runtime.executor?.reviewGeneration(ticketId),
         credentialBlocked: ticketId => attention.blocked(ticketId),
+        quotaBlocked: ticketId => runLimits.blocked(ticketId),
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
       const sessions = this.sessions = new Sessions({ context: ctx, store, projectMeter, prompts, effects, health: board.claim('models'), masterId,
@@ -219,6 +227,7 @@ export class Runtime extends Service implements SourceHost {
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
         sourceHost: this, setup, requestPass: () => { this.passes.request() },
+        runLimitsChanged: () => runLimits.configurationChanged(),
         validate: (before, after) => {
           if (this.closing()) throw new InstallationError(409, 'switching')
           if (project && (before.sources.github?.config.cli !== after.sources.github?.config.cli
@@ -230,6 +239,7 @@ export class Runtime extends Service implements SourceHost {
       this.executor = new DshExecutor({ context: ctx, commands, get engine() { return runtime.engine }, store, effects,
         health: board.claim('worker'), machine: projectMachine, lifetime: this.lifetime, sessions, closing: () => this.closing(),
         credentialBlocked: ticketId => attention.blocked(ticketId),
+        quota: runLimits,
         paused: () => this.paused(), environment, sourceLink: link,
         repliedTo: trigger => repliedTo({ store, sources }, trigger) })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
@@ -269,6 +279,7 @@ export class Runtime extends Service implements SourceHost {
       const policy = () => settingsPolicy(store.settings(), sources)
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor, ...(project ? { projectId: project.id } : {}),
         credentialBlocked: ticketId => attention.blocked(ticketId),
+        quotaBlocked: ticketId => runLimits.blocked(ticketId),
         outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
           if (event.type === 'assignment.started') {
             const ticket = store.tickets.get(event.data.ticketId)
@@ -290,7 +301,8 @@ export class Runtime extends Service implements SourceHost {
             for (const message of pullEndNotices(ended, request, setup.deployment.repository)) outbox.send(message)
           }
         } })
-      this.planDispatcher = new PlanDispatcher({ store, plans, engine, executor, attention, bindWorker: (ticket, id) => sessions.bindWorker(ticket, id) })
+      this.planDispatcher = new PlanDispatcher({ store, plans, engine, executor, attention, limits: runLimits,
+        bindWorker: (ticket, id) => sessions.bindWorker(ticket, id) })
       const mainline = new MainlineQueue({ store, effects, lifetime: this.lifetime,
         available: () => this.configured() && !this.closing(), paused: () => this.paused(),
         approve: async (id, candidate, signal, replay) => {
@@ -336,7 +348,7 @@ export class Runtime extends Service implements SourceHost {
           return passes.receive(trigger)
         } }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, mainline, planDispatcher: this.planDispatcher, settings: this.settings,
-        assessor, resources, projectMeter, attention, handoffs, plans, lifetime: this.lifetime,
+        assessor, resources, projectMeter, runLimits, attention, handoffs, plans, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
@@ -444,7 +456,20 @@ export class Runtime extends Service implements SourceHost {
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposeHttp = registerHttp(this.ctx, this.httpHost())
+    this.runLimits.recover()
     this.executor.recoverCredentialPauses()
+    this.disposeAdmission = installModelAdmission(this.ctx, {
+      owns: id => this.projectMeter.owns(id) || this.sessions.hasManagedAncestry(id),
+      acquire: (id, maximum, signal) => {
+        const binding = this.store.get(KV.projectMeter.binding(id))
+        if (this.closing() || !binding) return { admitted: false, reason: 'Run limit Session is not authorized in this mount' }
+        const { ticket_id: ticket } = binding
+        if (ticket && !this.executor.writerAuthorized(ticket, workerSessionId(ticket))) {
+          return { admitted: false, reason: 'Run limit Session has no active Ticket writer' }
+        }
+        return this.runLimits.acquire(binding, maximum, signal)
+      },
+    })
     await this.installation.initialize()
     if (this.closing()) return
     const project = this.installation.project
@@ -512,7 +537,7 @@ export class Runtime extends Service implements SourceHost {
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, setup, passes, installation,
       projectMeter } = this
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, projectMeter, installation,
-      attention: this.attention,
+      attention: this.attention, runLimits: this.runLimits,
       meter: { read: (id, signal) => this.readScopedMeter(id, signal) },
       topicBinding: this.topicBinding, verifyTopicBinding: () => this.verifyTopicBinding(),
       get ready() { return runtime.ready }, assertNewWork: () => installation.assertNewWork(),
@@ -599,6 +624,8 @@ export class Runtime extends Service implements SourceHost {
       this.installation.stopped()
     } finally {
       // Close the database before releasing the directory lock so another process cannot open the database mid-write; a compromised lock may already be released.
+      this.runLimits.close()
+      this.disposeAdmission?.()
       this.setup.restore()
       try { try { this.store.close() } finally { this.installation.close() } } finally {
         const unreleased = (error: unknown) => { this.ctx.logger.warn('dsh-superagent could not release its state directory lock: %s',

@@ -29,7 +29,7 @@ The Hub passes `{"resource":"project/attention"}` or `{"resource":"plan/<id>/att
 | `AttentionSummary` field | Type and meaning |
 | --- | --- |
 | `planId` | `string` for a Plan summary; `null` for the mounted project summary. |
-| `running` | Number of live Tickets on `running` Plan nodes that have a running Assignment, no current credential blocker or pending question, and no latest `blocked`, `failed` or `ready` report. |
+| `running` | Number of live Tickets on `running` Plan nodes that have a running Assignment, no current credential blocker, pending question or quota pause, and no latest `blocked`, `failed` or `ready` report. |
 | `awaitingHuman` | Number of live Tickets on `running` Plan nodes with a current credential blocker or pending Ticket question, counted once even if both are present. |
 | `message` | String in the format `<running> 张执行中，<awaitingHuman> 张待你处理`. |
 | `actions` | Array of current `CredentialAction` records among the Tickets counted as awaiting human action. Ordinary Ticket questions affect the count but do not create credential actions. |
@@ -64,7 +64,7 @@ Assignment and Session IDs, verifier executable and arguments, credential values
 
 ## Plan notification policy
 
-For Plan execution push, the allowlist is `human-action`, `quota-paused` and `plan-delivered`. This flow produces `human-action` from a credential blocker (and Plan reports with a concrete `human_action` can relay a question). The credential relay has stable ID `credential-action:<id>` and its payload includes `kind`, the Plan `AttentionSummary` fields, the triggering `action`, and a `request` to configure and verify the test account without sharing credentials in chat. The quota-pause and Plan-delivery event producers are outside S21; having these event kinds does not make a Worker report, provider retry or PR close generate one. Plan progress, readiness, ordinary technical blockers, failures, closure and review activity stay internal. This policy does not replace handoff, intake or other control-plane messages. Legacy non-Plan notification behavior is unchanged. The relay is to the Hub, not an outgoing Channel message from the Worker.
+For Plan execution push, the allowlist is `human-action`, `quota-paused` and `plan-delivered`. This flow produces `human-action` from a credential blocker (and Plan reports with a concrete `human_action` can relay a question). Its stable credential relay ID is `credential-action:<id>`; the payload includes `kind`, the Plan `AttentionSummary` fields, the triggering `action`, and a request to configure and verify the test account without sharing credentials in chat. The quota producer is described in `016-run-limits.md`. Plan progress, readiness, ordinary technical blockers, failures, closure and review activity stay internal. This policy does not replace handoff, intake or other control-plane messages. Legacy non-Plan report behavior is unchanged. The relay is to the Hub, not an outgoing Channel message from the Worker.
 
 The Hub instructions in `prompts/handoff-orchestrator.md` tell it to show the operator the Ticket, affected work, status and controlled configuration reference in Harness, rather than asking for a secret or announcing an unchanged or failed check again. S21 supplies API resources and a relay, not a credential entry form or panel UI.
 

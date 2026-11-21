@@ -8,12 +8,13 @@ import type { DshExecutor } from '../executor/dsh.ts'
 import type { Store } from './store.ts'
 import type { Plans } from './plans.ts'
 import type { CredentialAction, ScopedAttention } from './scoped-attention.ts'
+import type { RunLimits } from './run-limits.ts'
 
 export type PlanDispatchResult = {
   planId: string
   nodeId: string
   role: PlanRole
-  status: PlanNodeState['status'] | 'blocked' | 'waiting-for-slot'
+  status: PlanNodeState['status'] | 'blocked' | 'waiting-for-slot' | 'quota-paused' | 'waiting-for-budget'
   reused: boolean
   claim?: PlanNodeClaim
   attention?: CredentialAction
@@ -27,6 +28,7 @@ interface PlanDispatcherHost {
   readonly engine: Pick<Engine, 'createPlanTicket'>
   readonly executor: Pick<DshExecutor, 'reserveLaunch' | 'releaseLaunch' | 'start'>
   readonly attention: Pick<ScopedAttention, 'forTicket' | 'blocked'>
+  readonly limits: Pick<RunLimits, 'dispatchBlock' | 'blocked'>
   bindWorker(ticketId: string, sessionId: string): void
   readonly now?: () => string
 }
@@ -44,6 +46,9 @@ export class PlanDispatcher {
     const current = this.host.plans.state(planId, nodeId)
     if (current) {
       this.bindClaim(current, node.role)
+      if (['claimed', 'running', 'awaiting-delivery'].includes(current.status) && this.host.limits.blocked(current.claim.ticketId)) {
+        return { ...this.result(planId, nodeId, node.role, current, true), status: 'quota-paused', reason: 'Run limit paused this Ticket' }
+      }
       return this.result(planId, nodeId, node.role, current, true)
     }
     const waitingOn = this.host.plans.waitingOn(planId, node)
@@ -51,6 +56,9 @@ export class PlanDispatcher {
       reason: `Waiting for formal delivery of ${waitingOn.join(', ')}` }
 
     const ticketId = key('plan-ticket', planId, nodeId)
+    const block = this.host.limits.dispatchBlock(ticketId, { planId, nodeId, role: node.role })
+    if (block) return { planId, nodeId, role: node.role, status: block.state === 'reserved' ? 'waiting-for-budget' : 'quota-paused',
+      reused: false, reason: `${block.scope} budget: ${block.state}` }
     if (!this.host.executor.reserveLaunch(ticketId)) {
       return { planId, nodeId, role: node.role, status: 'waiting-for-slot', reused: false, reason: 'No worker slot is free' }
     }
@@ -101,6 +109,7 @@ export class PlanDispatcher {
         const state = this.host.plans.state(plan.id, node.id)
         if (!state || ['delivered', 'failed', 'stopped'].includes(state.status)) continue
         if (this.host.attention.blocked(state.claim.ticketId)) continue
+        if (this.host.limits.blocked(state.claim.ticketId)) continue
         const ticket = this.host.store.tickets.get(state.claim.ticketId)
         const assignment = ticket && latestAssignment(ticket)
         if (!ticket || !assignment || assignment.state !== 'pending') continue

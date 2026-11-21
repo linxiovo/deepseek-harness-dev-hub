@@ -22,6 +22,7 @@ export class SettingsConflict extends Error {}
 const now = (): string => new Date().toISOString()
 /** Executor settings that control shell execution paths, repository identity, pinned base selection, prepare commands, and command shims. */
 const environment = ({ executor }: SettingsValue) => JSON.stringify([executor.directory, executor.repository, executor.baseRef, executor.prepare, executor.blockedCommands])
+const runLimits = ({ executor }: SettingsValue) => JSON.stringify([executor.maxWorkers, executor.runLimits])
 
 /** Schema parser, settings merger, and non-panel origin guard for one settings block kind. */
 interface Block {
@@ -41,8 +42,11 @@ const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
   executor: {
     parse: value => ExecutorConfigSchema.parse(value),
     merge: (settings, value) => ({ ...settings, executor: value as SettingsValue['executor'] }),
-    // Only the management panel may modify repository identity, base selection, shell execution paths, or commands.
-    guard: (current, candidate, origin) => { if (origin !== 'panel' && environment(current) !== environment(candidate)) throw new UserError('panelOnlyEnvironment') },
+    guard: (current, candidate, origin) => {
+      if (origin === 'panel') return
+      if (runLimits(current) !== runLimits(candidate)) throw new UserError('panelOnlyRunLimits')
+      if (environment(current) !== environment(candidate)) throw new UserError('panelOnlyEnvironment')
+    },
   },
   source: {
     parse: (value, sources, id) => sources.validate(id, z.object({ enabled: z.boolean(), config: z.unknown() }).parse(value)),
@@ -54,7 +58,7 @@ const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
 
 /** Host dependencies used by `Settings`. */
 export interface SettingsHost {
-  readonly store: Pick<Store, 'settings' | 'saveSettings' | 'blockRevision' | 'atomic' | 'tickets' | 'get'>
+  readonly store: Pick<Store, 'settings' | 'saveSettings' | 'blockRevision' | 'atomic' | 'afterCommit' | 'tickets' | 'get'>
   readonly sources: SourceRegistry
   /** Notified when a settings save changes the policy version. */
   readonly engine: EngineForSettings
@@ -70,6 +74,8 @@ export interface SettingsHost {
   /** Setup state, account/command checks, and restart trigger when setup-read fields change. */
   readonly setup: Pick<Setup, 'configured' | 'checkAccounts' | 'blockCommands' | 'restart'>
   validate?(before: SettingsValue, after: SettingsValue): void
+  /** Reconcile live admission only after an executor run-limit change commits. */
+  runLimitsChanged?(): void
   /** Triggers an immediate pass so work newly allowed by a settings save runs right away. */
   requestPass(): void
 }
@@ -141,7 +147,7 @@ export class Settings {
    * Validates and saves one settings block against its `revision`; a no-op save records no new revision, a changed policy
    * version notifies affected open tickets, and changing a setup-read field (`SETUP_FIELDS`, such as an account CLI) or any
    * change saved while waiting for setup (`!this.host.setup.configured()`) restarts `dsh-superagent` so setup runs again.
-   * @param origin - Caller origin; restricts execution-environment and account-CLI changes to `'panel'` (a guardrail against prompt-injected tool calls, not an OS security boundary, since agents run shell commands; `origin` has no default so no caller receives panel privileges implicitly).
+   * @param origin - Caller origin; only the panel can change execution environment, concurrency, run limits, and account CLIs. This is a prompt-injection guardrail, not an OS security boundary.
    * @returns Save outcome with the block's current `revision`, whether `policy_changed`, whether `restarting`, and `context_delivery` status (`'injected'` or `'pending'`).
    * @throws SettingsConflict when `block`'s revision changed before or during validation checks.
    * @throws UserError | z.ZodError when `block` is unknown, the source is not installed, `value` is invalid (such as an `executor` block carrying `paused`, which only `pause` sets), a non-panel `origin` changes panel-only fields, or a role-model or account check fails.
@@ -158,6 +164,7 @@ export class Settings {
     const parsed = rules.parse(value, sources, id)
     const current = store.settings()
     const candidate = rules.merge(current, parsed, id)
+    rules.guard?.(current, candidate, origin)
     this.host.validate?.(current, candidate)
     const model = block === 'eval' ? candidate.eval.model : block === 'executor' ? candidate.executor.model : null
     const previous = block === 'eval' ? current.eval.model : block === 'executor' ? current.executor.model : null
@@ -165,7 +172,6 @@ export class Settings {
       try { await resolveRoleModel(this.host.context, model) }
       catch (error) { throw new UserError('modelUnavailable', { block, error: error instanceof Error ? error.message : String(error) }) }
     }
-    rules.guard?.(current, candidate, origin)
     if (setupChanged(current, candidate)) await this.host.setup.checkAccounts(block, candidate)
     if (stale()) throw new SettingsConflict('Settings changed during the checks. Reload before saving.')
     // Re-read current settings after async checks in case unrelated blocks were saved concurrently.
@@ -186,6 +192,9 @@ export class Settings {
       store.saveSettings(SettingsSchema.parse(settings), { source: origin, block, policyVersion: after, policyChanged: before !== after, notified })
       if (origin !== 'tool') sessions.notify(...settingsNotice(block, changedPaths(old, settings)))
       if (before !== after) engine.policyChanged(before, after, effects)
+      if (block === 'executor' && this.host.runLimitsChanged && runLimits(old) !== runLimits(settings)) {
+        store.afterCommit(() => this.host.runLimitsChanged?.())
+      }
     })
     // Rewrite worker command shims immediately when `blockedCommands` changes.
     const blocked = settings.executor.blockedCommands

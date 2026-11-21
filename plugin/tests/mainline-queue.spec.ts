@@ -40,6 +40,7 @@ const write = (dir: string, path: string, body: string) => writeFileSync(join(di
 const routeDoc = 'docs/labels.md'
 const contractDoc = 'docs/label-contract.md'
 const labelFile = 'label.mjs'
+const exampleFile = 'label.example.json'
 
 /** One overlapping line in code and one in the actual Doc Tree navigation route. */
 function formatLabel(directory: string, expression: string, contract: string) {
@@ -548,12 +549,16 @@ it('serializes two reviewed Plan candidates, then verifies a conflict repair onl
 }, 240_000)
 
 /** B is C's last prerequisite. The one authorized push succeeded, but its Actions run disappeared before closure. */
-async function verifiedLowercaseWithoutCI() {
+async function verifiedLowercaseWithoutCI(linkExample = false) {
   const { git, base, remote, tip, runGit } = mainlineRepository()
   const ci = actionsHost()
   await configureCI()
   const { id, b, dispatch } = await registerPlan(['lowercase'])
   formatLabel(b.directory, 'value.toLocaleLowerCase()', 'Convert letters to lowercase')
+  if (linkExample) {
+    write(b.directory, exampleFile, '{"label":"alert"}\n')
+    write(b.directory, contractDoc, `# Public label formatter\n\nConvert letters to lowercase.\n\n[An example](../${exampleFile})\n`)
+  }
   const candidate = commit(b.directory, 'Lowercase display labels')
   const branch = git('-C', b.directory, 'branch', '--show-current')
   await recordEvidence(b, id, base, candidate, '2', '  alert  ')
@@ -614,7 +619,7 @@ it('rechecks the Worker checkout after the real target fetch before closing a ve
 }, 180_000)
 
 it('checks the ticket Doc Tree at the actual descendant and receipts an unrelated advance', async () => {
-  const { git, base, remote, tip, id, b, dispatch, candidate, integration, intent, formalBlock, replay } = await verifiedLowercaseWithoutCI()
+  const { git, base, remote, tip, id, b, dispatch, candidate, integration, intent, formalBlock, replay } = await verifiedLowercaseWithoutCI(true)
   const upstream = join(h.directory, 'upstream')
   h.localGit!.worktree(upstream, 'upstream', integration)
   const advance = (message: string) => {
@@ -635,6 +640,20 @@ it('checks the ticket Doc Tree at the actual descendant and receipts an unrelate
   await formalBlock('mainline_docs')
 
   git('-C', upstream, 'restore', '--source', integration, '--staged', '--worktree', '--', contractDoc)
+  git('-C', upstream, 'rm', '--', exampleFile)
+  const missingExample = advance('Restore the contract but remove its linked example')
+  expect(git('diff', '--name-only', integration, missingExample)).toBe(exampleFile)
+  await replay()
+  await formalBlock('mainline_docs')
+
+  git('-C', upstream, 'restore', '--source', integration, '--staged', '--worktree', '--', exampleFile)
+  write(upstream, labelFile, 'export const label = value => value\n')
+  const revertedCode = advance('Restore the example but revert the reviewed behavior')
+  expect(git('diff', '--name-only', integration, revertedCode)).toBe(labelFile)
+  await replay()
+  await formalBlock('mainline_candidate_changed')
+
+  git('-C', upstream, 'restore', '--source', integration, '--worktree', '--', labelFile)
   write(upstream, 'release-notes.txt', 'Unrelated release housekeeping.\n')
   const actual = advance('Restore the contract and add unrelated release notes')
   expect(git('diff', '--name-only', integration, actual)).toBe('release-notes.txt')

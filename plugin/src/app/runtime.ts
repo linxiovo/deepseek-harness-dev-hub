@@ -324,7 +324,7 @@ export class Runtime extends Service implements SourceHost {
         },
         read: target => readMainline(commands, target),
         precedes: (target, ancestor, descendant) => precedes(commands, target, ancestor, descendant),
-        verifyDelivery: (target, integration, actual, documents) => verifyDeliveryOnTarget(commands, target, integration, actual, documents),
+        verifyDelivery: (target, base, integration, actual, scope) => verifyDeliveryOnTarget(commands, target, base, integration, actual, scope),
         prepare: (target, candidate, intent, queuedAt) => prepareMainline(commands, target, candidate, intent, queuedAt),
         advance: (target, base, candidate, authorize) => advanceMainline(commands, target, base, candidate, authorize),
         repair: (id, repair) => executor.requestMainlineRepair(id, repair),

@@ -220,6 +220,7 @@ it('reacquires changed evidence after the final retro and only queues with curre
     if (status !== 'not_run') {
       const run = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: directory, encoding: 'utf8' })
       expect(run.status, run.stderr).toBe(status === 'passed' ? 0 : 1)
+      if (status === 'failed') expect(run.stderr).toMatch(/AssertionError/)
     }
     return h.runTool(session, 'orchestrator_test_evidence', { candidate, scope: 'focused', reason: 'Only label() changed.', red: null,
       checks: [{ directory: '.', command: `node --input-type=module -e ${JSON.stringify(code)}`, status,

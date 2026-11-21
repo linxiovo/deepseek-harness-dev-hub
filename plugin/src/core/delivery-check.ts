@@ -171,7 +171,8 @@ function project(events: readonly Entry[], reviews: readonly ReviewEvidence[], t
       case 'acceptance':
         active.expected = entry.expected
         for (const result of entry.results) {
-          if (result.status === 'passed' && (!cited(result.evidence) || referenceError(result.evidence, events, index, ticketId, revision, true))) {
+          const passed = result.status === 'passed'
+          if ((passed && !cited(result.evidence)) || referenceError(result.evidence, events, index, ticketId, revision, passed)) {
             active.results.delete(result.id)
             continue
           }

@@ -6,6 +6,7 @@ import { UserError, key, latestReport, reached, reviewStatus, runningAssignment,
   type Trigger } from '../core/index.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { inspectWorktree } from '../executor/worktree.ts'
+import { docTreeImpactSchema, docTreeScopeSchema } from '../executor/doc-tree.ts'
 import { readGithub } from '../sources/github-read.ts'
 import { actionsEvidence, type ActionsEvidence } from '../sources/actions-evidence.ts'
 import { githubKind, type GithubConfig } from '../sources/github.ts'
@@ -292,9 +293,11 @@ async function deliveryCheckout(commands: Commands, { ticket, assignment }: Deli
     const checkout = await inspectWorktree(commands, { ...identity, directory: identity.worktree, ticket: ticket.id,
       assignment: assignment.id, session, mode: 'reuse',
       previous: { ...identity, ticket: ownership.ticket, assignment: assignment.id, generation: ownership.generation, verified: true } })
-    const clean = !(await commands.git(['status', '--porcelain=v1', '--untracked-files=all'], checkout.worktree)).trim()
     if (formal) await verifyCheckout(commands, checkout.worktree, checkout.head, 'ticket')
-    else if ((await commands.git(['rev-parse', '--verify', 'HEAD'], checkout.worktree)).trim() !== checkout.head) return undefined
+    // Sample branch, candidate and cleanliness together, after every other checkout read.
+    const status = (await commands.git(['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all'], checkout.worktree)).split('\0')
+    if (!status.includes(`# branch.oid ${checkout.head}`) || !status.includes(`# branch.head ${checkout.branch}`)) return undefined
+    const clean = status.every(record => record === '' || record.startsWith('# '))
     return { worktree: checkout.worktree, base: checkout.base.sha, baseRef: checkout.base.ref, candidate: checkout.head,
       branch: checkout.branch, clean }
   } catch (error) {
@@ -309,11 +312,7 @@ const deliveryStamp = (state: DeliveryState, checkout: DeliveryCheckout | undefi
 
 const ciBinding = z.union([z.strictObject({ pull: z.number().int().positive() }), z.strictObject({ branch: z.string().min(1) })])
 
-const scopedDocuments = z.object({
-  scope: z.object({ root: z.string().nullable(), routes: z.array(z.string()), leaves: z.array(z.string()) }),
-  impact: z.discriminatedUnion('kind', [z.object({ kind: z.literal('unchanged') }),
-    z.object({ kind: z.literal('updated'), documents: z.array(z.string()) })]),
-})
+const scopedDocuments = z.object({ scope: docTreeScopeSchema, impact: docTreeImpactSchema })
 
 async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSignal,
   scope?: { replay: MainlineIntent | undefined; formal?: never } | { replay: MainlineIntent; formal: true; verify: CheckDeliveryTarget }) {
@@ -416,8 +415,8 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
     if (ciStatus === 'passed' && scope?.formal) {
       const docs = scopedDocuments.safeParse(result.view.docs?.evidence)
       if (docs.success) {
-        const { scope: { root, routes, leaves }, impact } = docs.data
-        observation = await scope.verify(root === null ? [] : [root, ...routes, ...leaves, ...(impact.kind === 'updated' ? impact.documents : [])])
+        const { scope: reviewed, impact } = docs.data
+        observation = await scope.verify(impact.kind === 'updated' ? { ...reviewed, documents: impact.documents } : reviewed)
       } else observation = { missing: 'docs' }
     }
     // Re-read the worktree and lease after all external evidence, including the final Git target observation.

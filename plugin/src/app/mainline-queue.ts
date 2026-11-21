@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { UserError } from '../core/errors.ts'
 import { KV } from '../kv.ts'
-import type { MainlineTarget } from '../executor/mainline-git.ts'
+import type { DeliveryTargetResult, MainlineTarget } from '../executor/mainline-git.ts'
+import type { DocTreeScope } from '../executor/doc-tree.ts'
 import type { MainlineRepair } from '../core/model.ts'
 import type { PlanDeliveryReceipt } from '../core/plan.ts'
 import { Later, type Effects } from './effects.ts'
@@ -13,7 +14,7 @@ import type { Store } from './store.ts'
 export type MainlineCiBinding = { pull: number } | { branch: string }
 
 export type DeliveryTargetObservation = { actual: string; verifiedAt: string } | { missing: string }
-export type CheckDeliveryTarget = (documents: readonly string[]) => Promise<DeliveryTargetObservation>
+export type CheckDeliveryTarget = (scope: DocTreeScope) => Promise<DeliveryTargetObservation>
 
 export interface MergeApproval {
   readonly target: MainlineTarget
@@ -55,8 +56,7 @@ interface QueueHost {
   closeDelivery(approval: MergeApproval, receipt: PlanDeliveryReceipt): string | undefined
   read(target: MainlineTarget): Promise<string>
   precedes(target: MainlineTarget, ancestor: string, descendant: string): Promise<boolean>
-  verifyDelivery(target: MainlineTarget, integration: string, actual: string,
-    documents: readonly string[]): Promise<'passed' | 'mainline_verification' | 'mainline_docs'>
+  verifyDelivery(target: MainlineTarget, base: string, integration: string, actual: string, scope: DocTreeScope): Promise<DeliveryTargetResult>
   prepare(target: MainlineTarget, candidate: string, intent: string, queuedAt: string): Promise<string>
   advance(target: MainlineTarget, base: string, candidate: string, authorize: () => Promise<void>): Promise<'advanced' | 'unchanged'>
   repair(id: string, repair: MainlineRepair): Promise<void>
@@ -146,14 +146,14 @@ export class MainlineQueue {
     })
   }
 
-  private async verifyDeliveryTarget(intent: MainlineIntent, documents: readonly string[]): Promise<DeliveryTargetObservation> {
+  private async verifyDeliveryTarget(intent: MainlineIntent, scope: DocTreeScope): Promise<DeliveryTargetObservation> {
     const { host } = this, { integration, verification } = intent
     if (!intent.applying_at || !integration || integration === intent.candidate || !intent.actual ||
         verification?.status !== 'passed' || verification.method !== 'integration_on_target') return { missing: 'mainline_verification' }
     try {
       const actual = await host.read(intent.target)
       if (actual !== integration) {
-        const check = await host.verifyDelivery(intent.target, integration, actual, documents)
+        const check = await host.verifyDelivery(intent.target, intent.base, integration, actual, scope)
         if (check !== 'passed') return { missing: check }
       }
       host.lifetime.throwIfAborted()
@@ -170,7 +170,7 @@ export class MainlineQueue {
     const { host } = this, { store } = host
     const intent = mainlineIntent(store, ticketId)
     if (intent?.id !== id || intent.status !== 'verified' || store.tickets.get(ticketId)?.ended?.by === 'delivery') return
-    const { missing, approval, observation } = await host.inspectDelivery(intent, documents => this.verifyDeliveryTarget(intent, documents))
+    const { missing, approval, observation } = await host.inspectDelivery(intent, scope => this.verifyDeliveryTarget(intent, scope))
     const integration = intent.integration
     host.lifetime.throwIfAborted()
     store.atomic(() => {

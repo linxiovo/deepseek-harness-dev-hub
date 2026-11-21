@@ -13,7 +13,7 @@ import type {} from '@deepseek-ai/dsh-subprocess'
 import { existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
-import { Engine, key, latestAssignment, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
+import { Engine, key, latestAssignment, UserError, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { settingsPolicy, SettingsSchema } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
@@ -234,6 +234,12 @@ export class Runtime extends Service implements SourceHost {
             || before.sources.github?.config.repository !== after.sources.github?.config.repository
             || before.executor.repository !== after.executor.repository || before.executor.directory !== after.executor.directory)) {
             throw new InstallationError(409, 'projectBindingImmutable')
+          }
+          const overrides = after.executor.runLimits?.ticketOverrides
+          if (overrides !== before.executor.runLimits?.ticketOverrides) for (const { planId, nodeId } of overrides ?? []) {
+            const plan = plans.get(planId)
+            if (plan?.status !== 'registered') throw new UserError('unknownPlan', { id: planId })
+            if (!plan.nodes.some(node => node.id === nodeId)) throw new UserError('unknownPlanNode', { id: planId, node: nodeId })
           }
         } })
       this.executor = new DshExecutor({ context: ctx, commands, get engine() { return runtime.engine }, store, effects,
@@ -469,7 +475,7 @@ export class Runtime extends Service implements SourceHost {
         }
         return this.runLimits.acquire(binding, maximum, signal)
       },
-    })
+    }, this.lifetime)
     await this.installation.initialize()
     if (this.closing()) return
     const project = this.installation.project

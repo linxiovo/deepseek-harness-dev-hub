@@ -23,6 +23,8 @@ export interface BudgetLedger {
 
 type BudgetState = 'unlimited' | 'available' | 'reserved' | 'exhausted' | 'usage-missing'
 export type QuotaHold = Extract<BudgetState, 'exhausted' | 'usage-missing'>
+export type DispatchLimits = Pick<EffectiveRunLimits['effective'], 'maxWorkers' | 'projectTokens' | 'ticketTokens' | 'stagnation'>
+type DispatchBlock = { state: QuotaHold | 'reserved'; scope: 'project' | 'ticket' }
 
 const EMPTY: BudgetLedger = { accountedTokens: null, reportedCalls: 0, missing: [] }
 function quotaHold(limit: number | null, ledger: BudgetLedger): QuotaHold | undefined {
@@ -59,6 +61,7 @@ interface RunLimitsHost {
 export class RunLimits {
   private readonly since: string
   private closed = false
+  private balanceChanged: PromiseWithResolvers<void> | undefined
 
   constructor(private readonly host: RunLimitsHost) {
     const { store } = host
@@ -84,9 +87,9 @@ export class RunLimits {
     const { store } = this.host
     store.atomic(() => {
       const configuration = effectiveRunLimits(store.settings().executor)
-      const projectHeld = this.updateHold(null, configuration.effective.projectTokens)
-      for (const ticket of store.tickets.open()) this.updateHold(ticket.id, this.ticketLimit(configuration, ticket.plan), !projectHeld)
-      store.afterCommit(this.host.changed)
+      this.updateHold(null, configuration.effective.projectTokens)
+      for (const ticket of store.tickets.open()) this.updateHold(ticket.id, this.ticketLimit(configuration, ticket.plan))
+      store.afterCommit(() => { this.wakeWaiters(); this.host.changed() })
     })
   }
 
@@ -103,18 +106,22 @@ export class RunLimits {
       if (ticketId !== null && (!owner || !liveTicket(owner))) return { admitted: false, reason: 'Run limit Ticket is not live' }
       const ticketTokens = owner ? this.ticketLimit(config, owner.plan) : null
       const pending = projectTokens === null && ticketTokens === null ? [] : this.pending()
+      let waiting = false
       for (const budget of [projectTokens === null ? undefined : this.budget(projectTokens, store.get(KV.runLimits.project), pending),
         ticketTokens === null || ticketId === null ? undefined :
-          this.budget(ticketTokens, store.get(KV.runLimits.ticket(ticketId)), pending.filter(item => item.ticketId === ticketId))]) {
-        if (!budget) continue
+          this.ticketBudget(ticketId, ticketTokens, pending)]) {
+        if (!budget || budget.limitTokens === null) continue
         if (budget.state === 'exhausted' || budget.state === 'usage-missing') {
           return { admitted: false, reason: `Run limit paused: ${budget.state}` }
         }
         if (maximumTokens === null) return { admitted: false, reason: 'Run limit requires a verified request token bound' }
-        if (budget.availableTokens === null || maximumTokens > budget.availableTokens) {
-          return { admitted: false, reason: 'Run limit budget cannot cover this request and existing reservations' }
+        if (maximumTokens > budget.limitTokens - (budget.accountedTokens ?? 0)) {
+          return { admitted: false, reason: 'Run limit balance cannot cover this request' }
         }
+        waiting ||= budget.availableTokens === null || maximumTokens > budget.availableTokens
       }
+      if (waiting) return { admitted: false, reason: 'Run limit balance is reserved by existing requests',
+        wait: (this.balanceChanged ??= Promise.withResolvers<void>()).promise }
       const key = KV.runLimits.pending(randomUUID())
       const request: PendingUsage = { sessionId, ticketId, maximumTokens, startedAt: new Date().toISOString() }
       store.set(key, request)
@@ -127,23 +134,32 @@ export class RunLimits {
           const config = effectiveRunLimits(store.settings().executor)
           const projectHeld = this.updateHold(null, config.effective.projectTokens)
           const ticket = ticketId === null ? undefined : store.tickets.get(ticketId)
-          const ticketHeld = ticket && liveTicket(ticket) && this.updateHold(ticket.id, this.ticketLimit(config, ticket.plan), !projectHeld)
-          if (projectHeld || ticketHeld) store.afterCommit(this.host.changed)
+          const ticketHeld = ticket && liveTicket(ticket) && this.updateHold(ticket.id, this.ticketLimit(config, ticket.plan))
+          store.afterCommit(() => {
+            this.wakeWaiters()
+            if (projectHeld || ticketHeld) this.host.changed()
+          })
         })
       } }
     })
   }
 
   /** New dispatch checks complete and transient balance before claiming the node or holding a slot. */
-  dispatchBlock(ticketId: string, plan: NonNullable<Ticket['plan']>): { state: QuotaHold | 'reserved'; scope: 'project' | 'ticket' } | undefined {
+  forDispatch(ticketId: string, plan: NonNullable<Ticket['plan']>): { limits: DispatchLimits; block?: DispatchBlock } {
     const { store } = this.host
     const config = effectiveRunLimits(store.settings().executor)
+    const { maxWorkers, projectTokens, stagnation } = config.effective
+    const ticketTokens = this.ticketLimit(config, plan)
+    const limits = { maxWorkers, projectTokens, ticketTokens, stagnation }
+    if (projectTokens === null && ticketTokens === null) return { limits }
     const pending = this.pending()
-    const project = this.budget(config.effective.projectTokens, store.get(KV.runLimits.project), pending)
-    if (project.state !== 'unlimited' && project.state !== 'available') return { state: project.state, scope: 'project' }
-    const ticket = this.budget(this.ticketLimit(config, plan), store.get(KV.runLimits.ticket(ticketId)), pending.filter(item => item.ticketId === ticketId))
-    if (ticket.state !== 'unlimited' && ticket.state !== 'available') return { state: ticket.state, scope: 'ticket' }
-    return undefined
+    const project = this.budget(projectTokens, store.get(KV.runLimits.project), pending)
+    const ticket = this.ticketBudget(ticketId, ticketTokens, pending)
+    if (project.state === 'exhausted' || project.state === 'usage-missing') return { limits, block: { scope: 'project', state: project.state } }
+    if (ticket.state === 'exhausted' || ticket.state === 'usage-missing') return { limits, block: { scope: 'ticket', state: ticket.state } }
+    if (project.state === 'reserved') return { limits, block: { scope: 'project', state: 'reserved' } }
+    if (ticket.state === 'reserved') return { limits, block: { scope: 'ticket', state: 'reserved' } }
+    return { limits }
   }
 
   blocked(ticketId: string): boolean {
@@ -165,10 +181,20 @@ export class RunLimits {
     const inFlight = this.pending()
     const projectBudget = this.budget(configuration.effective.projectTokens, store.get(KV.runLimits.project), inFlight)
     return ticket ? { scope: 'ticket', ticketId: ticket.id, configuration, projectBudget,
-      budget: this.budget(this.ticketLimit(configuration, ticket.plan), store.get(KV.runLimits.ticket(ticket.id)),
-        inFlight.filter(item => item.ticketId === ticket.id)) }
+      budget: this.ticketBudget(ticket.id, this.ticketLimit(configuration, ticket.plan), inFlight) }
       : { scope: 'project', ticketId: null, configuration, budget: projectBudget }
   }
+
+  private wakeWaiters(): void {
+    const waiting = this.balanceChanged
+    this.balanceChanged = undefined
+    waiting?.resolve()
+  }
+
+  private ticketBudget(ticketId: string, limit: number | null, inFlight: PendingUsage[]): BudgetView {
+    return this.budget(limit, this.host.store.get(KV.runLimits.ticket(ticketId)), inFlight.filter(item => item.ticketId === ticketId))
+  }
+
   private pending(): PendingUsage[] {
     const { store } = this.host
     return store.keys(KV.runLimits.pending).flatMap(key => store.get(key) ?? [])
@@ -195,7 +221,7 @@ export class RunLimits {
   }
 
   /** The active marker and its single normal Hub relay commit together. A new episode requires the hold to clear first. */
-  private updateHold(ticketId: string | null, limit: number | null, notify = true): boolean {
+  private updateHold(ticketId: string | null, limit: number | null): boolean {
     const { store } = this.host
     const key = ticketId === null ? KV.runLimits.projectHold : KV.runLimits.ticketHold(ticketId)
     const prior = store.get(key)
@@ -204,7 +230,7 @@ export class RunLimits {
       if (prior) store.delete(key)
       return false
     }
-    if (notify && !prior) {
+    if (!prior) {
       store.set(key, true)
       const ticket = ticketId === null ? undefined : store.tickets.get(ticketId)
       const relay = projectPushRelay({ id: `quota-paused:${randomUUID()}`, kind: 'quota-paused', payload: {

@@ -22,7 +22,7 @@ export class SettingsConflict extends Error {}
 const now = (): string => new Date().toISOString()
 /** Executor settings that control shell execution paths, repository identity, pinned base selection, prepare commands, and command shims. */
 const environment = ({ executor }: SettingsValue) => JSON.stringify([executor.directory, executor.repository, executor.baseRef, executor.prepare, executor.blockedCommands])
-const runLimits = ({ executor }: SettingsValue) => JSON.stringify([executor.maxWorkers, executor.runLimits])
+const runLimitFingerprint = ({ executor }: SettingsValue) => JSON.stringify([executor.maxWorkers, executor.runLimits])
 
 /** Schema parser, settings merger, and non-panel origin guard for one settings block kind. */
 interface Block {
@@ -44,7 +44,7 @@ const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
     merge: (settings, value) => ({ ...settings, executor: value as SettingsValue['executor'] }),
     guard: (current, candidate, origin) => {
       if (origin === 'panel') return
-      if (runLimits(current) !== runLimits(candidate)) throw new UserError('panelOnlyRunLimits')
+      if (runLimitFingerprint(current) !== runLimitFingerprint(candidate)) throw new UserError('panelOnlyRunLimits')
       if (environment(current) !== environment(candidate)) throw new UserError('panelOnlyEnvironment')
     },
   },
@@ -192,7 +192,7 @@ export class Settings {
       store.saveSettings(SettingsSchema.parse(settings), { source: origin, block, policyVersion: after, policyChanged: before !== after, notified })
       if (origin !== 'tool') sessions.notify(...settingsNotice(block, changedPaths(old, settings)))
       if (before !== after) engine.policyChanged(before, after, effects)
-      if (block === 'executor' && this.host.runLimitsChanged && runLimits(old) !== runLimits(settings)) {
+      if (block === 'executor' && this.host.runLimitsChanged && runLimitFingerprint(old) !== runLimitFingerprint(settings)) {
         store.afterCommit(() => this.host.runLimitsChanged?.())
       }
     })

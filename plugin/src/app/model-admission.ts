@@ -7,10 +7,18 @@ import { addAbortListener } from 'node:events'
 /** Stable host refusal; a competing reservation is not a provider failure or a failed Ticket. */
 export const RUN_LIMIT_REFUSAL = 'SUPERAGENT_RUN_LIMIT'
 
-export type ModelAdmission = { admitted: true; settle(totalTokens: number | null): void } | { admitted: false; reason: string }
+export type ModelAdmission = { admitted: true; settle(totalTokens: number | null): void }
+  | { admitted: false; reason: string; wait?: Promise<void> }
 interface AdmissionHost {
   owns(sessionId: string): boolean
   acquire(sessionId: string, reservation: number | null, signal?: AbortSignal): ModelAdmission
+}
+
+async function waitForBalance(change: Promise<void>, signal: AbortSignal): Promise<void> {
+  const { promise: aborted, reject } = Promise.withResolvers<never>()
+  const listener = addAbortListener(signal, () => reject(new LlmError('Model request cancelled while waiting for quota.', RUN_LIMIT_REFUSAL)))
+  try { await Promise.race([change, aborted]) }
+  finally { listener[Symbol.dispose]() }
 }
 
 /** Throw outside the finish-chunk protocol: even a DSH `always` provider retry policy must not retry admission. */
@@ -51,9 +59,10 @@ function reservation(options: GenerateOptions, agent: Agent): number | null {
  *
  * @param context - plugin context with the pinned DSH agent registry and LLM stream event.
  * @param host - trusted Session ownership, durable admission and settlement. Null means unknown, never zero.
+ * @param lifetime - aborts requests still waiting at admission when the Runtime stops.
  * @returns the listener disposer; leave installed until owned Sessions are stopped and drained.
  */
-export function installModelAdmission(context: Context, host: AdmissionHost): () => void {
+export function installModelAdmission(context: Context, host: AdmissionHost, lifetime: AbortSignal): () => void {
   let installed = true
   const remove = context.on('llm/stream', (options, next) => {
     // Capture at dispatch, not at first pull: the initiating async scope and the Session's prepared route
@@ -73,10 +82,18 @@ export function installModelAdmission(context: Context, host: AdmissionHost): ()
 
     // No reservation for a handle never iterated. Each DSH retry/restart dispatches a fresh handle.
     const stream = (async function* (): AsyncGenerator<StreamChunk, void> {
-      if (!installed || signal?.aborted || options.sessionId !== sessionId || context.agents.get(subject) !== initiator) refuse()
-      let lease: ModelAdmission
-      try { lease = host.acquire(subject, maximum, signal) } catch { refuse() }
-      if (!lease.admitted) refuse(lease.reason)
+      let lease: Extract<ModelAdmission, { admitted: true }>
+      let waitSignal: AbortSignal | undefined
+      for (;;) {
+        if (!installed || lifetime.aborted || signal?.aborted || options.sessionId !== sessionId || context.agents.get(subject) !== initiator) refuse()
+        let decision: ModelAdmission
+        try { decision = host.acquire(subject, maximum, signal) }
+        catch { throw new LlmError('Host could not reserve model usage.', 'SUPERAGENT_USAGE_RESERVATION_FAILED') }
+        if (decision.admitted) { lease = decision; break }
+        if (!decision.wait) refuse(decision.reason)
+        waitSignal ??= signal ? AbortSignal.any([signal, lifetime]) : lifetime
+        await waitForBalance(decision.wait, waitSignal)
+      }
       let evidence: TokenUsage | null | undefined
       let finished = false
       let cancellation: Disposable | undefined
@@ -102,8 +119,9 @@ export function installModelAdmission(context: Context, host: AdmissionHost): ()
       } finally {
         cancellation?.[Symbol.dispose]()
         try { lease.settle(evidence?.totalTokens ?? null) } catch {
-          // A failed commit remains the host's recovery responsibility. Do not retry or expose store/provider details.
-          throw new LlmError('Host could not settle model usage.', RUN_LIMIT_REFUSAL)
+          // Keep the durable reservation for recovery; a store failure is not a quota refusal or provider retry.
+          context.logger.error('Could not persist model usage settlement; reservation retained for restart recovery.')
+          throw new LlmError('Host could not settle model usage. Restart to recover the pending reservation.', 'SUPERAGENT_USAGE_SETTLEMENT_FAILED')
         }
       }
     })()

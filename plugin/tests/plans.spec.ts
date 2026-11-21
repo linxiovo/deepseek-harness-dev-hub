@@ -234,6 +234,8 @@ const PlanDispatchClaimSchema = z.object({ planId: z.string(), nodeId: z.string(
   role: z.enum(['backend', 'frontend']), pendingAction: z.enum(['launch', 'resume']).nullable(), claimedAt: z.string(), startedAt: z.string().optional() }).strict()
 const PlanDispatchSchema = z.object({ planId: z.string(), nodeId: z.string(), role: z.enum(['backend', 'frontend']), status: z.string(), reused: z.boolean(),
   claim: PlanDispatchClaimSchema.optional(), waitingOn: z.array(z.string()).optional(), reason: z.string().optional(),
+  limits: z.strictObject({ maxWorkers: z.number(), projectTokens: z.number().nullable(), ticketTokens: z.number().nullable(),
+    stagnation: z.strictObject({ maxAttemptsWithoutProgress: z.number(), idleSeconds: z.number() }) }),
   attention: z.looseObject({ id: z.string(), status: z.literal('awaiting') }).optional() }).strict()
 type PlanDispatch = z.infer<typeof PlanDispatchSchema>
 const dispatchPlan = async (planId: string, nodeId: string): Promise<PlanDispatch> => PlanDispatchSchema.parse(
@@ -252,7 +254,14 @@ describe('managed project plan pause', () => {
     expect(await get()).toMatchObject({ status: 200, body: { scope: 'project', configuration: {
       preset: 'default', defaults, effective: { ...defaults, ticketOverrides: [] },
     } } })
-    const settings = await readExecutorSettings()
+    const panel = await h.api('GET', 'settings', undefined, project.id)
+    expect(panel.status).toBe(200)
+    const { executor: settings } = z.object({ executor: z.object({ value: z.record(z.string(), z.unknown()), revision: z.number() }) })
+      .parse(panel.body.blocks)
+    expect(settings).toMatchObject(await readExecutorSettings().then(({ value, revision }) => ({ value, revision })))
+    expect(await h.api('PUT', 'settings/executor', { revision: settings.revision, value: { ...settings.value,
+      runLimits: { ticketOverrides: [{ planId: 'missing-plan', nodeId: 'catalog', tokens: 10 }] },
+    } }, project.id)).toMatchObject({ status: 404, body: { code: 'unknownPlan' } })
     const value = { ...settings.value, maxWorkers: 2, runLimits: { projectTokens: 1000, ticketTokens: 400,
       stagnation: { idleSeconds: 45 } } }
     expect(await h.api('PUT', 'settings/executor', { revision: settings.revision, value }, project.id)).toMatchObject({ status: 200 })
@@ -299,8 +308,8 @@ describe('managed project plan pause', () => {
       yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 } }
     }
     await Promise.race([head.promise, first])
+    const second = h.modelRequest(b.session, 35, later).then(() => 'completed', () => 'refused')
     try {
-      await expect(h.modelRequest(b.session, 100, later)).rejects.toThrow(/budget|limit/i)
       expect(providerCalls).toBe(0)
       expect(await read('project/run-limits')).toMatchObject({ budget: { state: 'reserved', accountedTokens: null,
         reservedTokens: 100, availableTokens: 0, missing: [], inFlight: [{ sessionId: a.session, maximumTokens: 100 }] } })
@@ -308,9 +317,7 @@ describe('managed project plan pause', () => {
       finish.resolve()
       await first
     }
-    expect(await read('project/run-limits')).toMatchObject({ budget: { state: 'available', accountedTokens: 65,
-      reservedTokens: 0, availableTokens: 35, reportedCalls: 1, missing: [], inFlight: [] } })
-    await h.modelRequest(b.session, 35, later)
+    expect(await second).toBe('completed')
     expect(providerCalls).toBe(1)
     expect(await read('project/run-limits')).toMatchObject({ budget: { accountedTokens: 77, availableTokens: 23, reportedCalls: 2 } })
   })
@@ -352,7 +359,10 @@ describe('managed project plan pause', () => {
     await h.runtime.idle()
     expect(await get()).toEqual(paused)
     expect(await dispatchPlan(id, 'catalog')).toMatchObject({ status: 'quota-paused', reused: true, claim: identity })
-    const b = (await dispatchPlan(id, 'accounts')).claim!
+    const dispatched = await dispatchPlan(id, 'accounts')
+    expect(dispatched.limits).toEqual({ maxWorkers: 1, projectTokens: null, ticketTokens: 80,
+      stagnation: { maxAttemptsWithoutProgress: 3, idleSeconds: 900 } })
+    const b = dispatched.claim!
     await h.runtime.idle()
     await h.modelRequest(b.session, 80, async function* (): AsyncGenerator<StreamChunk> {
       yield { type: 'usage', usage: { inputTokens: 47, outputTokens: 3, totalTokens: 50 } }

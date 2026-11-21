@@ -59,8 +59,8 @@ export class Engine {
   }
   /**
    * A Source's fact that a Thread closed, such as its pull request's merge, at the time it happened. An open ticket that
-   * follows it ends once it is done with the Threads it follows, unless work resumed since the close has not finished, or
-   * its worker took up a person's message the ticket decides after its latest report.
+   * follows it ends once it is done with the Threads it follows, unless it awaits credential verification, work resumed
+   * since the close has not finished, or its worker took up a person's message the ticket decides after its latest report.
    */
   threadClosed(thread: ThreadRef, outcome: 'merged' | 'closed', at: string): void {
     // Normalize source timestamps (such as GitHub whole seconds) to canonical ISO form.
@@ -123,6 +123,10 @@ export class Engine {
         { kind: 'accept', title: node.title, scope: mandate.scope, reason: 'Plan dispatch', name: 'plan-node', note }, isoTime(at), plan)
       return this.repo.tickets.get(id)!
     })
+  }
+  /** Record the Hub's proven direct-user answer and clear its Plan Ticket question in the same transaction. */
+  answerPlanQuestion(ticketId: string, questionId: string, answer: string, sessionId: string, messageId: string): string {
+    return this.repo.atomic(() => this.tickets.answerPlanQuestion(ticketId, questionId, answer, sessionId, messageId))
   }
   /**
    * Attach a Trigger to a ticket that the message points at: the ticket follows the Trigger's Threads and receives it as an
@@ -189,9 +193,19 @@ export class Engine {
    * Assignment ends and a new one starts under the same Mandate.
    * @throws UserError when the ticket is unknown, has ended, or is not retryable.
    */
-  retryTicket(ticketId: string): Ticket { return this.repo.atomic(() => this.tickets.retry(ticketId)) }
+  retryTicket(ticketId: string): Ticket {
+    return this.repo.atomic(() => {
+      if (this.options.credentialBlocked?.(ticketId)) throw new UserError('credentialBlocked')
+      return this.tickets.retry(ticketId)
+    })
+  }
 
   // The Executor
+
+  /** Resume the same live Assignment, inside the trusted credential verification transaction. */
+  resumeVerifiedCredential(ticketId: string, blockerId: string, recoveryNote: string): void {
+    this.repo.atomic(() => { this.tickets.resumeVerifiedCredential(ticketId, blockerId, recoveryNote) })
+  }
 
   /** Atomically reserve exclusive preparation rights before filesystem writes or Session creation. */
   reserveExecution(ticketId: string, assignmentId: string, identity: ExecutionIdentity): ExecutionResult<ExecutionClaim> {
@@ -304,7 +318,12 @@ export class Engine {
    * @throws UserError for an unknown or ended ticket, an ended assignment, a question that comes with a ready result or an
    * answer, or a question or answer that names a message that is not a person's or did not reach the ticket.
    */
-  report(ticketId: string, report: WorkerReport): Ticket { return this.repo.atomic(() => this.assignments.report(ticketId, report)) }
+  report(ticketId: string, report: WorkerReport): Ticket {
+    return this.repo.atomic(() => {
+      if (this.options.credentialBlocked?.(ticketId)) throw new UserError('credentialBlocked')
+      return this.assignments.report(ticketId, report)
+    })
+  }
   /** Persist one review through the Engine's single-write transaction boundary. */
   recordReview(ticketId: string, reviewerSession: string, input: { axis: ReviewAxis; basis: string[]; base: string; candidate: string;
     conclusion: ReviewConclusion; blockers: string[]; summary: string; reuses?: string[] }) {
@@ -337,7 +356,7 @@ export class Engine {
 /** What Sources ask and tell the Engine. */
 export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
 /** What the main Session asks of the Engine. */
-export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
+export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note' | 'answerPlanQuestion'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
 /** What Settings tells the Engine. */
@@ -345,4 +364,5 @@ export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
 export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
   | 'assignmentInterrupted' | 'report' | 'recordReview' | 'recordDeliveryEvidence' | 'markUnrelated' | 'handback' | 'followForContext' | 'takeUp'
-  | 'reserveExecution' | 'recordExecutionVerified' | 'pinMainlineRepair' | 'rejectExecution' | 'acquireExecutionWriter' | 'releaseExecutionWriter'>
+  | 'reserveExecution' | 'recordExecutionVerified' | 'pinMainlineRepair' | 'rejectExecution' | 'acquireExecutionWriter' | 'releaseExecutionWriter'
+  | 'resumeVerifiedCredential'>

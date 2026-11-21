@@ -322,6 +322,9 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET topic-binding': { answer: installationUnavailable },
   'POST topic-binding': { body: true, answer: installationUnavailable },
   'POST topic-binding/unbind': { answer: installationUnavailable },
+  'GET attention/summary': { query: ['planId'], answer: installationUnavailable },
+  'GET attention/credentials/:id': { answer: installationUnavailable },
+  'POST attention/credentials/:id/verify': { body: true, answer: installationUnavailable },
   'GET state': { answer: stateView },
   'GET overview': { answer: overviewView },
   'GET search': { query: ['q'], answer: async ({ query }) => {

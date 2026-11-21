@@ -14,7 +14,7 @@ The Hub keeps the coordination and assessment tools registered by `mainTools` in
 
 If DeepSeek Harness selects another preset for the main Session before its first turn, `Sessions` selects `ROUTER_PRESET` again. A main Session the host creates or reloads is decorated with the runtime restriction, so it cannot recover shell, job or write tools even when the profile mounts one.
 
-The Hub also owns `orchestrator_handoff_confirm`, `orchestrator_handoff_answer` and `orchestrator_plan_context`. Neither planning Session owns these tools. [009 Handoff](009-handoff.md) describes the planner and splitter scopes; they can submit only their own planning artifact, never issue a Channel reply or start a Worker.
+The Hub also owns `orchestrator_handoff_confirm`, `orchestrator_handoff_answer`, `orchestrator_plan_context` and `orchestrator_plan_answer`. Neither planning Session owns these tools. [009 Handoff](009-handoff.md) describes the planner and splitter scopes; they can submit only their own planning artifact, never issue a Channel reply or start a Worker. Planner questions still use `orchestrator_handoff_answer`.
 
 The Hub alone owns `orchestrator_queue_merge`; it requests the checked, durable operation in [Merging](003-execution.md#merging), not a general Git command. Worker and planning tools cannot start it.
 
@@ -37,7 +37,17 @@ Acceptance is different from Worker take-up: when a Ticket is created with an ac
 
 ### Reports and questions
 
-`orchestrator_report` records progress, `ready`, `blocked`, `failed` or `dropped` and an optional `human_action` question. The result is a report on the Ticket and an internal relay to the Hub; it sends nothing to a person. The Hub decides whether and where to answer with `orchestrator_reply` (`answer`, `result` or `attention`), its model-facing Channel send tool. Host-side acceptance acknowledgement is a separate outbox path; no Worker tool exposes a Channel send path.
+`orchestrator_report` records progress, `ready`, `blocked`, `failed` or `dropped` and an optional `human_action` question. For a Plan Ticket, ordinary reports stay on the Ticket; a concrete question for a person relays to the Hub as `human-action`. A report with `reply_to_trigger_id` that the Engine accepts as an answer to a reached human question still relays as `worker_report` with `answer_to`, for a solicited reply to that original question. Review evidence alone is not a proactive receipt. Non-Plan reports retain the legacy relay policy. The Hub owns `orchestrator_reply` (`answer`, `result` or `attention`) for Channel sends. Host-side acceptance acknowledgement is a separate outbox path; no Worker tool exposes a Channel send path.
+
+Only the current root Worker of a Plan Ticket has `orchestrator_credential_blocked`. It registers a blocker with an identifier, not a secret, and routes the operator action to the Hub. No Session tool verifies the account; verification is a scoped management operation. The Hub's `project/attention` and `plan/<id>/attention` reads are not Worker or planner resources. See `015-scoped-attention.md` for the role, replay and management contracts.
+
+### Direct Harness answers to Plan Workers
+
+When the Plan Ticket has no reply Channel, the Hub asks the question in its normal Harness reply; it does not call `orchestrator_reply` or guess a destination. The `human-action` question relay supplies `ticket.ticket_id`, `ticket.attention.id` and `ticket.attention.question`. Questions raised by a specific Source message keep their existing original-Channel route.
+
+`orchestrator_plan_answer` is Hub-only. Its strict input is `{"ticket_id":"<ticket id>","question_id":"<attention id>","answer":"<verbatim answer>"}`: all three fields are required, nonblank strings and no extra fields are accepted. The latest direct `user/message` in the Hub must itself be that JSON object, with all three decoded strings equal to the tool arguments. JSON whitespace and key order do not matter; plain text, code fences, paraphrases, source relays and earlier direct messages are not proof. The Hub cannot construct an answer on the user's behalf.
+
+Success returns `{ticket_id, question_id, input_id}`. The Engine requires a live Plan Ticket with that exact current attention ID; unknown, ended, non-Plan, replaced, cross-Ticket or already answered questions are refused. It atomically clears the attention and queues one `kind: 'text'` input with the answer unchanged. The durable ID binds the Ticket, question and direct Hub session event, so retry or restart does not create a second copy. The Worker receives the answer through normal input delivery (oversized text is readable in full at the supplied input resource). No mandate, dependency, credential or delivery status is changed by the answer. If credential verification is pending, the answer is recorded but not delivered until trusted verification resumes the Ticket.
 
 ### CLI guard
 
@@ -66,11 +76,13 @@ A Session is protected only when its ancestry reaches a `worker-<ticketId>` Sess
 
 The Hub may still read an ended Ticket's reports and results through `orchestrator_read` (`ticket/<id>`, `/result`, `/report/<assignment id>`) and the management HTTP reads; the end of a Ticket removes Worker write access, not Hub or management read access.
 
+A PR closure or merge observed during a credential pause is still recorded on the followed Thread, but it does not end the Ticket, complete its Plan node, or release successors. A restart does not lift the pause. A human STOP still ends the paused Ticket.
+
 ## Acceptance
 
 The agreed contract for this boundary:
 
-- The Hub coordinates and inspects through its own tools: it has no shell, job or file-write tool, its inherited surface is restricted to `HUB_TOOLS`, and its human-facing responses use `orchestrator_reply`; host-side acceptance acknowledgement separately queues an outbox message.
+- The Hub coordinates and inspects through its own tools: it has no shell, job or file-write tool, its inherited surface is restricted to `HUB_TOOLS`, and external Channel replies use `orchestrator_reply`; host-side acceptance acknowledgement separately queues an outbox message. Channel-less Plan questions and their explicitly addressed answers stay in Harness.
 - A Worker takes a person's request up internally (`orchestrator_ack`), reports internally, and has no Channel send path; the `gh` and `lark-cli` shims refuse the by-name CLI sends that the CLI guard lists.
 - When a Ticket ends, every work tool refuses further calls at any depth (failing closed while a reloaded child resolves its `parentSession` ancestry, and staying guarded if `inspect` fails rather than proving non-ownership), and the Executor cancels the turn, kills and collects tracked jobs across all non-`external` descendants before `drainChildren`, and cancels any descendant Session still loaded afterward.
 - Normal development keeps its network, dependency installs, `web_search` and the two read-only Context7 MCP tools in `DEV_MCP_TOOLS`; no other MCP tool is allowed.
@@ -87,7 +99,7 @@ The agreed contract for this boundary:
 | `plugin/src/app/plan-dispatch.ts` | Hub-only Frontier selection, slot reservation, durable Plan Ticket claims and restart rearming |
 | `plugin/src/app/tools/executor.ts` | Worker read, take-up, report, Thread and hand-back tools, plus candidate evidence in `011-doc-tree-impact.md` and `013-development-verification.md` |
 | `plugin/src/core/replies.ts` | `Replies.takeUpInternally` records a Worker's take-up without sending; `Replies.acknowledgeAccepted` queues the host's accepted-Ticket acknowledgement for a human Trigger |
-| `plugin/src/core/engine.ts` | `Engine.takeUp` (atomic take-up entry) and `Engine.reply` (Hub answer, result and attention messages) |
+| `plugin/src/core/engine.ts` | Atomic take-up, Channel reply, Plan question answer and verified credential continuation commands |
 | `plugin/src/infra/environment.ts` | Worker command shims: `gh` and `lark-cli`, `blockedCommands`, and the by-name refusal of human-facing CLI sends |
 | `plugin/tests/bundle-patch.spec.ts` | Reads the patch as the host does and checks both presets and their tool sets |
 | `plugin/tests/environment.spec.ts` | Runs the shims against a fake CLI and inbox: refused sends, allowed reads and authorized writes, and the host's own absolute CLIs |

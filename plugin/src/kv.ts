@@ -10,6 +10,7 @@ import type { SettingsVersion } from './app/store.ts'
 import type { SessionMeterState } from './app/session-meter.ts'
 import type { MeterSessionBinding } from './app/project-meter.ts'
 import type { TopicBindingRecord } from './app/topic-binding.ts'
+import type { CredentialBlocker } from './app/scoped-attention.ts'
 import type { SettingsSave } from './policy.ts'
 import type { Retry } from './sources/github.ts'
 
@@ -85,4 +86,6 @@ export const KV = {
   /** Mainline: versioned Ticket attempts and the FIFO per GitHub repo/ref. */
   mainline: { ticket: family<MainlineIntent[], [ticketId: string]>('mainline-ticket:'),
     pending: family<string[], [target: string]>('mainline-pending:') },
+  /** Scoped attention: durable action receipts and at most one active credential blocker per Ticket. */
+  attention: { credential: family<CredentialBlocker>('credential-action:'), active: family<string>('active-credential-action:') },
 }

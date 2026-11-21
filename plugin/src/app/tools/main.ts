@@ -15,6 +15,7 @@ import type { ProjectMeter } from '../project-meter.ts'
 import { ticketCard } from '../cards.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
+import type { ScopedAttention } from '../scoped-attention.ts'
 import type { Sessions } from '../sessions.ts'
 import type { Settings } from '../settings.ts'
 import { promptFile } from '../skill-files.ts'
@@ -43,6 +44,11 @@ const PlanMessageSchema = z.object({
   target: PlanTargetSchema,
   text: z.string().trim().min(1).max(4000),
 }).strict()
+const PlanAnswerSchema = z.object({
+  ticket_id: z.string().min(1).refine(id => !!id.trim()),
+  question_id: z.string().min(1).refine(id => !!id.trim()),
+  answer: z.string().min(1).refine(text => !!text.trim(), 'Answer cannot be blank'),
+}).strict()
 const handoffErrors = z.object({
   latestConfirmation: z.string().min(1),
   latestAnswer: z.string().min(1),
@@ -53,20 +59,20 @@ const handoffErrors = z.object({
   latestPlanMessage: z.string().min(1),
 }).strict().parse(JSON.parse(promptFile('handoff-errors')))
 /** Only the latest direct Hub user event may authorize a handoff or address a plan. */
-function latestDirectUserMessageId(agent: Agent, text: string, mismatch: string): string {
+function latestDirectUserMessageId(agent: Agent, expected: string | ((text: string) => boolean), mismatch: string): string {
   const events = agent.session.snapshotEvents()
   for (let index = events.length - 1; index >= 0; index--) {
     const event = events[index]
     if (!event || event.type !== 'user/message' || event.data.source.kind !== 'user') continue
     const message = event.data.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
-    if (message === text) return String(event.seq)
+    if (typeof expected === 'string' ? message === expected : expected(message)) return String(event.seq)
     break
   }
   throw new Error(mismatch)
 }
 export interface MainToolsHost {
   readonly context: Context
-  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
+  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note' | 'answerPlanQuestion'> & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry'>
@@ -74,6 +80,7 @@ export interface MainToolsHost {
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
   readonly projectMeter: Pick<ProjectMeter, 'read'>
+  readonly attention: Pick<ScopedAttention, 'summary' | 'forTicket'>
   readonly handoffs: Pick<Handoffs, 'confirm' | 'answer' | 'get' | 'spec'>
   readonly plans: Pick<Plans, 'get' | 'view' | 'node' | 'append'>
   readonly planDispatcher: Pick<PlanDispatcher, 'dispatch'>
@@ -210,7 +217,7 @@ function routeTool(host: MainToolsHost): Tool {
 /** Builds the main Session's tools; `agent` scopes prompt preview resources to that Session. */
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings,
-    handoffs: host.handoffs, plans: host.plans, projectMeter: host.projectMeter }
+    handoffs: host.handoffs, plans: host.plans, projectMeter: host.projectMeter, attention: host.attention }
   return [
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
@@ -255,6 +262,24 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         latestDirectUserMessageId(agent, answer, handoffErrors.latestAnswer)
         const handoff = host.handoffs.answer(handoffId, questionId, answer)
         return { handoffId, handoff, read: `handoff/${handoffId}`, spec: `spec/${handoffId}` }
+      },
+    }),
+    tool({
+      name: 'orchestrator_plan_answer',
+      description: 'Record the latest direct Hub user’s JSON answer to a current Plan Ticket question.',
+      schema: PlanAnswerSchema,
+      execute: async ({ ticket_id, question_id, answer }) => {
+        if (agent.id !== host.resources.masterId) throw new Error('Only the Hub may record Plan Ticket answers')
+        const messageId = latestDirectUserMessageId(agent, text => {
+          let raw: unknown
+          try { raw = JSON.parse(text) } catch { return false }
+          const parsed = PlanAnswerSchema.safeParse(raw)
+          return parsed.success && parsed.data.ticket_id === ticket_id && parsed.data.question_id === question_id
+            && parsed.data.answer === answer
+        }, 'Plan answer must match the latest direct user message: JSON with ticket_id, question_id and answer')
+        const input_id = host.engine.answerPlanQuestion(ticket_id, question_id, answer, agent.id, messageId)
+        host.requestPass()
+        return { ticket_id, question_id, input_id }
       },
     }),
     tool({

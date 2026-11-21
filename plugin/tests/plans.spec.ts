@@ -1,19 +1,18 @@
-import { afterEach, beforeEach, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { z } from 'zod'
 import { resolve } from 'node:path'
 import { KV } from '../src/kv.ts'
 import { planDeliveryWriter } from '../src/app/plans.ts'
-import { startRuntime, type Host } from './fixtures/host.ts'
+import { startManagedProject, startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host
-beforeEach(async () => { h = await startRuntime(undefined, { withFeishu: false }) })
-afterEach(async () => { await h.stop() })
+let brief: { project: { repository: string; workspace: string }; goal: string; constraints: string[];
+  acceptanceScope: string[]; authorization: { scope: string; release: 'not-authorized' } }
 
-const brief = {
-  project: { repository: 'acme/widgets', workspace: resolve('workspaces/widgets') },
-  goal: 'Let shoppers view their saved products.', constraints: ['Saved products are private.'],
-  acceptanceScope: ['A shopper can see their saved products.'],
-  authorization: { scope: 'Implement and verify private saved products.', release: 'not-authorized' },
+function savedProductsBrief(project: typeof brief.project) {
+  return { project, goal: 'Let shoppers view their saved products.', constraints: ['Saved products are private.'],
+    acceptanceScope: ['A shopper can see their saved products.'],
+    authorization: { scope: 'Implement and verify private saved products.', release: 'not-authorized' as const } }
 }
 const spec = {
   body: 'Provide an authenticated saved-products endpoint and a page for signed-in shoppers.',
@@ -66,6 +65,19 @@ const fanInDraft = {
   ],
 }
 
+async function registeredFanIn() {
+  const published = await publish({ ...brief, goal: fanInSpec.body }, fanInSpec)
+  await h.runtime.idle()
+  await published.register(fanInDraft)
+  return published
+}
+
+describe('plans on the legacy host fixture', () => {
+  beforeEach(async () => {
+    h = await startRuntime(undefined, { withFeishu: false })
+    brief = savedProductsBrief({ repository: 'acme/widgets', workspace: resolve('workspaces/widgets') })
+  })
+  afterEach(async () => { await h.stop() })
 it('automatically delegates a published spec, resumes interrupted splitting, and registers without starting a Worker', async () => {
   const { id, specId, sessionId, register } = await publish()
   await h.runtime.idle()
@@ -205,6 +217,7 @@ it('keeps direct root background and single-node instructions separate across a 
 })
 
 
+})
 const fanInSpec = {
   ...spec,
   body: 'Build independent catalog and account backends followed by a dashboard.',
@@ -217,17 +230,138 @@ const fanInSpec = {
 const PlanDispatchClaimSchema = z.object({ planId: z.string(), nodeId: z.string(), ticketId: z.string(), assignmentId: z.string(), session: z.string(),
   role: z.enum(['backend', 'frontend']), pendingAction: z.enum(['launch', 'resume']).nullable(), claimedAt: z.string(), startedAt: z.string().optional() }).strict()
 const PlanDispatchSchema = z.object({ planId: z.string(), nodeId: z.string(), role: z.enum(['backend', 'frontend']), status: z.string(), reused: z.boolean(),
-  claim: PlanDispatchClaimSchema.optional(), waitingOn: z.array(z.string()).optional(), reason: z.string().optional() }).strict()
+  claim: PlanDispatchClaimSchema.optional(), waitingOn: z.array(z.string()).optional(), reason: z.string().optional(),
+  attention: z.looseObject({ id: z.string(), status: z.literal('awaiting') }).optional() }).strict()
 type PlanDispatch = z.infer<typeof PlanDispatchSchema>
 const dispatchPlan = async (planId: string, nodeId: string): Promise<PlanDispatch> => PlanDispatchSchema.parse(
   await h.runTool(h.runtime.masterId, 'orchestrator_plan_dispatch', { planId, nodeId }))
 
-async function registeredFanIn() {
-  const published = await publish({ ...brief, goal: fanInSpec.body }, fanInSpec)
+
+describe('managed project plan pause', () => {
+  let managedHost: Host | undefined
+  afterEach(async () => { if (managedHost) { await managedHost.stop(); managedHost = undefined } })
+  it('pauses only the Plan ticket with a missing test account and sends one controlled action request', async () => {
+  const managed = await startManagedProject({ withFeishu: false, machine: project => ({ credentialChecks: [{ projectId: project.id,
+    id: 'test-account', executable: process.execPath, args: ['--fixture-check-test-account'],
+    providerUrl: 'https://account.example.test/test-account' }] }) })
+  managedHost = managed.host
+  h = managed.host
+  const project = managed.project
+  brief = savedProductsBrief(managed.projectBrief)
+
+  const third = { id: 'export', kind: 'backend' }
+  const { id, register } = await publish({ ...brief, goal: fanInSpec.body }, fanInSpec)
   await h.runtime.idle()
-  await published.register(fanInDraft)
-  return published
-}
+  await register({ features: [...fanInDraft.features, third], nodes: [
+    ...fanInDraft.nodes.map(node => node.id === 'dashboard' ? { ...node, blockedBy: ['accounts'] } : node),
+    { id: third.id, featureId: third.id, title: 'Export catalogue', role: 'backend', acceptance: [1],
+      demonstration: 'Export catalogue rows as CSV.', blockedBy: [] },
+  ] })
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, maxWorkers: 3 } })
+  const a = (await dispatchPlan(id, 'catalog')).claim!, b = (await dispatchPlan(id, 'accounts')).claim!
+  const c = (await dispatchPlan(id, 'export')).claim!
+  await h.runtime.idle()
+  h.deliveries.mockClear()
+  await expect(h.runTool(b.session, 'orchestrator_report', { state: 'blocked', summary: 'Blocked', human_action: 'Paste the API key here.' }))
+    .rejects.toThrow(/credential blocker/)
+  const activeJobs = [a, b, c].map(claim => h.jobs.run(claim.session))
+  const reportMissing = () => h.runTool(b.session, 'orchestrator_credential_blocked', { credential_id: 'test-account' })
+  const action = await reportMissing()
+  expect(await reportMissing()).toEqual(action)
+  expect(action).toMatchObject({ providerUrl: 'https://account.example.test/test-account', verifierConfigured: true, occurrence: 0 })
+  await h.runtime.idle()
+  expect(h.jobs.service.kill.mock.calls.map(([job]) => job)).toEqual([activeJobs[1]])
+  const summary = () => h.api('GET', `attention/summary?planId=${id}`, undefined, project.id)
+  const expected = { running: 2, awaitingHuman: 1, message: '2 张执行中，1 张待你处理' }
+  expect(await summary()).toMatchObject({ status: 200, body: expected })
+  expect(await read(`plan/${id}/attention`)).toMatchObject(expected)
+  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['accounts'] })
+  expect(await read(`plan/${id}/node/accounts`)).toMatchObject({ attention: { id: action.id, status: 'awaiting' } })
+  const push = () => h.jsonRelays<{ kind: string } & Record<string, unknown>>(h.runtime.masterId, 'human-action')
+  expect(push()).toEqual([expect.objectContaining({ kind: 'human-action', ...expected, action: expect.objectContaining({
+    ticketId: b.ticketId, title: 'Account lookup', affectedNodes: ['dashboard'], configuration: expect.any(String),
+  }) })])
+  expect(await h.runTool(a.session, 'orchestrator_report', { state: 'progress', summary: 'Catalogue still running' }))
+    .toMatchObject({ notification: 'internal_only' })
+  expect(await h.runTool(c.session, 'orchestrator_report', { state: 'progress', summary: 'Export is still running' }))
+    .toMatchObject({ notification: 'internal_only' })
+  expect(await h.runTool(c.session, 'orchestrator_report', { state: 'failed', summary: 'Transient export retry' }))
+    .toMatchObject({ notification: 'internal_only' })
+  await expect(h.runTool(b.session, 'orchestrator_report', { state: 'ready', summary: 'Skip configuration' })).rejects.toThrow()
+  const workerDeliveries = () => h.deliveries.mock.calls.map(([delivery]) => delivery).filter(delivery => delivery.sessionId === b.session)
+
+  const path = String(action.configuration).replace('/orchestrator/api/', '')
+  expect(await h.api('GET', path, undefined, 'unselected-project')).toMatchObject({ status: 409 })
+  expect(await h.api('GET', 'attention/summary?planId=unknown', undefined, project.id)).toMatchObject({ status: 404 })
+  expect(await h.api('GET', path, undefined, project.id)).toMatchObject({ status: 200, body: { id: action.id, status: 'awaiting' } })
+  expect(await h.api('POST', `tickets/${b.ticketId}/retry`, undefined, project.id)).toMatchObject({ status: 400, body: { code: 'credentialBlocked' } })
+  expect(await h.api('POST', `${path}/verify`, { verified: true }, project.id)).toMatchObject({ status: 400 })
+  h.hooks.credentialCheck = () => false
+  const failed = await h.api('POST', `${path}/verify`, {}, project.id)
+  expect(failed).toMatchObject({ status: 200, body: { status: 'awaiting', verification: 'failed' } })
+  expect(JSON.stringify(failed)).not.toContain('fixture-secret-from-verifier')
+  const verificationStarted = Promise.withResolvers<void>()
+  const verificationResult = Promise.withResolvers<boolean>()
+  h.hooks.credentialCheck = () => {
+    verificationStarted.resolve()
+    return verificationResult.promise
+  }
+  const interruptedVerification = h.api('POST', `${path}/verify`, {}, project.id)
+  await verificationStarted.promise
+  const restart = h.restart()
+  verificationResult.resolve(true)
+  expect(await interruptedVerification).toMatchObject({ status: 409, body: { code: 'switching' } })
+  await restart
+  await h.runtime.idle()
+  expect(push()).toHaveLength(1)
+  expect(await summary()).toMatchObject({ status: 200, body: { awaitingHuman: 1 } })
+  expect(workerDeliveries()).toEqual([])
+  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['accounts'] })
+
+  h.hooks.credentialCheck = () => true
+  const verify = () => h.api('POST', `${path}/verify`, {}, project.id)
+  expect(await verify()).toMatchObject({ status: 200, body: { status: 'verified', verification: 'passed' } })
+  await h.runtime.idle()
+  expect(await h.runTool(b.session, 'orchestrator_report', { state: 'progress', summary: 'Validated account works' }))
+    .toMatchObject({ notification: 'internal_only' })
+  expect(workerDeliveries()).toEqual([expect.objectContaining({ mode: 'queue' })])
+  expect(await reportMissing()).toMatchObject({ id: action.id, status: 'verified' })
+  expect(await verify()).toMatchObject({ status: 200, body: { status: 'verified' } })
+  expect(await summary()).toMatchObject({ status: 200, body: { awaitingHuman: 0 } })
+  expect(push()).toHaveLength(1)
+  const recurrence = await h.runTool(b.session, 'orchestrator_credential_blocked', { credential_id: 'test-account', occurrence: 1 })
+  expect(recurrence).toMatchObject({ status: 'awaiting', occurrence: 1 })
+  expect(recurrence.id).not.toBe(action.id)
+  expect(await reportMissing()).toMatchObject({ id: action.id, status: 'verified' })
+  expect(await dispatchPlan(id, 'accounts')).toMatchObject({ reused: true, attention: { id: recurrence.id },
+    claim: { ticketId: b.ticketId, assignmentId: b.assignmentId, session: b.session } })
+  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['accounts'] })
+
+  const pull = { source: 'github', id: '42' }
+  h.runtime.engine.bindThread(b.ticketId, pull, true)
+  h.runtime.engine.threadClosed(pull, 'merged', new Date().toISOString())
+  expect(await read(`plan/${id}/node/accounts`)).toMatchObject({ attention: { id: recurrence.id, status: 'awaiting' } })
+  const repeatedPath = String(recurrence.configuration).replace('/orchestrator/api/', '')
+  expect(await h.api('POST', `${repeatedPath}/verify`, {}, project.id)).toMatchObject({ status: 200, body: { status: 'verified' } })
+  // A PR lifecycle event is not a receipt from the mainline queue; resume the same Assignment for real verification.
+  await h.runtime.idle()
+  const resumed = await read(`plan/${id}/node/accounts`)
+  expect(resumed).toMatchObject({ status: 'running', claim: { ticketId: b.ticketId, assignmentId: b.assignmentId, session: b.session } })
+  expect(resumed).not.toHaveProperty('delivery')
+  expect(resumed).not.toHaveProperty('attention')
+  expect(workerDeliveries()).toHaveLength(2)
+  await h.restart()
+  await h.runtime.idle()
+  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['accounts'] })
+})
+})
+describe('plans on the legacy host fixture after managed scenario', () => {
+  beforeEach(async () => {
+    h = await startRuntime(undefined, { withFeishu: false })
+    brief = savedProductsBrief({ repository: 'acme/widgets', workspace: resolve('workspaces/widgets') })
+  })
+  afterEach(async () => { await h.stop() })
 
 it('counts a forked review once and keeps one Hub call across two active Tickets in shared project usage', async () => {
   const { id } = await registeredFanIn()
@@ -401,6 +535,30 @@ async function dispatchedFanIn() {
   return { id, catalogClaim, accountsClaim }
 }
 
+it('delivers one direct Harness answer to the Plan ticket that asked the question', async () => {
+  const { id, catalogClaim, accountsClaim } = await dispatchedFanIn()
+  h.deliveries.mockClear()
+  const report = await h.runTool(accountsClaim.session, 'orchestrator_report', {
+    state: 'blocked', summary: 'Need the product decision', human_action: 'Should the profile support password login?',
+  }) as { attention: { id: string } }
+  await h.runtime.idle()
+  expect(h.relays(h.runtime.masterId)).toEqual([expect.objectContaining({ kind: 'human-action',
+    ticket: expect.objectContaining({ attention: expect.objectContaining({ id: report.attention.id }) }) })])
+  const master = h.runtime.masterId
+  const args = { ticket_id: accountsClaim.ticketId, question_id: report.attention.id, answer: 'Use sign-in links only.' }
+  await expect(h.runTool(master, 'orchestrator_plan_answer', args)).rejects.toThrow()
+  const wrongTicket = { ...args, ticket_id: catalogClaim.ticketId }
+  h.sendUserMessage(master, JSON.stringify(wrongTicket))
+  await expect(h.runTool(master, 'orchestrator_plan_answer', wrongTicket)).rejects.toThrow()
+  h.sendUserMessage(master, JSON.stringify(args))
+  expect(await h.runTool(master, 'orchestrator_plan_answer', args)).toMatchObject({ ticket_id: accountsClaim.ticketId, question_id: report.attention.id })
+  await expect(h.runTool(master, 'orchestrator_plan_answer', args)).rejects.toThrow()
+  await h.runtime.idle()
+  const delivered = h.deliveries.mock.calls.map(([call]) => call).filter(call => call.text === args.answer)
+  expect(delivered).toEqual([expect.objectContaining({ sessionId: accountsClaim.session })])
+  expect(await read(`plan/${id}/attention`)).toMatchObject({ awaitingHuman: 0 })
+})
+
 const receiptFor = (nodeId: string, claim: Pick<z.infer<typeof PlanDispatchClaimSchema>, 'ticketId' | 'assignmentId'>) => ({
   ticketId: claim.ticketId, assignmentId: claim.assignmentId, receiptId: `delivery-${nodeId}`,
   candidate: `commit-${nodeId}`, verifiedAt: '2026-11-17T11:00:47Z',
@@ -486,4 +644,5 @@ it('does not meter a preallocated Worker ID before its verified Session is hande
   expect(await read(meter)).toMatchObject(expected)
   await h.restart()
   expect(await read(meter)).toMatchObject(expected)
+})
 })

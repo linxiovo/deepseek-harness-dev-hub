@@ -7,6 +7,7 @@ import type { Engine } from '../core/engine.ts'
 import type { DshExecutor } from '../executor/dsh.ts'
 import type { Store } from './store.ts'
 import type { Plans } from './plans.ts'
+import type { CredentialAction, ScopedAttention } from './scoped-attention.ts'
 
 export type PlanDispatchResult = {
   planId: string
@@ -15,6 +16,7 @@ export type PlanDispatchResult = {
   status: PlanNodeState['status'] | 'blocked' | 'waiting-for-slot'
   reused: boolean
   claim?: PlanNodeClaim
+  attention?: CredentialAction
   waitingOn?: string[]
   reason?: string
 }
@@ -24,6 +26,7 @@ interface PlanDispatcherHost {
   readonly plans: Pick<Plans, 'get' | 'state' | 'waitingOn' | 'claim' | 'list' | 'rearm'>
   readonly engine: Pick<Engine, 'createPlanTicket'>
   readonly executor: Pick<DshExecutor, 'reserveLaunch' | 'releaseLaunch' | 'start'>
+  readonly attention: Pick<ScopedAttention, 'forTicket' | 'blocked'>
   bindWorker(ticketId: string, sessionId: string): void
   readonly now?: () => string
 }
@@ -97,6 +100,7 @@ export class PlanDispatcher {
         if (!PLAN_ROLES.includes(node.role)) continue
         const state = this.host.plans.state(plan.id, node.id)
         if (!state || ['delivered', 'failed', 'stopped'].includes(state.status)) continue
+        if (this.host.attention.blocked(state.claim.ticketId)) continue
         const ticket = this.host.store.tickets.get(state.claim.ticketId)
         const assignment = ticket && latestAssignment(ticket)
         if (!ticket || !assignment || assignment.state !== 'pending') continue
@@ -108,6 +112,7 @@ export class PlanDispatcher {
   }
 
   private result(planId: string, nodeId: string, role: PlanNodeClaim['role'], state: PlanNodeState, reused: boolean): PlanDispatchResult {
-    return { planId, nodeId, role, status: state.status, reused, claim: state.claim }
+    const attention = this.host.attention.forTicket(state.claim.ticketId)
+    return { planId, nodeId, role, status: state.status, reused, claim: state.claim, ...(attention ? { attention } : {}) }
   }
 }

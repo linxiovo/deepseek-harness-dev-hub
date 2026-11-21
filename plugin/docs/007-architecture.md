@@ -40,7 +40,7 @@ Ticket review evidence is submitted only by a Worker descendant through `orchest
 | Setup | `src/app/setup.ts` | Resolves the repository and the accounts by probing their CLIs the way worker shells run them, writes and applies the workers' environment and command shims, and keeps the setup problems; Settings checks a changed account through it, and restarts through it, which runs setup again |
 | Passes | `src/app/passes.ts` | One pass at a time, every two seconds and whenever a command asks: the due effects, then `Engine.evaluateDue`; a Source's Trigger reaches the Engine through it |
 | Outbox | `src/app/outbox.ts` | The `Outbox` port for every Channel message and the only writer of its receipts: the Hub's replies, the acceptance acknowledgement, pull-request end notices and Source notices all go through `send`, which keeps a message's receipt and queues its `reply` effect in one transaction, and the effect's handler sends it through `SourceRegistry.send`; a message waits while its Source is off, and is dropped when the conversation is gone or not listened to |
-| Notices | `src/app/notices.ts` | Converts domain events and worker activity into main-Session messages. `eventNotice` handles domain notices; `reportRelay` forwards questions immediately, keeps ordinary progress on its Ticket, and relays other reports; `followupRelay` names the Tickets that own a human follow-up. Relays arriving during a turn are delivered together at its next step through the DeepSeek Harness inbox |
+| Notices | `src/app/notices.ts` | Converts eligible domain events and Worker activity to main-Session messages. Legacy report rules remain in `reportRelay`; Plan report push is limited to human questions, and `projectPushRelay` projects the Plan push allowlist. Relays arriving during a turn are delivered together at its next step through the DeepSeek Harness inbox |
 | Session meter | `src/app/session-meter.ts` | One Session's context snapshot and cumulative usage read from its durable event log, with provenance, coverage ranges and the persisted exclusive cursor; a fork's inherited prefix is not charged to the child |
 | Project meter | `src/app/project-meter.ts` | Persists Session attribution and business parentage; rolls up the Session meter's own usage across Tickets, Plans, and the mounted project |
 
@@ -115,7 +115,7 @@ After a change, the Engine emits an event from `DomainEvents` in `src/core/ports
 
 `trigger.received`, `eval.started`, `decision.recorded`, `ticket.created`, `ticket.resumed`, `ticket.ended`, `assignment.started`, `assignment.ended`, `thread.subscribed`, `thread.unsubscribed`, `trigger.requeued`, or `policy.changed`.
 
-Runtime turns `ticket.ended`, `trigger.requeued` and `thread.unsubscribed` into notices. A human `trigger.received` delivered to Tickets becomes a follow-up relay. `pullEndNotices` sends one chat notice, using a stable id, when a Ticket ends merged or closed. Other events currently have no consumer.
+Runtime turns eligible `ticket.ended`, `trigger.requeued` and `thread.unsubscribed` events into notices. A human `trigger.received` delivered to Tickets can become a follow-up relay. `pullEndNotices` sends one chat notice, using a stable ID, when a legacy non-Plan Ticket ends merged or closed. Plan execution push uses the policy in `015-scoped-attention.md`.
 
 ### Model
 
@@ -408,6 +408,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/plans.ts` | `Plans`: validates and atomically registers authorized Plan DAGs; keeps plan background separate from node instructions |
 | `src/app/plan-dispatch.ts` | `PlanDispatcher`: validates Frontier predecessors, reserves a launch slot, atomically claims a node into a stable Ticket/Assignment, and rearms the same claim on restart |
 | `src/app/mainline-queue.ts` | Durable per-target FIFO, Ticket attempts, Worker repair handoff, and actual Git verification before recording merge evidence |
+| `src/app/scoped-attention.ts` | `ScopedAttention`: durable Plan Ticket credential blockers, deduplicated Hub relays, shared management and Hub projections, and verified continuation; contract in `plugin/docs/015-scoped-attention.md` |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
 | `src/app/settings.ts` | Settings |
@@ -501,6 +502,8 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 
 `scripts/` holds standalone operational CLIs outside `src/`: `scripts/dsh-superagent` manages the local service process, and `scripts/verify-linux.mjs` runs `pnpm install --frozen-lockfile && pnpm check` against a committed Linux or WSL snapshot with logs and a manifest under `plugin/.artifacts/verify/`.
 
+`scripts/test.mjs` is the shared `pnpm test*` runner; its Windows scheduling contract is in `013-development-verification.md`. `scripts/credential-smoke.mjs` exercises the real host's scoped credential management interface; see `015-scoped-attention.md` for its operator procedure and limits.
+
 ## Tests
 
 | Test | Covers |
@@ -539,7 +542,8 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, review evidence and child-only review submission, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
 | `tests/topic-binding.spec.ts` | Uses a mounted project and normalized Feishu events to verify topic isolation, answer provenance and idempotent outbound delivery |
-| `tests/plans.spec.ts` | Automatic spec continuation, restart and registration, graph and role queries, invalid graph refusal, root/node message isolation, and deduplicated scoped usage through the public Session tools and HTTP |
+| `tests/plans.spec.ts` | Automatic spec continuation, restart and registration, graph and role queries, invalid graph refusal, root/node message isolation, scoped usage, and credential pause, verification and claim replay through public Session tools and HTTP |
+| `tests/credential-smoke.spec.ts` | Credential smoke CLI against loopback HTTP: request scope, explicit verification and safe results; not a live account check |
 | `tests/runtime-concurrency.spec.ts` | Overlapping Triggers, deliveries and launches; Worker inbox recovery after restart, checked after the runtime drains launch and delivery effects against real Git worktrees |
 | `tests/http.spec.ts` | Management request bounds; ticket worktree and writer projections; meter status, ID decoding, same-origin protection and project switch races |
 | `tests/projects.spec.ts` | Durable project registration, selection, re-open and workspace collision checks |
@@ -692,6 +696,7 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 | `models`, `models/<provider>` | Available models |
 | `session/<id>` | The `SessionMeterView` of one Session: its `context` snapshot and cumulative `usage`, with provenance, quality, sampled ranges and missing ranges; main Session only |
 | `project/meter`, `plan/<id>/meter`, `ticket/<id>/meter` | Hub-only scoped usage, shared overhead, and per-Session samples; contract in `plugin/docs/014-project-metering.md` |
+| `project/attention`, `plan/<id>/attention` | Hub-only Plan execution and awaiting-human summary, including credential actions; contract in `plugin/docs/015-scoped-attention.md` |
 | `feishu/<trigger id>/…`, `github/…` | Original Source records, described in the Source skills |
 | `actions/<ticket\|plan>/<id>/commit/<40 lowercase hex SHA>` | GitHub Actions evidence for one owned commit, main Session only |
 
@@ -727,8 +732,9 @@ These messages are steered into the main Session's turn:
 | --- | --- |
 | Candidate | Batch Trigger cards, Thread, `related_tickets`, `tickets_total`, `delivered_to`, referenced Tickets from Issue/PR links, `handed_back` reasons and the next action |
 | `follow_up` | One message as its Executor sees it, `replies_to`, receiving Tickets, and the reminder that Executors decide it while the main Session may only stop work |
-| `worker_report` | Ticket card, originating Trigger, state and summary up to 600 characters; `chars` and a read pointer when truncated |
-| `worker_attention` | Ticket card carrying the question |
+| `worker_report` | Legacy non-Plan relay: Ticket card, originating Trigger, state and summary up to 600 characters; `chars` and a read pointer when truncated |
+| `worker_attention` | Legacy non-Plan relay: Ticket card carrying the question |
+| `human-action` | Plan question or scoped credential action; see `plugin/docs/015-scoped-attention.md` |
 
 Other notices are injected without waking the main Session: `ticket_ended`, `settings_saved`, prompt saves, Trigger requeues, dropped Subscriptions and context follows. A settings notice names the block, changed paths and `read: settings/<block>`. The main Session receives no redundant notice for a save, requeue, unsubscribe or attach it performed itself.
 
@@ -736,15 +742,15 @@ Workers receive assignments and Inputs inline. The first message includes the ti
 
 ### Panel-only actions
 
-There is no tool for dismissing an unavailable Decision, rerunning setup, refreshing Source display names, or sending an Executor-owned human follow-up to Eval. The last action is deliberately refused by `orchestrator_trigger_requeue`. Other panel actions have equivalent tools.
+There is no Session tool for dismissing an unavailable Decision, rerunning setup, refreshing Source display names, or verifying a Plan credential action. An Executor-owned human follow-up cannot be sent to Eval; `orchestrator_trigger_requeue` deliberately refuses it.
 
-Most built-in instructions live in `prompts/*.md`, with one sentence per line joined by `promptFile`. Source skills live in `skills/dsh-superagent-*/SKILL.md`. Tool descriptions and fixed notices such as restart recovery notes remain in code. Assessment instructions live only in `prompts/admission.md`.
+Built-in instructions live in `prompts/*.md`, with one sentence per line joined by `promptFile`. Source skills live in `skills/dsh-superagent-*/SKILL.md`. Assessment instructions live in `prompts/admission.md`; [004 Prompts](004-prompts.md) indexes the fixed credential workflow text.
 
 `tests/model-surface.spec.ts` checks these surfaces for drift. [004 Prompts](004-prompts.md) explains the team's editable parts.
 
 ## Configuration reload
 
-The host writes `cordis.patch.yml` and updates the volatile machine limits in place. dsh-superagent reads each limit when it uses it, so a limit change applies without a restart. Set `stateDir` and `runtimeMode` in the profile configuration. See [006 Deployment](006-deployment.md#machine-configuration).
+The host writes `cordis.patch.yml` and updates the volatile machine limits in place. dsh-superagent reads each limit when it uses it, so a limit change applies without a restart. Set `stateDir`, `runtimeMode` and `credentialChecks` in the profile configuration. See [006 Deployment](006-deployment.md#machine-configuration).
 
 A settings save that changes a Source field setup reads, such as an account's CLI, and any save while setup waits, restarts dsh-superagent. DeepSeek Harness's settings service does not serve the entry during that restart, so after its own restart dsh-superagent asks it to read the entry again, and an open form becomes editable again.
 

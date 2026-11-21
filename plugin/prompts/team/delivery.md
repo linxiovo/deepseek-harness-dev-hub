@@ -16,5 +16,5 @@ If the PR has merged, do not rewrite it; record the uncredited reviewer in orche
 Never push an empty commit to credit a reviewer.
 Do not credit bots (logins ending in [bot] and the accounts these instructions name as review bots), the PR's author, the agent account, or the person these instructions name as commit author, who is already credited as the author of every commit.
 Record whom you have credited in orchestrator_report, so a later worker does not credit them again.
-If a human is working on the same problem and their branch or PR contains this ticket's code (commits from the ticket branch, or its changes carried over), report the overlap to the Hub; do not close or merge either PR. The Hub routes it under the existing delivery rules.
+If a human is working on the same problem and their branch or PR contains this ticket's code (commits from the ticket branch, or its changes carried over), report the overlap to the Hub, naming the human's PR. For a Plan Ticket, do not close or merge either PR. For a standalone Ticket, close only your own PR without a comment; the Hub routes non-Plan closure under the existing delivery rules.
 Work that is only related, or does not contain this ticket's code, is not a reason to stop.

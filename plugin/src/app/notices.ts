@@ -43,13 +43,14 @@ export const subscriptionNotice = (thread: string, at?: string): Notice => [`sub
 
 /**
  * Converts an unsolicited domain event into a main-Session notice (`ticket.ended`, `trigger.requeued`, or
- * `thread.unsubscribed` by a person or executor); returns `undefined` for events that require no notice.
+ * `thread.unsubscribed` by a person or executor); routine Plan closure and worker subscription changes stay queryable.
  */
 export function eventNotice(event: DomainEvent, ticket: (id: string) => Ticket | undefined = () => undefined): Notice | undefined {
   const { at } = event
   if (event.type === 'ticket.ended') {
     const { ticketId, by, outcome, reason = outcome } = event.data
     const ended = ticket(ticketId)
+    if (ended?.plan) return undefined
     return receiptNotice(ended ? { ticket_ended: brief(ended) } : { ticket_ended: ticketId, by, outcome, reason, at }, `Ticket ${ticketId} ended (${reason})`)
   }
   if (event.type === 'trigger.requeued') {
@@ -59,6 +60,7 @@ export function eventNotice(event: DomainEvent, ticket: (id: string) => Ticket |
   if (event.type === 'thread.unsubscribed' && event.data.by === 'person') return subscriptionNotice(event.data.threadKey, at)
   if (event.type === 'thread.unsubscribed') {
     const { ticketId, threadKey: thread, reason } = event.data
+    if (ticket(ticketId)?.plan) return undefined
     const note = 'Its Executor found this thread unrelated after reading it; attach later triggers there to this ticket only when they '
       + 'point at it explicitly.'
     return receiptNotice({ thread_unrelated: { ticket_id: ticketId, thread, reason }, at, note },
@@ -75,6 +77,18 @@ export const threadFollowedNotice = (ticketId: string, thread: string, reason: s
 
 /** Steering relay payload for the main Session: `id` is the request ID that makes delivery idempotent, and `text` is the message body. */
 export interface Relay { id: string; text: string }
+
+/** Projects a trusted push event. Producers supply a durable request ID for retry and restart deduplication. */
+export function projectPushRelay(event: { id: string; kind: 'human-action' | 'quota-paused' | 'plan-delivered'; payload: Record<string, unknown> }): Relay | undefined {
+  switch (event.kind) {
+    case 'human-action':
+    case 'quota-paused':
+    case 'plan-delivered':
+      return { id: event.id, text: JSON.stringify({ ...event.payload, kind: event.kind }) }
+    default:
+      return undefined
+  }
+}
 /** What a follow-up asks of the main Session: nothing but a stop the person asks for, since its ticket's worker decides it. */
 const FOLLOWUP_NOTE = 'Its ticket\'s worker has it and decides; act only if the person asks to stop the work '
   + '(orchestrator_route kind stop with this trigger_id).'
@@ -113,17 +127,19 @@ export function resultRelay(ticket: Ticket, state: string, text: string, replyTo
   return { id: `report:${id}`, text: JSON.stringify(report) }
 }
 /**
- * Converts a worker report recorded on `ticket` into a main-Session relay: a question for a person produces a
- * `worker_attention` relay, and a result, blocker, end, or answer to a question produces a `worker_report` relay, while
- * routine `progress` reports without `answers` stay internal.
- * @returns The steering `Relay`, or `undefined` when the report is not relayed to the main Session.
+ * Relays explicit questions for a person and answers to a person's question. Other Plan reports stay on the Ticket;
+ * legacy non-Plan reports still relay results, blockers and ends.
  */
 export function reportRelay(ticket: Ticket, report: Pick<WorkerReport, 'state' | 'summary' | 'question' | 'answers'>): Relay | undefined {
   const asked = report.question ? ticket.attention : undefined
   if (asked) {
-    return { id: `attention:${ticket.id}:${asked.id}`,
-      text: JSON.stringify({ kind: 'worker_attention', ticket: brief(ticket), state: report.state, read: `ticket/${ticket.id}/result` }) }
+    const id = `attention:${ticket.id}:${asked.id}`
+    const payload = { ticket: brief(ticket), state: report.state, read: `ticket/${ticket.id}/result` }
+    if (ticket.plan) return projectPushRelay({ id, kind: 'human-action', payload: {
+      ...payload, ticket: { ...payload.ticket, attention: { ...payload.ticket.attention, id: asked.id } },
+    } })
+    return { id, text: JSON.stringify({ kind: 'worker_attention', ...payload }) }
   }
-  if (report.state === 'progress' && !report.answers) return undefined
+  if (!report.answers && (ticket.plan || report.state === 'progress')) return undefined
   return resultRelay(ticket, report.state, report.summary, report.answers)
 }

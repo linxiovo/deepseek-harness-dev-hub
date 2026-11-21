@@ -18,6 +18,8 @@ Each open Ticket has one stage, determined by what it is waiting for. Read the t
 
 A `person` stage means the Ticket cannot continue without human input. A new human message releases a `blocked` or `failed` Ticket to its Executor, so it moves to the next matching stage, usually `working`.
 
+A Plan credential pause is separate from these report-based stages. A follow-up or ordinary Ticket retry does not release it; the trusted account check must pass. See `015-scoped-attention.md`.
+
 An `idle` Ticket has finished its turn without an outstanding question. A Trigger on a subscribed Thread can continue it.
 
 ## The Executor
@@ -43,6 +45,8 @@ A person can also start a turn by writing directly in the Executor Session. Its 
 When an Assignment ends, its shell jobs are killed without waking the Session. Its subagents are released, and any completion turns they wake are dropped. The replacement Assignment and its waiting Inputs start after that shutdown finishes.
 
 Stopping or restarting the plugin inside the DeepSeek Harness process uses the same shutdown path. Inputs not yet taken into Session history are retained. Shutdown waits up to 10 seconds for each worker's background work; a process restart ends that work outright. An Assignment interrupted while busy restarts with a recovery note.
+
+A Plan Ticket waiting on credential verification is an exception: restart keeps it suspended, without an interruption note or launch. Successful verification queues continuation of the same Assignment and verified worktree.
 
 Worker subagents at every depth use DeepSeek Harness's `standard` preset with the worker's permissions. They retain only the worker's allowed work tools, and lose them once the Ticket ends, whichever level created them. Under `standard`, a shell command moves to the background after 60 seconds. A subagent's jobs are killed when it ends.
 A Worker’s implementation review uses two independent child Sessions: one checks project standards and Doc Tree/API-contract semantics, and one checks the specification, ticket acceptance and test evidence. They receive the same pinned base and committed candidate. Only those child Sessions can call `orchestrator_review_submit`; the tool binds the real child identity, active Assignment, pinned base and clean worktree HEAD. `ticket/<id>/reviews` exposes each axis, reviewer Session, basis, versions and blocking conclusion separately; review evidence is valid only for the live Worker lease generation. A missing axis, mismatched version or blocked conclusion is not a dual-review pass. After restart, reclaim, base change or candidate amendment, stale evidence remains readable as history but aggregate state is pending until both lanes submit for the new live generation.
@@ -123,11 +127,13 @@ These wrappers and directories establish defaults, not a security boundary. A wo
 
 Only the Hub can call `orchestrator_queue_merge({ticket_id, candidate})` for a registered Plan Ticket. `candidate` is the full lowercase SHA. The host requires the verified clean worktree and its pinned base, current delivery-check evidence including required CI, and the configured target `refs/heads/...`. A PR used for CI must still be open and point to that candidate and target. The queue never requests a GitHub PR merge or enables auto-merge.
 
-The host persists the intent and FIFO position before starting Git. One write at a time runs for a GitHub repository and branch. The queue creates an intent-specific `integration` commit whose only parent is the reviewed candidate and whose tree is identical. The host persists its SHA before advancing the actual remote branch from the exact reviewed base. Ticket detail (`GET tickets/:id` and `orchestrator_read ticket/<id>`) shows `mainline` once queued; `ticket/<id>/mainline` pages attempts newest first. Each attempt names `id`, `status`, `target`, `candidate`, the requested `base`, and `actual` once observed. A `verified` attempt means the integration commit was observed on the target, which is **not** formal delivery or permission to dispatch successors.
+The host persists the intent and FIFO position before starting Git. One write at a time runs for a GitHub repository and branch. The queue creates an intent-specific `integration` commit whose only parent is the reviewed candidate and whose tree is identical. The host persists its SHA before advancing the actual remote branch from the exact reviewed base. Ticket detail (`GET tickets/:id` and `orchestrator_read ticket/<id>`) shows `mainline` once queued; `ticket/<id>/mainline` pages attempts newest first. Each attempt names `id`, `status`, `target`, `candidate`, the reviewed `base`, the prepared `integration`, and `actual` once observed. A `verified` attempt means the integration commit was observed on the target, which is **not** formal delivery or permission to dispatch successors.
 
 If the target moved forward before the candidate could be applied, the intent records `repair` and the host sends a durable input to that Ticket's Worker with the new pinned base. Resolve code and Doc Tree conflicts in the Ticket worktree, preserve the earlier candidate's lineage, and obtain fresh dual review, acceptance, test, Doc Tree and CI evidence on the new pair. The Hub queues the new candidate; failed or unavailable repair and recheck remain visible. A rewritten target, a candidate already on the branch before the queued write, or a rejected Git write without matching verification is `waiting`, not success.
 
 After interruption, a queued intent can continue at the original base if the exact pair still passes the gate and the previous Worker is confirmed idle or still holds the valid lease. An `applying` intent checks actual Git before authorizing any write: if its integration commit is present, it records the missing observation without pushing again. A branch containing only the candidate, not the intent-specific commit, does not prove a queue write. Processing pause prevents new writes but does not erase a completed write. See `006-deployment.md` for repository permissions.
+
+A current Plan credential blocker prevents a new mainline write or a new repair dispatch for that Ticket. It does not erase an integration already observed on the target.
 
 ## How a Ticket ends
 
@@ -141,7 +147,7 @@ A standalone Ticket is done when none of the pull requests it opened remain open
 
 A close does not end the Ticket while resumed, retried or recovered work is unfinished. It also waits if the Executor took up a follow-up it owns (by recording it internally) or answered it but has not since made a non-progress Report or ended a turn after reading that message. A later `ready` Report ends the Ticket once the same pull-request completion rule is satisfied.
 
-Chat Channels receive one final notice, queued by the host, about the pull-request outcome. GitHub already displays the outcome on the pull request itself. Removing a Ticket's Subscription to a pull request also stops it following that pull request.
+Chat Channels receive one final pull-request notice for eligible non-Plan Tickets only. Plan closure stays queryable. Removing a Ticket's Subscription to a pull request also stops it following that pull request.
 
 "Awaiting review" therefore means a `ready` Report with a pull request.
 
@@ -214,7 +220,7 @@ The Feishu event consumer reports every failure, and polling of subscribed topic
 A malformed item in a GitHub list or a Feishu page is skipped, and the Source's state counts it.
 ### Channel failure
 
-Outgoing messages are stored and sent as stored work, retried with backoff from 5 seconds, doubling up to 300. The main Session sends an answer, a result or an attention message; the host itself queues the acknowledgement an accept carries and any pull-request end or Source notice. All are outgoing messages; neither a Worker's take-up nor its report queues one directly.
+Outgoing messages are stored and sent as stored work, retried with backoff from 5 seconds, doubling up to 300. The main Session sends an answer, a result or an attention message; the host itself queues the acknowledgement an accept carries and eligible legacy pull-request end notices and Source notices. All are outgoing messages; neither a Worker's take-up nor its report queues one directly. Plan Ticket closure stays internal; see `015-scoped-attention.md`.
 
 A Ticket's messages to one conversation go out in the order they were queued, so the acknowledgement an accept carries comes before the Ticket's later answer or result: a message waits while an earlier one of the same Ticket to the same conversation has not gone out, until that one has failed three times in a row and shows as a problem.
 

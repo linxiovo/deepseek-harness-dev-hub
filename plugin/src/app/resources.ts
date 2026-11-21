@@ -26,6 +26,7 @@ import type { Handoffs } from './handoffs.ts'
 import type { Plans } from './plans.ts'
 import { mainlineAttempts, mainlineIntent, type MainlineIntent, type MergeApproval } from './mainline-queue.ts'
 import type { ProjectMeter } from './project-meter.ts'
+import type { ScopedAttention } from './scoped-attention.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
 import type { SessionMeter } from './session-meter.ts'
 import type { Sessions } from './sessions.ts'
@@ -35,18 +36,19 @@ import type { TextCache } from './cache.ts'
 
 /** Resource descriptors exposed via orchestrator_read, marking which resources worker sessions may also read for their own ticket. */
 export const RESOURCES: readonly { name: string; holds: string; executor?: true }[] = [
-  { name: 'tickets', holds: 'newest ticket cards: person/review, person/blocked, person/failed, person/answer and person/delivery need attention; working/queued awaits a slot; idle has no fresh report' },
+  { name: 'tickets', holds: 'newest ticket cards and their current stage' },
   { name: 'triggers', holds: 'trigger cards with where each went, newest first' },
   { name: 'threads', holds: 'subscribed threads, newest activity first, with their labels, tickets, current assessment and polling errors' },
   { name: 'thread/<key>', holds: 'one thread: its label and link, its tickets and latest decisions, and its triggers, newest first', executor: true },
   { name: 'decisions', holds: 'decisions, newest first' },
   { name: 'decision/<id>', holds: 'one decision with its audit' },
-  { name: 'handoff/<id>', holds: 'the persisted, explicitly confirmed project and product intent, including planner questions and answers' },
-  { name: 'spec/<id>', holds: 'the published specification for this handoff, with observable acceptance and test interfaces; pending until publication' },
-  { name: 'plan/<id>', holds: 'the handoff’s Plan DAG, roles, dependencies, Frontier, node claims and formal delivery progress, plus root background' },
-  { name: 'plan/<id>/node/<node-id>', holds: 'one Slice Ticket with its role, waiting reason or claim/session/action state, delivery receipt and addressed instructions' },
-  { name: 'ticket/<id>', holds: 'ticket and Plan claim, preparation or rejection, repository, worktree, branch, base, Session and active writer; trigger, decision, threads, assignments, reports and inputs', executor: true },
-  { name: 'ticket/<id>/mainline', holds: 'durable mainline queue attempts and actual Git verification; not formal delivery', executor: true },
+  { name: 'handoff/<id>', holds: 'confirmed project, intent and planner question/answer' },
+  { name: 'spec/<id>', holds: 'published acceptance and test interfaces, or pending' },
+  { name: 'plan/<id>', holds: 'Plan graph, role totals, Frontier and claims with background' },
+  { name: 'plan/<id>/node/<node-id>', holds: 'node claim or waiting reason, delivery and instructions' },
+  { name: 'plan/<id>/attention', holds: 'Plan status counts and credential actions' },
+  { name: 'ticket/<id>', holds: 'ticket, claim, worktree, active writer and work history', executor: true },
+  { name: 'ticket/<id>/mainline', holds: 'mainline attempts and actual Git verification, not delivery', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
   { name: 'ticket/<id>/delivery-check', holds: 'current candidate queue readiness and paginated canonical acceptance, ordered evidence and required CI; never formal delivery', executor: true },
   { name: 'ticket/<id>/delivery-observation/<n>', holds: 'one durable delivery observation', executor: true },
@@ -74,6 +76,7 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'models/<provider>', holds: 'one provider\'s models' },
   { name: 'session/<id>', holds: 'context window sample and cumulative token buckets, including coverage gaps; not a bill' },
   { name: 'project/meter', holds: 'deduplicated usage including shared overhead and Session details' },
+  { name: 'project/attention', holds: 'project Plan status counts and credential actions' },
   { name: 'plan/<id>/meter', holds: 'Plan usage with shared overhead separate' },
   { name: 'ticket/<id>/meter', holds: 'Ticket usage with shared overhead separate' },
   { name: 'feishu/<trigger-id>/…', holds: 'a Feishu original, as the dsh-superagent-feishu skill describes', executor: true },
@@ -86,6 +89,7 @@ export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(r
 export interface ResourceHost {
   ownsSession?(id: string): boolean | Promise<boolean>
   reviewGeneration?(ticketId: string): number | undefined
+  credentialBlocked?(ticketId: string): boolean
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
   readonly handoffs?: Pick<Handoffs, 'spec'>
   readonly plans?: Pick<Plans, 'get'>
@@ -103,6 +107,7 @@ export interface ResourceHost {
 }
 export interface MainResourceHost extends ResourceHost {
   readonly projectMeter: Pick<ProjectMeter, 'read'>
+  readonly attention: Pick<ScopedAttention, 'summary' | 'forTicket'>
   readonly sessions: Pick<Sessions, 'status' | 'modelRetry'>
   readonly settings: Pick<Settings, 'view' | 'block'>
   readonly handoffs: Pick<Handoffs, 'get' | 'spec'>
@@ -243,6 +248,7 @@ interface DeliveryState {
   generation: number | undefined
   criteria: readonly { id: string; text: string }[]
   paused: boolean
+  credentialBlocked: boolean
   required: RequiredChecks
   pull: TicketPull | undefined
   stamp: string
@@ -254,12 +260,13 @@ function deliveryState(host: ResourceHost, id: string): DeliveryState {
   const assignment = ticket.assignments.at(-1)
   const criteria = deliveryAcceptance(host, ticket)
   const generation = host.reviewGeneration?.(id)
+  const credentialBlocked = host.credentialBlocked?.(id) === true
   const settings = host.store.settings()
   const required = githubKind.schema.parse(settings.sources.github?.config ?? {}).requiredChecks
   const pull = required.length ? ticketPull(host, ticket) : undefined
-  const stamp = createHash('sha256').update(JSON.stringify([host.store.get(KV.settings.revision), settings.paused,
+  const stamp = createHash('sha256').update(JSON.stringify([host.store.get(KV.settings.revision), settings.paused, credentialBlocked,
     settings.executor, settings.sources.github, ticket.plan, ticket.ended, ticket.execution, ticket.assignments, ticket.deliveryCheck, generation, criteria, pull])).digest('hex')
-  return { ticket, assignment, generation, criteria, paused: settings.paused, required, pull, stamp }
+  return { ticket, assignment, generation, criteria, paused: settings.paused, credentialBlocked, required, pull, stamp }
 }
 
 interface DeliveryCheckout {
@@ -333,6 +340,7 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
     }
     if (changed) missing.add('delivery_target_changed')
     if (paused) missing.add('project_paused')
+    if (state.credentialBlocked) missing.add('credential_blocked')
     const outcome = ticket.ended?.outcome, report = assignment?.report?.state
     if (outcome || report === 'failed' || report === 'blocked' || report === 'dropped') {
       missing.add('ticket_not_queueable')
@@ -501,23 +509,28 @@ const ROUTES: readonly Route[] = [
     return host.handoffs.spec(read.rest) ?? { handoffId: read.rest, status: 'pending' }
   }],
   ['plan/', read => {
-    const { plans, handoffs } = main(read)
+    const { plans, handoffs, attention } = main(read)
     const [id, section, nodeId, ...extra] = read.rest.split('/')
     if (id && section === 'meter' && nodeId === undefined) return projectMeter(read, 'plan', id)
+    if (id && section === 'attention' && nodeId === undefined) return attention.summary(id)
     if (!id || extra.length || (section !== undefined && (section !== 'node' || !nodeId))) throw new Error('Unknown plan resource')
     if (nodeId) {
       const node = plans.node(id, nodeId)
       if (!node) throw new UserError('unknownPlanNode', { id, node: nodeId })
       const { instructions, ...detail } = node
       const page = list(read, (offset, count) => instructions.slice(offset, offset + count))
-      return { ...detail, instructions: page.items, next_offset: page.next_offset }
+      const action = detail.claim && attention.forTicket(detail.claim.ticketId)
+      return { ...detail, ...(action ? { attention: action } : {}), instructions: page.items, next_offset: page.next_offset }
     }
     const handoff = handoffs.get(id)
     if (!handoff) throw new UserError('unknownPlan', { id })
     const graph = plans.view(id)
     if (graph) {
       const { nodes, context, ...header } = graph
-      const nodePage = list(read, (offset, count) => nodes.slice(offset, offset + count))
+      const nodePage = list(read, (offset, count) => nodes.slice(offset, offset + count).map(node => {
+        const action = node.claim && attention.forTicket(node.claim.ticketId)
+        return action ? { ...node, attention: action } : node
+      }))
       const contextPage = list(read, (offset, count) => context.slice(offset, offset + count))
       return { ...header, nodes: nodePage.items, context: contextPage.items, next_offset: nodePage.next_offset ?? contextPage.next_offset }
     }
@@ -580,6 +593,7 @@ const ROUTES: readonly Route[] = [
     return view
   }],
   ['project/meter', read => projectMeter(read, 'project')],
+  ['project/attention', read => main(read).attention.summary()],
   ['feishu/', async read => {
     const source = trigger(read.host, read.rest.split('/')[0]!, read.ticketId)
     const ref = feishuRef(source)

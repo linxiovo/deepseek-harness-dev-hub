@@ -112,9 +112,14 @@ export async function killJobs(ctx: Context, sessionId: string, reason: string, 
   const live = jobs ? owned(jobs, sessionId, except) : []
   const failures: unknown[] = []
   // The waits start before the kills, so each end counts as collected.
-  const collected = live.map(job => jobs!.wait(job.id, KILL_WAIT_MS, sessionId).catch(() => undefined))
-  for (const job of live) try { jobs!.kill(job.id, sessionId, reason) } catch (error) { failures.push(error) }
-  await Promise.all(collected)
+  const collected = live.map(({ id }) => {
+    const cancel = new AbortController()
+    return { id, cancel, end: jobs!.wait(id, KILL_WAIT_MS, sessionId, cancel.signal).catch(() => undefined) }
+  })
+  await Promise.all(collected.map(async ({ id, cancel, end }) => {
+    try { await jobs!.kill(id, sessionId, reason); await end }
+    catch (error) { failures.push(error); cancel.abort() } // A refused kill need not wait for a job that will not end.
+  }))
   if (failures.length) throw new AggregateError(failures, `Killing the shell jobs of ${sessionId} failed`)
 }
 
@@ -134,18 +139,22 @@ export async function collectJob(ctx: Context, sessionId: string, job: { id: str
 }
 
 /**
- * Stop descendant-owned jobs before the SDK releases its direct managed children (and their subtrees). A reloaded grandchild
- * can also remain live behind an unloaded intermediate parent without a resident SDK activation; cancel any such descendant
- * still loaded after the managed drain. Cancel the worker turn woken by child settlement, preserving its inbox when requested.
+ * Stop descendant-owned jobs before the SDK releases its direct managed children (and their subtrees). A descendant can
+ * be loaded behind an unloaded parent. For credential suspension the calling tool can itself be on the worker's turn;
+ * cancel that turn but leave joining it to the executor's separate writer-release barrier.
  */
-export async function stopSubagents(ctx: Context, agent: Agent, keepInbox = false): Promise<void> {
+export async function stopSubagents(ctx: Context, root: Agent | string, keepInbox = false, suspending = false): Promise<void> {
   const subagents = subagentsOf(ctx)
   if (!subagents) return
-  const direct = (await subagents.listChildren(agent.id)).filter(child => child.mode !== 'external')
-  const live = direct.map(child => child.id).filter(id => ctx.agents.get(id as SessionId))
+  const sessionId = typeof root === 'string' ? root : root.id
+  let agent = typeof root === 'string' ? ctx.agents.get(root as SessionId) : root
+  if (agent && agent.id !== sessionId) throw new Error(`Cannot stop descendants of ${sessionId} through another Session`)
+  const direct = await subagents.listChildren(sessionId)
+  // External activations have no local Agent. The SDK accepts absent/historical ids as no-ops and checks ownership.
+  const release = direct.filter(child => suspending || (child.mode !== 'external' && ctx.agents.get(child.id as SessionId))).map(child => child.id)
   const failures: unknown[] = []
-  const pending = direct.map(child => child.id)
-  const seen = new Set([agent.id, ...pending])
+  const pending = direct.filter(child => child.mode !== 'external').map(child => child.id)
+  const seen = new Set([sessionId, ...pending])
   for (let index = 0; index < pending.length; index++) {
     try {
       for (const child of await subagents.listChildren(pending[index]!)) {
@@ -156,33 +165,62 @@ export async function stopSubagents(ctx: Context, agent: Agent, keepInbox = fals
   }
   if (registry(ctx)) await Promise.all(pending.map(id => killJobs(ctx, id, 'Subagent released by its worker')
     .catch((error: unknown) => { failures.push(error) })))
-  if (live.length) {
-    try { await until(subagents.drainChildren(agent, live), undefined, DRAIN_LIMIT_MS) }
+  // External activations in particular have no loaded Agent to cancel individually. Never infer release from absence.
+  if (suspending && !agent && release.length) {
+    try {
+      const resolved = await ctx.sessionController.resolveAgent(sessionId as SessionId)
+      if ('error' in resolved || resolved.agent.id !== sessionId) throw new Error(`Cannot restore ${sessionId} to drain its descendants`)
+      agent = resolved.agent
+    } catch (error) { failures.push(error) }
+  }
+  if (agent && release.length) {
+    try {
+      if (await until(subagents.drainChildren(agent, release), undefined, DRAIN_LIMIT_MS) === false && suspending) {
+        throw new Error(`Subagents of ${sessionId} did not drain`)
+      }
+    }
     catch (error) { failures.push(error) }
     if (agent.status !== 'idle') cancelled.add(agent)
-    try { agent.cancel({ kind: 'user' }, { keepInbox }); await until(agent.whenIdle(), undefined, DRAIN_LIMIT_MS) }
+    try {
+      agent.cancel({ kind: 'user' }, { keepInbox })
+      if (!suspending) await until(agent.whenIdle(), undefined, DRAIN_LIMIT_MS)
+    }
     catch (error) { failures.push(error) }
   }
   // A Session restored independently of the subagent manager is not disposed by drainChildren.
   await Promise.all(pending.map(async id => {
     const child = ctx.agents.get(id as SessionId)
-    if (!child || child.id !== id || child.status === 'idle') return
+    if (!child) return
+    if (child.id !== id) {
+      if (suspending) failures.push(new Error(`Cannot confirm descendant ${id} through another Session`))
+      return
+    }
+    if (child.status === 'idle') return
     try {
       child.cancel({ kind: 'parent' }, { keepInbox })
-      if (await until(child.whenIdle(), undefined, DRAIN_LIMIT_MS) === false) throw new Error(`Subagent ${id} did not stop`)
+      if (await until(child.whenIdle(), undefined, DRAIN_LIMIT_MS) === false || (suspending && ctx.agents.get(id as SessionId)?.status === 'running')) {
+        throw new Error(`Subagent ${id} did not stop`)
+      }
     } catch (error) { failures.push(error) }
   }))
-  if (failures.length) throw new AggregateError(failures, `Stopping the subagents of ${agent.id} failed`)
+  if (suspending && pending.some(id => runningJobs(ctx, id).length)) failures.push(new Error('Descendant shell jobs still running'))
+  if (failures.length) throw new AggregateError(failures, `Stopping the subagents of ${sessionId} failed`)
 }
 
 /**
  * Stop what a worker runs in the background once its Assignment ends: kill its shell jobs and release its subagents (see
- * `stopSubagents`). A Session not loaded has no subagent at work. One failure stops nothing else.
+ * `stopSubagents`). Credential suspension also inspects descendants of an unloaded worker. One failure stops nothing else.
  */
-export async function stopBackground(ctx: Context, sessionId: string, reason: string, keepInbox = false): Promise<void> {
+export async function stopBackground(ctx: Context, sessionId: string, reason: string, keepInbox = false, mode?: 'credential-suspension'): Promise<void> {
   const failures: unknown[] = []
-  await killJobs(ctx, sessionId, reason).catch((error: unknown) => { failures.push(error) })
+  const jobs = killJobs(ctx, sessionId, reason).catch((error: unknown) => { failures.push(error) })
+  const suspending = mode === 'credential-suspension'
+  if (!suspending) await jobs
   const agent = ctx.agents.get(sessionId as SessionId)
-  if (agent) await stopSubagents(ctx, agent, keepInbox).catch((error: unknown) => { failures.push(error) })
+  if (agent || suspending) await stopSubagents(ctx, sessionId, keepInbox, suspending).catch((error: unknown) => { failures.push(error) })
+  if (suspending) {
+    await jobs
+    if (runningJobs(ctx, sessionId).length) failures.push(new Error(`Worker ${sessionId} still owns shell jobs`))
+  }
   if (failures.length) throw new AggregateError(failures, `Stopping the background work of ${sessionId} failed`)
 }

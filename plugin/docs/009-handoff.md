@@ -114,6 +114,8 @@ The dispatch transaction reserves the existing `DshExecutor` launch slot synchro
 
 `awaiting-delivery` is not delivery. A ready report can put an open Plan Ticket in that state without ending it; a baseline repair returns it to running until the Worker reports ready again. A verified mainline result also waits for the separate formal receipt.
 
+A credential pause keeps the claim and does not add a node status. `plan/<id>/node/<node-id>` and a dispatch replay include `attention` only while the claimed Ticket has a current credential blocker. The Hub can read `plan/<id>/attention` for the Plan summary. Verifying the credential resumes the existing Assignment; it is not a formal delivery receipt and does not unlock a successor. See `015-scoped-attention.md`.
+
 ## Optional Feishu entry
 
 A selected, registered project can use one Feishu private chat or group topic as a second entrance. This does not create a second Hub or change a Worker's tools. Harness confirmation, questions, and specification reads do not require a binding.

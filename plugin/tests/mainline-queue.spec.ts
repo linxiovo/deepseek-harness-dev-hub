@@ -71,7 +71,13 @@ function mainlineRepository() {
   return { repository, git, base, remote, tip, runGit }
 }
 
-async function registerPlan(checkDependsOn = ['trim', 'lowercase']) {
+const labelNodes = ['trim', 'lowercase'] as const
+type LabelNode = typeof labelNodes[number]
+
+async function registerPlan<Node extends LabelNode>({ start, checkDependsOn = labelNodes }: {
+  start: readonly Node[]
+  checkDependsOn?: readonly LabelNode[]
+}) {
   const criteria = [
     { statement: 'Trim label whitespace', observable: 'A padded label loses its surrounding spaces', delivery: 'backend' },
     { statement: 'Lowercase labels', observable: 'A mixed-case label becomes lowercase', delivery: 'backend' },
@@ -96,17 +102,17 @@ async function registerPlan(checkDependsOn = ['trim', 'lowercase']) {
     features: nodes.map(node => ({ id: node.id, kind: 'backend' })), nodes })
 
   const dispatch = (nodeId: string) => hub('orchestrator_plan_dispatch', { planId: id, nodeId })
-  const claims = await Promise.all(['trim', 'lowercase'].map(async node => {
+  const claims = await Promise.all(start.map(async node => {
     const result = await dispatch(node)
-    return claimIdentity.parse(result.claim)
+    return { node, claim: claimIdentity.parse(result.claim) }
   }))
   await h.runtime.idle()
-  const workers = await Promise.all(claims.map(async claim => {
+  const workers = await Promise.all(claims.map(async ({ node, claim }) => {
     const { directory } = await read(`ticket/${claim.ticketId}`)
     expect(directory).toEqual(expect.any(String))
-    return { ...claim, directory: String(directory) }
+    return [node, { ...claim, directory: String(directory) }] as const
   }))
-  return { id, a: workers[0]!, b: workers[1]!, dispatch }
+  return { id, workers: Object.fromEntries(workers) as Record<Node, Worker>, dispatch }
 }
 
 async function delivered(plan: string, nodeId: string, worker: Worker, intent: Record<string, unknown>, base: string, candidate: string, integration: string, actual = integration) {
@@ -279,7 +285,7 @@ function repairIntent(ticketId: string): MainlineIntent {
 }
 
 it('clears a failed durable repair reason after a restart resumes the same repair intent', async () => {
-  const { id: planId, a } = await registerPlan()
+  const { id: planId, workers: { trim: a } } = await registerPlan({ start: ['trim'] })
   const intent = repairIntent(a.ticketId)
   h.runtime.store.set(KV.mainline.ticket(a.ticketId), [intent])
   const calls: { ticketId: string; repairId: string }[] = []
@@ -313,7 +319,7 @@ it('clears a failed durable repair reason after a restart resumes the same repai
 }, 90_000)
 
 it('does not let a repair callback clear failure state for a different ticket or superseded intent', async () => {
-  const { a, b } = await registerPlan()
+  const { workers: { trim: a, lowercase: b } } = await registerPlan({ start: labelNodes })
   const intent = repairIntent(a.ticketId)
   h.runtime.store.set(KV.mainline.ticket(a.ticketId), [intent])
   const entered = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>()
@@ -364,7 +370,7 @@ it('serializes two reviewed Plan candidates, then verifies a conflict repair onl
   let actionsReads = 0
   const ci = actionsHost(async () => { actionsReads++ })
   await configureCI()
-  const { id, a, b, dispatch } = await registerPlan()
+  const { id, workers: { trim: a, lowercase: b }, dispatch } = await registerPlan({ start: labelNodes })
   formatLabel(a.directory, 'value.trim()', 'Trim leading and trailing whitespace')
   const shaA = commit(a.directory, 'Trim display labels')
   formatLabel(b.directory, 'value.toLowerCase()', 'Convert letters to lowercase')
@@ -553,7 +559,7 @@ async function verifiedLowercaseWithoutCI(linkExample = false) {
   const { git, base, remote, tip, runGit } = mainlineRepository()
   const ci = actionsHost()
   await configureCI()
-  const { id, b, dispatch } = await registerPlan(['lowercase'])
+  const { id, workers: { lowercase: b }, dispatch } = await registerPlan({ start: ['lowercase'], checkDependsOn: ['lowercase'] })
   formatLabel(b.directory, 'value.toLocaleLowerCase()', 'Convert letters to lowercase')
   if (linkExample) {
     write(b.directory, exampleFile, '{"label":"alert"}\n')
@@ -712,7 +718,7 @@ it.each(['intent stored', 'Git advanced', 'candidate already present', 'external
   })
   await configureCI()
   // Isolate recovery of the last prerequisite here; the serialization scenario above covers the two-way join.
-  const { id, a, dispatch } = await registerPlan(['trim'])
+  const { id, workers: { trim: a }, dispatch } = await registerPlan({ start: ['trim'], checkDependsOn: ['trim'] })
   formatLabel(a.directory, 'value.trim()', 'Trim leading and trailing whitespace')
   const candidate = commit(a.directory, 'Trim display labels')
   await recordEvidence(a, id, base, candidate, '1', 'ALERT')

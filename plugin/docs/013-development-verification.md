@@ -10,11 +10,13 @@ Run focused checks from `plugin/` as soon as the change is runnable. Pass the re
 | --- | --- |
 | New class or source module | Run `pnpm test tests/class-docs.spec.ts tests/docs.spec.ts` before the full check. Fix missing class JSDoc and missing module or test index entries before proceeding. |
 | Source imports or import boundary gate | `pnpm check:imports` on the current sources; when changing the gate itself, also run `pnpm test tests/import-boundaries.spec.ts`. |
-| Session tool or model-facing schema | `tests/tools.spec.ts` for public behavior and role boundaries; `tests/model-surface.spec.ts` for the registered surface and prompt budget |
+| Session tool, resource or model-facing schema | Run `pnpm test:session-tools` before the full check. It exercises public behavior, role boundaries, response and prompt budgets, and prompt contracts. |
 | Bundled skill or prompt registration | `tests/prompts.spec.ts`, `tests/model-surface.spec.ts`, `tests/tools.spec.ts` and `tests/panel-prompts.spec.tsx` for role scope, resource inventory and settings labels |
 | Prompt text or built-in delivery guidance | `tests/cards.spec.ts` for prompt contracts and budgets, plus the registration checks above when the mounted surface changes |
 | Doc Tree routes or committed-candidate inspection | `tests/docs.spec.ts` for this repository's navigation and source/test index; `tests/doc-tree.spec.ts` for Git snapshots and target-repository navigation |
 | Project selection or crash recovery | `pnpm test tests/runtime-crash.spec.ts`; for a deployed headless host, record the [live connection smoke check](006-deployment.md#live-headless-connection-smoke-check) separately. |
+
+Run `pnpm check` once at the end. On Windows the Vitest configuration limits concurrent Git fixtures; local verification and CI use the same command and test coverage.
 
 ## Worker implementation and test evidence
 

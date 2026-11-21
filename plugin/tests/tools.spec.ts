@@ -244,11 +244,26 @@ it('reacquires changed evidence after the final retro and only queues with curre
   await review(candidate, ['docs', 'acceptance:2', 'tests']) // An affected check cannot be carried even with approval.
   expect(await inspect()).toMatchObject({ ready: false, candidate, missing: expect.arrayContaining(['tests']) })
   const fixed = await tests(candidate, "assert.equal(label(' alert '), 'alert'); assert.equal(label(''), '')")
-  expect(await read(String(fixed.read))).toMatchObject({ text: expect.stringContaining(candidate) })
-  await expect(submit(candidate, acceptance(['1'], original.read))).rejects.toThrow(/match the current revision/i)
-  await expect(submit(candidate, acceptance(['1'], String(original.read).replace(/^ticket\//, 'task/')))).rejects.toThrow(/match the current revision/i)
-  await expect(submit(candidate, acceptance(['1'], `ticket/${ticketId}/delivery-observation/999`))).rejects.toThrow(/missing/i)
-  await submit(candidate, acceptance(['1'], fixed.read))
+  const foreign = await h.acceptedTicket(feishu('retro-foreign-observation', '@bot Verify a separate label ticket.'))
+  const foreignDir = foreign.ticket.execution!.directory
+  h.localGit!.git('-C', foreignDir, 'merge', '--ff-only', candidate)
+  const blankLabelCheck = "import { label } from './label.mjs'; if (label('') !== '') process.exit(1)"
+  const foreignRun = spawnSync(process.execPath, ['--input-type=module', '-e', blankLabelCheck], { cwd: foreignDir, encoding: 'utf8' })
+  expect(foreignRun.status, foreignRun.stderr).toBe(0)
+  const foreignEvidence = await h.runTool(foreign.sessionId, 'orchestrator_test_evidence', { candidate, scope: 'focused', reason: 'Check blank labels in this ticket.', red: null,
+    checks: [{ directory: '.', command: `node --input-type=module -e ${JSON.stringify(blankLabelCheck)}`, status: 'passed', observed: 'exit 0' }] })
+  // Exercise both readable address forms against the same acceptance gate, without rebuilding the Plan per cell.
+  for (const prefix of ['ticket', 'task']) {
+    const current = String(fixed.read).replace(/^ticket\//, `${prefix}/`)
+    const stale = String(original.read).replace(/^ticket\//, `${prefix}/`)
+    const other = String(foreignEvidence.read).replace(/^ticket\//, `${prefix}/`)
+    expect(await read(current)).toMatchObject({ text: expect.stringContaining(candidate) })
+    expect(await read(other)).toMatchObject({ text: expect.stringContaining(candidate) })
+    await expect(submit(candidate, acceptance(['1'], stale))).rejects.toThrow(/match the current revision/i)
+    await expect(submit(candidate, acceptance(['1'], other))).rejects.toThrow(/belongs to another ticket/i)
+    await expect(submit(candidate, acceptance(['1'], `${prefix}/${ticketId}/delivery-observation/999`))).rejects.toThrow(/missing/i)
+    await expect(submit(candidate, acceptance(['1'], current))).resolves.toMatchObject({ recorded: 'acceptance', candidate })
+  }
   await submit(candidate, { kind: 'final-retro', findings: [] })
   git('reset', '--keep', before)
   await expect(submit(before, { kind: 'first-retro', findings: [] })).rejects.toThrow(/repair lineage/i)

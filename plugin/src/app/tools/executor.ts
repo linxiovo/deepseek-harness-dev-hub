@@ -6,7 +6,7 @@ import { claimPull, readPull } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
 import type { DshExecutor } from '../../executor/dsh.ts'
 import { isMarkdownDocument } from '../../executor/doc-tree.ts'
-import { deliveryAcceptance, readResource, resourceName, type ResourceHost } from '../resources.ts'
+import { deliveryAcceptance, readResource, type ResourceHost } from '../resources.ts'
 import type { ScopedAttention } from '../scoped-attention.ts'
 import type { Store } from '../store.ts'
 import { reportRelay, threadFollowedNotice } from '../notices.ts'
@@ -114,17 +114,6 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId
           : kind === 'repair' && fixes ? { kind, fixes }
           : (kind === 'first-retro' || kind === 'final-retro') && findings ? { kind, findings } : undefined
         if (!event) throw new Error('Missing evidence for this delivery step')
-        const evidence = event.kind === 'acceptance' ? event.results : event.kind === 'repair' ? event.fixes : event.findings
-        for (const item of evidence) for (const ref of item.evidence) {
-          const reference = resourceName(ref)
-          if (reference === `ticket/${ticketId}/delivery-check`) throw new Error('Cite the original observation, not the delivery-check package itself')
-          if (!reference.startsWith('ticket/') || !reference.includes('/delivery-observation/')) continue
-          const match = /^ticket\/([^/]+)\/delivery-observation\/(0|[1-9]\d*)$/.exec(reference)
-          const observation = match?.[1] === ticketId ? current.deliveryCheck?.events[Number(match[2])] : undefined
-          if (!observation) throw new Error('Delivery observation is missing or belongs to another ticket')
-          if (event.kind === 'acceptance' && (observation.revision.candidate !== candidate || observation.revision.base !== revision.base
-            || observation.revision.generation !== revision.generation)) throw new Error('Acceptance observation must match the current revision')
-        }
         host.engine.recordDeliveryEvidence(ticketId, sessionId, revision, event, prior)
         return { ...revision, recorded: kind, read: `ticket/${ticketId}/delivery-check` }
       },

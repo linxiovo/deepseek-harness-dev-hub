@@ -137,11 +137,11 @@ A current Plan credential blocker prevents a new mainline write or a new repair 
 
 ## Formal Plan closure
 
-The host records the verified merge and enqueues closure in the same transaction. The closing check uses the same Ticket, Assignment, writer generation, base, candidate and target as the verified intent. It rechecks the clean worktree, acceptance, both reviews, tests, required repairs, Doc Tree and required CI (see `plugin/docs/013-development-verification.md`). The integration commit has the exact candidate tree, including its Doc Tree routes; the host fetches the actual target again and requires that intent's integration to be present. The observed tip can be a later descendant. An unrelated write that only puts the candidate on the branch does not qualify.
+The host records the verified merge and enqueues closure in the same transaction. The closing check uses the same Ticket, Assignment, writer generation, base, candidate and target as the verified intent. The host rechecks acceptance, both reviews, tests, required repairs, Doc Tree and required CI (see `plugin/docs/013-development-verification.md`). It fetches the target and requires the intent's integration commit, which has the exact candidate tree. A later tip qualifies only if it contains the integration and preserves the reviewed Doc Tree paths; changes there report `mainline_docs`. After reading the target, the host rechecks that the worktree is still clean and on the same candidate. An unrelated write that only puts the candidate on the branch does not qualify.
 
 The host ends the Ticket (`by: delivery`, `outcome: merged`) and records the Plan receipt atomically. It revokes the Worker grant and stops its work on commit. The Ticket cannot reopen on a later Thread message. Closure is internal; it neither closes a GitHub issue nor sends a per-Ticket external notice.
 
-If the evidence no longer passes, the Ticket stays open and `mainline.delivery_missing` names the blockers on the verified attempt. A verified merge remains a Git fact, not a closure. Restart resumes pending checks; replaying `orchestrator_queue_merge` for the same verified SHA rechecks an incomplete closure without advancing Git. After closure, replay returns the existing intent without closing or claiming again.
+If the evidence no longer passes, the Ticket stays open and `mainline.delivery_missing` names the blockers on the verified attempt. Restart resumes pending checks. Replaying the same SHA rechecks closure without advancing Git; a fresh checked SHA can enter the queue after a refused closure and follows the normal actual-baseline repair flow. After closure, replay returns the existing intent without closing or claiming again.
 
 ## How a Ticket ends
 

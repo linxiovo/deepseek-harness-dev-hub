@@ -39,7 +39,7 @@ import { Plans, planDeliveryWriter } from './plans.ts'
 import { ScopedAttention } from './scoped-attention.ts'
 import { PlanDispatcher } from './plan-dispatch.ts'
 import { MainlineQueue } from './mainline-queue.ts'
-import { advanceMainline, precedes, prepareMainline, readMainline } from '../executor/mainline-git.ts'
+import { advanceMainline, precedes, prepareMainline, readMainline, verifyDeliveryOnTarget } from '../executor/mainline-git.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import { projectNavigationLink } from '../navigation.ts'
@@ -302,9 +302,9 @@ export class Runtime extends Service implements SourceHost {
           if (!this.configured() || this.closing()) throw new Error('The project is not available for mainline writes')
           authorizeMainline(resources, id, approval)
         },
-        inspectDelivery: async intent => {
+        inspectDelivery: async (intent, verify) => {
           await executor.settleMainlineWriter(intent.ticket_id)
-          return inspectFormalDelivery(resources, intent, this.lifetime)
+          return inspectFormalDelivery(resources, intent, verify, this.lifetime)
         },
         closeDelivery: (approval, receipt) => {
           if (!this.configured() || this.closing()) return 'delivery_target_changed'
@@ -324,6 +324,7 @@ export class Runtime extends Service implements SourceHost {
         },
         read: target => readMainline(commands, target),
         precedes: (target, ancestor, descendant) => precedes(commands, target, ancestor, descendant),
+        verifyDelivery: (target, integration, actual, documents) => verifyDeliveryOnTarget(commands, target, integration, actual, documents),
         prepare: (target, candidate, intent, queuedAt) => prepareMainline(commands, target, candidate, intent, queuedAt),
         advance: (target, base, candidate, authorize) => advanceMainline(commands, target, base, candidate, authorize),
         repair: (id, repair) => executor.requestMainlineRepair(id, repair),

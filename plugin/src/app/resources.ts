@@ -24,7 +24,8 @@ import { sameDirectory } from '../infra/environment.ts'
 import { KV } from '../kv.ts'
 import type { Handoffs } from './handoffs.ts'
 import { PlanDeliveryReceiptSchema, type Plans } from './plans.ts'
-import { mainlineAttempts, mainlineIntent, type MainlineCiBinding, type MainlineIntent, type MergeApproval } from './mainline-queue.ts'
+import { mainlineAttempts, mainlineIntent, type CheckDeliveryTarget, type DeliveryTargetObservation,
+  type MainlineCiBinding, type MainlineIntent, type MergeApproval } from './mainline-queue.ts'
 import type { ProjectMeter } from './project-meter.ts'
 import type { ScopedAttention } from './scoped-attention.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
@@ -308,8 +309,14 @@ const deliveryStamp = (state: DeliveryState, checkout: DeliveryCheckout | undefi
 
 const ciBinding = z.union([z.strictObject({ pull: z.number().int().positive() }), z.strictObject({ branch: z.string().min(1) })])
 
+const scopedDocuments = z.object({
+  scope: z.object({ root: z.string().nullable(), routes: z.array(z.string()), leaves: z.array(z.string()) }),
+  impact: z.discriminatedUnion('kind', [z.object({ kind: z.literal('unchanged') }),
+    z.object({ kind: z.literal('updated'), documents: z.array(z.string()) })]),
+})
+
 async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSignal,
-  scope?: { replay: MainlineIntent | undefined; formal?: never } | { replay: MainlineIntent; formal: true }) {
+  scope?: { replay: MainlineIntent | undefined; formal?: never } | { replay: MainlineIntent; formal: true; verify: CheckDeliveryTarget }) {
   const replay = scope?.replay, formal = scope?.formal
   const commands = host.commands.withSignal(signal)
   let state = deliveryState(host, id)
@@ -333,7 +340,7 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
     const target = checkout?.clean && approvedGeneration !== undefined ?
       { base: checkout.base, candidate: checkout.candidate, generation: approvedGeneration } : undefined
     const reviews = ticket.assignments.flatMap(item => item.reviews?.evidence ?? [])
-    const view = viewDelivery(ticket.deliveryCheck, target, reviews, criteria)
+    const view = viewDelivery(ticket.deliveryCheck, target, reviews, criteria, id)
     const missing = new Set(view.missing)
     if (!view.ready && missing.size === 0) missing.add('delivery_evidence')
     if (!criteria.length) missing.add('registered_acceptance')
@@ -366,18 +373,6 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
               lane.conclusion !== 'passed' || lane.blockers.length) missing.add(`dual-review:${axis}`)
         }
       }
-      // A revision change resets projected evidence, but it cannot discharge a mandatory finding without a repair event.
-      let unresolved: Set<string> | undefined
-      for (const event of view.events) {
-        if (event.kind === 'first-retro' || event.kind === 'final-retro') {
-          for (const finding of event.findings) if (finding.category !== 'optional') (unresolved ??= new Set()).add(finding.id)
-        } else if (event.kind === 'acceptance') {
-          for (const result of event.results) if (result.status === 'failed') (unresolved ??= new Set()).add(result.id)
-        } else if (event.kind === 'repair' && unresolved?.size) {
-          for (const fix of event.fixes) unresolved.delete(fix.id)
-        }
-      }
-      if (unresolved?.size) for (const finding of unresolved) missing.add(`repair:${finding}`)
     }
     return { view, missing, target }
   }
@@ -388,6 +383,7 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
   let ci: MainlineCiBinding | undefined
   let ciFailure: { code?: number; exit_code?: number } | undefined
   let ciStatus = state.required.length ? 'pending_local_gate' : 'required_checks_unconfigured'
+  let observation: DeliveryTargetObservation | undefined
   if (result.target && result.view.ready && result.missing.size === 0 && state.required.length) {
     const { base, candidate } = result.target
     try {
@@ -417,7 +413,14 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
       if (error instanceof CliError) ciFailure = { ...error.code === undefined ? {} : { code: error.code },
         ...error.exitCode === undefined ? {} : { exit_code: error.exitCode } }
     }
-    // An Actions response is only usable if the ticket, lease, settings and clean checkout are still the same.
+    if (ciStatus === 'passed' && scope?.formal) {
+      const docs = scopedDocuments.safeParse(result.view.docs?.evidence)
+      if (docs.success) {
+        const { scope: { root, routes, leaves }, impact } = docs.data
+        observation = await scope.verify(root === null ? [] : [root, ...routes, ...leaves, ...(impact.kind === 'updated' ? impact.documents : [])])
+      } else observation = { missing: 'docs' }
+    }
+    // Re-read the worktree and lease after all external evidence, including the final Git target observation.
     const prior = deliveryStamp(state, checkout)
     latest = deliveryState(host, id)
     checkout = await deliveryCheckout(commands, latest, signal, formal)
@@ -433,13 +436,14 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
       ciStatus = 'stale'
     }
   }
-  if (ciStatus !== 'passed') result.missing.add('required_ci')
+  if (observation && 'missing' in observation) result.missing.add(observation.missing)
+  if (ciStatus !== 'passed' && (!formal || (ciStatus !== 'pending_local_gate' && ciStatus !== 'stale'))) result.missing.add('required_ci')
   const identity = state.ticket.execution?.ownership?.identity
   const approval: MergeApproval | undefined = scope && result.missing.size === 0 && checkout && identity && result.target && state.assignment && ci
     ? { target: { repository: identity.repository, slug: commands.repository, ref: checkout.baseRef }, base: checkout.base,
       candidate: checkout.candidate, generation: result.target.generation, assignment: state.assignment.id, stamp: state.stamp, ci }
     : undefined
-  return { state, checkout, local: result.view, missing: [...result.missing], actions, ciStatus, ciFailure, approval }
+  return { state, checkout, local: result.view, missing: [...result.missing], actions, ciStatus, ciFailure, approval, observation }
 }
 
 /** Obtain the actual queue authorization from fresh, version-matched evidence, never from a read page or Worker report. */
@@ -454,10 +458,10 @@ export async function approveMainline(host: ResourceHost, id: string, candidate:
   return approval
 }
 
-/** Recheck the exact prewrite candidate and CI binding; the caller separately verifies Git integration and records delivery. */
-export async function inspectFormalDelivery(host: ResourceHost, intent: MainlineIntent, signal?: AbortSignal): Promise<{ missing: string[]; approval?: MergeApproval }> {
-  const { missing, approval } = await inspectDelivery(host, intent.ticket_id, signal, { replay: intent, formal: true })
-  return approval ? { missing, approval } : { missing }
+/** Bind the mainline observation to fresh candidate evidence before authorizing the closing transaction. */
+export async function inspectFormalDelivery(host: ResourceHost, intent: MainlineIntent, verify: CheckDeliveryTarget, signal?: AbortSignal) {
+  const { missing, approval, observation } = await inspectDelivery(host, intent.ticket_id, signal, { replay: intent, formal: true, verify })
+  return { missing, ...(approval ? { approval } : {}), ...(observation ? { observation } : {}) }
 }
 
 /** Recheck non-Git authorization synchronously at the point that starts the Git write. */

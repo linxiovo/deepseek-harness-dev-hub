@@ -130,7 +130,7 @@ The active Worker writes `orchestrator_retro_evidence` for the full lowercase `c
 
 `evidence` cites openable observations, not the delivery-check package itself. The test and Doc Tree tools return a `read` resource for the exact durable observation; command results, Session events, diffs and CI runs can also be cited. Finding IDs are stable. Classify defects as `correctness`, security issues as `security`, and current quality-standard violations as `standard`; each requires repair. Use `optional` only when all required behavior and standards remain satisfied. The Hub reads `retro-followups` for independent backlog items; these do not block this Ticket or dispatch work. Keep Doc Tree leaves and routes about current facts, not retro discussions.
 
-An acceptance result that cites a durable observation must cite this Ticket and the same base, candidate and writer generation. The gate refuses a missing observation or one from a prior candidate. Reaffirmed evidence retains its original reference and is carried by both independent reviews, not copied into a new acceptance result.
+An acceptance result that cites a durable observation must cite this Ticket and the same base, candidate and writer generation. A passing result cannot cite failed or unrun tests, a Doc Tree check with issues, an absent observation, or one from a prior revision. The host applies this rule on submission and when re-reading the ledger. Reaffirmed evidence retains its original reference and is carried by both independent reviews, not copied into a new acceptance result.
 
 ### Repair and evidence reuse
 

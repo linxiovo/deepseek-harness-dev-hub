@@ -117,6 +117,20 @@ export function precedes(commands: Commands, target: MainlineTarget, ancestor: s
   return inScratch(commands, target, scratch => contains(scratch, ancestor, descendant))
 }
 
+/** Verify that a later target still contains the integration and its reviewed Doc Tree scope. */
+export function verifyDeliveryOnTarget(commands: Commands, target: MainlineTarget, integration: string, actual: string,
+  documents: readonly string[]): Promise<'passed' | 'mainline_verification' | 'mainline_docs'> {
+  return inScratch(commands, target, async scratch => {
+    if (!await contains(scratch, integration, actual)) return 'mainline_verification'
+    if (!documents.length) return 'passed'
+    // Compare names from Git rather than placing hundreds of user-declared paths in a Windows command line.
+    const scoped = new Set(documents)
+    const changed = await scratch.git('compare delivered Doc Tree paths', ['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff',
+      '--no-textconv', integration, actual, '--'])
+    return changed.split('\0').some(path => scoped.has(path)) ? 'mainline_docs' : 'passed'
+  })
+}
+
 /** Create a reproducible intent-specific commit with the exact reviewed tree and candidate as its only parent. */
 export function prepareMainline(commands: Commands, target: MainlineTarget, candidate: string, intent: string, queuedAt: string): Promise<string> {
   const dated = commands.withIsolatedGit({ GIT_AUTHOR_DATE: queuedAt, GIT_COMMITTER_DATE: queuedAt })

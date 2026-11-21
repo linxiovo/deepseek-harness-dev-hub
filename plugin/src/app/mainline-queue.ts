@@ -12,6 +12,9 @@ import type { Store } from './store.ts'
 /** Exact Actions lookup authorized before the Git write, independent of later PR state. */
 export type MainlineCiBinding = { pull: number } | { branch: string }
 
+export type DeliveryTargetObservation = { actual: string; verifiedAt: string } | { missing: string }
+export type CheckDeliveryTarget = (documents: readonly string[]) => Promise<DeliveryTargetObservation>
+
 export interface MergeApproval {
   readonly target: MainlineTarget
   readonly base: string
@@ -46,10 +49,14 @@ interface QueueHost {
   paused(): boolean
   approve(id: string, candidate: string, signal?: AbortSignal, replay?: MainlineIntent): Promise<MergeApproval>
   authorize(id: string, approval: MergeApproval): void
-  inspectDelivery(intent: MainlineIntent): Promise<{ missing: string[]; approval?: MergeApproval }>
+  inspectDelivery(intent: MainlineIntent, verify: CheckDeliveryTarget): Promise<{
+    missing: string[]; approval?: MergeApproval; observation?: DeliveryTargetObservation
+  }>
   closeDelivery(approval: MergeApproval, receipt: PlanDeliveryReceipt): string | undefined
   read(target: MainlineTarget): Promise<string>
   precedes(target: MainlineTarget, ancestor: string, descendant: string): Promise<boolean>
+  verifyDelivery(target: MainlineTarget, integration: string, actual: string,
+    documents: readonly string[]): Promise<'passed' | 'mainline_verification' | 'mainline_docs'>
   prepare(target: MainlineTarget, candidate: string, intent: string, queuedAt: string): Promise<string>
   advance(target: MainlineTarget, base: string, candidate: string, authorize: () => Promise<void>): Promise<'advanced' | 'unchanged'>
   repair(id: string, repair: MainlineRepair): Promise<void>
@@ -73,7 +80,11 @@ export class MainlineQueue {
   private existing(ticketId: string, candidate: string) {
     const existing = mainlineIntent(this.host.store, ticketId)
     if (!existing || existing.status === 'repair' || existing.status === 'waiting') return undefined
-    if (existing.candidate !== candidate) throw new UserError('mainlineRefused', { reason: 'Ticket already has a queued or verified mainline candidate' })
+    if (existing.candidate !== candidate) {
+      // Preserve the real merge as history; an open Ticket can queue fresh, fully checked work after a refused closure.
+      if (existing.status === 'verified' && existing.delivery_missing?.length && !this.host.store.tickets.get(ticketId)?.ended) return undefined
+      throw new UserError('mainlineRefused', { reason: 'Ticket already has a queued or verified mainline candidate' })
+    }
     return existing
   }
 
@@ -135,35 +146,39 @@ export class MainlineQueue {
     })
   }
 
+  private async verifyDeliveryTarget(intent: MainlineIntent, documents: readonly string[]): Promise<DeliveryTargetObservation> {
+    const { host } = this, { integration, verification } = intent
+    if (!intent.applying_at || !integration || integration === intent.candidate || !intent.actual ||
+        verification?.status !== 'passed' || verification.method !== 'integration_on_target') return { missing: 'mainline_verification' }
+    try {
+      const actual = await host.read(intent.target)
+      if (actual !== integration) {
+        const check = await host.verifyDelivery(intent.target, integration, actual, documents)
+        if (check !== 'passed') return { missing: check }
+      }
+      host.lifetime.throwIfAborted()
+      return { actual, verifiedAt: now() }
+    } catch (error) {
+      host.lifetime.throwIfAborted()
+      if (error instanceof Error && error.name === 'AbortError') throw error
+      return { missing: 'mainline_unavailable' }
+    }
+  }
+
   /** Close only after rechecking the exact approved evidence and reacquiring proof from the actual target. */
   private async deliver(ticketId: string, id: string): Promise<void> {
     const { host } = this, { store } = host
     const intent = mainlineIntent(store, ticketId)
     if (intent?.id !== id || intent.status !== 'verified' || store.tickets.get(ticketId)?.ended?.by === 'delivery') return
-    const { missing, approval } = await host.inspectDelivery(intent)
-    const { applying_at, integration, verification } = intent
-    let receipt: PlanDeliveryReceipt | undefined
-    if (!applying_at || !integration || integration === intent.candidate || !intent.actual ||
-        verification?.status !== 'passed' || verification.method !== 'integration_on_target') {
-      missing.push('mainline_verification')
-    } else if (approval && !missing.length) {
-      try {
-        const actual = await host.read(intent.target)
-        if (actual === integration || await host.precedes(intent.target, integration, actual)) {
-          receipt = { ticketId, assignmentId: intent.assignment, receiptId: id, base: intent.base,
-            generation: intent.generation, candidate: intent.candidate, integration, actual, verifiedAt: now() }
-        } else missing.push('mainline_verification')
-      } catch (error) {
-        host.lifetime.throwIfAborted()
-        if (error instanceof Error && error.name === 'AbortError') throw error
-        missing.push('mainline_unavailable')
-      }
-    }
+    const { missing, approval, observation } = await host.inspectDelivery(intent, documents => this.verifyDeliveryTarget(intent, documents))
+    const integration = intent.integration
     host.lifetime.throwIfAborted()
     store.atomic(() => {
       const current = mainlineIntent(store, ticketId)
       if (current?.id !== id || current.status !== 'verified' || store.tickets.get(ticketId)?.ended?.by === 'delivery') return
-      if (approval && receipt && !missing.length) {
+      if (approval && integration && observation && 'actual' in observation && !missing.length) {
+        const receipt: PlanDeliveryReceipt = { ticketId, assignmentId: intent.assignment, receiptId: id, base: intent.base,
+          generation: intent.generation, candidate: intent.candidate, integration, ...observation }
         const refused = host.closeDelivery(approval, receipt)
         if (!refused) {
           if (current.delivery_missing) this.update(current, 'verified', { delivery_missing: undefined })

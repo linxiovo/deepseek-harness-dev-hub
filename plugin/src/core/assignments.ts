@@ -185,7 +185,7 @@ export class Assignments extends EnginePart {
     }
     const at = this.now()
     const reviews = ticket.assignments.flatMap(item => item.reviews?.evidence ?? [])
-    ticket.deliveryCheck = advanceDelivery(ticket.deliveryCheck, revision, reviews, event, at)
+    ticket.deliveryCheck = advanceDelivery(ticket.deliveryCheck, revision, reviews, event, at, ticket.id)
     ticket.updatedAt = at
     this.repo.tickets.save(ticket)
     return ticket.deliveryCheck.events.length - 1

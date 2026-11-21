@@ -1,6 +1,7 @@
 /** What the Executor and its workers report about the Assignments that run tickets. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
+import { advanceDelivery, type DeliveryEvent, type DeliveryRevision } from './delivery-check.ts'
 import { latestAssignment, liveTicket, reviewStatus, runningAssignment } from './model.ts'
 import type { ReviewAxis, ReviewConclusion, ReviewEvidence, ReportState, Ticket } from './model.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
@@ -133,7 +134,7 @@ export class Assignments extends EnginePart {
   }
   /** Records one independently authorized review against the running ticket's pinned base. */
   review(ticketId: string, reviewerSession: string, input: { axis: ReviewAxis; basis: string[]; base: string; candidate: string;
-    conclusion: ReviewConclusion; blockers: string[]; summary: string }): { evidence: ReviewEvidence; status: 'pending' | 'blocked' | 'passed' } {
+    conclusion: ReviewConclusion; blockers: string[]; summary: string; reuses?: string[] }): { evidence: ReviewEvidence; status: 'pending' | 'blocked' | 'passed' } {
     const ticket = this.require(ticketId)
     if (!liveTicket(ticket)) throw new UserError('ticketEnded')
     const assignment = runningAssignment(ticket)
@@ -157,11 +158,33 @@ export class Assignments extends EnginePart {
     const evidence: ReviewEvidence = { id: key('review', assignment.id, input.axis, input.candidate, String(generation)), axis: input.axis,
       reviewer_session: reviewerSession, generation, basis: [...input.basis], base, candidate: input.candidate,
       conclusion: input.blockers.length ? 'blocked' : input.conclusion, blockers: [...input.blockers], summary: input.summary, at: this.now() }
+    if (input.reuses?.length) evidence.reuses = [...new Set(input.reuses)]
     reviews.evidence.push(evidence)
     ticket.updatedAt = evidence.at
     this.repo.tickets.save(ticket)
     const status = reviewStatus(assignment)
     return { evidence, status }
+  }
+  /** Append one observation under the active writer lease without changing formal delivery. */
+  deliveryEvidence(ticketId: string, sessionId: string, revision: DeliveryRevision, event: DeliveryEvent, repairFrom?: DeliveryRevision) {
+    const ticket = this.require(ticketId)
+    const assignment = runningAssignment(ticket)
+    const writer = assignment?.writer
+    const active = ticket.execution?.active_writer
+    if (!liveTicket(ticket) || !assignment || writer?.state !== 'active' || writer.session !== sessionId
+      || active?.assignment !== assignment.id || active.session !== sessionId || writer.generation !== revision.generation
+      || ticket.execution?.base?.sha !== revision.base) throw new Error('Delivery evidence requires the active inspected Worker revision')
+    if (event.kind === 'repair') {
+      const prior = ticket.deliveryCheck?.events.at(-1)?.revision
+      if (!prior || !repairFrom || prior.base !== repairFrom.base || prior.candidate !== repairFrom.candidate
+        || prior.generation !== repairFrom.generation) throw new Error('Retro evidence changed during repair inspection; read the ticket again')
+    }
+    const at = this.now()
+    const reviews = ticket.assignments.flatMap(item => item.reviews?.evidence ?? [])
+    ticket.deliveryCheck = advanceDelivery(ticket.deliveryCheck, revision, reviews, event, at)
+    ticket.updatedAt = at
+    this.repo.tickets.save(ticket)
+    return ticket.deliveryCheck.events.length - 1
   }
   /** The ticket, while it is open and `assignmentId` runs it. */
   private running(ticketId: string, assignmentId: string): Ticket | undefined {

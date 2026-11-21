@@ -23,8 +23,8 @@ For an authorized implementation Ticket, the Worker loads `dsh-worker-implement`
 1. Load `dsh-worker-test-scope`. Start with the Ticket's acceptance criteria and the diff from the pinned base. Locate the public entry that exposes the behavior, the existing runner and its focused and full-suite commands. Identify required CI separately.
 2. Load `dsh-worker-tdd` for each changed behavior. Reproduce the expected failure through the authorized public entry on a reproducible red revision. Use an existing regression check when it already reaches the failing assertion. Otherwise add or extend a check and pin its test-only red commit. Confirm that the runner reached the assertion and record the revision, working directory, exact command, failure output and exit status. A setup failure, skipped case or empty run leaves red unverified.
 3. Make the smallest change that satisfies the behavior. Run the same check and confirm that the same assertion passes. Keep the regression check in the candidate. Complete one red–green cycle before starting the next.
-4. Finish writes and review the complete diff. Select the verification scope using the table below. Run the selected checks on the clean committed candidate and retain actual command outcomes. Include any required CI and independent review under the repository's delivery rules.
-5. Call `orchestrator_test_evidence` for the candidate. Keep the returned evidence in the existing `orchestrator_report` summary and the candidate's PR description when there is a PR. Include prerequisites, the red assertion and matching green run, and links or references to logs or Session events. Check that the report and PR name the same base and candidate as the evidence.
+4. Finish writes and review the complete diff. Select the local verification scope using the table below and run those checks on the clean committed candidate. Required CI is a separate gate.
+5. Record the actual runs with `orchestrator_test_evidence` and the committed Doc Tree observation with [`orchestrator_doc_impact`](011-doc-tree-impact.md#worker-tool-contract). Both tools accept an optional `reference` string for an openable log URL or Session resource. Use it to bind the original observation to the durable result, not instead of recording what happened. Preserve prerequisites, red assertions, matching green results, document paths or unchanged rationale, and references in `orchestrator_report` and any candidate PR. Check that these name the same base and candidate as the evidence.
 
 | Scope | When to select it |
 | --- | --- |
@@ -32,7 +32,7 @@ For an authorized implementation Ticket, the Worker loads `dsh-worker-implement`
 | `consumers` | A contract change with known affected consumers. Trace real call sites and dependency paths, then check the provider and its affected consumers through that contract. |
 | `full` | Shared infrastructure, an uncertain consumer list or dependency cycles make the impact unclear. Run the repository's full suite. |
 
-On resumption, read the actual worktree HEAD, base-to-candidate diff, prior reports and PR state. Evidence remains tied to the observed pair. If HEAD or the base changed, re-evaluate scope and reacquire evidence for the current pair. Reuse a red observation only when its recorded revision still reproduces the same assertion failure and the same regression check is present in the current candidate. Record unknown outcomes as unverified.
+Reuse a red observation only when its recorded revision still reproduces the same assertion failure and the same regression check is present in the current candidate. Report unknown outcomes as unverified. For changed or interrupted candidates, follow [repair and evidence reuse](#repair-and-evidence-reuse).
 
 ### Worker test evidence tool
 
@@ -46,7 +46,7 @@ Only the active Worker for the Ticket can call `orchestrator_test_evidence`. It 
 | `checks` | A list of `{directory, command, status, observed}` records. Give the working directory relative to the worktree, the exact command, and what was observed. Use `passed`, `failed`, `not_run`, `pending` or `cancelled` for `status`. |
 | `red` | An array of `{revision, directory, command, observed}` records for reproducible red runs. Use `[]` if a required red is unavailable and `null` if the change requires no red. Name the full revision, worktree-relative directory, exact command and observed assertion failure. |
 
-The result identifies the candidate and pinned base and has `source` set to `worker`. It returns `failed` when a check is reported as failed. It returns `reported_passed` when the Worker reports at least one check and all listed checks passed, and either no red was required or a nonempty red list has a matching candidate check for each command and directory. All other cases return `unverified`. The tool verifies Git identity. The Worker supplies run observations and scope rationale. Report ready only when the evidence covers the selected scope, including actual consumers for changed contracts. Apply required CI and review gates before delivery.
+The result identifies the candidate and pinned base and has `source` set to `worker`. It returns `failed` when a check is reported as failed. It returns `reported_passed` when the Worker reports at least one check and all listed checks passed, and either no red was required or a nonempty red list has a matching candidate check for each command and directory. All other cases return `unverified`. The tool verifies Git identity; the Worker supplies run observations and scope rationale. A reported pass does not establish adequate coverage or replace required CI.
 
 ## Worker test evidence smoke check
 
@@ -96,10 +96,43 @@ The output keeps skill names and call/result sequence references, fixture assert
 1. Finish writes for the first runnable slice, commit it, and pin the actual full lowercase base and candidate SHAs. In the same round, dispatch two independent `code-review` subagents in parallel. Give them the identical pair, and load `dsh-worker-code-review` in each. The `standards` reviewer receives repository guidance and Doc Tree sources; the `spec` reviewer receives the ticket, specification and acceptance sources. A reviewer that must wait still starts in that parallel dispatch.
 2. Each reviewer independently runs `git diff <base>...<candidate>` and inspects the commit list, then submits its own evidence through `orchestrator_review_submit`; the implementer never writes a review conclusion for either lane. The submission identifies reviewer Session, axis, basis, base, candidate, conclusion, blockers and summary. The runtime binds the actual reviewer Session and ticket base and exposes both lanes and aggregate state in review evidence.
 3. The standards lane checks repository constraints, Doc Tree requirements and actual backend/API contracts and semantics. The spec lane checks the specification, ticket acceptance criteria, required behavior and verification evidence. A correct citation or link does not excuse a wrong API argument or semantic contract. Wrong semantics or arguments, missing interface contract, missing specification, mismatched revisions, an absent lane, or any blocked conclusion prevents a dual-review pass.
-4. Wait for both submissions and inspect the aggregate review state before reporting ready. The first-slice review is a focused gate before broader checks; repeat the two-lane process for the complete candidate after committing it and running selected checks. After any fix, amendment or base move, pin the new actual pair and restart both reviewers together; prior prose is context, never approval for a new pair.
+4. Inspect the aggregate in `ticket/<id>/reviews` after both submissions. The first-slice review is a focused gate before broader checks. Repeat both lanes for the complete candidate after committing it and recording the selected local verification and doc impact. A blocked review stops the gate; correct the blocker and dispatch both lanes on the new pair.
 
-   Leave worktree ownership and recovery semantics to the review agents. Passing static checks does not establish who may reuse a worktree or what happens when execution resumes after an interruption.
-5. On resumption, read the actual HEAD/base and review records. If a reviewer did not finish before Worker restart, discard any old candidate's text as approval and launch both reviewers again for the current pinned pair. Never report ready while either lane is missing, blocked or tied to another version. Confirm required CI results cover the final PR head before merging.
+   When the change concerns worktree ownership or recovery, review the actual runtime paths. Passing static checks alone does not establish who may reuse a worktree or what happens after interruption.
+5. Begin the first retro only after both independent submissions pass for the same live base, candidate and writer generation. Start another matching review round whenever a repair changes the candidate. A prior approval is not approval of the new pair.
+
+## Delivery-check
+
+The delivery-check gate applies to Tickets linked to an immutable registered Plan and its specification. A missing Plan or specification for a Plan Ticket leaves the gate incomplete. Tickets without a Plan keep their own acceptance criteria, candidate verification, required CI and ordinary report/PR handoff; they do not receive canonical Plan IDs or a `ready_to_queue` result.
+
+### Retro and acceptance
+
+The active Worker writes `orchestrator_retro_evidence` for the full lowercase `candidate` SHA at the clean worktree HEAD. Read `ticket/<id>/delivery-check` through `orchestrator_read` for the evidence order, current gaps and canonical criteria. A Plan criterion ID is the decimal string of the node's one-based Spec acceptance reference; use exactly the IDs returned, not local numbering or replacements.
+
+| `kind` | Required payload and order |
+| --- | --- |
+| `first-retro` | `findings: [{id, category, summary, evidence, affects?}]` after observed execution evidence and matching dual review of the complete candidate. Inspect the execution and review observations; record `[]` if there are no findings. |
+| `repair` | `fixes: [{id, evidence}]` after committing the correction on a clean new SHA. Use the finding ID, or the canonical criterion ID for an acceptance failure, and cite the fix and its observable result. |
+| `acceptance` | `results: [{id, status, evidence}]` after the first retro and any required repairs and renewed review. Use `passed`, `failed` or `not_run` and cite the actual result or why it is missing. Account for every canonical criterion with a current result or eligible reaffirmed evidence. |
+| `final-retro` | The same `findings` shape after all canonical criteria pass. Inspect the accepted candidate and its evidence. A mandatory finding returns the candidate to repair, fresh dual review and acceptance before a new final retro. |
+
+`evidence` cites openable observations, not the delivery-check package itself. The test and Doc Tree tools return a `read` resource for the exact durable observation; command results, Session events, diffs and CI runs can also be cited. Finding IDs are stable. Classify defects as `correctness`, security issues as `security`, and current quality-standard violations as `standard`; each requires repair. Use `optional` only when all required behavior and standards remain satisfied. The Hub reads `retro-followups` for independent backlog items; these do not block this Ticket or dispatch work. Keep Doc Tree leaves and routes about current facts, not retro discussions.
+
+An acceptance result that cites a durable observation must cite this Ticket and the same base, candidate and writer generation. The gate refuses a missing observation or one from a prior candidate. Reaffirmed evidence retains its original reference and is carried by both independent reviews, not copied into a new acceptance result.
+
+### Repair and evidence reuse
+
+1. In each mandatory finding, name the affected `tests`, `docs` and `acceptance:<id>` keys. Omit `affects` if the scope is uncertain; that invalidates all keys. Fix every mandatory finding and record it on the new commit. Compare the old and new pair, including actual consumers, and treat any additional impact identified in the repair diff as affected. A base change requires reassessing the entire scope.
+2. Reacquire affected test, document and acceptance evidence. For any unchanged passing result proposed for reuse, give both review lanes its key, original reference and why the repair leaves that observation applicable. Both fresh reviewers must independently check the claim and include the exact key in `orchestrator_review_submit.reuses`. Without both affirmations, obtain a fresh observation. Never copy an old approval or claim an affected result under a new SHA. After a repair record at least one fresh acceptance result; if the timeline does not retain the first retro for the live pair, complete it again after matching dual review and before acceptance.
+3. On restart, read the live verified worktree, its clean HEAD, pinned base, writer generation and any PR head, then reconcile them with the durable review and delivery-check records. A stale read or old HEAD does not support a pass for a check touched by the repair. Incomplete or stale review is not approval; reacquire invalid or uncertain evidence for the real candidate before continuing. Wait only for an unresolved contract clarification that materially changes the required behavior, and keep independent work moving.
+
+### Read the candidate package and CI
+
+The Hub and the Ticket's active Worker can read `ticket/<id>/delivery-check`. Follow the Ticket detail pointer and continue through the paginated evidence for the pinned base and candidate, canonical criteria and per-criterion results, both review lanes, recorded tests and doc impact, and the first retro, repairs and final retro in order. Follow the evidence references to confirm the observations and use the package's `missing` list to identify gaps.
+
+Required CI is separate from local evidence. Configure the required workflow IDs and jobs; an empty or incomplete configuration does not verify CI. The package includes the version-scoped Actions result and available run, job and artifact references. An associated PR must still match the pinned base and candidate after querying Actions. A failed, cancelled, pending, missing or wrong-version required run does not pass. See [CI build and commit evidence](006-deployment.md#ci-build-and-commit-evidence).
+
+`ready_to_queue` is candidate readiness; `return_for_recheck` lists unmet gates. `mainline.status: pending_merge` means this package does not verify the result on mainline. It does not release a version, close a Ticket, record formal delivery or unlock a successor; those effects do not follow from a Worker report or PR closure. See [Frontier dispatch and claims](009-handoff.md#frontier-dispatch-and-claims) for the separate receipt boundary.
 
 ## Handoff evidence
 

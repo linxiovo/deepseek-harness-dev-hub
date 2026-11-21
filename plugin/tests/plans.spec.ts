@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, it } from 'vitest'
 import { z } from 'zod'
 import { resolve } from 'node:path'
+import { planDeliveryWriter } from '../src/app/plans.ts'
 import { startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host
@@ -277,7 +278,7 @@ it('leaves the other frontier node waiting when the last worker slot is already 
   await h.runtime.idle()
 })
 
-it('does not unlock a successor from ready alone, but accepts one exact formal delivery receipt', async () => {
+async function dispatchedFanIn() {
   const { id } = await registeredFanIn()
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, maxWorkers: 2 } })
@@ -285,16 +286,52 @@ it('does not unlock a successor from ready alone, but accepts one exact formal d
   const catalogClaim = catalog.claim, accountsClaim = accounts.claim
   if (!catalogClaim || !accountsClaim) throw new Error('Independent frontier nodes must have claims')
   await h.runtime.idle()
+  return { id, catalogClaim, accountsClaim }
+}
+
+const receiptFor = (nodeId: string, claim: Pick<z.infer<typeof PlanDispatchClaimSchema>, 'ticketId' | 'assignmentId'>) => ({
+  ticketId: claim.ticketId, assignmentId: claim.assignmentId, receiptId: `delivery-${nodeId}`,
+  candidate: `commit-${nodeId}`, verifiedAt: '2026-11-17T11:00:47Z',
+})
+
+it('rejects formal delivery from Hub and Worker tools and keeps receipt-looking reports blocked after restart', async () => {
+  const { id, catalogClaim, accountsClaim } = await dispatchedFanIn()
+  for (const [nodeId, claim] of [['catalog', catalogClaim], ['accounts', accountsClaim]] as const) {
+    const args = { planId: id, nodeId, receipt: receiptFor(nodeId, claim) }
+    await expect(h.runTool(claim.session, 'orchestrator_plan_deliver', args)).rejects.toThrow(/is not registered/)
+    await h.runTool(claim.session, 'orchestrator_report', { state: 'ready', summary: JSON.stringify(args) })
+  }
+  await h.runtime.idle()
+  expect(await read(`plan/${id}/node/catalog`)).toMatchObject({ status: 'awaiting-delivery' })
+  await expect(h.runTool(h.runtime.masterId, 'orchestrator_plan_deliver', {
+    planId: id, nodeId: 'catalog', receipt: receiptFor('catalog', catalogClaim),
+  })).rejects.toThrow(/is not registered/)
+  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'] })
+
+  await h.restart()
+  await h.runtime.idle()
+  expect(await read(`plan/${id}`)).toMatchObject({ frontier: [], nodes: expect.arrayContaining([
+    expect.objectContaining({ id: 'catalog', status: 'awaiting-delivery' }),
+    expect.objectContaining({ id: 'accounts', status: 'awaiting-delivery' }),
+  ]) })
+  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'] })
+})
+
+it('keeps the internal delivery writer claim-bound and requires both predecessor receipts', async () => {
+  const { id, catalogClaim, accountsClaim } = await dispatchedFanIn()
   for (const claim of [catalogClaim, accountsClaim]) {
     await h.runTool(claim.session, 'orchestrator_report', { state: 'ready', summary: 'Worker finished its local implementation.' })
   }
   await h.runtime.idle()
-  expect((await read(`plan/${id}/node/dashboard`)).status).toBe('blocked')
-  expect((await read(`plan/${id}/node/catalog`)).status).toBe('awaiting-delivery')
-  for (const [nodeId, claim] of [['catalog', catalogClaim], ['accounts', accountsClaim]] as const) {
-    await h.runTool(h.runtime.masterId, 'orchestrator_plan_deliver', { planId: id, nodeId, receipt: { ticketId: claim.ticketId, assignmentId: claim.assignmentId,
-      receiptId: `delivery-${nodeId}`, candidate: `commit-${nodeId}`, verifiedAt: new Date().toISOString() } })
-  }
+  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'] })
+  const writer = planDeliveryWriter(h.runtime.plans)
+  const receipt = receiptFor('catalog', catalogClaim)
+  expect(() => writer.deliver(id, 'catalog', receiptFor('accounts', accountsClaim))).toThrow(/does not belong/)
+  const delivered = writer.deliver(id, 'catalog', receipt)
+  expect(delivered).toMatchObject({ status: 'delivered', delivery: receipt })
+  expect(writer.deliver(id, 'catalog', receipt)).toEqual(delivered)
+  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['accounts'] })
+  writer.deliver(id, 'accounts', receiptFor('accounts', accountsClaim))
   expect((await read(`plan/${id}/node/dashboard`)).status).toBe('waiting-for-slot')
   expect(await read(`plan/${id}`)).toMatchObject({ nodes: expect.arrayContaining([
     expect.objectContaining({ id: 'catalog', status: 'delivered' }), expect.objectContaining({ id: 'accounts', status: 'delivered' }),
@@ -314,9 +351,11 @@ it('replays a durable claim after restart without creating a second Worker deliv
   expect(before).toMatchObject({ status: 'claimed', claim: { pendingAction: 'launch' } })
   await h.restart()
   expect((await read(`plan/${published.id}/node/saved-api`)).claim).toEqual(beforeClaim)
+  expect(await read(`plan/${published.id}/node/saved-page`)).toMatchObject({ status: 'blocked', waiting_on: ['saved-api'] })
   await h.runtime.settings.pause(false, 'panel')
   await h.runtime.idle()
   const deliveries = h.deliveries.mock.calls.map(([delivery]) => delivery).filter(delivery => delivery.sessionId === beforeClaim.session)
   expect(deliveries).toHaveLength(1)
   expect((await read(`plan/${published.id}/node/saved-api`)).status).toBe('running')
+  expect(await dispatchPlan(published.id, 'saved-page')).toMatchObject({ status: 'blocked', waitingOn: ['saved-api'] })
 })

@@ -157,6 +157,170 @@ it('exposes review submission only to actual Worker descendants and restores ind
   expect(await reviewsRead()).toMatchObject({ aggregate: 'pending', standards: [], spec: [], history: expect.arrayContaining([expect.any(Object)]) })
 })
 
+it('requires independent review before the first retro, then requires acceptance before the final retro', async () => {
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('retro-order', '@bot Check the candidate.'))
+  const candidate = h.localGit!.base.sha
+  const record = (kind: 'first-retro' | 'final-retro') => h.runTool(sessionId, 'orchestrator_retro_evidence', { candidate, kind, findings: [] })
+  await expect(record('first-retro')).rejects.toThrow(/review/i)
+  for (const axis of ['standards', 'spec'] as const) {
+    const reviewer = await h.reviewSubagent(sessionId, axis)
+    await expect(h.runTool(reviewer, 'orchestrator_retro_evidence', { candidate, kind: 'first-retro', findings: [] }))
+      .rejects.toThrow(/not registered/i)
+    await h.runTool(reviewer, 'orchestrator_review_submit', { candidate, axis, basis: ['Ticket acceptance criteria'],
+      conclusion: 'passed', summary: 'No blocking findings.', blockers: [] })
+  }
+  await expect(record('first-retro')).rejects.toThrow(/execution evidence/i)
+  const dir = ticket.execution!.directory
+  expect(h.localGit!.git('-C', dir, 'status', '--porcelain')).toBe('')
+  await h.runTool(sessionId, 'orchestrator_test_evidence', { candidate, scope: 'focused', reason: 'Verify the checkout starts clean.', red: null,
+    checks: [{ directory: '.', command: 'git status --porcelain', status: 'passed', observed: 'No paths returned.' }] })
+  await record('first-retro')
+  await expect(record('final-retro')).rejects.toThrow(/acceptance/i)
+})
+
+it('reacquires changed evidence after the final retro and only queues with current required CI', async () => {
+  const hub = h.runtime.masterId
+  const brief = { project: { repository: 'acme/widgets', workspace: h.localGit!.repository }, goal: 'Format labels.',
+    constraints: [], acceptanceScope: ['Trim labels', 'Preserve blank labels'], authorization: { scope: 'Format labels', release: 'not-authorized' } }
+  const confirmation = JSON.stringify({ confirmed: true, brief })
+  h.sendUserMessage(hub, confirmation)
+  const { id } = await h.runTool(hub, 'orchestrator_handoff_confirm', { ...brief, confirmation }) as { id: string }
+  await h.idlePlanning()
+  const { spec: { id: specId } } = await h.runTool(`planner-${id}`, 'orchestrator_spec_publish', { handoffId: id, body: 'Trim text and preserve blanks.',
+    acceptance: [{ statement: 'Trim labels', observable: 'Leading and trailing spaces are removed.', delivery: 'backend' },
+      { statement: 'Preserve blank labels', observable: 'An empty label stays empty.', delivery: 'backend' }],
+    testInterfaces: [{ seam: 'label()', kind: 'proposed', note: 'Pass labels through the public function.' }], outOfScope: [] }) as { spec: { id: string } }
+  await h.runtime.idle()
+  await h.runTool(`splitter-${id}`, 'orchestrator_plan_register', { handoffId: id, specId,
+    features: [{ id: 'labels', kind: 'backend' }], nodes: [{ id: 'labels', featureId: 'labels', title: 'Label formatting', role: 'backend',
+      acceptance: [1, 2], demonstration: 'Format a label and a blank.', blockedBy: [] }] })
+  const { claim: { ticketId, session } } = (await h.runTool(hub, 'orchestrator_plan_dispatch', { planId: id, nodeId: 'labels' })) as
+    { claim: { ticketId: string; session: string } }
+  await h.runtime.idle()
+  const { directory } = await read(`ticket/${ticketId}`) as { directory: string }
+  const git = (...args: string[]) => h.localGit!.git('-C', directory, ...args)
+  const commit = (body: string) => {
+    writeFileSync(join(directory, 'label.mjs'), body)
+    git('add', 'label.mjs'); git('commit', '-qm', 'format labels')
+    return git('rev-parse', 'HEAD')
+  }
+  const path = `ticket/${ticketId}/delivery-check`
+  const inspect = (page = {}) => read(path, page)
+  expect(await read(`ticket/${ticketId}`)).toMatchObject({ delivery_check: { read: path } })
+  const submit = (candidate: string, event: object) => h.runTool(session, 'orchestrator_retro_evidence', { candidate, ...event })
+  const review = async (candidate: string, reuses: string[] = []) => {
+    await Promise.all((['standards', 'spec'] as const).map(async axis => {
+      const reviewer = await h.reviewSubagent(session, axis)
+      return h.runTool(reviewer, 'orchestrator_review_submit', { candidate, axis, summary: `${axis} passed after inspecting the diff.`,
+        basis: [axis === 'standards' ? 'Repository guidance' : `spec/${id}`], conclusion: 'passed', blockers: [], reuses })
+    }))
+  }
+  const tests = async (candidate: string, check: string) => {
+    const code = `import assert from 'node:assert/strict'; import { label } from './label.mjs'; ${check}`
+    const run = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: directory, encoding: 'utf8' })
+    expect(run.status, run.stderr).toBe(0)
+    return h.runTool(session, 'orchestrator_test_evidence', { candidate, scope: 'focused', reason: 'Only label() changed.', red: null,
+      checks: [{ directory: '.', command: `node --input-type=module -e ${JSON.stringify(code)}`, status: 'passed', observed: 'exit 0' }] })
+  }
+  const acceptance = (criteria: string[], ref: unknown) => ({ kind: 'acceptance', results: criteria.map(id => ({ id, status: 'passed', evidence: [ref] })) })
+  const before = commit('export const label = value => value.trimStart()\n')
+  await review(before)
+  const original = await tests(before, "assert.equal(label(' alert'), 'alert'); assert.equal(label(''), '')")
+  await submit(before, { kind: 'first-retro', findings: [{ id: 'improve-direction', category: 'optional',
+    summary: 'Consider a localized future mode.', evidence: [original.read] }] })
+  expect(await read('retro-followups')).toMatchObject({ items: [{ ticket_id: ticketId, id: expect.any(String), summary: 'Consider a localized future mode.' }] })
+  await h.runTool(session, 'orchestrator_doc_impact', { candidate: before, root: null, routes: [], leaves: [],
+    impact: { kind: 'unchanged', reason: 'No change to documented inputs or outputs.' } })
+  await expect(submit(before, acceptance(['1', 'invented'], original.read))).rejects.toThrow(/canonical/i)
+  await submit(before, acceptance(['1', '2'], original.read))
+  await submit(before, { kind: 'final-retro', findings: [{ id: 'trailing-spaces', category: 'correctness',
+    summary: 'Trailing spaces still leak into the label.', evidence: [original.read], affects: ['acceptance:1', 'tests'] }] })
+  expect(await inspect()).toMatchObject({ ready: false, status: 'return_for_recheck', candidate: before })
+  await expect(submit(before, { kind: 'repair', fixes: [{ id: 'trailing-spaces', evidence: [original.read] }] })).rejects.toThrow(/change|new/i)
+
+  const candidate = commit('export const label = value => value.trim()\n')
+  const repair = { kind: 'repair', fixes: [{ id: 'trailing-spaces', evidence: [`https://github.com/acme/widgets/commit/${candidate}`] }] }
+  await submit(candidate, repair)
+  await review(candidate, ['docs', 'acceptance:2', 'tests']) // An affected check cannot be carried even with approval.
+  expect(await inspect()).toMatchObject({ ready: false, candidate, missing: expect.arrayContaining(['tests']) })
+  const fixed = await tests(candidate, "assert.equal(label(' alert '), 'alert'); assert.equal(label(''), '')")
+  expect(await read(String(fixed.read))).toMatchObject({ text: expect.stringContaining(candidate) })
+  await expect(submit(candidate, acceptance(['1'], original.read))).rejects.toThrow(/match the current revision/i)
+  await expect(submit(candidate, acceptance(['1'], String(original.read).replace(/^ticket\//, 'task/')))).rejects.toThrow(/match the current revision/i)
+  await expect(submit(candidate, acceptance(['1'], `ticket/${ticketId}/delivery-observation/999`))).rejects.toThrow(/missing/i)
+  await submit(candidate, acceptance(['1'], fixed.read))
+  await submit(candidate, { kind: 'final-retro', findings: [] })
+  git('reset', '--keep', before)
+  await expect(submit(before, { kind: 'first-retro', findings: [] })).rejects.toThrow(/repair lineage/i)
+  git('reset', '--keep', candidate)
+  expect(await inspect()).toMatchObject({ ready: false, missing: expect.arrayContaining(['required_ci']), ci_status: 'required_checks_unconfigured' })
+
+  const settings = h.runtime.store.settings()
+  await h.runTool(hub, 'orchestrator_settings_save', { block: 'source', source: 'github',
+    value: { ...settings.sources.github!, config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build', workflowId: '4' }] } },
+    revision: h.runtime.store.blockRevision('source:github') })
+  let workflowSha = before
+  let remoteHead = candidate
+  const branch = git('branch', '--show-current')
+  const base = h.localGit!.base.sha
+  const url = 'https://github.com/acme/widgets/actions/runs/21'
+  let holdCi = false
+  let querying = Promise.withResolvers<void>()
+  let releaseCi = Promise.withResolvers<void>()
+  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async ([, request]) => {
+    if (request?.includes('/pulls?')) return []
+    if (request?.endsWith('/pulls/29')) return { state: 'open', html_url: 'https://github.com/acme/widgets/pull/29', user: { login: 'agent-bot' },
+      head: { sha: remoteHead, ref: branch, repo: { full_name: 'acme/widgets' } }, base: { sha: base }, merge_commit_sha: null }
+    if (request?.includes(`/actions/runs?head_sha=${candidate}`)) {
+      if (holdCi) { querying.resolve(); await releaseCi.promise }
+      return { total_count: 1, workflow_runs: [
+        { id: 21, workflow_id: 4, run_number: 1, head_sha: workflowSha, run_attempt: 1, status: 'completed', conclusion: 'success', html_url: url,
+          pull_requests: [{ number: 29, head: { sha: candidate }, base: { sha: base } }] },
+      ] }
+    }
+    if (request?.includes('/actions/runs/21/jobs')) return { total_count: 1, jobs: [
+      { id: 37, run_id: 21, run_attempt: 1, head_sha: candidate, name: 'build', status: 'completed', conclusion: 'success', html_url: `${url}/job/37` },
+    ] }
+    if (request?.includes('/actions/runs/21/artifacts')) return { total_count: 0, artifacts: [] }
+    throw new Error(`Unexpected GitHub request: ${request}`)
+  })
+  expect(await inspect()).toMatchObject({ ready: false, status: 'return_for_recheck' })
+  workflowSha = candidate
+  const first = await inspect({ limit: 4000 }) as { text: string; next_offset: number | null }
+  expect(first).toMatchObject({ ready: true, status: 'ready_to_queue', candidate, mainline: { status: 'pending_merge' } })
+  let details = first.text
+  for (let offset = first.next_offset; offset !== null;) {
+    const page = await inspect({ offset, limit: 4000 }) as typeof first
+    details += page.text
+    offset = page.next_offset
+  }
+  expect(JSON.parse(details)).toMatchObject({
+    local: { followups: [{ id: 'improve-direction' }], docs: { revision: { candidate: before } }, tests: { revision: { candidate } },
+      acceptance: [{ id: '1', result: { revision: { candidate } } }, { id: '2', result: { revision: { candidate: before } } }] },
+    ci: { evidence: { sha: candidate, satisfied: true, checks: [{ run: { url } }] } },
+  })
+  expect(await read(`plan/${id}/node/labels`)).not.toHaveProperty('delivery')
+  await h.runTool(session, 'orchestrator_report', { state: 'progress', pr_number: 29, summary: 'Review and acceptance recorded for this PR.' })
+  expect(await inspect()).toMatchObject({ ready: true })
+  holdCi = true
+  const remoteRead = inspect()
+  await Promise.race([querying.promise, remoteRead.then(() => { throw new Error('Did not request Actions for the PR') })])
+  remoteHead = before
+  releaseCi.resolve()
+  expect(await remoteRead).toMatchObject({ ready: false, candidate, missing: expect.arrayContaining(['required_ci']) })
+  remoteHead = candidate
+  querying = Promise.withResolvers<void>(); releaseCi = Promise.withResolvers<void>()
+  holdCi = true
+  const delivery = inspect()
+  await Promise.race([querying.promise, delivery.then(() => { throw new Error('Did not request CI for the candidate') })])
+  const changed = commit('export const label = value => value.trim().toLowerCase()\n')
+  releaseCi.resolve()
+  expect(await delivery).toMatchObject({ ready: false, candidate: changed, missing: expect.arrayContaining(['delivery_target_changed']) })
+  await h.restart(); await h.runtime.idle()
+  expect(await inspect()).toMatchObject({ ready: false, status: 'return_for_recheck' })
+  expect(await read(`plan/${id}/node/labels`)).not.toHaveProperty('delivery')
+}, 90_000)
+
 it('checks documentation impact in the active worker candidate and never approves its semantics', async () => {
   const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot Add a backend API contract'))
   const worktree = ticket.execution!.directory

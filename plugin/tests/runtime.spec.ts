@@ -401,6 +401,11 @@ it('keeps project binding, authorization, cursors and Hub sessions separate acro
   expect(await api('POST', 'executor/pause', { paused: true }, project.id)).toMatchObject({ status: 409, body: { code: 'staleProject' } })
   expect(await api('GET', `sessions/${project.hubSessionId}/meter`, undefined, other.id)).toMatchObject({ status: 404 })
   expect(await api('GET', `tickets/${firstWork.ticket.id}`, undefined, other.id)).toMatchObject({ status: 404 })
+  expect(await api('GET', 'project/meter', undefined, project.id)).toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  expect(await api('GET', `tickets/${firstWork.ticket.id}/meter`, undefined, other.id)).toMatchObject({ status: 404 })
+  expect(await api('GET', 'project/meter', undefined, other.id)).toMatchObject({ status: 200, body: {
+    scope: 'project', sessions: [expect.objectContaining({ session_id: other.hubSessionId, roles: ['hub'] })],
+  } })
   const incoming = mention('acme/gadgets', 'bob')
   const run = vi.mocked(Commands.prototype.run)
   const runCommand = run.getMockImplementation()!

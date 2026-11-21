@@ -42,6 +42,7 @@ Ticket review evidence is submitted only by a Worker descendant through `orchest
 | Outbox | `src/app/outbox.ts` | The `Outbox` port for every Channel message and the only writer of its receipts: the Hub's replies, the acceptance acknowledgement, pull-request end notices and Source notices all go through `send`, which keeps a message's receipt and queues its `reply` effect in one transaction, and the effect's handler sends it through `SourceRegistry.send`; a message waits while its Source is off, and is dropped when the conversation is gone or not listened to |
 | Notices | `src/app/notices.ts` | Converts domain events and worker activity into main-Session messages. `eventNotice` handles domain notices; `reportRelay` forwards questions immediately, keeps ordinary progress on its Ticket, and relays other reports; `followupRelay` names the Tickets that own a human follow-up. Relays arriving during a turn are delivered together at its next step through the DeepSeek Harness inbox |
 | Session meter | `src/app/session-meter.ts` | One Session's context snapshot and cumulative usage read from its durable event log, with provenance, coverage ranges and the persisted exclusive cursor; a fork's inherited prefix is not charged to the child |
+| Project meter | `src/app/project-meter.ts` | Persists Session attribution and business parentage; rolls up the Session meter's own usage across Tickets, Plans, and the mounted project |
 
 ### Engine
 
@@ -330,6 +331,7 @@ Validation: `tests/session-meter.spec.ts` covers the read seam (absent vs corrup
   | A Ticket's worktree ownership and write access (`execution.ownership`, `execution.active_writer`) | `Tickets`, through `reserveExecution`, `recordExecutionVerified`, `rejectExecution`, `acquireExecutionWriter` and `releaseExecutionWriter`; the Executor supplies the Git verification and confirms the previous writer idle |
   | Confirmed handoffs and immutable specifications | `Handoffs` |
   | Plan DAGs, root background, and addressed node instructions | `Plans` |
+  | Project Session attribution and business parentage | `ProjectMeter`, through `bind` at a trusted delegation seam |
   | A Source's read positions, and the meta it keeps on its Threads (`label`, `url`, `facts` and its own keys) | That Source, through `SourceContext` |
   | Settings and their history | Settings |
   | Prompt versions | Prompts |
@@ -410,6 +412,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
 | `src/app/sessions.ts` | Sessions |
 | `src/app/session-meter.ts` | `SessionMeter`: one Session's context snapshot and cumulative usage from its durable event log, with provenance, missing and in-flight ranges, and the persisted exclusive cursor; forked prefixes are excluded |
+| `src/app/project-meter.ts` | `ProjectMeter`: project-local Session bindings and deduplicated scoped usage; contract in `plugin/docs/014-project-metering.md` |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
@@ -527,9 +530,9 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, review evidence and child-only review submission, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
 | `tests/topic-binding.spec.ts` | Uses a mounted project and normalized Feishu events to verify topic isolation, answer provenance and idempotent outbound delivery |
-| `tests/plans.spec.ts` | Automatic spec continuation, idempotent restart and registration, graph and role queries, invalid graph refusal, and root/node message isolation through the public Session tools |
+| `tests/plans.spec.ts` | Automatic spec continuation, restart and registration, graph and role queries, invalid graph refusal, root/node message isolation, and deduplicated scoped usage through the public Session tools and HTTP |
 | `tests/runtime-concurrency.spec.ts` | Overlapping Triggers, deliveries and launches; Worker inbox recovery after restart, checked after the runtime drains launch and delivery effects against real Git worktrees |
-| `tests/http.spec.ts` | Management request bounds; ticket worktree and writer projections; Session meter success, errors, ID decoding and same-origin protection |
+| `tests/http.spec.ts` | Management request bounds; ticket worktree and writer projections; meter status, ID decoding, same-origin protection and project switch races |
 | `tests/projects.spec.ts` | Durable project registration, selection, re-open and workspace collision checks |
 | `tests/project-work.spec.ts` | Bound handoff and Hub work gates, legacy receipt replay and project-scoped Worker IDs |
 | `tests/github-onboarding.spec.ts` | Managed setup only uses the verified account and bound repository |

@@ -391,3 +391,22 @@ it('rejects a stale scoped read and hides meters from outside the mounted projec
   expect(await call('GET', 'sessions/hub-beta/meter')).toEqual({ status: 404, body: { error: 'Session not found' } })
   expect(await call('GET', 'sessions/hub-alpha/meter')).toEqual({ status: 200, body: { session_id: alpha.hubSessionId } })
 })
+
+it('does not return the old project meter if the project changes while sampling', async () => {
+  let activeProjectId = alpha.id
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const call = serve({
+    installation: bindingInstallation(() => activeProjectId),
+    projectMeter: { read: async () => {
+      entered.resolve()
+      await release.promise
+      return { scope: 'project', sessions: [{ session_id: alpha.hubSessionId }] }
+    } },
+  })
+  const response = call('GET', 'project/meter', undefined, projectHeader(alpha.id))
+  await Promise.race([entered.promise, response])
+  activeProjectId = beta.id
+  release.resolve()
+  expect(await response).toMatchObject({ status: 409, body: { code: 'staleProject' } })
+})

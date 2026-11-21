@@ -90,7 +90,7 @@ export interface ExecutorHost {
   readonly machine: Pick<Machine, 'stateDir'>
   readonly lifetime: AbortSignal
   /** Session manager for worker sessions and for relaying worker reports to the main Session. */
-  readonly sessions: Pick<Sessions, 'ensure' | 'prompt' | 'promptedId' | 'relay' | 'holds'>
+  readonly sessions: Pick<Sessions, 'ensure' | 'prompt' | 'retry' | 'promptedId' | 'relay' | 'holds'>
   closing(): boolean
   /** Whether processing is paused, which holds launches and input deliveries. */
   paused(): boolean
@@ -882,7 +882,7 @@ export class DshExecutor implements Executor {
         if (!(failure instanceof Later)) throw failure
         this.after(SLOT_WAIT_MS, go); return
       }
-      const sent = this.host.sessions.prompt(sessionId, `retry:${assignmentId}:${tries}`, text, 'queue')
+      const sent = this.host.sessions.retry(ticketId, sessionId, `retry:${assignmentId}:${tries}`, text)
       void this.background(sent.finally(() => { if (waking) this.slots.free(ticketId); this.resuming.delete(assignmentId) })
         .catch(failure => { this.failed(ticketId, String(failure)) }))
     }

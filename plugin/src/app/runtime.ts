@@ -11,7 +11,7 @@ import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-skill'
 import type {} from '@deepseek-ai/dsh-subprocess'
 import { existsSync, mkdirSync, realpathSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
 import { Engine, latestAssignment, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { settingsPolicy, SettingsSchema } from '../policy.ts'
@@ -21,7 +21,7 @@ import { workerProbe, type Deployment, type Machine } from '../deployment.ts'
 import { sameDirectory } from '../infra/environment.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
-import { DshExecutor, sourceTrigger, ticketOfSession, workerSessionId } from '../executor/dsh.ts'
+import { DshExecutor, sourceTrigger, workerSessionId } from '../executor/dsh.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
@@ -49,7 +49,8 @@ import { Setup } from './setup.ts'
 import { feishuSettings, SOURCE as FEISHU } from '../sources/feishu.ts'
 import { health, type FeishuTopic, type Health, type SourceContext, type SourceHost } from '../sources/host.ts'
 import { SessionMeter } from './session-meter.ts'
-import { Sessions, splitterSessionId } from './sessions.ts'
+import { ProjectMeter, type MeterSessionBinding } from './project-meter.ts'
+import { Sessions, splitterSessionId, WORKER_PRESET } from './sessions.ts'
 import { Settings } from './settings.ts'
 import { sourceContextOf, type SourceContextDeps } from './source-context.ts'
 import type { ResourceHost } from './resources.ts'
@@ -80,6 +81,7 @@ export class Runtime extends Service implements SourceHost {
   readonly sources: SourceRegistry
   readonly commands: Commands
   readonly meter: SessionMeter
+  readonly projectMeter: ProjectMeter
   readonly sessions: Sessions
   readonly settings: Settings
   readonly executor: DshExecutor
@@ -153,6 +155,7 @@ export class Runtime extends Service implements SourceHost {
       const handoffs = this.handoffs = new Handoffs(store, effects, project, () => installation.assertNewWork(),
         handoff => this.topicBinding?.changed(handoff))
       const plans = this.plans = new Plans(store, handoffs, effects)
+      const projectMeter = this.projectMeter = new ProjectMeter({ store, meter, masterId, canSample: binding => this.canSample(binding) })
       const sources = this.sources = new SourceRegistry(() => store.settings(), board, kind => {
         // Sync source member lists once startup completes when a source plugin loads dynamically.
         if (kind.policy?.sync) void this.ready?.then(() => this.settings.syncable().includes(kind.kind) ? this.settings.sync(kind.kind) : undefined)
@@ -167,7 +170,7 @@ export class Runtime extends Service implements SourceHost {
         reviewGeneration: ticketId => runtime.executor?.reviewGeneration(ticketId),
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
-      const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
+      const sessions = this.sessions = new Sessions({ context: ctx, store, projectMeter, prompts, effects, health: board.claim('models'), masterId,
         lifetime: this.lifetime, boundWorkspace: project?.workspace,
         closing: () => this.closing(), environment, ownsPlanner: id => handoffs.get(id) !== undefined,
         plannerActive: id => this.configured() && handoffs.isPlanning(id),
@@ -177,7 +180,6 @@ export class Runtime extends Service implements SourceHost {
           return handoff?.id === id && handoff.status === 'specified' && handoff.spec?.handoffId === id ? project?.workspace ?? handoff.project.workspace : undefined
         },
         workerAuthorized: (ticketId, sessionId) => !this.closing() && this.configured() && runtime.executor?.writerAuthorized(ticketId, sessionId) === true,
-        authorizeReviewSession: (ticketId, sessionId, axis, candidate) => this.sessions.authorizeReviewSession(ticketId, sessionId, axis, candidate),
         tools: (agent, ticket, role) => role === 'planner' ? plannerTools(this.toolHost, agent)
           : role === 'splitter' ? splitterTools(this.toolHost, agent)
           : ticket ? executorTools(this.toolHost, ticket, agent.id, role === 'review') : mainTools(this.toolHost, agent) })
@@ -256,7 +258,15 @@ export class Runtime extends Service implements SourceHost {
             for (const message of pullEndNotices(ended, request, setup.deployment.repository)) outbox.send(message)
           }
         } })
-      this.planDispatcher = new PlanDispatcher({ store, plans, engine, executor })
+      this.planDispatcher = new PlanDispatcher({ store, plans, engine, executor, bindWorker: (ticket, id) => sessions.bindWorker(ticket, id) })
+      // Reconcile historical dispatch receipts before serving even paused/setup-pending reads. This grants no tools or writer lease.
+      this.planDispatcher.restoreBindings()
+      for (const ticket of store.tickets.list()) {
+        if (ticket.execution?.session) sessions.bindWorker(ticket.id, ticket.execution.session)
+        for (const [index, assignment] of ticket.assignments.entries()) {
+          if (assignment.writer?.session) sessions.bindWorker(ticket.id, assignment.writer.session, ticket.assignments[index - 1]?.endedReason === 'retried')
+        }
+      }
       const planDelivery = planDeliveryWriter(plans)
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
@@ -275,7 +285,7 @@ export class Runtime extends Service implements SourceHost {
           if (kind === FEISHU && this.topicBinding?.claims(trigger)) return this.receiveBoundFeishu(trigger)
           return passes.receive(trigger)
         } }
-      this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, planDispatcher: this.planDispatcher, planDelivery, settings: this.settings, assessor, resources, handoffs, plans, lifetime: this.lifetime,
+      this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, planDispatcher: this.planDispatcher, planDelivery, settings: this.settings, assessor, resources, projectMeter, handoffs, plans, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
@@ -444,8 +454,8 @@ export class Runtime extends Service implements SourceHost {
   private httpHost(): HttpHost {
     const runtime = this
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, setup, passes, installation,
-      meter } = this
-    return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, meter, installation,
+      meter, projectMeter } = this
+    return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, meter, projectMeter, installation,
       topicBinding: this.topicBinding, verifyTopicBinding: () => this.verifyTopicBinding(),
       get ready() { return runtime.ready }, assertNewWork: () => installation.assertNewWork(),
       ownsSession: id => this.ownsSession(id),
@@ -454,11 +464,34 @@ export class Runtime extends Service implements SourceHost {
       configured: () => runtime.configured(), links: () => runtime.links(), ticketEnvironment: ticket => runtime.ticketEnvironment(ticket),
       checkSetup: () => { runtime.checkSetup() }, requestPass: () => { passes.request() }, models: () => this.ctx.sessionController.modelCatalog() }
   }
-  private ownsSession(id: string): boolean {
-    if (!this.installation.project || id === this.masterId) return true
-    const ticketId = ticketOfSession(id)
-    if (ticketId) return this.store.tickets.get(ticketId) !== undefined
+  private ownsSession(id: string): boolean | Promise<boolean> {
+    if (!this.installation.project) return true
+    const binding = this.store.get(KV.projectMeter.binding(id))
+    if (binding) return this.canSample(binding)
     return this.handoffs.list().some(handoff => `planner-${handoff.id}` === id || splitterSessionId(handoff.id) === id)
+  }
+
+  /** Reserving a Worker ID is a dispatch intent, not proof that the DSH log under that ID belongs to this ticket. */
+  private async canSample(binding: MeterSessionBinding): Promise<boolean> {
+    const { session_id: id, ticket_id: ticketId } = binding
+    if (!ticketId || binding.parent_session_id !== this.masterId || !binding.roles.includes('implementation')) return true
+    const ticket = this.store.tickets.get(ticketId), execution = ticket?.execution
+    if (!ticket || execution?.ownership?.ticket !== ticketId || !execution.ownership.verified || !execution.worktree) return false
+    const assigned = ticket.assignments.filter(item => item.writer?.session === id)
+    if (!assigned.length && execution.session !== id) return false
+    let header = this.ctx.agents.get(id as SessionId)?.session.header
+    if (!header) {
+      try { header = (await this.ctx.sessionPersistence.stat(id as SessionId, { signal: this.lifetime }))?.header }
+      catch (error) {
+        this.lifetime.throwIfAborted()
+        if (error instanceof Error && error.name === 'AbortError') throw error
+        return false // Unreadable identity is unknown coverage, not permission to reuse a possibly unrelated sample.
+      }
+    }
+    // Only a historical started writer can retain its last measured prefix after the host deletes its log.
+    if (!header) return assigned.some(item => item.startedAt !== undefined)
+    return header.id === id && header.origin === undefined && header.parentSession === undefined && header.isSeeded === false
+      && header.agentPreset === WORKER_PRESET && !!header.cwd && isAbsolute(header.cwd) && sameDirectory(execution.worktree, header.cwd)
   }
   /** Idempotent stop; concurrent or repeated calls share the same shutdown promise. */
   stop(): Promise<void> { return this.stopping ??= this.shutdown() }

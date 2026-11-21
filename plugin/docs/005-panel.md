@@ -31,6 +31,8 @@ A human follow-up still owned by an Executor is marked **Delivered to Ticket**, 
 
 Ticket details show the originating Trigger, Decision and reason, scope and Policy version. Its execution block names the Worker Session, the allocated directory plus the canonical repository and worktree paths, branch, preparation base (ref and commit), preparation state and, when present, the reason it was rejected, plus the active writer, shown as none when no writer holds the worktree. A legacy Ticket shows only the facts it stores; the panel never fills in a base, branch or owner, and reads its preparation as unverified. Assignments and secondary details are folded below the immediate actions. **Retry** is available for failed Input delivery or a Ticket waiting for a person after a blocked or failed Report; a retry waits until the previous writer has stopped. Ended Tickets show outcomes such as **Pull request merged** or **Stopped by a person**.
 
+The Ticket, Plan and project usage query contract is in `plugin/docs/014-project-metering.md`.
+
 ## Settings groups
 
 - **Sources:** one card per Source with its switch, fields and verified account facts. GitHub also offers receive-all switches for new Issues, pull requests, comments and default-branch CI. Polling and read limits are under Advanced.

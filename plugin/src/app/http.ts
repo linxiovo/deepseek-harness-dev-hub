@@ -19,6 +19,7 @@ import type { DshExecutor } from '../executor/dsh.ts'
 import type { Health } from '../sources/host.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import type { Sessions } from './sessions.ts'
+import type { ProjectMeter } from './project-meter.ts'
 import type { SessionMeter } from './session-meter.ts'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
@@ -38,7 +39,7 @@ export interface HttpHost {
   /** Verify the workspace under the write lock, before the final scope check and bind. */
   readonly verifyTopicBinding?: (() => Promise<void>) | undefined
   assertNewWork?(): void
-  ownsSession?(id: string): boolean
+  ownsSession?(id: string): boolean | Promise<boolean>
   readonly store: Store
   /** Feishu message links resolved since startup, used by search to match AppLink URLs. */
   readonly sourceLinks: Pick<TextCache, 'entries'>
@@ -50,6 +51,7 @@ export interface HttpHost {
   readonly executor: Pick<DshExecutor, 'activeCount'>
   /** Session context snapshots and cumulative usage, shared with the Hub's `session/<id>` resource. */
   readonly meter: Pick<SessionMeter, 'read'>
+  readonly projectMeter: Pick<ProjectMeter, 'read'>
   readonly health: Record<string, Health>
   readonly machine: Machine
   readonly masterId: string
@@ -230,6 +232,10 @@ const topicBindingRoutes: Partial<Record<keyof Api, true>> = {
   'GET topic-binding': true, 'POST topic-binding': true, 'POST topic-binding/unbind': true,
 }
 
+const projectMeterRoutes: Partial<Record<keyof Api, true>> = {
+  'GET project/meter': true, 'GET plans/:id/meter': true, 'GET tickets/:id/meter': true,
+}
+
 function assertProjectScope(active: string | null, requested: string | string[] | undefined,
   requirement: 'optional' | 'when-active' | 'required'): void {
   if (requested !== undefined && requested !== active) throw new InstallationError(409, 'staleProject')
@@ -242,6 +248,11 @@ function routes(runtime: HttpHost): Routes {
   const verifyBinding = runtime.verifyTopicBinding?.bind(runtime)
   const ticket = (id: string) => { if (!store.tickets.get(id)) throw new RouteError(404, 'Ticket not found'); return id }
   const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
+  const meter = async (scope: 'project' | 'plan' | 'ticket', id?: string) => {
+    const view = await runtime.projectMeter.read(scope, id)
+    if (!view) throw new RouteError(404, `${scope === 'plan' ? 'Plan' : scope === 'ticket' ? 'Ticket' : 'Project'} not found`)
+    return view
+  }
   return {
     'GET runtime': () => runtimeView(installationOf(runtime).runtime()),
     'GET onboarding': () => onboardingView(installationOf(runtime).onboarding()),
@@ -340,11 +351,14 @@ function routes(runtime: HttpHost): Routes {
     'GET models': () => runtime.models(),
     'GET sessions/:id/meter': async ({ params }) => {
       // The Hub reads the same view; a corrupt Session log is not a missing Session and keeps its 500.
-      if (runtime.installation?.projects().activeProjectId && !runtime.ownsSession?.(params.id)) throw new RouteError(404, 'Session not found')
+      if (runtime.installation?.projects().activeProjectId && !(await runtime.ownsSession?.(params.id))) throw new RouteError(404, 'Session not found')
       const view = await runtime.meter.read(params.id)
       if (!view) throw new RouteError(404, 'Session not found')
       return view
     },
+    'GET project/meter': () => meter('project'),
+    'GET plans/:id/meter': ({ params }) => meter('plan', params.id),
+    'GET tickets/:id/meter': ({ params }) => meter('ticket', params.id),
     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
     'PUT prompts': async input => {
       const request = z.object({ config: z.unknown(), baseRevision: z.number().int().nonnegative() }).parse(await promptBody(input))
@@ -375,6 +389,15 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
   let activeWrite: Promise<unknown> | undefined
   let retiring = false
   let closed = false
+  function readableMount(scope: string | string[] | undefined, requirement: 'optional' | 'required'): string | null {
+    const { installation } = runtime
+    if (retiring || writing === 'installation' || installation?.runtime().reason === 'switching') {
+      throw new InstallationError(409, 'switching')
+    }
+    const active = installation?.projects().activeProjectId ?? null
+    assertProjectScope(active, scope, requirement)
+    return active
+  }
   async function write<T>(route: keyof Api, scope: string | string[] | undefined, operation: () => T | Promise<T>,
     verify?: () => Promise<void>): Promise<T> {
     if (retiring) throw new InstallationError(409, 'switching')
@@ -413,21 +436,25 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         installationRoute = installationRoutes.has(route.key)
         if (!installationRoute) await runtime.ready
         const scope = req.headers[PROJECT_SCOPE_HEADER]
-        if (route.key === 'GET topic-binding') {
-          if (retiring || writing === 'installation' || runtime.installation?.runtime().reason === 'switching') {
-            throw new InstallationError(409, 'switching')
-          }
-          assertProjectScope(runtime.installation?.projects().activeProjectId ?? null, scope, 'required')
-        } else if (!installationRoute && scope !== undefined && (route.key.startsWith('GET ') || route.key === 'POST prompts/preview')) {
+        const meterRoute = projectMeterRoutes[route.key]
+        const mounted = meterRoute ? readableMount(scope, 'optional') : undefined
+        if (route.key === 'GET topic-binding') readableMount(scope, 'required')
+        else if (!meterRoute && !installationRoute && scope !== undefined && (route.key.startsWith('GET ') || route.key === 'POST prompts/preview')) {
           assertProjectScope(runtime.installation?.projects().activeProjectId ?? null, scope, 'optional')
         }
         const query = Object.fromEntries(url.searchParams)
-        json(res, 200, await route.run({ params: route.params as never, query, body: async maxBytes => {
-          const body = await readBody(req, maxBytes)
-          if (closed) throw new InstallationError(409, 'switching')
-          return body
-        },
-          write: (operation, verify) => write(route.key, scope, operation, verify) }))
+        let result: unknown
+        try {
+          result = await route.run({ params: route.params as never, query, body: async maxBytes => {
+            const body = await readBody(req, maxBytes)
+            if (closed) throw new InstallationError(409, 'switching')
+            return body
+          }, write: (operation, verify) => write(route.key, scope, operation, verify) })
+        } finally {
+          // Sampling awaits the host. Never deliver an old mount's sample after selection or shutdown has begun.
+          if (meterRoute && readableMount(scope, 'optional') !== mounted) throw new InstallationError(409, 'staleProject')
+        }
+        json(res, 200, result)
       } catch (error) { json(res, ...(installationRoute ? installationFailure(error) : failure(error))) }
     } })]
   return async () => {

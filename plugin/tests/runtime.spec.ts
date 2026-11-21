@@ -2028,20 +2028,21 @@ test('slugify("  Worker Boundary!  ") returns "worker-boundary"', () => {
 it('recovers only detached reviewer receipts with verified direct business parents, without starting Sessions', async () => {
   const { ticket, sessionId } = await acceptedTicket()
   const { store, projectMeter } = runtime
-  const native = (id: string, parentSession = sessionId) => ({ id, origin: 'subagent', parentSession, title: 'Code review' })
-  const headers: Partial<Record<string, { id: string; origin?: string; parentSession: string; title: string }>> = {
+  const native = (id: string, parentSession = sessionId, createdAt = 0) => ({ id, origin: 'subagent', parentSession, createdAt })
+  const headers: Partial<Record<string, { id: string; origin?: string; parentSession: string; createdAt: number }>> = {
     'direct-review': native('direct-review'),
     'nested-review': native('nested-review', 'bound-parent'),
     'bound-parent': native('bound-parent'),
     'already-bound': native('already-bound'),
-    'manual-fork': { id: 'manual-fork', parentSession: sessionId, title: 'Code review' },
+    'manual-fork': { id: 'manual-fork', parentSession: sessionId, createdAt: 0 },
+    'recreated-review': native('recreated-review', sessionId, Date.UTC(2099, 0, 1)),
     'foreign-review': native('foreign-review', 'foreign-worker'),
     'unbound-lineage': native('unbound-lineage', 'unbound-parent'),
     'unbound-parent': native('unbound-parent'),
     'marker-only': native('marker-only'),
   }
   const reviewers = ['direct-review', 'nested-review', 'already-bound', 'manual-fork', 'foreign-review',
-    'unbound-lineage', 'unreadable-review', 'missing-review', 'direct-review']
+    'unbound-lineage', 'unreadable-review', 'missing-review', 'direct-review', 'recreated-review']
   const base = ticket.execution!.base!.sha
   reviewers.forEach((id, index) => runtime.engine.recordReview(ticket.id, id, {
     axis: 'standards', base, candidate: (index + 1).toString(16).repeat(40), basis: ['Ticket specification'],
@@ -2072,7 +2073,7 @@ it('recovers only detached reviewer receipts with verified direct business paren
   expect(stat).toHaveBeenCalledWith('direct-review', { signal })
   expect(stat).not.toHaveBeenCalledWith('already-bound', { signal })
   expect(binding('already-bound')).toEqual(priorChild)
-  for (const id of ['manual-fork', 'foreign-review', 'unbound-lineage', 'unreadable-review', 'missing-review', 'marker-only']) {
+  for (const id of ['manual-fork', 'foreign-review', 'unbound-lineage', 'unreadable-review', 'missing-review', 'marker-only', 'recreated-review']) {
     expect(binding(id), id).toBeUndefined()
   }
 

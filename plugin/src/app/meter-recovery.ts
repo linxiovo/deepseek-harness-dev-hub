@@ -9,16 +9,17 @@ import type { Store } from './store.ts'
 export async function restoreReviewBindings(ctx: Pick<Context, 'sessionPersistence'>, store: Pick<Store, 'tickets' | 'get'>,
   projectMeter: Pick<ProjectMeter, 'bind' | 'owns'>, signal: AbortSignal): Promise<void> {
   signal.throwIfAborted()
-  const parents = new Map<string, string | undefined>()
-  async function nativeParent(id: string): Promise<string | undefined> {
+  type Native = { parent: string; createdAt: number }
+  const parents = new Map<string, Native | undefined>()
+  async function nativeParent(id: string): Promise<Native | undefined> {
     signal.throwIfAborted()
     if (!parents.has(id)) {
-      let parent: string | undefined
+      let parent: Native | undefined
       try {
         const snapshot = await ctx.sessionPersistence.stat(id as SessionId, { signal })
         const header = snapshot?.header
-        if (snapshot?.formatStatus !== 'migration-required' && header?.id === id && header.origin === 'subagent') {
-          parent = header.parentSession
+        if (snapshot?.formatStatus !== 'migration-required' && header?.id === id && header.origin === 'subagent' && header.parentSession) {
+          parent = { parent: header.parentSession, createdAt: header.createdAt }
         }
       } catch {
         // An unavailable log cannot corroborate a receipt. A later recovery can try again.
@@ -35,10 +36,11 @@ export async function restoreReviewBindings(ctx: Pick<Context, 'sessionPersisten
       if (!evidence?.length || !workerId) continue
       const worker = store.get(KV.projectMeter.binding(workerId))
       if (worker?.session_id !== workerId || worker.ticket_id !== ticket.id || !worker.roles.includes('implementation')) continue
-      for (const { reviewer_session: id } of evidence) {
+      for (const { reviewer_session: id, at } of evidence) {
         if (!id || id === workerId || projectMeter.owns(id)) continue
-        const direct = await nativeParent(id)
-        if (!direct) continue
+        const child = await nativeParent(id)
+        if (!child || !(child.createdAt <= Date.parse(at))) continue
+        const direct = child.parent
 
         // Every intermediate hop must already have a matching business edge in this ticket.
         // Do not synthesize missing bindings or flatten a nested reviewer under the Worker.
@@ -50,7 +52,7 @@ export async function restoreReviewBindings(ctx: Pick<Context, 'sessionPersisten
             const binding: MeterSessionBinding | undefined = store.get(KV.projectMeter.binding(ancestor))
             if (binding?.session_id !== ancestor || binding.ticket_id !== ticket.id || binding.plan_id !== worker.plan_id
               || !(binding.roles.includes('implementation') || binding.roles.includes('review'))
-              || !binding.parent_session_id || await nativeParent(ancestor) !== binding.parent_session_id) break
+              || !binding.parent_session_id || (await nativeParent(ancestor))?.parent !== binding.parent_session_id) break
             ancestor = binding.parent_session_id
           }
         }

@@ -392,13 +392,48 @@ it('resumes a matching legacy cursor but refuses to assign it to a different obs
     const legacy = { view: first!, compaction_from: null }
     host.store.set(KV.meter.state(id), legacy)
     const original = host.settled
-    host.useLog(AT + 1000)
+    host.useLog(AT - 1000) // Older clock cannot prove this different prefix belongs to a new log instance.
     host.emit('assistant/message', { usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 } })
     await expect(meter.read(id)).rejects.toThrow('legacy meter cursor')
     host.useLog(AT, 0, original)
     host.emit('assistant/message', { usage: { inputTokens: 3, outputTokens: 1, totalTokens: 4 } })
     expect(await host.restart().read(id)).toMatchObject({ cursor: 2,
       usage: { counted_calls: 2, reported_total_tokens: 7, total_complete: true } })
+  } finally { host.stop() }
+})
+
+it('archives a legacy prefix when the replacement log was created after its final sampled event', async () => {
+  const host = fixture()
+  try {
+    const id = 'meter-test', meter = host.make()
+    host.emit('assistant/message', { usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } })
+    const oldLog = host.settled
+    const view = (await meter.read(id))!
+    host.store.set(KV.meter.state(id), { view, compaction_from: null })
+    host.useLog(AT + 1000)
+    host.emit('assistant/message', { usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 } })
+    const reopened = await host.restart().read(id)
+    expect(reopened).toMatchObject({ cursor: 1, usage: { reported_total_tokens: 10, counted_calls: 2, total_complete: false,
+      logs: [{ status: 'unavailable', range: { from: 0, through: 1 } }, { status: 'current' }] } })
+    expect(reopened?.usage.logs?.[0]?.created_at).toBeUndefined()
+    host.useLog(AT, 0, oldLog)
+    await expect(host.make().read(id)).rejects.toThrow('legacy meter cursor')
+  } finally { host.stop() }
+})
+
+it('rejects a replaced log between scope admission and opening, without pricing its calls', async () => {
+  const host = fixture()
+  try {
+    const id = 'meter-test', meter = host.make()
+    host.emit('assistant/message', { usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } })
+    const original = host.settled
+    const verify = (header: SessionHeader) => header.createdAt === AT
+    expect(await meter.read(id, undefined, verify)).toMatchObject({ usage: { reported_total_tokens: 3 } })
+    host.useLog(AT + 1000)
+    host.emit('assistant/message', { usage: { inputTokens: 99, outputTokens: 1, totalTokens: 100 } })
+    await expect(meter.read(id, undefined, verify)).rejects.toThrow('does not match the verified identity')
+    host.useLog(AT, 0, original)
+    expect(await host.restart().read(id, undefined, verify)).toMatchObject({ usage: { reported_total_tokens: 3, total_complete: true } })
   } finally { host.stop() }
 })
 

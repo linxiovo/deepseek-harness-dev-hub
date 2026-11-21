@@ -48,8 +48,8 @@ import { Passes } from './passes.ts'
 import { Setup } from './setup.ts'
 import { feishuSettings, SOURCE as FEISHU } from '../sources/feishu.ts'
 import { health, type FeishuTopic, type Health, type SourceContext, type SourceHost } from '../sources/host.ts'
-import { SessionMeter } from './session-meter.ts'
-import { ProjectMeter, type MeterLogAccess, type MeterSessionBinding } from './project-meter.ts'
+import { SessionMeter, SessionMeterIdentityError } from './session-meter.ts'
+import { matchesMeterHeader, ProjectMeter, type MeterLogAccess, type MeterSessionBinding } from './project-meter.ts'
 import { restoreReviewBindings } from './meter-recovery.ts'
 import { PLANNER_PRESET, ROUTER_PRESET, Sessions, splitterSessionId, WORKER_PRESET } from './sessions.ts'
 import { Settings } from './settings.ts'
@@ -166,7 +166,8 @@ export class Runtime extends Service implements SourceHost {
       const links: LinkHost = { store, links: this.sourceLinks, commands, sources, lifetime: this.lifetime }
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
-      const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx, meter,
+      const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx,
+        meter: { read: (id, signal) => this.readScopedMeter(id, signal) },
         ownsSession: id => this.ownsSession(id),
         reviewGeneration: ticketId => runtime.executor?.reviewGeneration(ticketId),
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
@@ -459,8 +460,9 @@ export class Runtime extends Service implements SourceHost {
   private httpHost(): HttpHost {
     const runtime = this
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, setup, passes, installation,
-      meter, projectMeter } = this
-    return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, meter, projectMeter, installation,
+      projectMeter } = this
+    return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, projectMeter, installation,
+      meter: { read: (id, signal) => this.readScopedMeter(id, signal) },
       topicBinding: this.topicBinding, verifyTopicBinding: () => this.verifyTopicBinding(),
       get ready() { return runtime.ready }, assertNewWork: () => installation.assertNewWork(),
       ownsSession: id => this.ownsSession(id),
@@ -469,13 +471,19 @@ export class Runtime extends Service implements SourceHost {
       configured: () => runtime.configured(), links: () => runtime.links(), ticketEnvironment: ticket => runtime.ticketEnvironment(ticket),
       checkSetup: () => { runtime.checkSetup() }, requestPass: () => { passes.request() }, models: () => this.ctx.sessionController.modelCatalog() }
   }
-  private async ownsSession(id: string): Promise<boolean> {
-    if (!this.installation.project) return true
+  private ownsSession(id: string): boolean {
+    return !this.installation.project || this.projectMeter.owns(id)
+  }
+
+  private async readScopedMeter(id: string, signal?: AbortSignal) {
+    if (!this.installation.project) return this.meter.read(id, signal)
     const binding = this.store.get(KV.projectMeter.binding(id))
-    if (!binding) return false
+    if (!binding) return undefined
     const access = await this.canSample(binding)
     if (access === 'unavailable') throw new Error('Session log identity could not be read')
-    return access === 'read'
+    if (typeof access === 'string') return access === 'read' ? this.meter.read(id, signal) : undefined
+    try { return await this.meter.read(id, signal, header => matchesMeterHeader(access.header, header)) }
+    catch (error) { if (error instanceof SessionMeterIdentityError) return undefined; throw error }
   }
 
   /** Check the host log independently of the business binding; a reservation alone does not prove log identity. */
@@ -500,14 +508,17 @@ export class Runtime extends Service implements SourceHost {
         return historyVerified ? 'unavailable' : 'unverified'
       }
     }
-    if (!header) return historyVerified ? 'read' : 'unverified'
+    if (!header) return historyVerified ? 'not-found' : 'unverified'
     if (header.id !== id) return 'unverified'
-    if (nativeChild) return header.origin === 'subagent' && header.parentSession === parentId ? 'read' : 'unverified'
+    if (nativeChild) return header.origin === 'subagent' && header.parentSession === parentId ? { header } : 'unverified'
     if (header.origin !== undefined || header.parentSession !== undefined || header.isSeeded) return 'unverified'
-    if (planning) return header.agentPreset === PLANNER_PRESET ? 'read' : 'unverified'
-    const cwd = worker ? execution!.worktree! : this.installation.project?.initial ? this.installation.project.workspace : this.machine.stateDir
-    return header.agentPreset === (worker ? WORKER_PRESET : ROUTER_PRESET)
-      && !!header.cwd && isAbsolute(header.cwd) && sameDirectory(cwd, header.cwd) ? 'read' : 'unverified'
+    const project = this.installation.project
+    const handoff = planning ? this.handoffs.get(id.slice(id.indexOf('-') + 1)) : undefined
+    const cwd = worker ? execution?.worktree : planning ? handoff && (project?.workspace ?? handoff.project.workspace)
+      : project?.initial ? project.workspace : this.machine.stateDir
+    const preset = worker ? WORKER_PRESET : planning ? PLANNER_PRESET : ROUTER_PRESET
+    return header.agentPreset === preset && cwd && header.cwd && isAbsolute(header.cwd) && sameDirectory(cwd, header.cwd)
+      ? { header } : 'unverified'
   }
   /** Idempotent stop; concurrent or repeated calls share the same shutdown promise. */
   stop(): Promise<void> { return this.stopping ??= this.shutdown() }

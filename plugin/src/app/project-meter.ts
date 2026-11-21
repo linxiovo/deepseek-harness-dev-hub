@@ -1,7 +1,8 @@
 /** Business attribution over SessionMeter's durable, session-local usage. */
+import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import { KV } from '../kv.ts'
 import type { Plan } from '../core/plan.ts'
-import { sessionMeterView, type Range, type SessionMeter, type SessionMeterView } from './session-meter.ts'
+import { SessionMeterIdentityError, sessionMeterView, type Range, type SessionMeter, type SessionMeterView } from './session-meter.ts'
 import type { Store } from './store.ts'
 
 const ROLES = ['hub', 'implementation', 'review', 'retro', 'retry', 'inspection', 'planner', 'splitter'] as const
@@ -45,7 +46,14 @@ export interface MeterSubtotal extends Pick<Usage, typeof TOKEN_FIELDS[number] |
 }
 
 type LogStatus = 'available' | 'not-found' | 'unavailable' | 'unverified'
-export type MeterLogAccess = 'read' | 'unavailable' | 'unverified'
+export type MeterLogAccess = { header: SessionHeader } | 'read' | 'not-found' | 'unavailable' | 'unverified'
+
+/** Checks the physical instance and routing identity on the actual read handle. */
+export function matchesMeterHeader(expected: SessionHeader, opened: SessionHeader): boolean {
+  return opened.id === expected.id && opened.createdAt === expected.createdAt && opened.parentSession === expected.parentSession
+    && opened.origin === expected.origin && opened.agentPreset === expected.agentPreset && opened.cwd === expected.cwd
+    && opened.isSeeded === expected.isSeeded
+}
 interface MeterSessionView extends MeterSessionBinding {
   log_status: LogStatus
   cursor: number | null
@@ -108,7 +116,7 @@ function subtotal(samples: Iterable<Sample>): MeterSubtotal {
     result.reported_total_calls += usage.reported_total_calls
     if (usage.logs) {
       for (const log of usage.logs) {
-        const ref = { session_id, created_at: log.created_at }
+        const ref = { session_id, ...(log.created_at === undefined ? {} : { created_at: log.created_at }) }
         recordCoverage(result, ref, log)
         if (log.status === 'unavailable') result.unknown.push({ ...ref, reason: 'log-unavailable', range: null })
       }
@@ -256,12 +264,16 @@ export class ProjectMeter {
     if (access === 'unverified') return { binding, log_status: access, view: undefined }
     let log_status: LogStatus = access === 'unavailable' ? access : 'not-found'
     try {
-      const view = access === 'read' ? await this.meter.read(binding.session_id, signal) : undefined
+      const view = typeof access === 'object'
+        ? await this.meter.read(binding.session_id, signal, header => matchesMeterHeader(access.header, header))
+        : access === 'read' ? await this.meter.read(binding.session_id, signal) : undefined
       signal?.throwIfAborted()
       if (view) return { binding, view, log_status: 'available' }
     } catch (error) {
       signal?.throwIfAborted()
       if (error instanceof Error && error.name === 'AbortError') throw error
+      if (error instanceof Error && 'code' in error && typeof error.code === 'string' && error.code.startsWith('ERR_SQLITE')) throw error
+      if (error instanceof SessionMeterIdentityError) return { binding, log_status: 'unverified', view: undefined }
       log_status = 'unavailable'
     }
     // Retain independently committed usage if the host log disappeared or cannot be read. It is only a known prefix.

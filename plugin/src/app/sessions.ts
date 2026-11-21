@@ -578,7 +578,8 @@ export class Sessions {
       const review = grant && grant.base === ticket.execution?.base?.sha && grant.generation === writer?.generation
       // Attribution recognizes a proven native dispatch even while its writer is being restored. Tools still require a live writer.
       if (!host.projectMeter.owns(agent.id)) {
-        const historicalReview = grant && ticket.assignments.some(item => item.writer?.generation === grant.generation)
+        const historicalReview = grant && grant.base === ticket.execution?.base?.sha
+          && ticket.assignments.some(item => item.writer?.generation === grant.generation)
         host.projectMeter.bind({ session_id: agent.id, parent_session_id: parent, ticket_id: ticketId, role: historicalReview ? 'review' : 'implementation' })
       }
       if (!admitted) { binding.disposers.shift()!(); admitted = true }

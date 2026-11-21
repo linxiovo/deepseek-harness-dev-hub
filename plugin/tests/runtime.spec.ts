@@ -51,6 +51,7 @@ type RegisteredTool = { name: string; description: string; parameters: Record<st
 type ContainerResult = { isError: boolean; content: { type: string; text?: string }[]; value?: unknown; error?: { message: string } }
 type Section = { name: string; text: (context: { signal?: AbortSignal }) => string; interpolate?: boolean }
 let sections: Map<string, Section>
+let inheritedGitConfigGlobal: string | undefined
 type HttpHandler = (req: unknown, res: unknown) => Promise<void>
 let http: HttpHandler
 async function api(method: string, path: string, body?: unknown, projectId?: string): Promise<{ status: number; body: unknown }> {
@@ -218,6 +219,7 @@ async function acceptedTicket(trigger = feishu('1', '@bot 修一下回归')) {
   return { trigger, ticket, sessionId: `worker-${ticket.id}` }
 }
 beforeEach(async () => {
+  inheritedGitConfigGlobal = process.env.GIT_CONFIG_GLOBAL
   directory = mkdtempSync(join(realpathSync.native(tmpdir()), 'orchestrator-runtime-'))
   repository = gitRepository(directory)
   vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : args[1]?.includes('/pulls?state=all&head=') ? [] : args[1]?.includes('/pulls/') ? { state: 'open', user: { login: 'agent-bot' }, html_url: 'https://github.com/acme/widgets/pull/' + args[1].split('/').at(-1), head: { ref: `agent/${String(runtime.store.tickets.list()[0]?.execution?.name)}`, sha: 'head-1', repo: { full_name: 'acme/widgets' } } } : { default_branch: 'master', permissions: { push: true } })
@@ -1255,7 +1257,7 @@ it('runs setup again while the Feishu bot check failed, and restores the process
   const broken = await restart()
   await broken.ready
   expect(broken.setupProblem).toMatchObject({ place: 'deployment', code: 'gitTooOld' })
-  expect(process.env.GIT_CONFIG_GLOBAL).toBeUndefined()
+  expect(process.env.GIT_CONFIG_GLOBAL).toBe(inheritedGitConfigGlobal)
   expect(process.env.PATH?.split(delimiter)).not.toContain(join(directory, 'worker-bin'))
 })
 
@@ -1286,7 +1288,7 @@ it('writes worker shims and the agent environment from the configuration only, a
   expect(process.env.GIT_AUTHOR_NAME).toBeUndefined()
   expect(process.env.PATH?.split(delimiter)[0]).toBe(bin)
   await next.stop()
-  expect(process.env.GIT_CONFIG_GLOBAL).toBeUndefined()
+  expect(process.env.GIT_CONFIG_GLOBAL).toBe(inheritedGitConfigGlobal)
   expect(process.env.PATH?.split(delimiter)).not.toContain(bin)
 })
 

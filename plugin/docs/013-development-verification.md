@@ -4,17 +4,21 @@
 
 Start with the ticket's acceptance criteria and prerequisites. Follow the repository's `DOCS.md` to the owner of the changed behavior. Read the cited spec sections and the related source and tests; broaden the search only if those references cannot answer a question.
 
-Before dispatching implementation slices, select their focused checks from this table and name the commands in the handoff. The integration owner runs the union from `plugin/` as soon as each affected surface is runnable. Use one runner for overlapping checks that create Git worktrees rather than competing Windows runs.
+Before dispatching implementation slices, select focused checks from this table and name the commands in the handoff. At handoff, the slice owner names the ready files and any dependencies that still prevent the combined slice from running. The integration owner starts the focused checks from `plugin/` when that combination is ready.
+
+Run Git worktree checks through one integration runner. Set the command timeout using the most recent duration for the same check on that platform, with room for slower runs. Count a red only when the runner reaches the expected failing assertion; a compile or setup failure means the seam has not run.
 
 | Change | Existing checks |
 | --- | --- |
 | New class or source module | Run `pnpm test tests/class-docs.spec.ts tests/docs.spec.ts` before the full check. Fix missing class JSDoc and missing module or test index entries before proceeding. |
 | Source imports or import boundary gate | `pnpm check:imports` on the current sources; when changing the gate itself, also run `pnpm test tests/import-boundaries.spec.ts`. |
 | Session tool, resource or model-facing schema | Run `pnpm test:session-tools` before the full check. It exercises public behavior, role boundaries, response and prompt budgets, and prompt contracts. |
+| Management HTTP route, Ticket detail or shared view | `pnpm test tests/http.spec.ts`; include affected panel checks for visible changes. For `mainline` in the Ticket response, also run the Mainline queue check below. |
 | Bundled skill or prompt registration | `tests/prompts.spec.ts`, `tests/model-surface.spec.ts`, `tests/tools.spec.ts` and `tests/panel-prompts.spec.tsx` for role scope, resource inventory and settings labels |
 | Prompt text or built-in delivery guidance | `tests/cards.spec.ts` for prompt contracts and budgets, plus the registration checks above when the mounted surface changes |
 | Doc Tree routes, numbered documents or committed-candidate inspection | `tests/docs.spec.ts` for navigation and source/test indexing; also `tests/doc-tree.spec.ts` when changing the candidate checker |
 | Project selection or crash recovery | `pnpm test tests/runtime-crash.spec.ts`; for a deployed headless host, record the [live connection smoke check](006-deployment.md#live-headless-connection-smoke-check) separately. |
+| Mainline queue or write permissions | `pnpm test tests/mainline-queue.spec.ts`; verify live server enforcement separately with [Verify queue-only writes on GitHub](006-deployment.md#verify-queue-only-writes-on-github). |
 
 Run `pnpm check` once at the end. On Windows the Vitest configuration limits concurrent Git fixtures; local verification and CI use the same command and test coverage.
 
@@ -103,6 +107,8 @@ The output keeps skill names and call/result sequence references, fixture assert
 4. Inspect the aggregate in `ticket/<id>/reviews` after both submissions. The first-slice review is a focused gate before broader checks. Repeat both lanes for the complete candidate after committing it and recording the selected local verification and doc impact. A blocked review stops the gate; correct the blocker and dispatch both lanes on the new pair.
 
    When the change concerns worktree ownership or recovery, review the actual runtime paths. Passing static checks alone does not establish who may reuse a worktree or what happens after interruption.
+
+   For replay of an external write, the spec lane checks attribution on the first runnable slice: what distinguishes this intent's result from the same outcome caused by another writer? Test both a lost receipt after this intent's write and an interruption followed by an outside write. Require recovery to recognize its own result without writing twice and to withhold proof for the outside result.
 5. Begin the first retro only after both independent submissions pass for the same live base, candidate and writer generation. Start another matching review round whenever a repair changes the candidate. A prior approval is not approval of the new pair.
 
 ## Delivery-check

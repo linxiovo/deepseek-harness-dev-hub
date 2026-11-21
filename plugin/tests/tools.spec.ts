@@ -446,7 +446,7 @@ test('trims a displayed label', () => assert.equal(label('  alert  '), 'alert'))
   await h.runtime.idle()
   expect(await read(`ticket/${ticket.id}/result`)).toMatchObject({ text: summary })
   await expect(evidence()).rejects.toThrow(/HEAD/i)
-})
+}, 45_000) // Repeated native Git checks and a runtime restart exceeded 20 s on Windows CI.
 
 it('reads configured GitHub Actions evidence for a ticket at its complete commit SHA', async () => {
   const { ticket } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))

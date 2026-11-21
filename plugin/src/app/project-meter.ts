@@ -121,9 +121,9 @@ function subtotal(samples: Iterable<Sample>): MeterSubtotal {
         if (log.status === 'unavailable') result.unknown.push({ ...ref, reason: 'log-unavailable', range: null })
       }
     } else recordCoverage(result, { session_id }, usage)
-    if (!sessionTokens) result.unknown.push({ session_id, reason: 'no-observed-usage', range: usage.range })
+    if (!sessionTokens) result.unknown.push({ session_id, reason: 'no-observed-usage', range: usage.logs ? null : usage.range })
     if (usage.reported_total_calls < usage.counted_calls) {
-      result.unknown.push({ session_id, reason: 'unreported-total', range: usage.range })
+      result.unknown.push({ session_id, reason: 'unreported-total', range: usage.logs ? null : usage.range })
     }
     if (result.sampled_at === null || result.sampled_at < usage.sampled_at) result.sampled_at = usage.sampled_at
     result.source = usage.source
@@ -262,7 +262,7 @@ export class ProjectMeter {
     const access = this.canSample ? await this.canSample(binding) : 'read'
     signal?.throwIfAborted()
     if (access === 'unverified') return { binding, log_status: access, view: undefined }
-    let log_status: LogStatus = access === 'unavailable' ? access : 'not-found'
+    let log_status: LogStatus = access === 'unavailable' || typeof access === 'object' ? 'unavailable' : 'not-found'
     try {
       const view = typeof access === 'object'
         ? await this.meter.read(binding.session_id, signal, header => matchesMeterHeader(access.header, header))

@@ -26,6 +26,8 @@ export interface EffectPayloads {
   mainline: Record<string, never>
   /** Hand a changed baseline to the Ticket's fenced Worker; the key is the merge intent. */
   mainlineRepair: { ticketId: string }
+  /** Recheck candidate evidence and actual Git before closing a Plan Ticket; the key is the verified merge intent. */
+  mainlineDelivery: { ticketId: string }
   /** Steer a report or a candidate into the main Session; the key is the request ID. */
   relay: { text: string }
   /** Inject a notice into the main Session without waking it; the key names what it reports, such as `prompts`. */

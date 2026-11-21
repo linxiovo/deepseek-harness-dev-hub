@@ -135,6 +135,14 @@ After interruption, a queued intent can continue at the original base if the exa
 
 A current Plan credential blocker prevents a new mainline write or a new repair dispatch for that Ticket. It does not erase an integration already observed on the target.
 
+## Formal Plan closure
+
+The host records the verified merge and enqueues closure in the same transaction. The closing check uses the same Ticket, Assignment, writer generation, base, candidate and target as the verified intent. It rechecks the clean worktree, acceptance, both reviews, tests, required repairs, Doc Tree and required CI (see `plugin/docs/013-development-verification.md`). The integration commit has the exact candidate tree, including its Doc Tree routes; the host fetches the actual target again and requires that intent's integration to be present. The observed tip can be a later descendant. An unrelated write that only puts the candidate on the branch does not qualify.
+
+The host ends the Ticket (`by: delivery`, `outcome: merged`) and records the Plan receipt atomically. It revokes the Worker grant and stops its work on commit. The Ticket cannot reopen on a later Thread message. Closure is internal; it neither closes a GitHub issue nor sends a per-Ticket external notice.
+
+If the evidence no longer passes, the Ticket stays open and `mainline.delivery_missing` names the blockers on the verified attempt. A verified merge remains a Git fact, not a closure. Restart resumes pending checks; replaying `orchestrator_queue_merge` for the same verified SHA rechecks an incomplete closure without advancing Git. After closure, replay returns the existing intent without closing or claiming again.
+
 ## How a Ticket ends
 
 - **Standalone ready without a pull request:** a `ready` Report ends a non-Plan Ticket as completed. Plan ready reports remain open.

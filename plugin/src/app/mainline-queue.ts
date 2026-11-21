@@ -1,11 +1,16 @@
 /** Durable Git-target FIFO and reconciliation of interrupted mainline writes. */
 import { randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import { UserError } from '../core/errors.ts'
 import { KV } from '../kv.ts'
 import type { MainlineTarget } from '../executor/mainline-git.ts'
 import type { MainlineRepair } from '../core/model.ts'
+import type { PlanDeliveryReceipt } from '../core/plan.ts'
 import { Later, type Effects } from './effects.ts'
 import type { Store } from './store.ts'
+
+/** Exact Actions lookup authorized before the Git write, independent of later PR state. */
+export type MainlineCiBinding = { pull: number } | { branch: string }
 
 export interface MergeApproval {
   readonly target: MainlineTarget
@@ -14,9 +19,10 @@ export interface MergeApproval {
   readonly assignment: string
   readonly generation: number
   readonly stamp: string
+  readonly ci: MainlineCiBinding
 }
 
-export interface MainlineIntent extends Omit<MergeApproval, 'stamp'> {
+export interface MainlineIntent extends Omit<MergeApproval, 'stamp' | 'ci'> {
   id: string
   ticket_id: string
   queued_at: string
@@ -28,22 +34,26 @@ export interface MainlineIntent extends Omit<MergeApproval, 'stamp'> {
   reason?: string
   repair_requested?: boolean
   verification?: { status: 'passed'; at: string; method: 'integration_on_target' }
+  ci?: MainlineCiBinding
+  delivery_missing?: string[]
 }
 
 interface QueueHost {
-  store: Pick<Store, 'get' | 'set' | 'delete' | 'atomic'>
-  effects: Pick<Effects, 'handle' | 'enqueue'>
+  store: Pick<Store, 'get' | 'set' | 'delete' | 'atomic' | 'tickets'>
+  effects: Pick<Effects, 'handle' | 'enqueue' | 'pending'>
   lifetime: AbortSignal
   available(): boolean
   paused(): boolean
   approve(id: string, candidate: string, signal?: AbortSignal, replay?: MainlineIntent): Promise<MergeApproval>
   authorize(id: string, approval: MergeApproval): void
+  inspectDelivery(intent: MainlineIntent): Promise<{ missing: string[]; approval?: MergeApproval }>
+  closeDelivery(approval: MergeApproval, receipt: PlanDeliveryReceipt): string | undefined
   read(target: MainlineTarget): Promise<string>
   precedes(target: MainlineTarget, ancestor: string, descendant: string): Promise<boolean>
   prepare(target: MainlineTarget, candidate: string, intent: string, queuedAt: string): Promise<string>
   advance(target: MainlineTarget, base: string, candidate: string, authorize: () => Promise<void>): Promise<'advanced' | 'unchanged'>
   repair(id: string, repair: MainlineRepair): Promise<void>
-  changed(intent: MainlineIntent): void
+  changed(intent: MainlineIntent, delivered?: boolean): void
 }
 
 type MainlineStore = Pick<Store, 'get'>
@@ -57,6 +67,7 @@ export class MainlineQueue {
   constructor(private readonly host: QueueHost) {
     host.effects.handle('mainline', (_, key) => this.drain(key), { limit: () => host.available() ? 8 : 0 })
     host.effects.handle('mainlineRepair', ({ ticketId }, id) => this.repair(ticketId, id), { limit: () => host.available() && !host.paused() ? 8 : 0 })
+    host.effects.handle('mainlineDelivery', ({ ticketId }, id) => this.deliver(ticketId, id), { limit: () => host.available() ? 8 : 0 })
   }
 
   private existing(ticketId: string, candidate: string) {
@@ -66,16 +77,26 @@ export class MainlineQueue {
     return existing
   }
 
+  /** Replaying an already verified intent can retry closure, but never queues another Git write. */
+  private replay(intent: MainlineIntent): MainlineIntent {
+    const { store, effects } = this.host
+    if (intent.status === 'verified' && store.tickets.get(intent.ticket_id)?.ended?.by !== 'delivery' && !effects.pending('mainlineDelivery', intent.id)) {
+      effects.enqueue('mainlineDelivery', intent.id, { ticketId: intent.ticket_id })
+    }
+    return intent
+  }
+
   async enqueue(ticketId: string, candidate: string, signal?: AbortSignal): Promise<MainlineIntent> {
     const { store, effects } = this.host
+    signal?.throwIfAborted()
     const existing = this.existing(ticketId, candidate)
-    if (existing) return existing
+    if (existing) return this.replay(existing)
     const approval = await this.host.approve(ticketId, candidate, signal)
     signal?.throwIfAborted()
     this.host.authorize(ticketId, approval)
     return store.atomic(() => {
       const latest = this.existing(ticketId, candidate)
-      if (latest) return latest
+      if (latest) return this.replay(latest)
       const { target, base, assignment, generation } = approval
       const previous = mainlineIntent(store, ticketId)
       if (previous?.status === 'repair' && (!previous.repair_requested || previous.actual !== base)) {
@@ -109,7 +130,52 @@ export class MainlineQueue {
       if (queue.length > 1) store.set(pending, queue.slice(1))
       else store.delete(pending)
       if (status === 'repair') effects.enqueue('mainlineRepair', intent.id, { ticketId: intent.ticket_id })
-      this.host.changed({ ...intent, ...fields, status })
+      if (status === 'verified') effects.enqueue('mainlineDelivery', intent.id, { ticketId: intent.ticket_id })
+      else this.host.changed({ ...intent, ...fields, status })
+    })
+  }
+
+  /** Close only after rechecking the exact approved evidence and reacquiring proof from the actual target. */
+  private async deliver(ticketId: string, id: string): Promise<void> {
+    const { host } = this, { store } = host
+    const intent = mainlineIntent(store, ticketId)
+    if (intent?.id !== id || intent.status !== 'verified' || store.tickets.get(ticketId)?.ended?.by === 'delivery') return
+    const { missing, approval } = await host.inspectDelivery(intent)
+    const { applying_at, integration, verification } = intent
+    let receipt: PlanDeliveryReceipt | undefined
+    if (!applying_at || !integration || integration === intent.candidate || !intent.actual ||
+        verification?.status !== 'passed' || verification.method !== 'integration_on_target') {
+      missing.push('mainline_verification')
+    } else if (approval && !missing.length) {
+      try {
+        const actual = await host.read(intent.target)
+        if (actual === integration || await host.precedes(intent.target, integration, actual)) {
+          receipt = { ticketId, assignmentId: intent.assignment, receiptId: id, base: intent.base,
+            generation: intent.generation, candidate: intent.candidate, integration, actual, verifiedAt: now() }
+        } else missing.push('mainline_verification')
+      } catch (error) {
+        host.lifetime.throwIfAborted()
+        if (error instanceof Error && error.name === 'AbortError') throw error
+        missing.push('mainline_unavailable')
+      }
+    }
+    host.lifetime.throwIfAborted()
+    store.atomic(() => {
+      const current = mainlineIntent(store, ticketId)
+      if (current?.id !== id || current.status !== 'verified' || store.tickets.get(ticketId)?.ended?.by === 'delivery') return
+      if (approval && receipt && !missing.length) {
+        const refused = host.closeDelivery(approval, receipt)
+        if (!refused) {
+          if (current.delivery_missing) this.update(current, 'verified', { delivery_missing: undefined })
+          host.changed(current, true)
+          return
+        }
+        missing.push(refused)
+      }
+      if (!missing.length) throw new Error('Formal delivery was neither approved nor blocked')
+      if (isDeepStrictEqual(current.delivery_missing, missing)) return
+      this.update(current, 'verified', { delivery_missing: missing })
+      host.changed({ ...current, delivery_missing: missing })
     })
   }
 
@@ -191,7 +257,7 @@ export class MainlineQueue {
         host.lifetime.throwIfAborted()
         if (host.paused()) throw new Later()
         host.authorize(intent.ticket_id, approval)
-        applying = { ...observed, status: 'applying', applying_at: observed.applying_at ?? now(), integration }
+        applying = { ...observed, status: 'applying', applying_at: observed.applying_at ?? now(), integration, ci: approval.ci }
         // Commit the intent before starting the mutating subprocess, including on its first attempt.
         this.update(applying, 'applying', { reason: 'Git write may be in flight; compare the actual target before retrying' })
       })

@@ -43,8 +43,10 @@ export const PlanTargetSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('node'), nodeId: SlugSchema }),
 ])
 const MessageSchema = z.strictObject({ sessionId: TextSchema, messageId: TextSchema, text: TextSchema })
+const CommitSchema = z.string().regex(/^[0-9a-f]{40}$/)
 export const PlanDeliveryReceiptSchema = z.strictObject({ ticketId: TextSchema, assignmentId: TextSchema, receiptId: TextSchema,
-  candidate: TextSchema, verifiedAt: TextSchema }) satisfies z.ZodType<PlanDeliveryReceipt>
+  base: CommitSchema, generation: z.number().int().positive(), candidate: CommitSchema, integration: CommitSchema,
+  actual: CommitSchema, verifiedAt: z.iso.datetime() }) satisfies z.ZodType<PlanDeliveryReceipt>
 const PlanNodeClaimSchema = z.strictObject({ planId: TextSchema, nodeId: SlugSchema, ticketId: TextSchema, assignmentId: TextSchema,
   session: TextSchema, role: z.enum(PLAN_ROLES), pendingAction: z.enum(['launch', 'resume']).nullable(), claimedAt: TextSchema, startedAt: TextSchema.optional() })
 const PlanNodeStateSchema = z.strictObject({ planId: TextSchema, nodeId: SlugSchema,
@@ -95,7 +97,7 @@ export class Plans {
     const state = result.data
     if (state.status === 'running' || state.status === 'awaiting-delivery') {
       const ticket = this.store.tickets.get(state.claim.ticketId), assignment = ticket && latestAssignment(ticket)
-      if (ticket && !ticket.ended && assignment?.id === state.claim.assignmentId) {
+      if (ticket && !ticket.ended && assignment && ticket.assignments[0]?.id === state.claim.assignmentId) {
         const merged = mainlineIntent(this.store, ticket.id)
         const repair = ticket.inputs.findLast(input => input.kind === 'mainline-repair')
         const ready = assignment.report?.state === 'ready' && (!repair || assignment.report.at > repair.at)
@@ -117,7 +119,8 @@ export class Plans {
   waitingOn(id: string, node: PlanNode): string[] {
     return node.blockedBy.filter(blocked => {
       const state = this.state(id, blocked), predecessor = this.get(id)?.nodes.find(item => item.id === blocked)
-      return state?.status !== 'delivered' || state.claim.role !== predecessor?.role
+      return state?.status !== 'delivered' || state.claim.role !== predecessor?.role || state.delivery?.ticketId !== state.claim.ticketId ||
+        this.store.tickets.get(state.claim.ticketId)?.ended?.by !== 'delivery'
     })
   }
 
@@ -215,24 +218,27 @@ export class Plans {
     })
   }
 
-  /** Records the later delivery-check gate; only a Runtime-issued delivery writer may call it. */
-  deliver(authority: symbol, id: string, nodeId: string, receipt: PlanDeliveryReceipt): PlanNodeState {
+  /** Persists the host-verified receipt inside the same transaction as the Ticket close. */
+  deliver(authority: symbol, id: string, nodeId: string, receipt: PlanDeliveryReceipt, closeTicket: (id: string) => void): PlanNodeState {
     if (authority !== DELIVERY_AUTHORITY) throw new UserError('invalidPlan', { detail: 'Only the delivery gate may record formal Plan delivery' })
     return this.store.atomic(() => {
+      const { node } = this.requireNode(id, nodeId)
       const state = this.state(id, nodeId)
       if (!state) throw new UserError('invalidPlan', { detail: `Node ${nodeId} has no dispatch claim` })
       if (state.status === 'delivered' && isDeepStrictEqual(state.delivery, receipt)) return state
-      if (state.claim.ticketId !== receipt.ticketId || state.claim.assignmentId !== receipt.assignmentId) {
-        throw new UserError('invalidPlan', { detail: `Delivery receipt does not belong to Plan node ${id}/${nodeId}` })
+      const ticket = this.store.tickets.get(receipt.ticketId), assignment = ticket && latestAssignment(ticket)
+      if (state.claim.ticketId !== receipt.ticketId || state.claim.assignmentId !== ticket?.assignments[0]?.id ||
+          ticket.plan?.planId !== id || ticket.plan.nodeId !== nodeId || ticket.plan.role !== node.role || state.claim.role !== node.role ||
+          assignment?.id !== receipt.assignmentId || assignment.writer?.generation !== receipt.generation) {
+        throw new UserError('invalidPlan', { detail: `Delivery receipt does not belong to the current Assignment of Plan node ${id}/${nodeId}` })
       }
-      if (!receipt.receiptId.trim() || !receipt.candidate.trim() || !receipt.verifiedAt.trim()) {
-        throw new UserError('invalidPlan', { detail: `Delivery receipt for ${id}/${nodeId} is incomplete` })
-      }
-      if (state.status !== 'awaiting-delivery') {
+      parse(PlanDeliveryReceiptSchema, receipt, 'delivery')
+      if (ticket.ended || state.status !== 'awaiting-delivery') {
         throw new UserError('invalidPlan', { detail: `Node ${id}/${nodeId} is not awaiting formal delivery` })
       }
       state.status = 'delivered'; state.claim.pendingAction = null; state.delivery = receipt
       this.store.set(KV.plans.node(id, nodeId), state)
+      closeTicket(ticket.id)
       return state
     })
   }
@@ -295,6 +301,6 @@ export interface PlanDeliveryWriter {
 }
 
 /** Exposes the formal-delivery write only to the Runtime's trusted delivery gate. */
-export function planDeliveryWriter(plans: Plans): PlanDeliveryWriter {
-  return { deliver: (id, nodeId, receipt) => plans.deliver(DELIVERY_AUTHORITY, id, nodeId, receipt) }
+export function planDeliveryWriter(plans: Plans, closeTicket: (id: string) => void): PlanDeliveryWriter {
+  return { deliver: (id, nodeId, receipt) => plans.deliver(DELIVERY_AUTHORITY, id, nodeId, receipt, closeTicket) }
 }

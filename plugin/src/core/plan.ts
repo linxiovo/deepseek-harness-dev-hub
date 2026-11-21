@@ -18,12 +18,16 @@ export interface PlanNodeClaim {
   startedAt?: string
 }
 
-/** A delivery-check record from the later delivery gate; a Worker report is not one. */
+/** The host closed this Ticket after matching candidate evidence to an observed mainline integration. */
 export interface PlanDeliveryReceipt {
   ticketId: string
   assignmentId: string
   receiptId: string
+  base: string
+  generation: number
   candidate: string
+  integration: string
+  actual: string
   verifiedAt: string
 }
 

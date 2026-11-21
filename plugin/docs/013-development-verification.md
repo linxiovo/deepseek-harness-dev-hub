@@ -146,7 +146,9 @@ Required CI is separate from local evidence. Configure the required workflow IDs
 
 Without an associated PR, the delivery gate accepts only `push` or `workflow_dispatch` runs from the verified candidate branch at the exact candidate SHA. A PR run from a different branch or base does not substitute for it.
 
-`ready_to_queue` is candidate readiness; `return_for_recheck` lists unmet gates. `mainline` is the independent queue observation described in [Merging](003-execution.md#merging), or `pending_merge` when there has been no attempt. Candidate readiness, a Worker report, PR closure and mainline verification each fall short of formal delivery. See [Frontier dispatch and claims](009-handoff.md#frontier-dispatch-and-claims) for the separate receipt boundary.
+`ready_to_queue` is candidate readiness; `return_for_recheck` lists unmet queue gates. `mainline` is the independent queue observation, or `pending_merge` before the first attempt. The Plan-only `formal_delivery` field separately reads `pending` while a verified attempt awaits closure, `blocked` with `missing` codes, or `delivered` with the durable receipt. Use that field for formal delivery, not `ready_to_queue`, a Worker report, PR state or `mainline.status` alone.
+
+At the Git write, the queue pins which CI lookup passed: the associated PR number on the reviewed base or the candidate's branch. [Formal closure](003-execution.md#formal-plan-closure) re-reads Actions for that same candidate and lookup, under the required-check configuration. It does not require the PR to still be open after the actual merge and does not use PR closure as merge evidence.
 
 ## Handoff evidence
 

@@ -75,21 +75,20 @@ function afterRepair(previous: Cycle, revision: DeliveryRevision, reviews: reado
     : previous.repaired.length ? previous.repaired : previous.blockers
   if (!previous.revision || !sameLease(previous.revision, revision)) return next
   next.first = previous.first
+  next.expected = previous.expected
   if (!reviews) return next
   const matching = currentReviews(reviews, revision)
   if (!dual(matching)) return next
   const affected = new Set<string>()
-  let allCriteria = false
   for (const issue of next.repaired) {
     if (!('affects' in issue) || !issue.affects?.length) return next
     if (previous.expected.length && issue.affects.some(key => key.startsWith('acceptance:') && !previous.expected.some(c => keyOf(c.id) === key))) return next
     for (const key of issue.affects) affected.add(key)
-    if (!issue.affects.some(key => key.startsWith('acceptance:'))) allCriteria = true
   }
   const keep = (key: string) => !affected.has(key) && matching.every(r => r.reuses?.includes(key))
   if (previous.tests && observationPassed(previous.tests) && keep('tests')) next.tests = previous.tests
   if (previous.docs && observationPassed(previous.docs) && keep('docs')) next.docs = previous.docs
-  if (!allCriteria) for (const [id, result] of previous.results) {
+  for (const [id, result] of previous.results) {
     if (result.status === 'passed' && keep(keyOf(id))) next.results.set(id, result)
   }
   return next
@@ -99,7 +98,7 @@ function complete(state: Cycle, expected: readonly Criterion[]): boolean {
   return validCriteria(expected) && state.expected.length === expected.length && expected.every(({ id, text }) => {
     const result = state.results.get(id)
     return result?.status === 'passed' && result.text === text && state.expected.some(c => c.id === id && c.text === text)
-  }) && expected.some(({ id }) => matches(state.results.get(id)?.revision, state.revision))
+  })
 }
 
 /** Only ledger addresses can be resolved here. Other evidence remains openable under the existing reference convention. */

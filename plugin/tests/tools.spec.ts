@@ -150,11 +150,17 @@ it('exposes review submission only to actual Worker descendants and restores ind
     spec: [expect.objectContaining({ reviewer_session: specSession, axis: 'spec' })] })
   const evidence = second.evidence
   if (!evidence || typeof evidence !== 'object' || !('id' in evidence) || typeof evidence.id !== 'string') throw new Error('Review evidence has no id')
-  expect(await read(`ticket/${ticket.id}/review/${evidence.id}`)).toMatchObject({ reviewer_session: specSession,
-    base: ticket.execution!.base!.sha, candidate, aggregate: 'passed' })
+  const reviewPath = `ticket/${ticket.id}/review/${evidence.id}`
+  const historical = { reviewer_session: specSession, base: ticket.execution!.base!.sha, candidate }
+  expect(await read(reviewPath)).toMatchObject({ ...historical, aggregate: 'passed', stale: false })
+  await h.runTool(sessionId, 'orchestrator_report', { state: 'failed', summary: 'The Worker stopped before delivery.' })
   await h.restart()
   expect(await read(`ticket/${ticket.id}/reviews`, { limit: 1 })).toMatchObject({ history: [expect.any(Object)], next_offset: 1 })
   expect(await reviewsRead()).toMatchObject({ aggregate: 'pending', standards: [], spec: [], history: expect.arrayContaining([expect.any(Object)]) })
+  await h.runTool(h.runtime.masterId, 'orchestrator_ticket_retry', { ticket_id: ticket.id })
+  await h.runtime.idle()
+  expect((await reviewsRead()).assignment_id).not.toBe(ticket.assignments.at(-1)?.id)
+  expect(await read(reviewPath)).toMatchObject({ ...historical, aggregate: 'pending', stale: true })
 })
 
 it('requires independent review before the first retro, then requires acceptance before the final retro', async () => {
@@ -324,11 +330,21 @@ it('reacquires changed evidence after the final retro and only queues with curre
     details += page.text
     offset = page.next_offset
   }
-  expect(JSON.parse(details)).toMatchObject({
+  const evidence = JSON.parse(details)
+  expect(evidence).toMatchObject({
     local: { followups: [{ id: 'improve-direction' }], docs: { revision: { candidate: before } }, tests: { revision: { candidate } },
       acceptance: [{ id: '1', result: { revision: { candidate } } }, { id: '2', result: { revision: { candidate: before } } }] },
     ci: { evidence: { sha: candidate, satisfied: true, checks: [{ run: { url } }] } },
   })
+  for (const [kind, sha] of [['docs', before], ['tests', candidate], ['repair', candidate]] as const) {
+    const event = evidence.local.events.findLast((item: { kind: string }) => item.kind === kind)
+    expect(event).toMatchObject({ read: expect.any(String) })
+    expect(JSON.parse(String((await read(event.read)).text))).toMatchObject({ kind, revision: { base, candidate: sha } })
+  }
+  for (const lane of evidence.local.reviews) {
+    expect(lane).toMatchObject({ read: expect.any(String) })
+    expect(await read(lane.read)).toMatchObject({ base, candidate, axis: lane.axis, aggregate: 'passed' })
+  }
   // Fault injection only: normal Workers cannot rewrite committed observations. Keep a later PASS in every case.
   const { tickets } = h.runtime.store
   const persisted = tickets.get(ticketId)!

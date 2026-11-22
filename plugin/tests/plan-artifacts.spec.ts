@@ -47,6 +47,17 @@ it('downloads, binds and serves only the package whose manifest matches the exac
   expect(file).toMatchObject({ fileName, contentType: 'application/gzip', size: packageBytes.length, sha256 })
   writeFileSync(file!.path, 'tampered package')
   expect(await openPlanArtifact(root, 'plan-a', view)).toBeUndefined()
+  const damaged = await downloadPlanArtifact(cli.value as never, root, 'plan-a', request, run,
+    { id: 42, name: `plugin-bundle-${request.sha}-${run.attempt}`, url: `${run.url}/artifacts/42` })
+  commitPlanArtifact(damaged)
+  expect(await openPlanArtifact(root, 'plan-a', view)).toMatchObject({ sha256 })
+  expect(readFileSync(file!.path)).toEqual(packageBytes)
+  rmSync(file!.path)
+  expect(await openPlanArtifact(root, 'plan-a', view)).toBeUndefined()
+  const missing = await downloadPlanArtifact(cli.value as never, root, 'plan-a', request, run,
+    { id: 42, name: `plugin-bundle-${request.sha}-${run.attempt}`, url: `${run.url}/artifacts/42` })
+  commitPlanArtifact(missing)
+  expect(readFileSync(file!.path)).toEqual(packageBytes)
 })
 
 it('rejects a package manifest for another workflow attempt', async () => {
@@ -95,10 +106,14 @@ it('distinguishes an absent retained file from an unexpected I/O error', async (
 
 it('removes staging directories left by a process restart', () => {
   const rootDir = join(root, 'plan-artifacts'), stale = join(rootDir, 'plan-artifacts-incoming-abandoned')
+  const replaced = join(rootDir, 'plan-artifacts-replaced-abandoned')
   mkdirSync(stale, { recursive: true })
+  mkdirSync(replaced, { recursive: true })
   writeFileSync(join(stale, 'partial'), 'interrupted')
+  writeFileSync(join(replaced, 'partial'), 'replaced')
   cleanupPlanArtifactStaging(root)
   expect(() => readFileSync(join(stale, 'partial'))).toThrow()
+  expect(() => readFileSync(join(replaced, 'partial'))).toThrow()
 })
 
 it('removes an uncommitted download draft', async () => {

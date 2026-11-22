@@ -7,9 +7,10 @@ import { build } from 'tsdown'
 import { afterAll, beforeAll, expect, it } from 'vitest'
 import { Store } from '../src/app/store.ts'
 import { KV } from '../src/kv.ts'
+import { Effects } from '../src/app/effects.ts'
+import { HealthBoard } from '../src/infra/health.ts'
 import type { PlanIntegrationView } from '../src/core/plan-integration.ts'
-
-type ChildMessage = { kind: 'accepted'; context: string } | { kind: 'recovered'; view: PlanIntegrationView; dispatches: number; relays: number }
+type ChildMessage = { kind: 'accepted'; context: string } | { kind: 'recovered'; view: PlanIntegrationView; retained?: PlanIntegrationView; dispatches: number; relays: number }
 
 const fixture = fileURLToPath(new URL('./fixtures/plan-integration-crash-child.ts', import.meta.url))
 const entry = 'plan-integration-crash-child.mjs'
@@ -76,6 +77,38 @@ it('recovers an accepted workflow dispatch after SIGKILL before its local receip
     expect(readFileSync(join(root, 'dispatch-count'), 'utf8')).toBe('1')
   } finally {
     if (crashing && crashing.exitCode === null && crashing.signalCode === null) crashing.kill('SIGKILL')
+    if (recovering && recovering.exitCode === null && recovering.signalCode === null) recovering.kill('SIGKILL')
+    rmSync(root, { recursive: true, force: true })
+  }
+}, 45_000)
+
+it('withdraws a queued delivery relay when restart finds its package missing', async () => {
+  const root = mkdtempSync(join(realpathSync.native(tmpdir()), 'plan-integration-missing-'))
+  let recovering: ChildProcess | undefined
+  try {
+    const store = new Store(join(root, 'plan.sqlite'))
+    try {
+      const effects = new Effects(store, new HealthBoard())
+      const planId = 'plan-crash'
+      store.atomic(() => {
+        store.set(KV.plans.integration(planId), { planId, status: 'delivered',
+          version: { repository: 'acme/widgets', ref: 'refs/heads/main', sha: 'a'.repeat(40), context: 'b'.repeat(64),
+            workflowId: '44', configuration: 'checks-v1', environment: 'hosted-ci-v1' },
+          run: { id: 101, attempt: 1, url: 'https://github.com/acme/widgets/actions/runs/101', checks: [] },
+          artifact: { id: 202, name: 'package', url: 'https://github.com/acme/widgets/actions/runs/101/artifacts/202',
+            fileName: 'package.tgz', contentType: 'application/gzip', size: 1, sha256: 'd'.repeat(64) }, verifiedAt: new Date().toISOString() })
+        effects.enqueue('relay', `plan-delivered:${planId}`, { text: 'verified package ready' })
+      })
+    } finally { store.close() }
+
+    const recovery = recovering = fork(join(bundleDir, entry), ['recover-missing', root], { execArgv: [], stdio: ['ignore', 'pipe', 'pipe', 'ipc'] })
+    const recoveryClosed = closed(recovery)
+    const recovered = await receiveWithin(recovery, 'Missing-package recovery did not finish')
+    if (recovered.kind !== 'recovered') throw new Error('Recovery fixture did not report its final state')
+    expect(recovered).toMatchObject({ relays: 0, retained: { status: 'blocked', reason: 'artifact_unavailable' } })
+    expect(await recoveryClosed).toEqual({ code: 0, signal: null })
+    recovering = undefined
+  } finally {
     if (recovering && recovering.exitCode === null && recovering.signalCode === null) recovering.kill('SIGKILL')
     rmSync(root, { recursive: true, force: true })
   }

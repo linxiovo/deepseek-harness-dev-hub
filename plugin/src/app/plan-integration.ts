@@ -30,8 +30,10 @@ interface IntegrationHost {
   dispatch(request: PlanVerificationRequest): Promise<void>
   deliveryLink(planId: string): string
   relay(message: Relay): void
+  cancelRelay(id: string): void
 }
 
+const deliveryRelayId = (planId: string): string => `plan-delivered:${planId}`
 const terminal = (view: PlanIntegrationView | undefined): view is Extract<PlanIntegrationView, { status: 'delivered' | 'awaiting-release-verification' }> =>
   view?.status === 'delivered' || view?.status === 'awaiting-release-verification'
 
@@ -66,7 +68,10 @@ export class PlanIntegration {
       const slot = KV.plans.integration(id), prior = this.host.store.get(slot)
       if (terminal(prior)) {
         if (await this.host.artifactAvailable(id, prior)) continue
-        this.host.store.set(slot, { planId: id, status: 'blocked', reason: 'artifact_unavailable', version: prior.version, run: prior.run })
+        this.host.store.atomic(() => {
+          this.host.store.set(slot, { planId: id, status: 'blocked', reason: 'artifact_unavailable', version: prior.version, run: prior.run })
+          this.host.cancelRelay(deliveryRelayId(id))
+        })
       }
       if (!this.host.verification) continue
       const required = this.host.plans.requiredDelivery(id)
@@ -176,7 +181,7 @@ export class PlanIntegration {
           store.atomic(() => {
             store.set(slot, { planId, status, version, run, artifact: draft.artifact, verifiedAt })
             if (status !== 'delivered') return
-            const relay = projectPushRelay({ id: `plan-delivered:${planId}`, kind: 'plan-delivered', payload: {
+            const relay = projectPushRelay({ id: deliveryRelayId(planId), kind: 'plan-delivered', payload: {
               planId, version, artifact: draft.artifact, verification: run.url, read: `plan/${planId}/delivery`,
               harness: host.deliveryLink(planId),
             } })

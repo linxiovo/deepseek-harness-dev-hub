@@ -13,6 +13,7 @@ Add `planVerification` to the `dsh-superagent` Machine configuration. It is opti
     planVerification:
       - projectId: '0123456789abcdef0123456789abcdef'
         workflowId: '44'
+        identityJob: integration-identity
         jobs: [integration-identity, windows, check, integration-bundle]
         artifactName: plugin-bundle
         configuration: plugin-check-v1

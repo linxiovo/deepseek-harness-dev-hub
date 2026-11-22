@@ -9,12 +9,16 @@ import type { PlanArtifactDraft } from '../../src/app/plan-artifacts.ts'
 import type { PlanIntegrationView, PlanVerificationConfig, PlanVerificationRequest, PlanVerificationRun } from '../../src/core/plan-integration.ts'
 import type { MainlineTarget } from '../../src/executor/mainline-git.ts'
 import { HealthBoard } from '../../src/infra/health.ts'
+import { KV } from '../../src/kv.ts'
 
-const [phase, root] = process.argv.slice(2) as ['crash' | 'recover', string]
+const [phase, root] = process.argv.slice(2) as ['crash' | 'recover' | 'recover-missing', string]
 const planId = 'plan-crash', sha = 'a'.repeat(40), integration = 'b'.repeat(40)
 const projectId = 'c'.repeat(32), runPath = join(root, 'accepted-run.json'), countPath = join(root, 'dispatch-count')
 const store = new Store(join(root, 'plan.sqlite'))
 const effects = new Effects(store, new HealthBoard())
+const relayPath = join(root, 'relay.jsonl')
+const relayCount = (): number => existsSync(relayPath) ? readFileSync(relayPath, 'utf8').trim().split('\n').filter(Boolean).length : 0
+effects.handle('relay', async ({ text }) => { appendFileSync(relayPath, `${text}\n`) }, { ordered: true })
 const verification: PlanVerificationConfig = { projectId, workflowId: '44', identityJob: 'verify', jobs: ['verify', 'full'],
   artifactName: 'package', configuration: 'checks-v1', environment: 'hosted-ci-v1' }
 const target: MainlineTarget = { repository: root, slug: 'acme/widgets', ref: 'refs/heads/main' }
@@ -32,7 +36,7 @@ const integrationHost = {
   plans,
   handoffs,
   lifetime: new AbortController().signal,
-  verification,
+  verification: phase === 'recover-missing' ? undefined : verification,
   paused: () => false,
   target: () => target,
   readTarget: async () => ({ sha, includesIntegrations: true }),
@@ -50,8 +54,8 @@ const integrationHost = {
     artifact: { ...artifact, fileName: 'package.tgz', contentType: 'application/gzip', size: 1, sha256: 'd'.repeat(64) } }),
   commitArtifact: (_draft: PlanArtifactDraft) => {},
   discardArtifact: (_draft: PlanArtifactDraft) => {},
-  artifactAvailable: async () => true,
-  artifactExists: () => true,
+  artifactAvailable: async () => phase !== 'recover-missing',
+  artifactExists: () => phase !== 'recover-missing',
   dispatch: async (request: PlanVerificationRequest) => {
     writeFileSync(runPath, JSON.stringify({ context: request.context, sha: request.sha }))
     writeFileSync(countPath, String(dispatchCount() + 1))
@@ -62,6 +66,7 @@ const integrationHost = {
   },
   deliveryLink: () => 'http://127.0.0.1:3082/?superagentProject=test&superagentTicket=test',
   relay: (message: Relay) => appendFileSync(join(root, 'relay.jsonl'), `${JSON.stringify(message)}\n`),
+  cancelRelay: (id: string) => effects.cancel('relay', id),
 } as never
 
 const integrationAgent = new PlanIntegration(integrationHost)
@@ -75,8 +80,9 @@ if (phase === 'crash') {
   await effects.idle()
   const view = integrationAgent.view(planId) as PlanIntegrationView
   await effects.drain()
+  const retained = store.get(KV.plans.integration(planId))
   store.close()
   clearInterval(hold)
-  ipc.send({ kind: 'recovered', view, dispatches: dispatchCount(), relays: readFileSync(join(root, 'relay.jsonl'), 'utf8').trim().split('\n').length })
+  ipc.send({ kind: 'recovered', view, retained, dispatches: dispatchCount(), relays: relayCount() })
   ipc.disconnect()
 }

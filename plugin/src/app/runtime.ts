@@ -248,6 +248,7 @@ export class Runtime extends Service implements SourceHost {
             : project ? projectNavigationLink(origin, project.id, 'project') : origin
         },
         relay: message => sessions.relay(message.id, message.text),
+        cancelRelay: id => effects.cancel('relay', id),
       })
       const verifyProjectBinding = installation.validateWorkspace.bind(installation)
       this.planning = new Planning({ handoffs, plans, effects, sessions, verifyProjectBinding,

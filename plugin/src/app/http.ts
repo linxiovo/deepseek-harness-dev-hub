@@ -485,7 +485,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         if (!installationRoute) await runtime.ready
         const scope = req.headers[PROJECT_SCOPE_HEADER]
         const runLimitRoute = runLimitRoutes[route.key] === true
-        const mountedRoute = attentionRoute || runLimitRoute || projectMeterRoutes[route.key]
+        const mountedRoute = attentionRoute || runLimitRoute || route.key === 'GET settings' || projectMeterRoutes[route.key]
         const requirement = attentionRoute || runLimitRoute ? 'required' : 'optional'
         const mounted = mountedRoute ? readableMount(scope, requirement) : undefined
         if (route.key === 'GET topic-binding') readableMount(scope, 'required')

@@ -6,7 +6,7 @@ import { z } from 'zod'
 import { Commands } from '../src/infra/commands.ts'
 import { githubKind } from '../src/sources/github.ts'
 import { observePull } from '../src/sources/github-pull.ts'
-import { feishu, startRuntime, type Host } from './fixtures/host.ts'
+import { feishu, startManagedProject, startRuntime, type Host } from './fixtures/host.ts'
 import { KV } from '../src/kv.ts'
 import type { MainlineRepair } from '../src/core/model.ts'
 import type { MainlineIntent } from '../src/app/mainline-queue.ts'
@@ -260,6 +260,11 @@ function actionsHost(beforeRuns?: (sha: string) => Promise<void>) {
   })
   return { number, publish: (sha: string, base?: string, branch?: string) => runs.set(sha, { id: ++runId, sha, base, branch }),
     withdraw: (sha: string) => runs.delete(sha),
+    respondWithRun: (requestedSha: string, oldSha: string) => {
+      const run = runs.get(oldSha)
+      if (!run) throw new Error(`No Actions run published for ${oldSha}`)
+      runs.set(requestedSha, run)
+    },
     stopDiscovery: () => { discoveryAvailable = false },
     setPull: (value: Pull) => { pull = value; return pullResponse(value) } }
 }
@@ -703,6 +708,107 @@ it('admits a fresh candidate after verified-but-unclosed delivery and requests r
   expect(tip()).toBe(actual)
   expect(transport.writes).toBe(2)
 }, 240_000)
+
+it('distinguishes a missing formal receipt from exhausted successor quota', async () => {
+  await h.stop()
+  const { host, project } = await startManagedProject({ withFeishu: false })
+  h = host
+  const { git, base, tip, runGit } = mainlineRepository()
+  const ci = actionsHost()
+  await configureCI()
+  const { id, workers: { lowercase: b }, dispatch } = await registerPlan({ start: ['lowercase'], checkDependsOn: ['lowercase'] })
+  const successor = 'combined-check'
+  const setSuccessorBudget = async (tokens: number) => {
+    const settings = await h.api('GET', 'settings', undefined, project.id)
+    expect(settings.status).toBe(200)
+    const { executor } = z.object({ executor: z.object({ revision: z.number(), value: z.record(z.string(), z.unknown()) }) })
+      .parse(settings.body.blocks)
+    expect(await h.api('PUT', 'settings/executor', { revision: executor.revision, value: { ...executor.value,
+      runLimits: { ticketOverrides: [{ planId: id, nodeId: successor, tokens }] },
+    } }, project.id)).toMatchObject({ status: 200 })
+  }
+  const noSuccessor = async () => {
+    expect(await read(`plan/${id}/node/${successor}`)).not.toHaveProperty('claim')
+    expect([...h.agents.keys()].filter(session => session.startsWith('worker-') && session !== b.session)).toEqual([])
+    expect(combinedAssignments()).toEqual([])
+  }
+  const blocked = async () => {
+    expect(await dispatch(successor)).toMatchObject({ status: 'blocked', reused: false, waitingOn: ['lowercase'], limits: { ticketTokens: 0 } })
+    expect(await read(`ticket/${b.ticketId}`)).not.toHaveProperty('ended')
+    expect(await read(`plan/${id}/node/lowercase`)).not.toHaveProperty('delivery')
+    await noSuccessor()
+  }
+  await setSuccessorBudget(0)
+  await blocked()
+
+  formatLabel(b.directory, 'value.toLocaleLowerCase()', 'Convert letters to lowercase')
+  const oldCandidate = commit(b.directory, 'Lowercase display labels using the host locale')
+  const branch = git('-C', b.directory, 'branch', '--show-current')
+  ci.publish(oldCandidate, undefined, branch)
+  formatLabel(b.directory, 'value.toLowerCase()', 'Convert letters to lowercase independently of the host locale')
+  const candidate = commit(b.directory, 'Make lowercasing independent of the host locale')
+  await recordEvidence(b, id, base, candidate, '2', '  alert  ')
+  ci.publish(candidate, undefined, branch)
+  await h.runTool(b.session, 'orchestrator_report', { state: 'ready', summary: 'The reviewed candidate is ready for handoff.' })
+  await h.runtime.idle()
+  await blocked()
+
+  let writes = 0
+  vi.spyOn(Commands.prototype, 'git').mockImplementation(async function (this: Commands, args, cwd) {
+    if (!args.includes(canonicalUrl) || !args.includes('push')) return runGit(this, args, cwd)
+    writes++
+    const result = await runGit(this, args, cwd)
+    // Serve the old successful run even for the current head query, after the real push.
+    ci.respondWithRun(candidate, oldCandidate)
+    return result
+  })
+  const intent = await queue(b.ticketId, candidate)
+  expect(intent).toMatchObject({ status: 'queued', base, candidate })
+  await h.runtime.idle()
+  const integration = tip()
+  expect(git('rev-parse', `${integration}^`)).toBe(candidate)
+  const verifiedWithoutReceipt = async () => {
+    expect(await delivery(b.ticketId)).toMatchObject({ formal_delivery: { status: 'blocked', missing: ['required_ci'] },
+      mainline: { id: intent.id, status: 'verified', integration, verification: { status: 'passed' } } })
+    expect(tip()).toBe(integration)
+    expect(writes).toBe(1)
+    await blocked()
+  }
+  await verifiedWithoutReceipt()
+
+  const replay = async () => {
+    expect(await queue(b.ticketId, candidate)).toMatchObject({ id: intent.id, status: 'verified' })
+    await h.runtime.idle()
+  }
+  await h.restart()
+  await h.runtime.idle()
+  await expect(hub('orchestrator_queue_merge', { ticket_id: b.ticketId, candidate, ci_status: 'passed' })).rejects.toThrow(/unrecognized key.*ci_status/i)
+  await replay()
+  await verifiedWithoutReceipt()
+
+  ci.publish(candidate, undefined, branch)
+  await replay()
+  const closed = await delivered(id, 'lowercase', b, intent, base, candidate, integration)
+  const paused = await dispatch(successor)
+  expect(paused).toMatchObject({ status: 'quota-paused', reused: false, limits: { ticketTokens: 0 }, reason: 'ticket budget: exhausted' })
+  expect(paused).not.toHaveProperty('claim')
+  expect(paused).not.toHaveProperty('waitingOn')
+  await h.runtime.idle()
+  await noSuccessor()
+  expect(await dispatch('lowercase')).toMatchObject({ status: 'delivered', reused: true })
+  expect(await delivered(id, 'lowercase', b, intent, base, candidate, integration)).toEqual(closed)
+
+  await setSuccessorBudget(80)
+  const claim = await claimCombined(id, dispatch)
+  expect(await dispatch(successor)).toMatchObject({ reused: true, claim, limits: { ticketTokens: 80 } })
+  expect(await h.api('GET', `tickets/${claim.ticketId}/run-limits`, undefined, project.id)).toMatchObject({ status: 200,
+    body: { budget: { state: 'available', limitTokens: 80, availableTokens: 80 } } })
+  await replay()
+  expect(await delivered(id, 'lowercase', b, intent, base, candidate, integration)).toEqual(closed)
+  expect(combinedAssignments()).toEqual([{ ticketId: claim.ticketId, session: claim.session }])
+  expect(tip()).toBe(integration)
+  expect(writes).toBe(1)
+}, 180_000)
 
 it.each(['intent stored', 'Git advanced', 'candidate already present', 'external advance during write'] as const)('reconciles mainline when %s', async point => {
   const { git, base, remote, tip, runGit } = mainlineRepository()

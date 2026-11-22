@@ -380,6 +380,62 @@ it('does not start a project switch during an asynchronous project write or admi
   expect(await select).toEqual({ status: 200, body: { project: beta, restarting: true } })
 })
 
+it('fences executor settings from the old mount during selection and after recovery with the same block revision', async () => {
+  const revision = 4
+  const value = (projectTokens: number) => SettingsSchema.parse({ executor: { runLimits: { projectTokens } } }).executor
+  const saves: unknown[] = []
+  const settingsHost = (projectTokens: number) => ({
+    store: { settings: () => SettingsSchema.parse({ executor: value(projectTokens) }), blockRevision: () => revision },
+    sources: { instances: () => [], environments: () => [], declarations: () => [] },
+    machine: { stateDir: 'D:/state' }, configured: () => false,
+    settings: { save: (...args: unknown[]) => { saves.push(args); return { saved: true, revision: revision + 1, restarting: false } } },
+  })
+  const expectedBlock = (projectTokens: number) => ({ status: 200, body: { blocks: { executor: { revision, value: value(projectTokens) } } } })
+  const unmounted = serve({ ...settingsHost(300), installation: {
+    projects: () => ({ activeProjectId: null, projects: [] }), runtime: idleRuntime,
+  } })
+  expect(await unmounted('GET', 'settings')).toMatchObject(expectedBlock(300))
+
+  const selectionStarted = Promise.withResolvers<void>(), finishSelection = Promise.withResolvers<void>()
+  const bodyStarted = Promise.withResolvers<void>(), finishBody = Promise.withResolvers<void>()
+  const oldMount = serve({ ...settingsHost(100), installation: { ...bindingInstallation(), selectProject: async () => {
+    selectionStarted.resolve()
+    await finishSelection.promise
+    return { project: beta, restarting: true }
+  } } })
+  const oldScope = projectHeader(alpha.id)
+  expect(await oldMount('GET', 'settings', undefined, oldScope)).toMatchObject(expectedBlock(100))
+  const update = { revision, value: value(101) }
+  const pending = oldMount('PUT', 'settings/executor', update, oldScope, () => {
+    bodyStarted.resolve()
+    return finishBody.promise
+  })
+  await Promise.race([bodyStarted.promise, pending])
+  const selection = oldMount('POST', 'projects/beta/select')
+  await Promise.race([selectionStarted.promise, selection])
+  let duringSelection
+  try { duringSelection = await oldMount('GET', 'settings', undefined, oldScope) }
+  finally { finishSelection.resolve() }
+  const selectionResult = await selection.finally(finishBody.resolve)
+  const pendingResult = await pending
+  const retiredRead = await oldMount('GET', 'settings', undefined, oldScope)
+
+  const newMount = serve({ ...settingsHost(200), installation: { ...bindingInstallation(() => beta.id), runtime: (): RuntimeView => ({
+    mode: 'desktop', status: 'paused', reason: 'recoveryPending', projectId: beta.id, resumedFrom: null,
+  }) } })
+  const newReadWithOldScope = await newMount('GET', 'settings', undefined, oldScope)
+  const newWriteWithOldScope = await newMount('PUT', 'settings/executor', update, oldScope)
+  expect(selectionResult).toEqual({ status: 200, body: { project: beta, restarting: true } })
+  for (const response of [duringSelection, retiredRead, pendingResult]) {
+    expect(response).toMatchObject({ status: 409, body: { code: 'switching' } })
+  }
+  for (const response of [newReadWithOldScope, newWriteWithOldScope]) {
+    expect(response).toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  }
+  expect(saves).toEqual([])
+  expect(await newMount('GET', 'settings', undefined, projectHeader(beta.id))).toMatchObject(expectedBlock(200))
+})
+
 it('rejects a stale scoped read and hides meters from outside the mounted project', async () => {
   const call = serve({
     installation: { projects: () => ({ activeProjectId: alpha.id, projects: [alpha, beta] }) },

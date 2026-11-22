@@ -64,6 +64,8 @@ Identity check failures such as `agentCliMissing`, `agentCliSignedOut`, `agentCl
 
 Project operations resolve records against the mounted Store. Send `x-orchestrator-project-id: <mounted ID>` on every mutation when a managed project is mounted. Missing scope returns `409 {error, code: "projectScopeRequired"}`. A mismatched scope returns `409 {error, code: "staleProject"}` even if the referenced record exists in the new project. The same mismatch check applies to GET requests and the read-only `POST /orchestrator/api/prompts/preview` when they supply a scope. With no managed mount, legacy operations do not require a header and a supplied scope is stale. The header checks whether the client is targeting the current mount.
 
+`GET settings` remains usable before a project is selected. During project selection or remount, it returns `409 switching` instead of exposing settings or a block revision from the outgoing mount. Fetch the block again with the active project ID before saving.
+
 Under `/orchestrator/api/`, scoped writes are `PUT settings/:block` and `PUT prompts`, plus `POST` to `sources/:id/labels`, `threads/:key/unsubscribe`, `triggers/:id/requeue`, `decisions/:id/dismiss`, `tickets/:id/retry`, `tickets/:id/stop`, `executor/pause`, `policy-sync/:id` and `setup/check`.
 
 `GET topic-binding`, `POST topic-binding` and `POST topic-binding/unbind` require a registered mount and its explicit scope, including for reads. Binding uses the local operator's management authority, not a Feishu credential; the header prevents wrong-project writes, not access by other programs running as the operator. See [the Feishu handoff contract](009-handoff.md#optional-feishu-entry).

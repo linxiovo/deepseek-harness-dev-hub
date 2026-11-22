@@ -259,7 +259,13 @@ async function ticketActions(commands: Commands, ticket: Ticket, sha: string, re
       || current.head.repo?.full_name !== pull.head.repo.full_name || !matchesTarget(current))
       throw new Error('Pull request changed while checking delivery CI')
   }
-  return { evidence, ci: { pull: number } }
+  if (base === undefined || !evidence.satisfied) return { evidence }
+  const runs: Record<string, number> = {}
+  for (const check of evidence.checks) {
+    if (!check.run) throw new Error('Passing CI is missing its verified workflow run')
+    runs[check.workflowId] = check.run.id
+  }
+  return { evidence, ci: { pull: number, runs } }
 }
 
 interface DeliveryState {
@@ -329,7 +335,10 @@ async function deliveryCheckout(commands: Commands, { ticket, assignment }: Deli
 /** Compare the same ticket and checkout observations before and after remote evidence collection. */
 const deliveryStamp = (state: DeliveryState, checkout: DeliveryCheckout | undefined) => JSON.stringify([state.stamp, checkout])
 
-const ciBinding = z.union([z.strictObject({ pull: z.number().int().positive() }), z.strictObject({ branch: z.string().min(1) })])
+const ciBinding = z.union([
+  z.strictObject({ pull: z.number().int().positive(), runs: z.record(z.string().regex(/^[1-9][0-9]*$/), z.number().int().positive()) }),
+  z.strictObject({ branch: z.string().min(1) }),
+])
 
 const scopedDocuments = z.object({ scope: docTreeScopeSchema, impact: docTreeImpactSchema })
 
@@ -415,7 +424,7 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
           if (fixed.success) {
             const work = { kind: 'ticket', id } as const
             if ('pull' in fixed.data) actions = await actionsEvidence(commands, work, candidate, state.required,
-              { number: fixed.data.pull, baseSha: scope.replay.base })
+              { number: fixed.data.pull, baseSha: scope.replay.base, boundRuns: fixed.data.runs })
             else if (fixed.data.branch === checkout?.branch) actions = await actionsEvidence(commands, work, candidate, state.required,
               undefined, fixed.data.branch)
             if (actions) ci = fixed.data

@@ -217,7 +217,7 @@ async function configureCI() {
 
 /** Keep hosting responses tied to the specific revisions explicitly published by the test. */
 function actionsHost(beforeRuns?: (sha: string) => Promise<void>) {
-  const runs = new Map<string, { id: number; sha: string; base?: string; branch?: string }>()
+  const runs = new Map<string, { id: number; sha: string; base?: string; branch?: string; detachPull?: boolean; conclusion?: 'success' | 'failure' }>()
   let pull: Pull | undefined
   const number = 29
   let discoveryAvailable = true
@@ -243,9 +243,9 @@ function actionsHost(beforeRuns?: (sha: string) => Promise<void>) {
       if (beforeRuns) await beforeRuns(sha)
       const run = runs.get(sha)
       const workflow_runs = run ? [{ id: run.id, workflow_id: 4, run_number: run.id, head_sha: run.sha, run_attempt: 1,
-        status: 'completed', conclusion: 'success', html_url: `${url}/actions/runs/${run.id}`, event: run.base ? 'pull_request' : 'push',
+        status: 'completed', conclusion: run.conclusion ?? 'success', html_url: `${url}/actions/runs/${run.id}`, event: run.base ? 'pull_request' : 'push',
         head_branch: run.branch,
-        pull_requests: run.base ? [{ number, head: { sha: run.sha }, base: { sha: run.base } }] : [] }] : []
+        pull_requests: run.base && !run.detachPull ? [{ number, head: { sha: run.sha }, base: { sha: run.base } }] : [] }] : []
       return { total_count: workflow_runs.length, workflow_runs }
     }
     for (const run of runs.values()) {
@@ -264,6 +264,16 @@ function actionsHost(beforeRuns?: (sha: string) => Promise<void>) {
       const run = runs.get(oldSha)
       if (!run) throw new Error(`No Actions run published for ${oldSha}`)
       runs.set(requestedSha, run)
+    },
+    saveRun(sha: string) {
+      const run = runs.get(sha)
+      if (!run) throw new Error(`No Actions run published for ${sha}`)
+      return () => { runs.set(sha, run) }
+    },
+    detachPull: (sha: string, conclusion: 'success' | 'failure' = 'success') => {
+      const run = runs.get(sha)
+      if (!run?.base) throw new Error(`No Actions PR run published for ${sha}`)
+      runs.set(sha, { ...run, detachPull: true, conclusion })
     },
     stopDiscovery: () => { discoveryAvailable = false },
     setPull: (value: Pull) => { pull = value; return pullResponse(value) } }
@@ -748,17 +758,20 @@ it('distinguishes a missing formal receipt from exhausted successor quota', asyn
   formatLabel(b.directory, 'value.toLowerCase()', 'Convert letters to lowercase independently of the host locale')
   const candidate = commit(b.directory, 'Make lowercasing independent of the host locale')
   await recordEvidence(b, id, base, candidate, '2', '  alert  ')
-  ci.publish(candidate, undefined, branch)
-  await h.runTool(b.session, 'orchestrator_report', { state: 'ready', summary: 'The reviewed candidate is ready for handoff.' })
+  ci.publish(candidate, base, branch)
+  ci.setPull({ sha: candidate, base, branch, closed: false })
+  await h.runTool(b.session, 'orchestrator_report', { state: 'ready', pr_number: ci.number, summary: 'The reviewed candidate is ready for handoff.' })
   await h.runtime.idle()
   await blocked()
+
+  const originalRun = ci.saveRun(candidate)
 
   let writes = 0
   vi.spyOn(Commands.prototype, 'git').mockImplementation(async function (this: Commands, args, cwd) {
     if (!args.includes(canonicalUrl) || !args.includes('push')) return runGit(this, args, cwd)
     writes++
     const result = await runGit(this, args, cwd)
-    // Serve the old successful run even for the current head query, after the real push.
+    ci.setPull({ sha: candidate, base, branch, closed: true })
     ci.respondWithRun(candidate, oldCandidate)
     return result
   })
@@ -786,7 +799,16 @@ it('distinguishes a missing formal receipt from exhausted successor quota', asyn
   await replay()
   await verifiedWithoutReceipt()
 
-  ci.publish(candidate, undefined, branch)
+  // GitHub can clear pull_requests after the actual fast-forward closes the PR. A different green run cannot replace the original.
+  ci.publish(candidate, base, branch)
+  ci.detachPull(candidate)
+  await replay()
+  await verifiedWithoutReceipt()
+  originalRun()
+  ci.detachPull(candidate, 'failure')
+  await replay()
+  await verifiedWithoutReceipt()
+  ci.detachPull(candidate)
   await replay()
   const closed = await delivered(id, 'lowercase', b, intent, base, candidate, integration)
   const paused = await dispatch(successor)

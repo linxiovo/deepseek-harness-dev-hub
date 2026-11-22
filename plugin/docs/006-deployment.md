@@ -322,6 +322,8 @@ A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write s
 
 The Plan merge queue uses the configured GitHub account to fast-forward the configured `refs/heads/...` directly, not to merge a PR. Configure branch rules that allow the intended fast-forward write, deny branch deletion and force pushes, and disable any independent auto-merge for the protected target. A server rejection leaves the attempt waiting; the plugin does not fall back to PR merge or silently override a rule.
 
+The queue uses an isolated Git configuration: it does not copy the operator's `git config http.proxy`. Where GitHub Git transport needs a proxy, set `HTTPS_PROXY` in the DSH host process environment before startup (with `NO_PROXY` for any endpoints that must connect directly). Keep TLS verification enabled.
+
 Mainline CI or branch rules that demand signatures or checks on the integration commit itself may reject this write. The queue does not synthesize signatures or rerun candidate checks as if they had run on the integration commit. Remove direct-merge advice from any saved team prompt overrides; they cannot grant merge authority.
 
 The packaged Worker tools and ordinary `gh` command cannot start an alternate merge. This deployment runs the host and Worker shell under the same OS user and account, so it cannot prevent an arbitrary Worker shell with usable credentials from writing remotely. Enforcing queue-only writes against untrusted shell commands requires isolation of the merge identity from Workers and GitHub rules granting the target write only to that identity; the default deployment is a cooperative workflow, not that security boundary.

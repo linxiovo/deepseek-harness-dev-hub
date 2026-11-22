@@ -520,6 +520,17 @@ function formalDeliverySummary(host: ResourceHost, ticket: Ticket, attempt: Main
   return { status: 'blocked' as const, missing: [...missing, 'mainline_verification'] }
 }
 
+const deliveryObservationRead = (ticket: string, index: number) => `ticket/${ticket}/delivery-observation/${index}`
+const ticketReviewRead = (ticket: string, review: string) => `ticket/${ticket}/review/${review}`
+
+function requireTicketReview(ticket: Ticket, id: string) {
+  for (const assignment of ticket.assignments) {
+    const review = assignment.reviews?.evidence.find(item => item.id === id)
+    if (review) return review
+  }
+  throw new Error('Unknown ticket review')
+}
+
 async function deliveryPage(read: Read, id: string) {
   const { host, signal, offset } = read
   const cacheKey = `${read.sessionId}:${read.resource}`
@@ -543,7 +554,9 @@ async function deliveryPage(read: Read, id: string) {
     status: ready ? 'ready_to_queue' as const : 'return_for_recheck' as const, mainline, ...formal ? { formal_delivery: formal } : {} }
   const body = JSON.stringify({ observed_at: new Date().toISOString(), ticket_id: id, assignment_id: header.assignment_id,
     base: header.base, candidate: header.candidate, generation: header.generation, mainline: header.mainline,
-    criteria: state.criteria, local,
+    criteria: state.criteria, local: { ...local,
+      events: local.events.map((event, index) => ({ ...event, read: deliveryObservationRead(id, index) })),
+      reviews: local.reviews.map(review => ({ ...review, read: ticketReviewRead(id, review.id) })) },
     revisions: checkout ? { base: { worktree: checkout.worktree, sha: checkout.base, ref: checkout.baseRef },
       candidate: { worktree: checkout.worktree, sha: checkout.candidate, ref: `refs/heads/${checkout.branch}` } } : null,
     ci: { status: ciStatus, required: state.required, evidence: actions ?? null, ...ciFailure ? { failure: ciFailure } : {} } })
@@ -573,7 +586,7 @@ const ROUTES: readonly Route[] = [
         for (const finding of event.findings) {
           if (finding.category !== 'optional' || backlog.has(finding.id)) continue
           backlog.set(finding.id, { id: key('retro-followup', ticket.id, finding.id), ticket_id: ticket.id,
-            summary: finding.summary, created_at: event.at, read: `ticket/${ticket.id}/delivery-observation/${index}` })
+            summary: finding.summary, created_at: event.at, read: deliveryObservationRead(ticket.id, index) })
         }
       }
       return [...backlog.values()]
@@ -804,8 +817,7 @@ const ROUTES: readonly Route[] = [
       const assignment = ticket.assignments.at(-1)
       const reviews = assignment?.reviews
       if (section === 'review' && !part || section === 'reviews' && part !== undefined) throw new Error('Unknown context resource')
-      const item = section === 'review' ? assignment?.reviews?.evidence.find(review => review.id === part) : undefined
-      if (section === 'review' && !item) throw new Error('Unknown ticket review')
+      const item = section === 'review' && part ? requireTicketReview(ticket, part) : undefined
       let currentHead: string | undefined
       let clean = false
       if (ticket.execution?.directory) {
@@ -821,10 +833,12 @@ const ROUTES: readonly Route[] = [
       const active = matches ? evidence.filter(review => review.base === base && review.candidate === candidate && review.generation === generation) : []
       const aggregate = !clean || !currentHead || !reviews?.target || reviews.target.base !== base || reviews.target.candidate !== candidate
         || reviews.target.generation !== generation ? 'pending' : reviewStatus(assignment!)
-      if (section === 'review') return { ...item, current_base: base, current_candidate: candidate,
-        stale: !matches, aggregate: matches ? aggregate : 'pending' }
+      if (item) {
+        const stale = !active.some(review => review.id === item.id)
+        return { ...item, current_base: base, current_candidate: candidate, stale, aggregate: stale ? 'pending' : aggregate }
+      }
       const history = list(read, (offset, count) => evidence.slice().reverse().slice(offset, offset + count).map(review => ({ ...review,
-        read: `ticket/${id}/review/${review.id}` })))
+        read: ticketReviewRead(id, review.id) })))
       return { ticket_id: id, assignment_id: assignment?.id ?? null, base, candidate, generation, clean, stale: !matches,
         aggregate: matches ? aggregate : 'pending', standards: active.filter(review => review.axis === 'standards'),
         spec: active.filter(review => review.axis === 'spec'), history: history.items, next_offset: history.next_offset }

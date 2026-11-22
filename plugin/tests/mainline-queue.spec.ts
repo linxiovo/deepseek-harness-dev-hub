@@ -363,6 +363,49 @@ it('does not let a repair callback clear failure state for a different ticket or
   expect(ticket.mainline).not.toHaveProperty('verification')
 })
 
+it('reuses unaffected acceptance after a documentation-only final retro repair', async () => {
+  const { git, base } = mainlineRepository()
+  const ci = actionsHost()
+  await configureCI()
+  const { id, workers: { trim: worker }, dispatch } = await registerPlan({ start: ['trim'], checkDependsOn: ['trim'] })
+  const { directory, ticketId, session } = worker
+  formatLabel(directory, 'value.trim()', 'Trim surrounding whitespace')
+  write(directory, contractDoc, '# Public label formatter\n\nTrim surrounding whitespace and lowercase letters.\n')
+  const before = commit(directory, 'Trim labels but overstate the contract')
+  const test = await reviewAndTest(worker, id, base, before, 'ALERT')
+  const docs = await inspectDocs(worker, before)
+  expect(docs).toMatchObject({ structure: 'checked' }) // Structure passes even though the contract is wrong.
+  await retro(worker, before, { kind: 'first-retro', findings: [] })
+  await accept(worker, before, '1', test)
+  await retro(worker, before, { kind: 'final-retro', findings: [{ id: 'contract', category: 'standard', affects: ['docs'],
+    summary: 'The contract promises lowercase output but the casing is unchanged.', evidence: [docs.read, test] }] })
+  expect(await delivery(ticketId)).toMatchObject({ ready: false, missing: expect.arrayContaining(['repair:contract']) })
+
+  write(directory, contractDoc, '# Public label formatter\n\nTrim surrounding whitespace and preserve case.\n')
+  const candidate = commit(directory, 'Document the actual label format')
+  await retro(worker, candidate, { kind: 'repair', fixes: [{ id: 'contract', evidence: [`${candidate}:${contractDoc}`] }] })
+  const review = async (axis: 'standards' | 'spec') => {
+    const reviewer = await h.reviewSubagent(session, axis)
+    await h.runTool(reviewer, 'orchestrator_review_submit', { candidate, axis, conclusion: 'passed', blockers: [],
+      basis: [axis === 'standards' ? contractDoc : `spec/${id}`, test], summary: 'The correction changes the contract text, not the formatter.',
+      reuses: ['docs', 'tests', 'acceptance:1'] })
+  }
+  await review('standards')
+  expect(await delivery(ticketId)).toMatchObject({ ready: false, missing: expect.arrayContaining(['dual-review', 'tests', 'acceptance:1']) })
+  await review('spec')
+  const recheck = await delivery(ticketId)
+  expect(recheck).toMatchObject({ candidate, ready: false, missing: expect.arrayContaining(['docs', 'final-retro']) })
+  expect(recheck.missing).not.toContain('acceptance:1')
+  expect(recheck.missing).not.toContain('tests')
+
+  await expect(inspectDocs(worker, candidate)).resolves.toMatchObject({ candidate, structure: 'checked' })
+  await retro(worker, candidate, { kind: 'final-retro', findings: [] })
+  expect(await delivery(ticketId)).toMatchObject({ ready: false, missing: ['required_ci'] })
+  ci.publish(candidate, undefined, git('-C', directory, 'branch', '--show-current'))
+  expect(await delivery(ticketId)).toMatchObject({ ready: true, base, candidate, mainline: { status: 'pending_merge' } })
+  expect(await dispatch('combined-check')).toMatchObject({ status: 'blocked', waitingOn: ['trim'] })
+}, 90_000)
+
 it('serializes two reviewed Plan candidates, then verifies a conflict repair only with fresh evidence', async () => {
   const { repository, git, base, remote, tip, runGit } = mainlineRepository()
   const firstPush = Promise.withResolvers<void>()

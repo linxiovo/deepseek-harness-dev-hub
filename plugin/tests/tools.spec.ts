@@ -4,8 +4,8 @@ import { spawnSync } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { TICKET_STATES } from '../src/app/cards.ts'
-import { builtInBase, builtInParts, defaultPrompts } from '../src/app/prompts.ts'
-import { key, UserError } from '../src/core/index.ts'
+import { builtInParts, defaultPrompts, type PromptConfig } from '../src/app/prompts.ts'
+import { key } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
 import { RESOURCES } from '../src/app/resources.ts'
 import { CliError, Commands } from '../src/infra/commands.ts'
@@ -17,6 +17,12 @@ let h: Host
 beforeEach(async () => { h = await startRuntime() })
 afterEach(async () => { await h.stop() })
 const words = (count: number) => Array.from({ length: count }, () => 'word').join(' ')
+const importPromptSnapshot = (config: PromptConfig, revision: number) => {
+  h.runtime.store.set(KV.prompts.version(revision), { revision, previousRevision: revision ? revision - 1 : null,
+    savedAt: '', source: 'panel', config })
+  h.runtime.store.set(KV.prompts.revision, revision)
+  h.runtime.store.set(KV.prompts.active, revision)
+}
 const read = (resource: string, page: { offset?: number; limit?: number } = {}) =>
   h.runTool(h.runtime.masterId, 'orchestrator_read', { resource, ...page })
 /** Stand in for the external git CLI, not the resource or Commands adapter, so checkout ownership is exercised. */
@@ -71,7 +77,8 @@ it('reads the lists, a ticket, a decision, the settings, the prompts and the mod
   await expect(read('ticket')).rejects.toThrow('Unknown context resource')
   // A list page holds at most 50 items, the prompt history too.
   const config = h.runtime.prompts.current().config
-  for (let revision = 0; revision < 51; revision++) h.runtime.prompts.save({ ...config, scope: `Scope ${revision}.` }, revision, 'panel')
+  for (let revision = 0; revision < 51; revision++) importPromptSnapshot({ ...config, scope: `Scope ${revision}.` }, revision)
+  await h.restart()
   expect(await read('prompts', { limit: 8000 })).toMatchObject({ items: expect.objectContaining({ length: 50 }), next_offset: 50 })
 })
 
@@ -291,9 +298,9 @@ it('reacquires changed evidence after the final retro and only queues with curre
   expect(await inspect()).toMatchObject({ ready: false, missing: expect.arrayContaining(['required_ci']), ci_status: 'required_checks_unconfigured' })
 
   const settings = h.runtime.store.settings()
-  await h.runTool(hub, 'orchestrator_settings_save', { block: 'source', source: 'github',
+  expect(await h.api('PUT', 'settings/source:github', {
     value: { ...settings.sources.github!, config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build', workflowId: '4' }] } },
-    revision: h.runtime.store.blockRevision('source:github') })
+    revision: h.runtime.store.blockRevision('source:github') })).toMatchObject({ status: 200 })
   let workflowSha = before
   let remoteHead = candidate
   const branch = git('branch', '--show-current')
@@ -516,9 +523,9 @@ it('reads configured GitHub Actions evidence for a ticket at its complete commit
   const sha = 'a'.repeat(40)
   const git = checkouts({ [ticket.execution!.directory]: { sha } })
   const settings = h.runtime.store.settings()
-  await h.runTool(h.runtime.masterId, 'orchestrator_settings_save', { block: 'source', source: 'github',
+  expect(await h.api('PUT', 'settings/source:github', {
     value: { ...settings.sources.github!, config: { ...settings.sources.github!.config, requiredChecks: [{ id: 'build', workflowId: '4' }] } },
-    revision: h.runtime.store.blockRevision('source:github') })
+    revision: h.runtime.store.blockRevision('source:github') })).toMatchObject({ status: 200 })
   expect(JSON.parse((await read('settings/source:github') as { text: string }).text).value.config.requiredChecks).toEqual([{ id: 'build', workflowId: '4' }])
   const gh = vi.spyOn(Commands.prototype, 'gh')
     .mockResolvedValueOnce({ total_count: 1, workflow_runs: [
@@ -744,7 +751,8 @@ it('lists in prompts the built-in parts whose text changed since the team overro
   const read = (resource: string, offset = 0) => h.runTool(h.runtime.masterId, 'orchestrator_read', { resource, offset, limit: 8000 })
   expect(await read('prompts')).not.toHaveProperty('default_changed')
   // An override edited from the built-in text of an earlier version.
-  h.runtime.prompts.save({ ...defaultPrompts(), overrides: { 'runtime/dispatch': { text: '## dispatch\nOurs.', base: 'earlier' } } }, 0, 'panel')
+  importPromptSnapshot({ ...defaultPrompts(), overrides: { 'runtime/dispatch': { text: '## dispatch\nOurs.', base: 'earlier' } } }, 1)
+  await h.restart()
   expect(await read('prompts')).toMatchObject({ default_changed: ['runtime/dispatch'] })
   // A text page at a time, which the whole text joins.
   let text = '', offset: number | null = 0
@@ -756,23 +764,8 @@ it('lists in prompts the built-in parts whose text changed since the team overro
   expect(defaults.parts).toEqual(Object.fromEntries(Object.entries(builtInParts()).map(([key, part]) => [key, part.text])))
 })
 
-it('saves with the prompt save tool an override without its base, refuses a part no version has, and drops a removed one read back', async () => {
-  const save = (overrides: Record<string, unknown>) => h.runTool(h.runtime.masterId, 'orchestrator_prompts_save',
-    { config: { ...defaultPrompts(), overrides }, baseRevision: h.runtime.prompts.current().revision })
-  await expect(save({ constructor: { text: 'x' } })).rejects.toThrow(new UserError('unknownPromptPart', { part: 'constructor' }))
-  await save({ 'runtime/dispatch': { text: '## dispatch\nOurs.' } })
-  const dispatch = { text: '## dispatch\nOurs.', base: builtInBase(builtInParts()['runtime/dispatch'].text) }
-  expect(h.runtime.prompts.current().config.overrides).toEqual({ 'runtime/dispatch': dispatch })
-  // The saved version overrides a part this version no longer has: saving back the configuration as read drops it.
-  const { revision } = h.runtime.prompts.current(), read = { ...defaultPrompts(), overrides: { 'runtime/dispatch': dispatch,
-    'runtime/retired': { text: 'Old.', base: 'b' } } }
-  h.runtime.store.set(KV.prompts.version(revision + 1), { revision: revision + 1, previousRevision: revision, savedAt: '', source: 'panel', config: read })
-  h.runtime.store.set(KV.prompts.revision, revision + 1)
-  await h.runTool(h.runtime.masterId, 'orchestrator_prompts_save', { config: read, baseRevision: revision + 1 })
-  expect(h.runtime.prompts.current().config.overrides).toEqual({ 'runtime/dispatch': dispatch })
-  // The tool describes the overrides once, in its schema.
-  const tool = h.tools.get(h.runtime.masterId)!.get('orchestrator_prompts_save') as unknown as { description: string }
-  expect(tool.description).not.toContain('overrides')
+it('does not expose prompt saving to the main Session tools', () => {
+  expect(h.tools.get(h.runtime.masterId)?.has('orchestrator_prompts_save')).toBe(false)
 })
 
 it('keeps the main Session\'s resources from an Executor Session, which lists only its own', async () => {
@@ -1044,20 +1037,8 @@ it('saves a settings block by name, a Source\'s block with the Source\'s id', as
   expect(await save({ block: 'pause', value: { paused: true }, revision: 0 })).toEqual({ paused: true })
 })
 
-it('previews a prompt configuration without saving it, and saves one only against the revision it edits', async () => {
-  const save = (args: Record<string, unknown>) => h.runTool(h.runtime.masterId, 'orchestrator_prompts_save', args)
-  const config = { ...h.runtime.prompts.current().config, scope: 'Finish what was asked.' }
-  const preview = await save({ config, preview: true }) as { previews: { role: string; read: string }[] }
-  expect(preview.previews.map(item => item.role)).toEqual(['orchestrator', 'worker'])
-  let text = '', offset: number | null = 0
-  while (offset !== null) {
-    const page = await read(preview.previews[1]!.read, { offset, limit: 8000 }) as { text: string; next_offset: number | null }
-    text += page.text; offset = page.next_offset
-  }
-  expect(text).toContain('## Ticket scope\nFinish what was asked.')
-  expect(h.runtime.prompts.current().revision).toBe(0)
-  await expect(save({ config })).rejects.toThrow('baseRevision')
-  expect(await save({ config, baseRevision: 0 })).toMatchObject({ revision: 1 })
+it('does not expose prompt preview or saving as main Session tools', () => {
+  expect(h.tools.get(h.runtime.masterId)?.has('orchestrator_prompts_save')).toBe(false)
 })
 
 it('releases the tools it registered for a Session once its agent is disposed, and leaves the other Sessions\' tools', async () => {
@@ -1198,9 +1179,11 @@ it('tells the main Session of the settings, prompts, requeues and unsubscription
   await h.runtime.idle()
   expect(notices().at(-1)).toEqual({ settings_saved: 'eval', changed: ['eval.mode'], read: 'settings/eval' })
   const before = notices().length
-  expect(await save({ block: 'eval', value: { ...evaluation, mode: 'auto' }, revision: h.runtime.store.blockRevision('eval') })).not.toHaveProperty('context_delivery')
-  const config = { ...h.runtime.prompts.current().config, scope: 'Finish what was asked.' }
-  expect(await h.runTool(h.runtime.masterId, 'orchestrator_prompts_save', { config, baseRevision: 0 })).not.toHaveProperty('context_delivery')
+  await expect(save({ block: 'eval', value: { ...evaluation, mode: 'auto' }, revision: h.runtime.store.blockRevision('eval') }))
+    .rejects.toThrow(/Only the operator can change the admission Policy/)
+  expect(h.runtime.store.settings().eval.mode).toBe('observe')
+  expect(await save({ block: 'eval', value: { ...evaluation, mode: 'observe', timeoutSeconds: evaluation.timeoutSeconds + 1 },
+    revision: h.runtime.store.blockRevision('eval') })).not.toHaveProperty('context_delivery')
   await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
   const thanks = feishu('5', '@bot 谢谢')
   h.runtime.receive(thanks); await h.runtime.idle()

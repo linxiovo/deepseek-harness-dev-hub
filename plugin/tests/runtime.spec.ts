@@ -8,7 +8,6 @@ import { DatabaseSync } from 'node:sqlite'
 import { delimiter, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
-import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { Runtime } from '../src/app/runtime.ts'
 import { restoreReviewBindings } from '../src/app/meter-recovery.ts'
 import { ProjectMeter } from '../src/app/project-meter.ts'
@@ -573,7 +572,8 @@ it('assesses a proactive observation in the orchestrator Session and creates the
 
 it('accepts silently under a rule that says so, gives the worker the rule procedure, and closes it as dropped when nothing is left for a human', async () => {
   const policy = runtime.store.settings().policy
-  await runtime.settings.save('policy', { ...policy, rules: [...policy.rules, { id: 'silent-bugfix', name: '沉默地复现和修复', enabled: true, instruction: 'Reproduce minimally first; accept silently.' }] }, runtime.store.blockRevision('policy'), 'panel')
+  runtime.store.saveSettings({ ...runtime.store.settings(), policy: { ...policy, rules: [...policy.rules,
+    { id: 'silent-bugfix', name: '沉默地复现和修复', enabled: true, instruction: 'Reproduce minimally first; accept silently.' }] } })
   await runtime.settings.save('eval', { ...runtime.store.settings().eval, mode: 'auto' }, runtime.store.blockRevision('eval'), 'panel')
   const trigger = feishu('20', '切换主题后刷新，图标颜色不对', { mentions: [] })
   await receive(trigger)
@@ -690,13 +690,13 @@ it('tells live workers about policy changes instead of revoking them and restart
   await receive(pending)
   expect(runtime.store.threads.get(`feishu:${CHAT}:om_8`)?.evaluating).toBeDefined()
   deliveries.mockClear()
-  const settings = runtime.store.settings()
-  const result = await runtime.settings.save('policy', { ...settings.policy, rules: settings.policy.rules.map(rule => ({ ...rule, enabled: rule.id === 'copy' })) }, runtime.store.blockRevision('policy'), 'panel')
+  const evaluation = runtime.store.settings().eval
+  await runtime.settings.save('eval', { ...evaluation, mode: 'observe' }, runtime.store.blockRevision('eval'), 'panel')
   await runtime.idle()
-  expect(result).toMatchObject({ saved: true, policy_changed: true })
-  // The rules changed, but not as they bear on this explicit ticket, whose requester is still allowed: its worker is not woken.
+  // An unrelated active Ticket receives no new instructions when an evaluation is reconfigured.
   expect(runtime.store.tickets.get(ticket.id)!.inputs).toEqual([])
   expect(relays(sessionId)).toEqual([])
+  expect(relays(runtime.masterId).filter(item => item.kind === 'candidate' && item.trigger_id === pending.id)).toHaveLength(1)
   // Its requester comes off the allowed list: the worker is told so, inline, and the ticket goes on.
   const current = runtime.store.settings().policy
   await runtime.settings.save('policy', { ...current, sources: { ...current.sources, feishu: { ...current.sources.feishu!, allowed: [] } } },
@@ -707,7 +707,6 @@ it('tells live workers about policy changes instead of revoking them and restart
   expect(runtime.store.tickets.get(ticket.id)!.ended).toBeUndefined()
   expect(relays(sessionId)).toEqual([{ text: expect.stringContaining('may no longer start work') }])
   expect(runtime.store.decisions.byThread(`feishu:${CHAT}:om_8`)[0]).toMatchObject({ kind: 'unavailable', reason: [{ code: 'policyChanged' }] })
-  expect(relays(runtime.masterId).filter(item => item.kind === 'candidate' && item.trigger_id === pending.id)).toHaveLength(1)
 })
 
 it('attaches an event to an existing open task through orchestrator_route', async () => {
@@ -938,7 +937,10 @@ it('describes rule edits in the Policy history and skips Policy syncs that chang
   // The sync chat lists exactly the allowed users already, so nothing is saved.
   await runtime.settings.sync('feishu')
   expect(revision()).toBe(before)
-  await runtime.settings.save('policy', { ...runtime.store.settings().policy, rules: [{ ...settings.policy.rules[0]!, name: '文案' }, { ...settings.policy.rules[1]!, enabled: false }, { id: 'docs', name: '文档', enabled: true, instruction: 'x' }] }, runtime.store.blockRevision('policy'), 'panel')
+  const policy = { ...settings.policy, rules: [{ ...settings.policy.rules[0]!, name: '文案' }, { ...settings.policy.rules[1]!, enabled: false },
+    { id: 'docs', name: '文档', enabled: true, instruction: 'x' }] }
+  const next = { ...settings, policy }
+  runtime.store.saveSettings(next, { source: 'panel', block: 'policy', policyVersion: policyVersion(next), policyChanged: true, notified: [] })
   expect(policyHistory(runtime.store, runtime.sources, policyVersion(runtime.store.settings())).items[0]!.changes).toEqual([{ code: 'ruleRenamed', from: 'Copy fixes', to: '文案' }, { code: 'ruleDisabled', name: 'Visual fixes' }, { code: 'ruleAdded', name: '文档' }])
 })
 
@@ -1093,9 +1095,8 @@ it('keeps pages of Source reads, prompt previews and Feishu message links in mem
   expect(await runTool(runtime.masterId, 'orchestrator_read', { resource: `trigger/${message.id}` })).toMatchObject({ source_url: link })
   // An AppLink is found by the links read since dsh-superagent started.
   expect((await api('GET', `search?q=${encodeURIComponent(link)}`)).body).toMatchObject({ items: [expect.objectContaining({ id: message.id })] })
-  const config = runtime.prompts.current().config
-  const { previews } = await runTool(runtime.masterId, 'orchestrator_prompts_save', { config, preview: true }) as { previews: { read: string }[] }
-  expect(await runTool(runtime.masterId, 'orchestrator_read', { resource: previews[0]!.read, offset: 4000 })).toMatchObject({ offset: 4000 })
+  await expect(runTool(runtime.masterId, 'orchestrator_prompts_save', { config: runtime.prompts.current().config, preview: true }))
+    .rejects.toThrow()
   expect(runtime.store.keys('').filter(name => /-read:|source-link:|prompt-preview\//.test(name))).toEqual([])
 })
 
@@ -1143,7 +1144,8 @@ it('waits for setup without the agent\'s GitHub CLI: the panel works, and nothin
   const revision = next.store.get<number>('settings-revision')
   expect(await next.settings.save('policy', next.store.settings().policy, next.store.blockRevision('policy'), 'panel')).toMatchObject({ saved: true, restarting: false })
   expect(next.store.get<number>('settings-revision')).toBe(revision)
-  expect(await next.settings.save('policy', { ...next.store.settings().policy, rules: [] }, next.store.blockRevision('policy'), 'panel')).toMatchObject({ saved: true, restarting: true })
+  const { eval: evaluation } = next.store.settings()
+  expect(await next.settings.save('eval', { ...evaluation, timeoutSeconds: evaluation.timeoutSeconds + 1 }, next.store.blockRevision('eval'), 'panel')).toMatchObject({ saved: true, restarting: true })
   await vi.waitFor(() => expect(restarts).toHaveBeenCalledTimes(1))
   next.checkSetup()
   await vi.waitFor(() => expect(restarts).toHaveBeenCalledTimes(2))
@@ -1232,9 +1234,9 @@ it('checks a changed account CLI before saving it, restarts after the save, and 
   expect((await runtime.settings.save('executor', { ...runtime.store.settings().executor, prepare: 'true' }, runtime.store.blockRevision('executor'), 'panel')).restarting).toBe(false)
   // A save of another block during the account check is kept: the check runs first, then the save merges.
   const pending = save({ cli: AGENT() })
-  await runtime.settings.save('policy', { ...runtime.store.settings().policy, rules: [] }, runtime.store.blockRevision('policy'), 'panel')
+  await runtime.settings.save('eval', { ...runtime.store.settings().eval, mode: 'observe' }, runtime.store.blockRevision('eval'), 'panel')
   await pending
-  expect(runtime.store.settings().policy.rules).toEqual([])
+  expect(runtime.store.settings().eval.mode).toBe('observe')
   expect(runtime.store.settings().sources.github!.config).toMatchObject({ cli: AGENT() })
   const feishuSave = (cli: string) => runtime.settings.save('source:feishu', { enabled: true, config: { ...runtime.store.settings().sources.feishu!.config, cli } },
     runtime.store.blockRevision('source:feishu'), 'panel')
@@ -1351,39 +1353,20 @@ it('tells both roles the execution environment through a generated prompt sectio
   expect(Object.keys(next.prompts.preview(next.prompts.current().config).skills)).not.toContain('feishu')
 })
 
-it('lets a worker read the prompt version it works under and the ones it worked under before, also after a restart, and no other', async () => {
-  const { sessionId } = await acceptedTicket()
-  const save = () => { const { config, revision } = runtime.prompts.current(); return runtime.prompts.save({ ...config, delivery: `${config.delivery}.` }, revision, 'panel').revision }
-  // A model request reads the system prompt, which binds the Session to the version current then.
+it('keeps a worker on its ticket-pinned prompt across requests and restart', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  const pinned = runtime.prompts.forTicket(ticket.id)
   const request = () => sections.get(sessionId)!.text({ signal: new AbortController().signal })
   const read = (resource: string) => runTool(sessionId, 'orchestrator_read', { resource })
-  const first = save(), second = save()
   request()
-  await expect(read(`prompts/${first}`)).rejects.toThrow('inaccessible prompt version')
-  const third = save()
-  // Until its next request it works under the version it read; after it, it may still read that one.
-  expect(await read('prompts/current')).toMatchObject({ resource: `prompts/${second}` })
-  request()
-  expect(await read('prompts/current')).toMatchObject({ resource: `prompts/${third}` })
-  expect(await read(`prompts/${second}`)).toMatchObject({ resource: `prompts/${second}` })
-  expect(runtime.sessions.status().sessions).toContainEqual({ sessionId, revision: third })
+  expect(runtime.prompts.effective().revision).toBe(pinned.revision)
+  expect(await read(`prompts/${pinned.revision}`)).toMatchObject({ resource: `prompts/${pinned.revision}` })
   const next = await restart()
   await next.ready
-  expect([next.sessions.promptVersion(sessionId).revision, next.sessions.mayRead(sessionId, second), next.sessions.mayRead(sessionId, first)])
-    .toEqual([third, true, false])
+  expect(next.sessions.promptVersion(sessionId).revision).toBe(pinned.revision)
+  await expect(read(`prompts/${pinned.revision + 1}`)).rejects.toThrow(/inaccessible prompt version/)
 })
 
-it('passes team text with template braces to every Session literally, without reading them as prompt variables', async () => {
-  const delivery = 'Pin the build to ${{ github.sha }}; keep {{x}} as written.'
-  const current = runtime.prompts.current()
-  runtime.prompts.save({ ...current.config, delivery }, current.revision, 'panel')
-  const { sessionId } = await acceptedTicket()
-  for (const id of [runtime.masterId, sessionId]) {
-    const section = sections.get(id)!
-    const text = renderPrompt({ sections: [{ name: section.name, text: section.text({}), interpolate: section.interpolate }], contexts: [], tools: [], variables: {} })
-    expect(text).toContain(delivery)
-  }
-})
 
 
 it('runs the prepare command once for a new ticket, under the execution root with the ticket\'s environment, and fails the ticket with its output', async () => {
@@ -1673,10 +1656,10 @@ it('refuses a settings save with an unknown model or a Source kind that is not i
     .toMatchObject({ status: 400, body: { code: 'sourceNotInstalled', values: { source: 'slack' } } })
   const huge = { ...runtime.prompts.current().config, delivery: 'x'.repeat(runtime.machine.promptMaxChars.get()) }
   expect(await request('POST', 'prompts/preview', huge)).toMatchObject({ status: 400, body: { code: 'promptTooLong' } })
-  expect(await request('PUT', 'prompts', { config: huge, baseRevision: runtime.prompts.current().revision })).toMatchObject({ status: 400, body: { code: 'promptTooLong' } })
+  expect(await request('PUT', 'prompts', { config: huge, baseRevision: runtime.prompts.current().revision, maintenanceTicketId: 'unused' })).toMatchObject({ status: 400, body: { code: 'promptTooLong' } })
   // An override of a part this version does not have is refused, not missing.
   expect(await request('PUT', 'prompts', { config: { ...runtime.prompts.current().config, overrides: { 'runtime/nothing': { text: 'x' } } },
-    baseRevision: runtime.prompts.current().revision })).toMatchObject({ status: 400, body: { code: 'unknownPromptPart' } })
+    baseRevision: runtime.prompts.current().revision, maintenanceTicketId: 'unused' })).toMatchObject({ status: 400, body: { code: 'unknownPromptPart' } })
   expect(await request('GET', 'prompts?revision=99')).toMatchObject({ status: 404, body: { code: 'unknownPromptRevision' } })
   expect(await request('GET', 'threads/%E0%A4%A')).toEqual({ status: 400, body: { error: 'A path segment has a malformed escape' } })
 })
@@ -1735,27 +1718,27 @@ it('refuses a second process on the same state directory before it opens the dat
   runtime.store.set(KV.store.schema, SCHEMA_VERSION)
 })
 
-it('applies a changed prompt size limit to the next save and request without a restart', async () => {
+it('applies a changed prompt size limit to the next preview and request without a restart', async () => {
   const limit = reference(100000)
   const next = await restart({ promptMaxChars: limit })
   await next.ready
-  const put = async (config: unknown) => {
+  const preview = async (config: unknown) => {
     let status = 0, text = ''
-    const chunks = [Buffer.from(JSON.stringify({ config, baseRevision: next.prompts.current().revision }))]
-    const req = { method: 'PUT', url: '/orchestrator/api/prompts', headers: { host: '127.0.0.1:3082', 'x-orchestrator-request': '1' }, async *[Symbol.asyncIterator]() { yield* chunks } }
+    const chunks = [Buffer.from(JSON.stringify(config))]
+    const req = { method: 'POST', url: '/orchestrator/api/prompts/preview', headers: { host: '127.0.0.1:3082', 'x-orchestrator-request': '1' }, async *[Symbol.asyncIterator]() { yield* chunks } }
     await http(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
     return { status, body: JSON.parse(text) as Record<string, unknown> }
   }
   const config = next.prompts.current().config
   const size = JSON.stringify(config).length
-  expect(await put({ ...config, delivery: 'x'.repeat(size) })).toMatchObject({ status: 200 })
-  // The loader commits a lower limit in place; the next save reads it.
+  expect(await preview({ ...config, delivery: 'x'.repeat(size) })).toMatchObject({ status: 200 })
+  // The loader commits a lower limit in place; the next preview reads it.
   limit.set(size + 1000)
-  expect(await put({ ...config, delivery: `${config.delivery}${'y'.repeat(2000)}` }))
+  expect(await preview({ ...config, delivery: config.delivery + 'y'.repeat(2000) }))
     .toMatchObject({ status: 400, body: { code: 'promptTooLong', values: { limit: String(size + 1000) } } })
   // So does the request body limit, four bytes a character and a margin.
   const bytes = 4 * (size + 1000) + 4096
-  expect(await put({ ...config, delivery: 'z'.repeat(bytes) })).toMatchObject({ status: 400, body: { error: `Request exceeds ${bytes} bytes` } })
+  expect(await preview({ ...config, delivery: 'z'.repeat(bytes) })).toMatchObject({ status: 400, body: { error: `Request exceeds ${bytes} bytes` } })
   expect(restarts).not.toHaveBeenCalled()
 })
 
@@ -2604,7 +2587,7 @@ it('ends the main Session\'s prompt with its Policy section, each rule on one li
   const settings = runtime.store.settings()
   const rules = settings.policy.rules.map(rule => rule.id === 'copy'
     ? { ...rule, name: 'Copy\nfixes', instruction: 'Fix typos.\n- Keep the tone.\n\n## Not a heading' } : rule)
-  await runtime.settings.save('policy', { ...settings.policy, rules }, runtime.store.blockRevision('policy'), 'panel')
+  runtime.store.saveSettings({ ...settings, policy: { ...settings.policy, rules } })
   const prompt = (sections.get(runtime.masterId)!.text as (context: object) => string)({})
   const policy = prompt.slice(prompt.indexOf('## Policy'))
   // Nothing follows the section, whose lines after its head are exactly the enabled rules.
@@ -2626,12 +2609,12 @@ it('keeps the Policy the main Session judges by in its prompt, after admission a
   expect(policy()).toContain('The accept mode and the rules decide proactive candidates only: an explicit request is routed as dispatch says, in any mode and whatever the rules.')
   // A save changes it from the next request: one rule disabled, the other's instruction changed.
   const rules = settings.policy.rules.map(rule => rule.id === 'copy' ? { ...rule, instruction: `${rule.instruction} Keep it short.` } : { ...rule, enabled: false })
-  await runtime.settings.save('policy', { ...settings.policy, rules }, runtime.store.blockRevision('policy'), 'panel')
+  runtime.store.saveSettings({ ...settings, policy: { ...settings.policy, rules } })
   const saved = runtime.store.settings()
   expect(policy()).toContain(`Policy version ${policyVersion(saved)}`)
   expect(policy().split('\n').filter(item => item.startsWith('- '))).toEqual(rules.filter(rule => rule.enabled).map(line))
   // With no rule enabled, a proactive candidate can only be ignored.
-  await runtime.settings.save('policy', { ...saved.policy, rules: rules.map(rule => ({ ...rule, enabled: false })) }, runtime.store.blockRevision('policy'), 'panel')
+  runtime.store.saveSettings({ ...saved, policy: { ...saved.policy, rules: rules.map(rule => ({ ...rule, enabled: false })) } })
   expect(policy()).toContain('No rule is enabled: a proactive candidate can only be ignored.')
   expect(policy()).toContain('The accept mode and the rules decide proactive candidates only')
 })

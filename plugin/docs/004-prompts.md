@@ -29,7 +29,7 @@ Overrides use these keys:
 | Worker skills | `skill/doc-tree`, `skill/worker/implement`, `skill/worker/tdd`, `skill/worker/test-scope`, `skill/worker/code-review` |
 | Generated sections | `runtime/environment`, `runtime/policy`, `runtime/policy/none` |
 
-The worker guards load `prompts/worker-ticket-ended.md`, `prompts/worker-writer-required.md`, and `prompts/worker-ancestry-pending.md` as fixed tool responses, not editable system-prompt parts.
+The Worker guards load `prompts/worker-ticket-ended.md`, `prompts/worker-writer-required.md`, `prompts/worker-ancestry-pending.md`, and `prompts/worker-skill-not-bound.md` as fixed tool responses, not editable system-prompt parts.
 
 The Executor loads `prompts/worker-recovery.md` as the recovery message sent to the original Worker Session for an interrupted Assignment.
 
@@ -45,9 +45,7 @@ The generated sections are editable templates. They must retain these placeholde
 
 Editing a part changes the instructions the model receives. It does not change the gate, Mandates, tool checks, channel delivery or account wrappers, which remain enforced by code; the host also queues the acknowledgement an accept carries, pull-request end notices and Source notices itself. The Hub's tool set is such a fact; `plugin/docs/010-session-boundaries.md` records the boundary and the code that enforces it, and no prompt section creates or widens it. A rule stated only in prompt text, such as a worker's duty not to reach a person itself, is behavior, not enforcement.
 
-On an explicit human request, the main Session can also save overrides with `orchestrator_prompts_save`. If a save omits an override's `base`, it keeps the saved base. A removed part already present in the saved configuration is dropped on save; any other unknown part is refused.
-
-An override records which built-in text it was based on. Upgrades preserve the team's text. If the default changes, the panel marks the part **Default updated** and shows the difference beside the team's text. The team can keep its text, use the new default or edit it. Parts without overrides automatically follow new defaults.
+Prompt changes are staged through management settings, not Session tools. If an override omits its `base`, validation keeps the saved base. A removed part already present in the effective configuration is dropped when staging; any other unknown part is refused. **Default updated** compares the packaged default with the recorded base of an override.
 
 The main Session can read affected part names in `orchestrator_read prompts`, under `default_changed`.
 
@@ -114,7 +112,11 @@ These apply [000 Philosophy](000-philosophy.md) to the agents:
 
 ## Versions
 
-- Each save creates an immutable version containing the full configuration, revision number, predecessor, timestamp and origin (panel or tool). Restoring a version or defaults creates another version.
-- Saves name their base revision. A conflicting save is refused without discarding the draft.
-- Sessions read the latest version on every model request, including later steps in the same turn. Saving does not restart, cancel or wake a Session. The host records the revisions each Session used; an Executor can read any revision it worked under.
-- The deployment sets a total size limit, including overrides. Validation refuses unknown keys, reserved built-in skill names, unknown override parts and missing template placeholders. It never silently truncates text. An override identical to the default is removed so the part follows future defaults.
+1. Confirm and dispatch a separate, single-node maintenance Plan Ticket. In **Settings → Prompts**, edit team instructions, admission rules or Skills and copy the draft as JSON. `admissionRules`, when present, replaces the admission rule list on publication; omitting it keeps the current list. The optional `disabledSkills` array names custom keys in `skills`; disabled Skills retain their text but are not registered.
+2. Stage the draft against the effective `baseRevision` with that Ticket's internal ID. `PUT /orchestrator/api/prompts` accepts exactly `{config, baseRevision, maintenanceTicketId}` and returns `{revision, effect: 'pending-review'}`. This same-origin management write requires the mounted project ID where applicable. Invalid input is `400`; a stale base, ineligible Ticket or proposal fenced by a queued mainline attempt is `409`. Repeating the same staging request reuses the proposal.
+3. In the maintenance Ticket, commit only `.dsh-superagent/rules.json`, a bounded regular UTF-8 JSON file with the proposed configuration. The queue inspects the committed tree, never the worktree's loose files. A mixed candidate, an unmatched proposal or an invalid manifest cannot queue. The candidate still needs both independent review lanes, all registered acceptance criteria, tests, required CI and [formal delivery on the target](003-execution.md#formal-plan-closure). Receipt, close and publication commit together. A failed review or lost CI evidence does not publish.
+4. `GET /orchestrator/api/prompts` returns the active `revision`, the requested `current` configuration (`revision` query, or the effective version by default), `shownState`, and paged `revisions` (`offset`). States are `active`, `previous`, `pending` and `stale`. Restoring an older configuration or defaults stages another proposal. `POST /orchestrator/api/prompts/preview` validates and renders a draft without staging it.
+
+Each Ticket binds the effective revision before launch. Retry, restart and independent re-review keep that binding. `ticket/<id>` reports `rules_revision`; management Ticket detail returns `rulesRevision`. Workers can read the snapshot through `prompts/current` or its exact revision. Calls to a managed Skill (`dsh-superagent-` or `dsh-worker-`) not mounted for the Ticket are refused rather than loaded from a same-name filesystem Skill. Non-Ticket Sessions use the published revision on their next request. Managed text does not grant tool permissions, lower registered acceptance, alter required checks or raise resource limits.
+
+Verification: `tests/prompts.spec.ts`, `tests/mainline-git.spec.ts`, `tests/mainline-queue.spec.ts`, `tests/http.spec.ts`, and `tests/panel-prompts.spec.tsx`.

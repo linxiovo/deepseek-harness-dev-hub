@@ -91,7 +91,7 @@ it('shows a Ticket\'s verified worktree facts and writer, and a rejected prepara
       active_writer: null, preparation: { state: 'rejected', reason: 'Another Ticket owns this worktree; nothing was changed.' } }),
   }
   const call = serve({
-    store: { tickets: { get: (id: string) => tickets[id] }, decisions: { get: () => undefined }, triggers: { get: () => undefined },
+    store: { get: () => undefined, tickets: { get: (id: string) => tickets[id] }, decisions: { get: () => undefined }, triggers: { get: () => undefined },
       settings: () => SettingsSchema.parse({}), read: { subscribedThreads: () => [] } },
     sources: { kind: () => undefined }, links: () => () => ({ url: '', label: { zh: '', en: '' } }), configured: () => false,
   })
@@ -122,18 +122,26 @@ it('answers a prompt save that lost a race with 409, and a settings body over 12
   const call = serve({
     machine: { promptMaxChars: { get: () => 100_000 } },
     store: { atomic: (work: () => unknown) => work(), blockRevision: () => 0 },
-    prompts: { save: () => { throw new PromptConflict('Prompt version changed to 3; compare the latest version before saving') } },
+    prompts: { stage: () => { throw new PromptConflict('Prompt version changed to 3; compare the latest version before saving') } },
     sessions: { notify: () => {}, delivery: async () => 'injected' },
     settings: { save: async (...args: unknown[]) => { saves.push(args); return { saved: true, revision: 1, restarting: false } } },
   })
-  expect(await call('PUT', 'prompts', { config: {}, baseRevision: 2 }))
-    .toEqual({ status: 409, body: { error: 'Prompt version changed to 3; compare the latest version before saving' } })
+  expect(await call('PUT', 'prompts', { config: {}, baseRevision: 2, maintenanceTicketId: 'T-12' }))
+    .toEqual({ status: 409, body: { error: 'Prompt version changed to 3; compare the latest version before saving', code: 'promptRevisionChanged' } })
   const value = { prepare: 'x'.repeat(128 * 1024) }
   expect(await call('PUT', 'settings/executor', { value, revision: 0 })).toEqual({ status: 400,
     body: { error: `Request exceeds ${128 * 1024} bytes` } })
   expect(saves).toEqual([])
 })
 
+it('requires a maintenance Ticket ID and refuses top-level authority fields on prompt staging', async () => {
+  const staged: unknown[] = []
+  const call = serve({ machine: { promptMaxChars: { get: () => 100_000 } },
+    prompts: { stage: (...args: unknown[]) => { staged.push(args); return { revision: 4 } } } })
+  expect((await call('PUT', 'prompts', { config: {}, baseRevision: 0 })).status).toBe(400)
+  expect((await call('PUT', 'prompts', { config: {}, baseRevision: 0, maintenanceTicketId: 'T-22', maxWorkers: 100 })).status).toBe(400)
+  expect(staged).toEqual([])
+})
 it('answers the Session meter view the Hub reads, decoded from the path, and 404 for an unknown Session', async () => {
   const range = { from: 1, through: 9 }
   const view: SessionMeterView = { session_id: 'worker/a b', inherited_events: 3, cursor: 9,

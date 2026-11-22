@@ -15,7 +15,7 @@ export interface UserFailure { code: UserErrorCode; values: Record<string, strin
  */
 export class ApiError extends Error {
   constructor(message: string, readonly status: number,
-    readonly details: { issues?: { path: string; message: string }[]; setup?: SetupProblem; user?: UserFailure; unreachable?: boolean } = {}) {
+    readonly details: { code?: string; issues?: { path: string; message: string }[]; setup?: SetupProblem; user?: UserFailure; unreachable?: boolean } = {}) {
     super(message)
   }
   get issues() { return this.details.issues ?? [] }
@@ -52,7 +52,8 @@ async function api<T>(messages: ApiMessages, path: string, method: string, body?
     const message = failure.setup ? messages.setup(failure.setup) : user ? messages.user(user)
       : typeof failure.error === 'string' ? failure.error : !text && status === 404 ? messages.notRunning
       : status >= 500 ? messages.serverError(status) : messages.requestFailed(status)
-    throw new ApiError(message, status, { issues, ...failure.setup ? { setup: failure.setup } : {}, ...user ? { user } : {},
+    throw new ApiError(message, status, { issues, ...typeof failure.code === 'string' ? { code: failure.code } : {},
+      ...failure.setup ? { setup: failure.setup } : {}, ...user ? { user } : {},
       ...text ? {} : { unreachable: true } })
   }
   return value as T

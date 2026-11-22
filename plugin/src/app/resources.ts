@@ -7,6 +7,7 @@ import { UserError, key, latestReport, reached, reviewStatus, runningAssignment,
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { inspectWorktree } from '../executor/worktree.ts'
 import { docTreeImpactSchema, docTreeScopeSchema } from '../executor/doc-tree.ts'
+import { inspectRulesChange } from '../executor/mainline-git.ts'
 import { readGithub } from '../sources/github-read.ts'
 import { actionsEvidence, type ActionsEvidence } from '../sources/actions-evidence.ts'
 import { githubKind, type GithubConfig } from '../sources/github.ts'
@@ -74,7 +75,6 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'prompts', holds: 'the prompt revision each Session reads, the skills, and the saved versions' },
   { name: 'prompts/<revision>', holds: 'one prompt version by number, or current, the one the Session works under', executor: true },
   { name: 'prompts/defaults', holds: 'the built-in prompt configuration, and the built-in parts by the key an override names' },
-  { name: 'prompt-preview/<id>', holds: 'a composed prompt that orchestrator_prompts_save previewed' },
   { name: 'models', holds: 'model providers, the DSH default and each role\'s model' },
   { name: 'models/<provider>', holds: 'one provider\'s models' },
   { name: 'session/<id>', holds: 'context window sample and cumulative token buckets, including coverage gaps; not a bill' },
@@ -100,14 +100,13 @@ export interface ResourceHost {
   readonly handoffs?: Pick<Handoffs, 'spec'>
   readonly plans?: Pick<Plans, 'get'>
   readonly pages: TextCache
-  readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'skills' | 'defaultChanged'>
+  readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'skills' | 'defaultChanged' | 'boundRevision' | 'proposal' | 'state' | 'matches'>
+  rulesManifestMaxBytes(): number
   readonly commands: Commands
   readonly masterId: string
   readonly context: Context
   readonly meter: Pick<SessionMeter, 'read'>
   promptVersion(sessionId: string): PromptVersion
-  /** Whether a Session may read `revision` (the revision it currently runs under or any revision it ran under previously). */
-  mayRead(sessionId: string, revision: number): boolean
   feishuPageSize(): number
   sourceLink(trigger: Trigger, signal?: AbortSignal): Promise<{ source_url?: string; source_url_read?: string }>
 }
@@ -278,6 +277,7 @@ interface DeliveryState {
   quotaBlocked: boolean
   required: RequiredChecks
   pull: TicketPull | undefined
+  proposal: number | undefined
   stamp: string
 }
 
@@ -290,11 +290,15 @@ function deliveryState(host: ResourceHost, id: string): DeliveryState {
   const credentialBlocked = host.credentialBlocked?.(id) === true
   const quotaBlocked = host.quotaBlocked?.(id) === true
   const settings = host.store.settings()
-  const required = githubKind.schema.parse(settings.sources.github?.config ?? {}).requiredChecks
+  const required = ticket.plan ? host.store.get(KV.plans.requiredChecks(id)) ?? []
+    : githubKind.schema.parse(settings.sources.github?.config ?? {}).requiredChecks
   const pull = required.length ? ticketPull(host, ticket) : undefined
+  const proposal = host.prompts.proposal(id)
+  const proposalState = proposal === undefined ? undefined : host.prompts.state(proposal)
   const stamp = createHash('sha256').update(JSON.stringify([host.store.get(KV.settings.revision), settings.paused, credentialBlocked, quotaBlocked,
-    settings.executor, settings.sources.github, ticket.plan, ticket.ended, ticket.execution, ticket.assignments, ticket.deliveryCheck, generation, criteria, pull])).digest('hex')
-  return { ticket, assignment, generation, criteria, paused: settings.paused, credentialBlocked, quotaBlocked, required, pull, stamp }
+    settings.executor, settings.sources.github, ticket.plan, ticket.ended, ticket.execution, ticket.assignments, ticket.deliveryCheck, generation, criteria, pull,
+    required, proposal, proposalState])).digest('hex')
+  return { ticket, assignment, generation, criteria, paused: settings.paused, credentialBlocked, quotaBlocked, required, pull, proposal, stamp }
 }
 
 interface DeliveryCheckout {
@@ -412,6 +416,20 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
   let ciFailure: { code?: number; exit_code?: number } | undefined
   let ciStatus = state.required.length ? 'pending_local_gate' : 'required_checks_unconfigured'
   let observation: DeliveryTargetObservation | undefined
+  let rulesRevision: number | undefined
+  let rulesMissing: string | undefined
+  if (checkout?.clean && state.ticket.plan) {
+    const change = await inspectRulesChange(commands, checkout.worktree, checkout.base, checkout.candidate, host.rulesManifestMaxBytes())
+    if (change.kind === 'not-isolated') rulesMissing = 'shared_rules_not_isolated'
+    else if (change.kind === 'invalid') rulesMissing = 'shared_rules_invalid'
+    else if (change.kind === 'changed') {
+      if (state.proposal === undefined || host.prompts.state(state.proposal) !== 'pending') rulesMissing = 'shared_rules_proposal'
+      else if (!host.prompts.matches(state.proposal, change.config)) rulesMissing = 'shared_rules_mismatch'
+      else rulesRevision = state.proposal
+    } else if (state.proposal !== undefined) rulesMissing = 'shared_rules_manifest_required'
+    if (replay && replay.rulesRevision !== rulesRevision) rulesMissing ??= 'shared_rules_proposal_changed'
+    if (rulesMissing) result.missing.add(rulesMissing)
+  }
   if (result.target && result.view.ready && result.missing.size === 0 && state.required.length) {
     const { base, candidate } = result.target
     try {
@@ -464,12 +482,14 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
       ciStatus = 'stale'
     }
   }
+  if (rulesMissing) result.missing.add(rulesMissing)
   if (observation && 'missing' in observation) result.missing.add(observation.missing)
   if (ciStatus !== 'passed' && (!formal || (ciStatus !== 'pending_local_gate' && ciStatus !== 'stale'))) result.missing.add('required_ci')
   const identity = state.ticket.execution?.ownership?.identity
   const approval: MergeApproval | undefined = scope && result.missing.size === 0 && checkout && identity && result.target && state.assignment && ci
     ? { target: { repository: identity.repository, slug: commands.repository, ref: checkout.baseRef }, base: checkout.base,
-      candidate: checkout.candidate, generation: result.target.generation, assignment: state.assignment.id, stamp: state.stamp, ci }
+      candidate: checkout.candidate, generation: result.target.generation, assignment: state.assignment.id, stamp: state.stamp, ci,
+      ...rulesRevision === undefined ? {} : { rulesRevision } }
     : undefined
   return { state, checkout, local: result.view, missing: [...result.missing], actions, ciStatus, ciFailure, approval, observation }
 }
@@ -684,21 +704,17 @@ const ROUTES: readonly Route[] = [
         ({ ...version, previous_revision: previousRevision, saved_at: savedAt })),
       next_offset: history.next_offset }
   }],
-  // A worker Session may read only its current prompt revision and revisions it previously ran under.
+  // A Worker may inspect only the immutable version of its Ticket.
   ['prompts/', read => {
     const { host, resource, rest, sessionId, ticketId } = read
     const prompts = host.prompts
     const bound = host.promptVersion(sessionId)
     const parts = () => Object.fromEntries(Object.entries(builtInParts()).map(([key, part]) => [key, part.text]))
-    const version = rest === 'current' ? bound : rest === 'defaults' && !ticketId ? { revision: 0, config: defaultPrompts(), parts: parts() }
-      : /^\d+$/.test(rest) ? (Number(rest) === 0 && prompts.current().revision === 0 ? prompts.current() : prompts.version(Number(rest))) : undefined
-    if (!version || (ticketId && !host.mayRead(sessionId, version.revision))) throw new Error('Unknown or inaccessible prompt version')
+    const version = rest === 'current' || (ticketId && /^\d+$/.test(rest) && Number(rest) === bound.revision) ? bound
+      : ticketId ? undefined : rest === 'defaults' ? { revision: 0, config: defaultPrompts(), parts: parts() }
+      : /^\d+$/.test(rest) ? prompts.version(Number(rest)) : undefined
+    if (!version) throw new Error('Unknown or inaccessible prompt version')
     return text({ ...read, resource: rest === 'current' ? `prompts/${version.revision}` : resource }, JSON.stringify(version))
-  }],
-  ['prompt-preview/', read => {
-    const body = main(read).pages.get(`${read.sessionId}:${read.resource}`)
-    if (body === undefined) throw new Error('Unknown preview for this Session')
-    return text(read, body)
   }],
   ['models', async read => {
     const host = main(read), catalog = await host.context.sessionController.modelCatalog(), settings = host.store.settings()
@@ -739,7 +755,8 @@ const ROUTES: readonly Route[] = [
     const handoff = kind === 'plan' ? host.handoffs.get(id) : undefined
     if (!ticket && !handoff) throw new Error('Unknown ticket or handoff')
     const commands = host.commands.withSignal(read.signal)
-    const required = githubKind.schema.parse(host.store.settings().sources.github?.config ?? {}).requiredChecks
+    const required = ticket?.plan ? host.store.get(KV.plans.requiredChecks(id)) ?? []
+      : githubKind.schema.parse(host.store.settings().sources.github?.config ?? {}).requiredChecks
     return sourcePage(read, 'github', async () => {
       if (ticket) return (await ticketActions(commands, ticket, sha, required, ticketPull(host, ticket))).evidence
       if (handoff) {
@@ -795,7 +812,9 @@ const ROUTES: readonly Route[] = [
       const threads = [...subscribed.map(thread => marked(thread.key, !!thread.context?.includes(id))),
         ...[...bound].filter(key => !subscribed.some(thread => thread.key === key)).map(key => marked(key, false))]
       const mainline = mainlineIntent(host.store, id)
+      const revision = host.prompts.boundRevision(id)
       return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId), ...retry,
+        ...revision === undefined ? {} : { rules_revision: revision },
         ...mainline ? { mainline } : {},
         ...ticket.plan || ticket.deliveryCheck ? { delivery_check: { read: `ticket/${id}/delivery-check` } } : {} }
     }

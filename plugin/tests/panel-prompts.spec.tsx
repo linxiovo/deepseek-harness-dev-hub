@@ -6,8 +6,22 @@ import { expect, it } from 'vitest'
 import { zh } from '../src/client/locales.ts'
 import { usePanel, mount, settle, all, tab, click, type, text, field, at } from './fixtures/panel.tsx'
 import { server, promptVersion } from './fixtures/panel-server.ts'
+import type { PromptConfig } from '../src/app/prompts.ts'
 
 usePanel()
+const stagePrompt = async () => {
+  await type(field<HTMLInputElement>(zh.promptMaintenanceTicket), 'M-22')
+  await click(zh.save)
+}
+
+async function pendingConfig(): Promise<PromptConfig> {
+  const revision = server.prompts.revisions.find(item => item.state === 'pending')!.revision
+  const response = await fetch(`/orchestrator/api/prompts?revision=${revision}`, { headers: { 'x-orchestrator-request': '1' } })
+  expect(response.status).toBe(200)
+  const { current, shownState } = JSON.parse(await response.text())
+  expect(shownState).toBe('pending')
+  return current.config
+}
 it('lists the team sections, then the built-in parts, edits and saves them separately from settings, and resets one section', async () => {
   at({ page: 'settings', query: { group: 'prompts' } })
   await mount()
@@ -25,8 +39,9 @@ it('lists the team sections, then the built-in parts, edits and saves them separ
   await click(zh.promptResetSection)
   expect(text()).not.toContain('处修改')
   await type(field<HTMLTextAreaElement>(zh.promptBody), 'Second rule')
-  await click(zh.save)
-  expect(server.prompts.current.config.communication).toBe('Second rule')
+  await stagePrompt()
+  expect(field<HTMLTextAreaElement>(zh.promptBody).value).toBe(defaultPrompts().communication)
+  expect((await pendingConfig()).communication).toBe('Second rule')
   expect(server.requests.some(request => request.path.startsWith('settings/'))).toBe(false)
 })
 
@@ -35,11 +50,11 @@ it('keeps a conflicting prompt draft, rebases it onto the newer version and save
   await mount()
   await type(field<HTMLTextAreaElement>(zh.promptBody), 'Mine')
   server.prompts.revision = 1; server.prompts.current = promptVersion(1, { ...defaultPrompts(), scope: 'Theirs' })
-  await click(zh.save)
+  await stagePrompt()
   expect(document.querySelector('.dt-savebar')?.textContent).toContain('提示词已被修改到版本 1。已保留你的草稿')
-  await click(zh.save)
+  await stagePrompt()
   // The other save's section stays: the draft moved onto version 1 section by section, not as a whole.
-  expect(server.prompts.current.config).toMatchObject({ communication: 'Mine', scope: 'Theirs' })
+  expect(await pendingConfig()).toMatchObject({ communication: 'Mine', scope: 'Theirs' })
 })
 
 it('shows a built-in skill with the CLI notes in the full prompt, editable as a built-in part, and adds a team skill but no skill under a built-in name', async () => {
@@ -120,17 +135,13 @@ it('edits a built-in part as an override of its built-in text, marks it changed,
   expect(text()).toContain(zh['promptReadBy.both'])
   await type(field<HTMLTextAreaElement>(zh.promptBody), 'Shared, the team way.')
   expect(builtInItem(zh['promptPart.runtime/shared']).querySelector('.dt-changed-tag')?.textContent).toBe(zh.promptChanged)
-  await click(zh.save)
-  // The override records the built-in text it was edited from.
-  expect(server.prompts.current.config.overrides).toEqual({ 'runtime/shared': { text: 'Shared, the team way.', base: builtInBase(shared.text) } })
-  // The full prompt reads the override in place of the built-in text, compared with the defaults.
+  // The draft preview uses the override without assigning it to the active version.
   await click(tab(zh.promptViewFull))
-  expect(all('.dt-preview-part ins').map(line => line.textContent)).toContain('Shared, the team way.\n')
+  expect(text()).toContain('Shared, the team way.')
   await click(all('.dt-preview-part[data-editable] button')[0]!)
   await click(zh.promptResetSection)
   expect(field<HTMLTextAreaElement>(zh.promptBody).value).toBe(shared.text)
-  await click(zh.save)
-  expect(server.prompts.current.config).not.toHaveProperty('overrides')
+  expect(server.requests.some(request => request.method === 'PUT')).toBe(false)
 })
 
 it('says which placeholders a template keeps', async () => {
@@ -166,8 +177,8 @@ it('marks an override whose built-in text an upgrade changed, shows how it chang
   // Keeping the team's text records the new built-in text as the one it was edited from.
   await click(zh.promptKeepMine)
   expect(all('.dt-default-updated')).toHaveLength(0)
-  await click(zh.save)
-  expect(server.prompts.current.config.overrides).toEqual({ 'runtime/dispatch': { text: '## dispatch\nOur routing.', base: builtInBase(dispatch.text) } })
+  await stagePrompt()
+  expect((await pendingConfig()).overrides).toEqual({ 'runtime/dispatch': { text: '## dispatch\nOur routing.', base: builtInBase(dispatch.text) } })
 })
 
 it('shows the team\'s text against the new default when the default it was edited from is not known, or is another one', async () => {
@@ -194,10 +205,10 @@ it('keeps both sides\' first overrides when a draft moves onto a version saved m
   await type(field<HTMLTextAreaElement>(zh.promptBody), 'Shared, ours.')
   const theirs = { 'runtime/dispatch': { text: '## dispatch\nTheirs.', base: builtInBase(builtInParts()['runtime/dispatch'].text) } }
   server.prompts.revision = 1; server.prompts.current = promptVersion(1, { ...defaultPrompts(), overrides: theirs })
-  await click(zh.save)
+  await stagePrompt()
   expect(document.querySelector('.dt-savebar')?.textContent).not.toContain('undefined')
-  await click(zh.save)
-  expect(server.prompts.current.config.overrides).toEqual({ ...theirs,
+  await stagePrompt()
+  expect((await pendingConfig()).overrides).toEqual({ ...theirs,
     'runtime/shared': { text: 'Shared, ours.', base: builtInBase(builtInParts()['runtime/shared'].text) } })
 })
 
@@ -212,7 +223,7 @@ it('shows a draft\'s template of a generated part filled, and names a part by it
   await click(tab(zh.promptViewEdit))
   await click(builtInItem(zh['promptPart.runtime/policy']))
   await type(field<HTMLTextAreaElement>(zh.promptBody), '## Policy\n{version} {mode}')
-  await click(zh.save)
+  await stagePrompt()
   expect(text()).toContain(`「${zh['promptPart.runtime/policy']}」的模板必须保留占位符 {rules}`)
 })
 
@@ -228,11 +239,11 @@ it('loads a version from the history without its overrides of parts this version
   at({ page: 'settings', query: { group: 'prompts' } })
   await mount()
   await click(tab(zh.promptViewHistory))
-  // The version restored overrides a part a later version removed.
-  const saved = server.prompts.current
+  await type(field<HTMLInputElement>(zh.promptMaintenanceTicket), 'M-22')
+  const original = server.prompts.current
   server.prompts.current = promptVersion(0, { ...defaultPrompts(), overrides: { 'runtime/dispatch': dispatch, 'runtime/retired': { text: 'Old.', base: 'b' } } })
   await click(zh.promptRestore)
-  server.prompts.current = saved
-  await click(zh.save)
-  expect(server.prompts.current.config.overrides).toEqual({ 'runtime/dispatch': dispatch })
+  server.prompts.current = original
+  await stagePrompt()
+  expect((await pendingConfig()).overrides).toEqual({ 'runtime/dispatch': dispatch })
 })

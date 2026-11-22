@@ -108,13 +108,7 @@ For that Ticket, a rule's process and communication requirements override the de
 
 Rules, accept mode and each Source's Policy form the Policy version. Every Mandate records the version under which it was accepted.
 
-A version change discards running Evals and queues their Triggers again. It also sends a policy-changed Input to each affected live Ticket. The Input explains whether:
-
-- a matched rule changed, including its new text, or no longer applies;
-- the requester may no longer start work; or
-- proactive work is no longer accepted, for example because the mode changed from `auto`.
-
-Unaffected Tickets receive no notice. The change does not immediately revoke live Tickets' Mandates.
+A change to the Policy version discards running Evals and requeues their Triggers for the current admission rules. Publishing reviewed rules (`plugin/docs/004-prompts.md`) does not send changed rule text into open Tickets. When an operator changes the accept mode or Source authorization, affected live Tickets receive a notice about the restriction: for instance, the requester may no longer start work or proactive intake may be off. A notice grants no new authority and does not by itself end an open Ticket.
 
 Source configuration is separate from Policy. It controls what enters the system: which chats are read and whether a scope receives all messages or only mentions. A Mandate records its Source and receiving scope. Resuming needs the Source to still listen to the Thread, but does not require it to still receive every message there.
 

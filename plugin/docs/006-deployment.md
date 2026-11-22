@@ -262,7 +262,7 @@ Agents may rely on these routes and fields. The other routes in `src/app/api.ts`
 | `POST executor/pause` with `{"paused": true}` or `false` | Pauses or resumes processing: `paused` |
 | `POST setup/check` | Retries setup or pending project recovery by restarting dsh-superagent: `{restarting: true}`. Refused when there is nothing to fix |
 | `POST policy-sync/<source id>` | Syncs that Source's allowed list now: `policy`, the Source's part as saved |
-| `GET prompts`, `PUT prompts` with `{"config", "baseRevision"}` | Reads the prompt configuration: `current`, with its `revision` and `config`, `defaults`, `sections`, the team sections in the order Sessions read them, `skillName`, the pattern of a team skill's name, `builtin`, the names a team skill cannot take, and `skillPrefix`, which Sessions load a skill's name under. Or saves it: the new `revision` |
+| `GET prompts`, `PUT prompts`, `POST prompts/preview` | Read rule history, stage a maintenance proposal, or preview without writing. See [Prompt versions](004-prompts.md#versions) for the request, response and publication rules. |
 | `POST tickets/<id>/retry`, `POST tickets/<id>/stop` | Retries or stops a Ticket, as the panel does |
 
 Health entries are grouped by responsibility:
@@ -349,7 +349,7 @@ From an allowed GitHub account, open an Issue or post a comment containing `@<ag
 
 To adopt an existing deployment, keep `stateDir` at its original path. Verify its dedicated agent CLI, then register its current repository, workspace and base ref with `policy` omitted. After remount, confirm the original Hub ID, settings and Tickets before registering other projects. See `012-project-runtime.md` for the exact adoption checks and errors.
 
-A restart ends running Assignments and starts replacements with recovery notes. Team text and overridden prompt parts are retained; parts without overrides follow the new defaults. Review parts marked **Default updated** after upgrading.
+Ticket recovery retains the persisted rule revision. Existing installations without Ticket pins import the last recorded Worker revision when available; otherwise they bind the effective revision at upgrade. See [Prompt versions](004-prompts.md#versions).
 
 Tickets accepted before this version stored only a directory. They keep that directory and its record, but have no verified worktree, branch or base; the Executor does not adopt an existing tree or infer a base from its current HEAD. A legacy Ticket whose earlier worker's idle state cannot be proven refuses a retry with that reason, and an existing directory is never reused. A legacy Ticket that never started can prepare under the new rules when its directory does not already exist.
 

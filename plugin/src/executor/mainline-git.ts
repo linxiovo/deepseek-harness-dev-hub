@@ -1,7 +1,8 @@
 /** Compare and advance one exact GitHub branch without using the primary checkout's refs or Git transport settings. */
+import { createHash } from 'node:crypto'
 import { access, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { isAbsolute, join, posix } from 'node:path'
 import { CliError, type Commands } from '../infra/commands.ts'
 import { credentialHelper, sameDirectory } from '../infra/environment.ts'
 import { validateRepositoryIdentity } from './repository-identity.ts'
@@ -15,14 +16,18 @@ const observed = 'refs/dsh/mainline/observed'
 const commitId = /^[0-9a-f]{40}$/i
 const outputLine = (value: string): string => value.replace(/\r?\n$/, '')
 
-async function git(commands: Commands, cwd: string, label: string, args: string[]): Promise<string> {
+async function git(commands: Pick<Commands, 'git'>, cwd: string, label: string, args: string[]): Promise<string> {
   try { return await commands.git(args, cwd) }
   catch (error) {
-    // Never surface external stderr/argv. A helper, Git, or the remote can emit sensitive diagnostics.
-    if (error instanceof Error && error.name === 'AbortError') throw new DOMException('The operation was aborted', 'AbortError')
-    const exit = error instanceof CliError ? error.exitCode : undefined
-    throw new CliError(`Cannot ${label}${exit === undefined ? '' : ` (Git exit ${exit})`}`, undefined, exit)
+    throw gitFailure(label, error)
   }
+}
+
+function gitFailure(label: string, error: unknown): Error {
+  // Never surface external stderr/argv. A helper, Git, or the remote can emit sensitive diagnostics.
+  if (error instanceof Error && error.name === 'AbortError') return new DOMException('The operation was aborted', 'AbortError')
+  const exit = error instanceof CliError ? error.exitCode : undefined
+  return new CliError(`Cannot ${label}${exit === undefined ? '' : ` (Git exit ${exit})`}`, undefined, exit)
 }
 
 interface Scratch {
@@ -82,6 +87,103 @@ async function inScratch<T>(commands: Commands, target: MainlineTarget, act: (sc
   } finally {
     await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
   }
+}
+
+export const RULES_MANIFEST = '.dsh-superagent/rules.json'
+
+type RulesChange = { kind: 'unchanged' } | { kind: 'not-isolated' } | { kind: 'invalid' } | { kind: 'changed'; config: unknown }
+
+/** Inspect only the immutable Git trees named by base and candidate, never files or filters from the checkout. */
+export async function inspectRulesChange(commands: Pick<Commands, 'git'>, directory: string, base: string, candidate: string,
+  maxBytes: number): Promise<RulesChange> {
+  const fullOid = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i
+  if (!fullOid.test(base) || !fullOid.test(candidate)) throw new Error('Rules inspection requires full commit object IDs.')
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error('Rules inspection requires a non-negative byte limit.')
+  let options = ['--no-pager', '--no-replace-objects', '--no-lazy-fetch']
+  const run = (label: string, ...args: string[]): Promise<string> => git(commands, directory, label, [...options, ...args])
+  const readFormat = ['rev-parse', '--show-object-format']
+  let format: string
+  try { format = outputLine(await commands.git([...options, ...readFormat], directory)) }
+  catch (error) {
+    if (!(error instanceof CliError) || ![1, 129].includes(error.exitCode ?? 0) || !error.message.startsWith('unknown option: --no-lazy-fetch')) {
+      throw gitFailure('identify the rules repository object format', error)
+    }
+    // Older supported Git cannot disable lazy fetch. Reject promisor configuration before reading any objects.
+    options = options.filter(option => option !== '--no-lazy-fetch')
+    try {
+      await run('inspect Git promisor configuration', 'config', '--includes', '--name-only', '--get-regexp',
+        '^(extensions[.]partialclone|remote[.].*[.](promisor|partialclonefilter))$')
+      throw new Error('Rules inspection requires a complete clone on this Git version.')
+    } catch (error) {
+      if (!(error instanceof CliError) || error.exitCode !== 1) throw error
+    }
+    format = outputLine(await run('identify the rules repository object format', ...readFormat))
+  }
+  if (format !== 'sha1' && format !== 'sha256') throw new Error('Unexpected Git object format for rules inspection.')
+  const oidLength = format === 'sha1' ? 40 : 64
+  base = base.toLowerCase()
+  candidate = candidate.toLowerCase()
+  for (const id of new Set([base, candidate])) {
+    if (id.length !== oidLength || outputLine(await run('read a rules commit object', 'cat-file', '-t', id)) !== 'commit') {
+      throw new Error('Rules inspection requires full commit object IDs.')
+    }
+  }
+
+  const parent = posix.dirname(RULES_MANIFEST)
+  const name = posix.basename(RULES_MANIFEST)
+  const entry = async (treeish: string, path: string): Promise<{ mode: string; oid: string } | undefined> => {
+    const output = await run('read a rules tree entry', '--literal-pathspecs', 'ls-tree', '--full-tree', '-z', `--abbrev=${oidLength}`, treeish, '--', path)
+    if (!output) return undefined
+    const match = /^([0-7]{6}) (?:blob|tree|commit) ([0-9a-f]+)\t/.exec(output)
+    if (!match || match[2]!.length !== oidLength || output.slice(match[0].length) !== `${path}\0`) {
+      throw new Error('Unexpected Git tree entry for rules inspection.')
+    }
+    return { mode: match[1]!, oid: match[2]! }
+  }
+  const beforeDir = await entry(base, parent)
+  const afterDir = base === candidate ? beforeDir : await entry(candidate, parent)
+  if (beforeDir?.mode === afterDir?.mode && beforeDir?.oid === afterDir?.oid) return { kind: 'unchanged' }
+  const beforeTree = beforeDir?.mode === '040000' ? beforeDir.oid : undefined
+  const afterTree = afterDir?.mode === '040000' ? afterDir.oid : undefined
+  const before = beforeTree ? await entry(beforeTree, name) : undefined
+  const after = afterTree ? await entry(afterTree, name) : undefined
+  if (before?.mode === after?.mode && before?.oid === after?.oid) return { kind: 'unchanged' }
+
+  // Compare one level at a time: any changed sibling tree counts, including an empty tree.
+  // No path filter can hide a sibling, and Git's capture limit rejects oversized output rather than truncating it.
+  if ((beforeDir && !beforeTree) || (afterDir && !afterTree)) return { kind: 'not-isolated' }
+  const emptyTree = createHash(format).update('tree 0\0').digest('hex')
+  const diffPaths = (left: string, right: string): Promise<string> => run('compare rule snapshots', 'diff-tree',
+    '--no-commit-id', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none',
+    '--no-relative', '-O/dev/null', left, right, '--')
+  for (const [left, right, allowed] of [[base, candidate, parent], [beforeTree ?? emptyTree, afterTree ?? emptyTree, name]] as const) {
+    const paths = await diffPaths(left, right)
+    if (!paths || !paths.endsWith('\0')) throw new Error('Unexpected Git path output for rules inspection.')
+    const record = `${allowed}\0`
+    if (paths !== record && paths !== record + record) return { kind: 'not-isolated' }
+  }
+  if (before?.mode === '040000' || after?.mode === '040000') {
+    const nested = await diffPaths(before?.mode === '040000' ? before.oid : emptyTree, after?.mode === '040000' ? after.oid : emptyTree)
+    if (nested && !nested.endsWith('\0')) throw new Error('Unexpected Git path output for rules inspection.')
+    if (nested) return { kind: 'not-isolated' }
+  }
+  if (after?.mode !== '100644' && after?.mode !== '100755') return { kind: 'invalid' }
+
+  if (outputLine(await run('read the rules object type', 'cat-file', '-t', after.oid)) !== 'blob') {
+    throw new Error('Unexpected Git object type for candidate rules.')
+  }
+  const sizeOutput = outputLine(await run('read the rules blob size', 'cat-file', '-s', after.oid))
+  if (!/^[0-9]+$/.test(sizeOutput)) throw new Error('Unexpected Git blob size for candidate rules.')
+  const size = Number(sizeOutput)
+  if (size > maxBytes) return { kind: 'invalid' }
+  const text = await run('read the rules blob', 'cat-file', 'blob', after.oid)
+  const decodedSize = Buffer.byteLength(text, 'utf8')
+  if (decodedSize < size) throw new Error('Incomplete Git blob output for candidate rules.')
+  // Commands decodes UTF-8 lossily. Distinguish invalid input from a genuine replacement character.
+  if (text.includes('\uFFFD') && createHash(format).update(`blob ${size}\0`).update(text).digest('hex') !== after.oid) return { kind: 'invalid' }
+  if (decodedSize !== size) throw new Error('Incomplete Git blob output for candidate rules.')
+  try { return { kind: 'changed', config: JSON.parse(text) as unknown } }
+  catch { return { kind: 'invalid' } }
 }
 
 async function requireCommit(scratch: Scratch, id: string): Promise<void> {

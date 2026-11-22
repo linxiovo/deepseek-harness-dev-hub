@@ -68,7 +68,7 @@ export interface Api {
   'GET project/run-limits': { response: RunLimitStatus }
   'GET tickets/:id/run-limits': { response: RunLimitStatus }
   'GET prompts': { query?: { revision?: number; offset?: number }; response: PromptsView }
-  'PUT prompts': { body: { config: PromptConfig; baseRevision: number }; response: { revision: number; context_delivery: Delivery } }
+  'PUT prompts': { body: { config: PromptConfig; baseRevision: number; maintenanceTicketId: string }; response: { revision: number; effect: 'pending-review' } }
   'POST prompts/preview': { body: PromptConfig; response: ReturnType<Prompts['preview']> }
 }
 type Path<K> = K extends `${string} ${infer P}` ? P : never

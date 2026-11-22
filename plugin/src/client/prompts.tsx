@@ -4,11 +4,12 @@ import type { ApiResponse } from '../app/api.ts'
 import type { PromptConfig, PromptsView } from './api.ts'
 import { SaveBar, useDraft, type DraftWords } from './draft.tsx'
 import { changedSections, isPart, isSkill, lineDiff, partKey, partText, partWith, sectionLabel, sectionText, skillNameFree, withOverride,
-  withOverrides, withSection, withoutSkill, type BuiltInPart, type DiffLine } from './prompt-config.ts'
+  withOverrides, withSection, withSkillEnabled, withoutSkill, type BuiltInPart, type DiffLine } from './prompt-config.ts'
 import { useAction, usePanel } from './provider.tsx'
 import { errorText, valueLabel, when, type T } from './text.ts'
 import { Hint, LoadState } from './widgets.tsx'
 import { Button, Icon, Input, SegmentedControl } from './controls.tsx'
+import { AdmissionRuleEditor } from './eval.tsx'
 
 type Tab = 'edit' | 'full' | 'history'
 type Origin = { revision: number } | 'defaults' | { reset: string }
@@ -29,17 +30,19 @@ export function PromptsPage() {
 function PromptsEditor({ view, reload }: { view: PromptsView; reload: () => Promise<void> }) {
   const { t, call, notify } = usePanel()
   const saved = withOverrides(view.current.config)
+  const [maintenanceTicketId, setMaintenanceTicketId] = useState('')
   const draft = useDraft<PromptConfig, PromptNote>({ key: `dsh-superagent/prompts/${view.masterId}`, saved, revision: view.revision,
     reload,
     save: async (config, baseRevision) => {
-      const result = await call('PUT prompts', { body: { config, baseRevision } })
-      notify(t(result.context_delivery === 'pending' ? 'promptSavedPending' : 'saved'))
-      return result
+      if (!maintenanceTicketId.trim()) throw new Error(t('promptMaintenanceTicketRequired'))
+      const result = await call('PUT prompts', { body: { config, baseRevision, maintenanceTicketId: maintenanceTicketId.trim() } })
+      notify(t('promptSavedPendingReview', { revision: result.revision }))
+      setMaintenanceTicketId('')
+      return { revision: view.revision }
     } })
   const config = draft.value
   const [tab, setTab] = useState<Tab>('edit')
   const [selection, select] = useState(draft.meta?.selection ?? 'communication')
-  // Fall back to the first section when the selected section (e.g., a skill removed by discard) is no longer in the draft.
   const exists = isPart(selection) ? view.parts.some(part => part.key === partKey(selection)) : sectionText(config, selection) !== undefined
   const selected = exists ? selection : 'communication'
   const changed = changedSections(config, saved)
@@ -55,13 +58,20 @@ function PromptsEditor({ view, reload }: { view: PromptsView; reload: () => Prom
     { value: 'history' as const, label: t('promptViewHistory') }]
   const removed = view.defaultChanged.filter(item => item.removed).map(item => item.part)
   return <div className="dt-form">
+    <Hint>{t(`promptVersionState.${view.shownState}`, { revision: view.current.revision })} · {t('promptEffectiveVersion', { revision: view.effective.revision })}</Hint>
+    <div className="dt-field"><label htmlFor="prompt-maintenance-ticket">{t('promptMaintenanceTicket')}</label>
+      <Input id="prompt-maintenance-ticket" value={maintenanceTicketId} onChange={event => setMaintenanceTicketId(event.target.value)} /></div>
+    <Hint>{t('promptMaintenanceTicketHint')}</Hint>
+    {removed.length > 0 && <Hint>{t('promptRemovedParts', { parts: removed.join(t('listSeparator')) })}</Hint>}
     <div className="dt-subtabs" role="tablist" aria-label={t('promptViews')}>{tabs.map(item => <button key={item.value} type="button"
       role="tab" className="dt-subtab" aria-selected={tab === item.value} onClick={() => setTab(item.value)}>{item.label}</button>)}</div>
-    {removed.length > 0 && <Hint>{t('promptRemovedParts', { parts: removed.join(t('listSeparator')) })}</Hint>}
     {tab === 'edit' && <PromptSections config={config} view={view} changed={changed} selected={selected} onSelect={select} onEdit={edit} />}
+    {tab === 'edit' && <AdmissionRuleEditor rules={config.admissionRules ?? view.admissionRules}
+      onChange={admissionRules => edit({ ...config, admissionRules })} />}
     {tab === 'full' && <FullPrompt config={config} view={view} dirty={draft.dirty} revision={draft.revision} onEdit={open} />}
     {tab === 'history' && <PromptHistory key={view.revision} view={view} from={draft.meta?.from}
       onLoad={(next, from) => edit(withOverrides(next, view.parts), { from })} />}
+    {draft.dirty && <Hint>{t('promptPendingReviewNotice')}</Hint>}
     <SaveBar {...draft} words={words} onSave={() => { void draft.submit() }}
       onDiscard={() => { draft.discard(); reload().catch(failure => notify(errorText(failure))) }} />
   </div>
@@ -98,8 +108,9 @@ function PromptSections({ config, view, changed, selected, onSelect, onEdit }: {
         {updated(config, entry) && <span className="dt-changed-tag dt-updated-tag">{t('promptDefaultUpdated')}</span>}
         {unsaved(`part/${entry.key}`)}</span>))}
       <div className="dt-nav-group">{t('promptSkillsGroup')}</div>
-      {Object.keys(config.skills).map(skill => item(`skill/${skill}`, <span>{sectionLabel(t, view, `skill/${skill}`)}{unsaved(
-        `skill/${skill}`)}</span>))}
+      {Object.keys(config.skills).map(skill => item(`skill/${skill}`, <span>{sectionLabel(t, view, `skill/${skill}`)}
+        {config.disabledSkills?.includes(skill) && <span className="dt-changed-tag">{t('promptSkillDisabled')}</span>}{unsaved(
+          `skill/${skill}`)}</span>))}
       <form className="dt-add-skill" onSubmit={add}>
         <Input value={name} placeholder={t('promptSkillName')} aria-label={t('promptAddSkill')} spellCheck={false}
           onChange={event => { setName(event.target.value); setInvalid(false) }} />
@@ -125,8 +136,12 @@ function TeamEditor({ config, view, selected, onSelect, onEdit }: {
   return <div className="dt-prompt-main">
     <div className="dt-subhead"><h3 className="dt-section-title">{sectionLabel(t, view, selected)}</h3>
       <span className="dt-actions">{isSkill(selected)
-        ? <Button variant="outline" size="sm" icon={<Icon name="trash" />} onClick={() => { onEdit(withoutSkill(config, selected),
-          { selection: 'communication' }); onSelect('communication') }}>{t('remove')}</Button>
+        ? <>
+          <label><input type="checkbox" checked={!config.disabledSkills?.includes(selected.slice(6))}
+            onChange={event => onEdit(withSkillEnabled(config, selected.slice(6), event.target.checked))} /> {t('promptSkillEnabled')}</label>
+          <Button variant="outline" size="sm" icon={<Icon name="trash" />} onClick={() => { onEdit(withoutSkill(config, selected),
+            { selection: 'communication' }); onSelect('communication') }}>{t('remove')}</Button>
+        </>
         : <Button variant="outline" size="sm" icon={<Icon name="refresh" />} disabled={fallback === text}
           onClick={() => onEdit(withSection(config, selected, fallback ?? ''), { from: { reset: selected } })}>
           {t('promptResetSection')}
@@ -219,6 +234,9 @@ function FullPrompt({ config, view, dirty, revision, onEdit }: {
       <Button variant="outline" size="sm" icon={<Icon name="copy" />} onClick={() => {
         void navigator.clipboard.writeText(parts.map(part => part.text).join('\n\n')).then(() => notify(t('copied')))
       }}>{t('promptCopyAll')}</Button>
+      <Button variant="outline" size="sm" icon={<Icon name="copy" />} onClick={() => {
+        void navigator.clipboard.writeText(JSON.stringify(config, null, 2)).then(() => notify(t('copied')))
+      }}>{t('promptCopyConfig')}</Button>
     </div>
     {parts.map(part => {
       const { kind } = part
@@ -275,6 +293,7 @@ function PromptHistory({ view, from, onLoad }: {
       <div className="dt-row-main">
         <div className="dt-row-title">{t('promptHistoryItem', { revision: version.revision, time: version.savedAt
           ? when(version.savedAt, t('lang')) : t('promptHistoryInitial'), source: valueLabel(t, 'historySource', version.source) })}</div>
+        <div className="dt-row-meta">{t(`promptVersionState.${version.state}`, { revision: version.revision })}</div>
         <div className="dt-row-meta">{version.changed.length ? t('promptHistoryChanged', { parts: version.changed.map(name =>
           sectionLabel(t, view, name)).join(t('listSeparator')) }) : t('promptHistoryNone')}</div>
       </div>

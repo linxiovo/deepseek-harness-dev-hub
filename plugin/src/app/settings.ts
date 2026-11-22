@@ -7,6 +7,7 @@ import type { Settings as SettingsValue, SettingsBlock, SettingsOrigin, Settings
 import type { SourceHost } from '../sources/host.ts'
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
+import { githubKind, type GithubConfig } from '../sources/github.ts'
 import { resolveRoleModel } from './role-models.ts'
 import { changedPaths, settingsNotice } from './notices.ts'
 import type { Sessions } from './sessions.ts'
@@ -19,6 +20,13 @@ import { KV } from '../kv.ts'
  * Thrown by `Settings.save` and `Settings.sync` and translated into an HTTP 409 response by the management routes.
  */
 export class SettingsConflict extends Error {}
+
+/** Bind only a complete configured set; a later settings change cannot replace it. */
+export function bindRequiredChecks(store: Pick<Store, 'get' | 'set'>, ticketId: string, required: GithubConfig['requiredChecks']): void {
+  if (!required.length || required.some(check => !check.workflowId)) return
+  const binding = KV.plans.requiredChecks(ticketId)
+  if (!store.get(binding)) store.set(binding, required)
+}
 const now = (): string => new Date().toISOString()
 /** Executor settings that control shell execution paths, repository identity, pinned base selection, prepare commands, and command shims. */
 const environment = ({ executor }: SettingsValue) => JSON.stringify([executor.directory, executor.repository, executor.baseRef, executor.prepare, executor.blockedCommands])
@@ -37,8 +45,17 @@ const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
       return { ...policy, sources: sources.validatePolicy(policy.sources) }
     },
     merge: (settings, value) => ({ ...settings, policy: value as SettingsValue['policy'] }),
+    guard: (current, candidate, origin) => {
+      if (JSON.stringify(current.policy.rules) !== JSON.stringify(candidate.policy.rules))
+        throw new UserError('ruleMaintenanceRequired')
+      if (origin === 'tool' && JSON.stringify(current.policy) !== JSON.stringify(candidate.policy))
+        throw new UserError('panelOnlyPolicy')
+    },
   },
-  eval: { parse: value => EvalConfigSchema.parse(value), merge: (settings, value) => ({ ...settings, eval: value as SettingsValue['eval'] }) },
+  eval: { parse: value => EvalConfigSchema.parse(value), merge: (settings, value) => ({ ...settings, eval: value as SettingsValue['eval'] }),
+    guard: (current, candidate, origin) => {
+      if (origin !== 'panel' && current.eval.mode !== candidate.eval.mode) throw new UserError('panelOnlyPolicy')
+    } },
   executor: {
     parse: value => ExecutorConfigSchema.parse(value),
     merge: (settings, value) => ({ ...settings, executor: value as SettingsValue['executor'] }),
@@ -52,13 +69,18 @@ const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
     parse: (value, sources, id) => sources.validate(id, z.object({ enabled: z.boolean(), config: z.unknown() }).parse(value)),
     merge: (settings, value, id) => ({ ...settings, sources: { ...settings.sources, [id]: value as SettingsValue['sources'][string] } }),
     // Only the management panel may switch source accounts.
-    guard: (current, candidate, origin) => { if (origin !== 'panel' && setupChanged(current, candidate)) throw new UserError('panelOnlyAccounts') },
+    guard: (current, candidate, origin) => {
+      if (origin === 'panel') return
+      if (setupChanged(current, candidate)) throw new UserError('panelOnlyAccounts')
+      if (JSON.stringify(current.sources.github?.config.requiredChecks ?? []) !==
+          JSON.stringify(candidate.sources.github?.config.requiredChecks ?? [])) throw new UserError('panelOnlyRequiredChecks')
+    },
   },
 }
 
 /** Host dependencies used by `Settings`. */
 export interface SettingsHost {
-  readonly store: Pick<Store, 'settings' | 'saveSettings' | 'blockRevision' | 'atomic' | 'afterCommit' | 'tickets' | 'get'>
+  readonly store: Pick<Store, 'settings' | 'saveSettings' | 'blockRevision' | 'atomic' | 'afterCommit' | 'tickets' | 'get' | 'set'>
   readonly sources: SourceRegistry
   /** Notified when a settings save changes the policy version. */
   readonly engine: EngineForSettings
@@ -177,6 +199,7 @@ export class Settings {
     // Re-read current settings after async checks in case unrelated blocks were saved concurrently.
     const old = store.settings()
     const settings = rules.merge(old, parsed, id)
+    rules.guard?.(old, settings, origin)
     this.host.validate?.(old, settings)
     if (JSON.stringify(SettingsSchema.parse(settings)) === JSON.stringify(old)) {
       const delivery = await sessions.delivery(`settings:${block}`)
@@ -190,6 +213,10 @@ export class Settings {
     const notified = [...effects.keys()]
     store.atomic(() => {
       store.saveSettings(SettingsSchema.parse(settings), { source: origin, block, policyVersion: after, policyChanged: before !== after, notified })
+      if (block === 'source:github') {
+        const { requiredChecks } = githubKind.schema.parse(settings.sources.github?.config ?? {})
+        for (const ticket of store.tickets.open()) if (ticket.plan) bindRequiredChecks(store, ticket.id, requiredChecks)
+      }
       if (origin !== 'tool') sessions.notify(...settingsNotice(block, changedPaths(old, settings)))
       if (before !== after) engine.policyChanged(before, after, effects)
       if (block === 'executor' && this.host.runLimitsChanged && runLimitFingerprint(old) !== runLimitFingerprint(settings)) {

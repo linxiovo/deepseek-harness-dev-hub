@@ -13,7 +13,7 @@ import type { BudgetLedger, PendingUsage } from './app/run-limits.ts'
 import type { TopicBindingRecord } from './app/topic-binding.ts'
 import type { CredentialBlocker } from './app/scoped-attention.ts'
 import type { SettingsSave } from './policy.ts'
-import type { Retry } from './sources/github.ts'
+import type { GithubConfig, Retry } from './sources/github.ts'
 
 /** Key of a KV record whose value has type `V`; a plain string represents an untyped key. */
 export type Key<V> = string & { readonly __value?: V }
@@ -35,6 +35,10 @@ export const KV = {
     version: family<SettingsVersion, [revision: number]>('settings-version:') },
   /** Prompts: current revision and saved prompt versions. */
   prompts: { revision: record<number>('prompt-revision'), version: family<PromptVersion, [revision: number]>('prompt-version:'),
+    active: record<number>('prompt-active-revision'),
+    snapshot: family<PromptVersion, [revision: number]>('prompt-snapshot:'),
+    ticket: family<number>('ticket-prompt-revision:'),
+    proposal: family<number>('ticket-prompt-proposal:'),
     /** The built-in text of a prompt part an override was edited from, by its `base`, which shows what an upgrade changed. */
     builtIn: family<string, [base: string]>('prompt-built-in:') },
   /** Runtime: the main Session's ID. */
@@ -82,6 +86,7 @@ export const KV = {
       'handoff-confirmation:', (sessionId, messageId) => JSON.stringify([sessionId, messageId])) },
   /** Plans: immutable DAGs plus mutable node execution claims and append-only context. */
   plans: { record: family<Plan, [id: string]>('plan:'),
+    requiredChecks: family<GithubConfig['requiredChecks']>('plan-ticket-required-checks:'),
     node: family<PlanNodeState, [id: string, nodeId: string]>('plan-node:', (id, nodeId) => JSON.stringify([id, nodeId])),
     background: family<PlanMessage[], [id: string]>('plan-background:'),
     instructions: family<PlanMessage[], [id: string, nodeId: string]>('plan-instructions:',

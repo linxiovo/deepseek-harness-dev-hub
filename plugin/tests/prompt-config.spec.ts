@@ -1,7 +1,7 @@
 import { expect, it } from 'vitest'
 import { SKILL_NAME, defaultPrompts } from '../src/app/prompts.ts'
-import { changedSections, lineDiff, partText, partWith, sectionText, skillNameFree, withOverride, withOverrides, withSection, withoutSkill }
-  from '../src/client/prompt-config.ts'
+import { changedSections, lineDiff, partText, partWith, sectionText, skillNameFree, withOverride, withOverrides, withSection,
+  withSkillEnabled, withoutSkill } from '../src/client/prompt-config.ts'
 
 it('reads and writes a configuration by section, and lists the sections two configurations differ in', () => {
   const config = withSection(defaultPrompts(), 'skill/testing', 'Run the tests.')
@@ -11,6 +11,15 @@ it('reads and writes a configuration by section, and lists the sections two conf
   expect(changedSections(withSection(config, 'scope', 'Mine'), withoutSkill(config, 'skill/testing'))).toEqual(['scope', 'skill/testing'])
   expect(['testing', 'github', 'Bad Name', 'ok-2'].map(name => skillNameFree(name, config, { skillName: SKILL_NAME.source,
     builtin: ['github'] }))).toEqual([false, false, false, true])
+})
+it('preserves custom Skill text while toggling it, tracks the toggle as a diff, and clears it on deletion', () => {
+  const config = withSection(defaultPrompts(), 'skill/testing', 'Keep this text.')
+  const disabled = withSkillEnabled(config, 'testing', false)
+  expect(disabled.skills.testing).toBe('Keep this text.')
+  expect(disabled.disabledSkills).toEqual(['testing'])
+  expect(changedSections(disabled, config)).toEqual(['skill/testing'])
+  expect(withSkillEnabled(disabled, 'testing', true).disabledSkills).toEqual([])
+  expect(withoutSkill(disabled, 'skill/testing')).toMatchObject({ skills: {}, disabledSkills: [] })
 })
 
 it('diffs two texts by line, folding a long unchanged run to its ends, and reads a team part with another text', () => {

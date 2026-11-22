@@ -89,13 +89,13 @@ it('refuses a Policy sync that a Policy save outran, reports it on sync:feishu, 
   vi.mocked(Commands.prototype.lark).mockImplementationOnce(() => members.promise as never)
   const syncing = settings.sync('feishu')
   const policy = store.settings().policy
-  const rules = [{ id: 'docs', name: 'Docs', enabled: true, instruction: 'Fix docs' }]
-  await settings.save('policy', { ...policy, rules }, store.blockRevision('policy'), 'panel')
+  const feishu = { ...policy.sources.feishu!, allowed: [{ id: 'ou_alice', name: 'Alice' }, { id: 'ou_saved', name: 'Saved' }] }
+  await settings.save('policy', { ...policy, sources: { ...policy.sources, feishu } }, store.blockRevision('policy'), 'panel')
   members.resolve({ users: [{ member_id: 'ou_alice', name: 'Alice' }, { member_id: 'ou_new', name: 'New' }], has_more: false })
   await expect(syncing).rejects.toThrow(SettingsConflict)
   expect(h.runtime.health['sync:feishu']).toMatchObject({ state: 'error',
     detail: expect.stringContaining('Policy changed during synchronization') })
-  expect(store.settings().policy).toMatchObject({ rules, sources: { feishu: { allowed: [{ id: 'ou_alice', name: 'Alice' }] } } })
+  expect(store.settings().policy).toMatchObject({ sources: { feishu } })
 })
 
 it('syncs a Policy part again after a failed sync, a minute later and then after a wait that doubles, until it succeeds', async () => {

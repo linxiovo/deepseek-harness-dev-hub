@@ -24,6 +24,7 @@ export interface MergeApproval {
   readonly generation: number
   readonly stamp: string
   readonly ci: MainlineCiBinding
+  readonly rulesRevision?: number
 }
 
 export interface MainlineIntent extends Omit<MergeApproval, 'stamp' | 'ci'> {
@@ -114,7 +115,8 @@ export class MainlineQueue {
         throw new UserError('mainlineRefused', { reason: 'Candidate needs Worker repair and fresh evidence on the observed target baseline' })
       }
       if (base === candidate) throw new UserError('mainlineRefused', { reason: 'Mainline candidate must change the pinned base' })
-      const intent: MainlineIntent = { id: randomUUID(), ticket_id: ticketId, queued_at: now(), status: 'queued', target, base, candidate, assignment, generation }
+      const intent: MainlineIntent = { id: randomUUID(), ticket_id: ticketId, queued_at: now(), status: 'queued', target, base, candidate, assignment, generation,
+        ...approval.rulesRevision === undefined ? {} : { rulesRevision: approval.rulesRevision } }
       const key = targetKey(target), pending = KV.mainline.pending(key)
       store.set(KV.mainline.ticket(ticketId), [...mainlineAttempts(store, ticketId), intent])
       const queue = store.get(pending) ?? []
@@ -266,7 +268,7 @@ export class MainlineQueue {
       await host.advance(intent.target, intent.base, integration, async () => {
         const approval = await host.approve(intent.ticket_id, intent.candidate, host.lifetime, intent)
         if (approval.base !== intent.base || targetKey(approval.target) !== targetKey(intent.target) || approval.target.repository !== intent.target.repository ||
-            approval.assignment !== intent.assignment || approval.generation !== intent.generation) {
+            approval.assignment !== intent.assignment || approval.generation !== intent.generation || approval.rulesRevision !== intent.rulesRevision) {
           throw new UserError('mainlineRefused', { reason: 'Queued candidate no longer has matching delivery evidence' })
         }
         host.lifetime.throwIfAborted()

@@ -283,6 +283,33 @@ describe('managed project plan pause', () => {
     expect(await get()).toEqual(after)
   })
 
+  it('admits a native reviewer before its first skill call and charges its Worker ticket', async () => {
+    const { host, project, projectBrief } = await startManagedProject({ withFeishu: false })
+    managedHost = h = host
+    brief = savedProductsBrief(projectBrief)
+    const { id } = await registeredFanIn()
+    const settings = await readExecutorSettings()
+    expect(await h.api('PUT', 'settings/executor', { revision: settings.revision, value: {
+      ...settings.value, runLimits: { ticketTokens: 100, projectTokens: 100 },
+    } }, project.id)).toMatchObject({ status: 200 })
+    const worker = (await dispatchPlan(id, 'catalog')).claim!
+    await h.runtime.idle()
+    const reviewer = await h.reviewSubagent(worker.session, 'standards', undefined, true, [], async sessionId => {
+      expect(h.tools.get(sessionId)?.has('orchestrator_review_submit')).toBe(false)
+      await h.modelRequest(sessionId, 100, async function* (): AsyncGenerator<StreamChunk> {
+        for (const resource of ['project/run-limits', `ticket/${worker.ticketId}/run-limits`]) {
+          expect(await read(resource)).toMatchObject({ budget: { availableTokens: 0, reservedTokens: 100,
+            inFlight: [{ sessionId, ticketId: worker.ticketId, maximumTokens: 100 }] } })
+        }
+        yield { type: 'usage', usage: { inputTokens: 16, outputTokens: 4, totalTokens: 20 } }
+      })
+    })
+    expect(h.tools.get(reviewer)?.has('orchestrator_review_submit')).toBe(true)
+    expect(await read(`ticket/${worker.ticketId}/run-limits`)).toMatchObject({ budget: {
+      accountedTokens: 20, reportedCalls: 1, reservedTokens: 0, missing: [],
+    }, projectBudget: { accountedTokens: 20, reportedCalls: 1 } })
+  })
+
   it('reserves the last project balance before provider I/O and settles only observed usage', async () => {
     const { host, project, projectBrief } = await startManagedProject({ withFeishu: false })
     managedHost = h = host

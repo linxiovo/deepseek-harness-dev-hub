@@ -585,8 +585,14 @@ export class Sessions {
         // Restrict as soon as the delegated task is known, not after the first model call/Skill lookup.
         binding.disposers.push(...this.workOnly(agent, ticketId, REVIEW_TOOLS))
         const skill = bundledSkills['worker/code-review']
-        binding.disposers.push(agent.ctx.skills.register({ name: skill.name, description: skill.description, content: skill.content,
-          source: 'runtime', resourceBase: { kind: 'directory', path: dirname(skill.path) } }))
+        // Native DSH children belong to AgentLoop, which does not inject the skills service.
+        const skillScope = agent.ctx.inject(['skills'], scope => {
+          scope.skills.register({ name: skill.name, description: skill.description, content: skill.content,
+            source: 'runtime', resourceBase: { kind: 'directory', path: dirname(skill.path) } })
+        })
+        binding.disposers.push(() => { skillScope.dispose().catch((error: unknown) => {
+          this.ctx.logger.warn('dsh-superagent could not release a review skill scope: %s', String(error))
+        }) })
         limited = true
       }
       const writer = latestAssignment(ticket)?.writer

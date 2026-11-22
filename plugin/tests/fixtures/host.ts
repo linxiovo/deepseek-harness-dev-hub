@@ -394,15 +394,17 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   }
   /** Create a real Cordis Agent boundary for a Worker descendant; authorization still runs through Sessions and DSH tools. */
   async function reviewSubagent(parentId: string, axis: ReviewAxis, childId = `review-${++reviewChildSequence}`, loadReviewSkill = true,
-    inherited: readonly Omit<StoredEvent, 'seq'>[] = []) {
+    inherited: readonly Omit<StoredEvent, 'seq'>[] = [], beforeSkill?: (childId: string) => Promise<void>) {
     const parent = agents.get(parentId)
     if (!parent) throw new Error(`Session ${parentId} does not exist`)
-    const agentCtx = new Context(), sessionTools = new Map<string, RegisteredTool>()
+    const childHost = new Context(), sessionTools = new Map<string, RegisteredTool>()
+    await childHost.plugin(scope => { scope.provide('skills', { register: () => () => {} } as never) })
+    // DSH creates native children in an agent-loop scope without injecting skills into it.
+    const agentCtx = childHost.plugin(() => {}).ctx
     tools.set(childId, sessionTools)
     agentCtx.reflect.provide('tools', { register: (tool: RegisteredTool) => { sessionTools.set(tool.name, tool); return () => sessionTools.delete(tool.name) },
       get: (name: string) => name, restrict: vi.fn(({ allow }: { allow: string[] }) => { toolLimits.set(childId, new Set(allow)); return () => {} }),
       guard: vi.fn(() => () => {}) })
-    agentCtx.reflect.provide('skills', { register: () => () => {} })
     agentCtx.reflect.provide('systemPrompt', { section: () => () => {} })
     const parentSession = parent.session as unknown as { header?: { cwd?: string } } | undefined
     const ticket = runtime.store.tickets.get(parentId.slice('worker-'.length))!
@@ -414,19 +416,19 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
       cwd: parentSession?.header?.cwd ?? '', parentSession: parentId as SessionId, origin: 'subagent' }
     sessionHeaders.set(childId, header)
     const session = { id: childId, header, inheritedEventCount: inherited.length,
-      snapshotEvents: () => sessionHistory.get(childId)!, requestHeader: () => undefined }
+      snapshotEvents: () => sessionHistory.get(childId)!, requestHeader: () => undefined, requestContext: () => modelContexts.get(childId) }
     const agent = { ...parent, id: childId, ctx: agentCtx, session, status: 'idle' } as never
     agents.set(childId, agent)
-    ctx.emit('agent/created', { agent } as never)
+    await ctx.serial('agent/created', { agent, source: 'startup' } as never)
     record(childId, [
       { type: 'subagent/descriptor', data: { version: 3, mode: 'one-shot', provider: 'fixture' } },
       { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: `DSH_REVIEW_ASSIGNMENT: ${assignment}` }] } },
+    ])
+    await beforeSkill?.(childId)
+    record(childId, [
       { type: 'tool/call', data: { turn: 1, step: 1, callId: 'review-skill', name: 'skill', arguments: JSON.stringify({ name: 'dsh-worker-code-review' }) } },
       { type: 'tool/result', data: { turn: 1, step: 1, message: { role: 'tool', toolCallId: 'review-skill', isError: !loadReviewSkill, content: [] } } },
     ])
-    const { promise, resolve } = Promise.withResolvers<void>()
-    setTimeout(resolve, 0)
-    for (let tries = 0; tries < 20 && !sessionTools.has('orchestrator_review_submit'); tries++) await promise
     return childId
   }
   const sendUserMessage = (sessionId: string, text: string) => {

@@ -27,6 +27,8 @@ An Executor Session is created with `WORKER_PRESET` (`dsh-superagent-worker`) an
 Workers use two separate code-review subagent Sessions for the `standards` and `spec` lanes; each receives the same pinned base/candidate pair and its own evidence sources. The initial delegated task binds axis, base, candidate and lease generation; the real child must load the packaged review Skill before its session receives `orchestrator_review_submit`. Only that reviewer submits its own conclusion; the Worker cannot self-sign either lane. Review evidence is not a Hub reply. Both lanes must pass for the same current generation before readiness.
 Marked review children lose direct file-write/edit/patch, job-management, delegation and message tools; their shell remains for Git inspection. This is a cooperative guardrail, not an OS sandbox. Submission rechecks the full candidate SHA and clean worktree; the Hub resource returns pending unless evidence matches the live Worker lease generation. Ordinary Worker descendants keep their existing work tools.
 
+Before the first model request, the host binds a proven native review child to its Worker's Ticket and registers the packaged Skill in the child's scoped skill service. Model calls charge that Ticket and the project before the child can submit any evidence. Loading the Skill is still required to expose the submission tool.
+
 Only the active parent Worker can record retro, acceptance, repair, test and document observations for its own candidate; the Hub and reviewers cannot write them. The Delivery-check section in `013-development-verification.md` defines the status and evidence fields.
 
 ### Internal take-up

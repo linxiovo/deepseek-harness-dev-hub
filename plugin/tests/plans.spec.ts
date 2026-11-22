@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { z } from 'zod'
 import { resolve } from 'node:path'
 import { KV } from '../src/kv.ts'
@@ -39,6 +40,8 @@ async function publish(projectBrief = brief, specification = spec) {
   }) }
 }
 const read = (resource: string, page = {}) => h.runTool(h.runtime.masterId, 'orchestrator_read', { resource, ...page })
+const readExecutorSettings = async (): Promise<{ value: Record<string, unknown>; revision: number }> =>
+  JSON.parse(String((await read('settings/executor')).text))
 const splitDraft = {
   features: [{ id: 'saved-products', kind: 'cross-end' }],
   nodes: [
@@ -230,6 +233,8 @@ const PlanDispatchClaimSchema = z.object({ planId: z.string(), nodeId: z.string(
   role: z.enum(['backend', 'frontend']), pendingAction: z.enum(['launch', 'resume']).nullable(), claimedAt: z.string(), startedAt: z.string().optional() }).strict()
 const PlanDispatchSchema = z.object({ planId: z.string(), nodeId: z.string(), role: z.enum(['backend', 'frontend']), status: z.string(), reused: z.boolean(),
   claim: PlanDispatchClaimSchema.optional(), waitingOn: z.array(z.string()).optional(), reason: z.string().optional(),
+  limits: z.strictObject({ maxWorkers: z.number(), projectTokens: z.number().nullable(), ticketTokens: z.number().nullable(),
+    stagnation: z.strictObject({ maxAttemptsWithoutProgress: z.number(), idleSeconds: z.number() }) }),
   attention: z.looseObject({ id: z.string(), status: z.literal('awaiting') }).optional() }).strict()
 type PlanDispatch = z.infer<typeof PlanDispatchSchema>
 const dispatchPlan = async (planId: string, nodeId: string): Promise<PlanDispatch> => PlanDispatchSchema.parse(
@@ -239,6 +244,166 @@ const dispatchPlan = async (planId: string, nodeId: string): Promise<PlanDispatc
 describe('managed project plan pause', () => {
   let managedHost: Host | undefined
   afterEach(async () => { if (managedHost) { await managedHost.stop(); managedHost = undefined } })
+  it('reports the same effective limits at startup and after a scoped operator save, not a Hub elevation', async () => {
+    const { host, project } = await startManagedProject({ withFeishu: false })
+    managedHost = h = host
+    const get = () => h.api('GET', 'project/run-limits', undefined, project.id)
+    const defaults = { maxWorkers: 3, projectTokens: null, ticketTokens: null,
+      stagnation: { maxAttemptsWithoutProgress: 3, idleSeconds: 900 } }
+    expect(await get()).toMatchObject({ status: 200, body: { scope: 'project', configuration: {
+      preset: 'default', defaults, effective: { ...defaults, ticketOverrides: [] },
+    } } })
+    const panel = await h.api('GET', 'settings', undefined, project.id)
+    expect(panel.status).toBe(200)
+    const { executor: settings } = z.object({ executor: z.object({ value: z.record(z.string(), z.unknown()), revision: z.number() }) })
+      .parse(panel.body.blocks)
+    expect(settings).toMatchObject(await readExecutorSettings().then(({ value, revision }) => ({ value, revision })))
+    expect(await h.api('PUT', 'settings/executor', { revision: settings.revision, value: { ...settings.value,
+      runLimits: { ticketOverrides: [{ planId: 'missing-plan', nodeId: 'catalog', tokens: 10 }] },
+    } }, project.id)).toMatchObject({ status: 404, body: { code: 'unknownPlan' } })
+    const value = { ...settings.value, maxWorkers: 2, runLimits: { projectTokens: 1000, ticketTokens: 400,
+      stagnation: { idleSeconds: 45 } } }
+    expect(await h.api('PUT', 'settings/executor', { revision: settings.revision, value }, project.id)).toMatchObject({ status: 200 })
+    expect(await h.api('PUT', 'settings/executor', { revision: settings.revision, value: settings.value }, project.id)).toMatchObject({ status: 409 })
+    const after = await get()
+    expect(after).toMatchObject({ status: 200, body: { configuration: { defaults, effective: {
+      maxWorkers: 2, projectTokens: 1000, ticketTokens: 400, stagnation: { maxAttemptsWithoutProgress: 3, idleSeconds: 45 },
+    } } } })
+    const saved = await readExecutorSettings()
+    await expect(h.runTool(h.runtime.masterId, 'orchestrator_settings_save', {
+      block: 'executor', revision: saved.revision, value: { ...saved.value, maxWorkers: 16 },
+    })).rejects.toThrow()
+    await expect(h.runTool(h.runtime.masterId, 'orchestrator_settings_save', {
+      block: 'executor', revision: saved.revision, value: { ...saved.value, runLimits: {} },
+    })).rejects.toThrow()
+    expect(await read('project/run-limits')).toEqual(after.body)
+    expect(await h.api('GET', 'project/run-limits')).toMatchObject({ status: 409, body: { code: 'projectScopeRequired' } })
+    expect(await h.api('GET', 'project/run-limits', undefined, 'other-project')).toMatchObject({ status: 409, body: { code: 'staleProject' } })
+    await h.restart()
+    expect(await get()).toEqual(after)
+  })
+
+  it('reserves the last project balance before provider I/O and settles only observed usage', async () => {
+    const { host, project, projectBrief } = await startManagedProject({ withFeishu: false })
+    managedHost = h = host
+    brief = savedProductsBrief(projectBrief)
+    const { id } = await registeredFanIn()
+    const settings = await readExecutorSettings()
+    expect(await h.api('PUT', 'settings/executor', { revision: settings.revision, value: {
+      ...settings.value, runLimits: { projectTokens: 100 },
+    } }, project.id)).toMatchObject({ status: 200 })
+    const a = (await dispatchPlan(id, 'catalog')).claim!
+    const b = (await dispatchPlan(id, 'accounts')).claim!
+    await h.runtime.idle()
+    const head = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>()
+    const first = h.modelRequest(a.session, 100, async function* (): AsyncGenerator<StreamChunk> {
+      head.resolve()
+      await finish.promise
+      yield { type: 'usage', usage: { inputTokens: 60, outputTokens: 5, totalTokens: 65 } }
+    })
+    let providerCalls = 0
+    const later = async function* (): AsyncGenerator<StreamChunk> {
+      providerCalls++
+      yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 } }
+    }
+    await Promise.race([head.promise, first])
+    const second = h.modelRequest(b.session, 35, later).then(() => 'completed', () => 'refused')
+    try {
+      expect(providerCalls).toBe(0)
+      expect(await read('project/run-limits')).toMatchObject({ budget: { state: 'reserved', accountedTokens: null,
+        reservedTokens: 100, availableTokens: 0, missing: [], inFlight: [{ sessionId: a.session, maximumTokens: 100 }] } })
+    } finally {
+      finish.resolve()
+      await first
+    }
+    expect(await second).toBe('completed')
+    expect(providerCalls).toBe(1)
+    expect(await read('project/run-limits')).toMatchObject({ budget: { accountedTokens: 77, availableTokens: 23, reportedCalls: 2 } })
+    await expect(h.modelRequest(b.session, 24, later)).rejects.toMatchObject({ code: 'SUPERAGENT_RUN_LIMIT_CONFIGURATION' })
+    expect(providerCalls).toBe(1)
+  })
+
+  it.each(['usage-missing', 'exhausted'] as const)('keeps a %s quota pause local and reports it once across restart', async state => {
+    const { host, project, projectBrief } = await startManagedProject({ withFeishu: false })
+    managedHost = h = host
+    brief = savedProductsBrief(projectBrief)
+    const { id } = await registeredFanIn()
+    const settings = await readExecutorSettings()
+    expect(await h.api('PUT', 'settings/executor', { revision: settings.revision, value: { ...settings.value, maxWorkers: 1,
+      runLimits: { ticketTokens: 40, ticketOverrides: [{ planId: id, nodeId: 'accounts', tokens: 80 }] },
+    } }, project.id)).toMatchObject({ status: 200 })
+    const a = (await dispatchPlan(id, 'catalog')).claim!
+    await h.runtime.idle()
+    const reported = state === 'exhausted'
+    await h.modelRequest(a.session, 40, async function* (): AsyncGenerator<StreamChunk> {
+      yield { type: 'usage', usage: { inputTokens: 34, outputTokens: 6, ...(reported ? { totalTokens: 40 } : {}) } }
+    })
+    const resource = `ticket/${a.ticketId}/run-limits`
+    const get = () => h.api('GET', `tickets/${a.ticketId}/run-limits`, undefined, project.id)
+    const paused = await get()
+    expect(paused).toMatchObject({ status: 200, body: { scope: 'ticket', ticketId: a.ticketId, budget: { state,
+      accountedTokens: reported ? 40 : null, availableTokens: reported ? 0 : null, reservedTokens: 0, inFlight: [],
+      missing: reported ? [] : [expect.objectContaining({ sessionId: a.session, calls: 1, interrupted: 0 })],
+    }, projectBudget: { state: 'unlimited' } } })
+    expect(await read(resource)).toEqual(paused.body)
+    await expect(h.runTool(a.session, 'orchestrator_read', { resource })).rejects.toThrow()
+    expect(await h.api('POST', `tickets/${a.ticketId}/retry`, undefined, project.id)).toMatchObject({ status: 400, body: { code: 'quotaPaused' } })
+    const identity = { ticketId: a.ticketId, assignmentId: a.assignmentId, session: a.session }
+    expect(await dispatchPlan(id, 'catalog')).toMatchObject({ status: 'quota-paused', reused: true, claim: identity })
+    expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'] })
+    await h.idleRelay()
+    const notices = () => h.jsonRelays(h.runtime.masterId, 'quota-paused')
+    expect(notices()).toEqual([expect.objectContaining({ scope: 'ticket', reason: state, ticketId: a.ticketId,
+      planId: id, nodeId: 'catalog', title: 'Catalog search', resource })])
+
+    await h.restart()
+    await h.runtime.idle()
+    expect(await get()).toEqual(paused)
+    expect(await dispatchPlan(id, 'catalog')).toMatchObject({ status: 'quota-paused', reused: true, claim: identity })
+    const dispatched = await dispatchPlan(id, 'accounts')
+    expect(dispatched.limits).toEqual({ maxWorkers: 1, projectTokens: null, ticketTokens: 80,
+      stagnation: { maxAttemptsWithoutProgress: 3, idleSeconds: 900 } })
+    const b = dispatched.claim!
+    await h.runtime.idle()
+    await h.modelRequest(b.session, 80, async function* (): AsyncGenerator<StreamChunk> {
+      yield { type: 'usage', usage: { inputTokens: 47, outputTokens: 3, totalTokens: 50 } }
+    })
+    expect(await read(`ticket/${b.ticketId}/run-limits`)).toMatchObject({ budget: { state: 'available', availableTokens: 30 } })
+    expect(await h.api('GET', 'attention/summary', undefined, project.id)).toMatchObject({ status: 200, body: { running: 1 } })
+    expect(await read(`plan/${id}/node/catalog`)).not.toHaveProperty('delivery')
+    expect(notices()).toHaveLength(1)
+  })
+
+  it('recovers an interrupted provider reservation as missing, never as a free or still-live request', async () => {
+    const { host, project, projectBrief } = await startManagedProject({ withFeishu: false })
+    managedHost = h = host
+    brief = savedProductsBrief(projectBrief)
+    const { id } = await registeredFanIn()
+    const settings = await readExecutorSettings()
+    expect(await h.api('PUT', 'settings/executor', { revision: settings.revision, value: {
+      ...settings.value, runLimits: { projectTokens: 64 },
+    } }, project.id)).toMatchObject({ status: 200 })
+    const a = (await dispatchPlan(id, 'catalog')).claim!
+    await h.runtime.idle()
+    const started = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>()
+    const first = h.modelRequest(a.session, 64, async function* (): AsyncGenerator<StreamChunk> {
+      started.resolve()
+      await finish.promise
+      yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 1, totalTokens: 11 } }
+    })
+    await Promise.race([started.promise, first])
+    try {
+      expect(await dispatchPlan(id, 'accounts')).toMatchObject({ status: 'waiting-for-budget', reused: false })
+      await h.restart()
+      expect(await dispatchPlan(id, 'accounts')).toMatchObject({ status: 'quota-paused', reused: false })
+    } finally {
+      finish.resolve()
+      await first
+    }
+    expect(await read('project/run-limits')).toMatchObject({ budget: { state: 'usage-missing', accountedTokens: null,
+      reservedTokens: 0, inFlight: [], missing: [expect.objectContaining({ sessionId: a.session, calls: 1, interrupted: 1 })] } })
+  })
+
   it('pauses only the Plan ticket with a missing test account and sends one controlled action request', async () => {
   const managed = await startManagedProject({ withFeishu: false, machine: project => ({ credentialChecks: [{ projectId: project.id,
     id: 'test-account', executable: process.execPath, args: ['--fixture-check-test-account'],

@@ -15,6 +15,7 @@ export interface EngineOptions {
   outbox: Outbox
   /** A durable ticket-local pause that normal reports and retries cannot bypass. */
   credentialBlocked?: (ticketId: string) => boolean
+  quotaBlocked?: (ticketId: string) => boolean
   prepareTicket?: (ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>) => Ticket
   now?: () => string
   emit?: (event: DomainEvent) => void

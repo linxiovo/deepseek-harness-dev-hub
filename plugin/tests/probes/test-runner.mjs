@@ -3,7 +3,7 @@
 // is invoked: no alternate lock namespace, platform override, or skip-lock flag.
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { copyFile, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -11,6 +11,11 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
 
 const runner = new URL('../../scripts/test.mjs', import.meta.url)
+async function publishOffset(path, value) {
+  const temporary = `${path}.${process.pid}.tmp`
+  await writeFile(temporary, String(value), { flag: 'wx' })
+  await rename(temporary, path)
+}
 const args = ['tests/a file.spec.ts', '-t', 'a & b', '--lock-dir', 'not a runner option', '--no-lock']
 const windows = process.platform === 'win32'
 
@@ -53,6 +58,24 @@ function start(cwd, previousPid, nodeOptions = []) {
   return run
 }
 
+const gatePattern = /gate=dsh-superagent-vitest-[0-9a-f]{64}/
+
+function stderrLines(run) {
+  return run.stderr.split(/\r?\n/)
+}
+
+function waitLines(run) {
+  return stderrLines(run).filter(line => line.includes('Windows Vitest gate') && line.includes('Vitest has not started'))
+}
+
+function assertWaiter(line, run) {
+  assert.match(line, gatePattern)
+  assert.match(line, new RegExp(`waiter pid=${run.child.pid}(?!\\d)`))
+  const waited = Number(line.match(/waited=([\d.]+)s/)[1])
+  assert.ok(Number.isFinite(waited), line)
+  return waited
+}
+
 async function observe(run, predicate) {
   const deadline = performance.now() + 30_000
   while (!predicate()) {
@@ -62,8 +85,14 @@ async function observe(run, predicate) {
 }
 
 async function observeWait(run) {
-  await observe(run, () => run.stderr.includes('Waiting for another Vitest run') || run.stdout.includes('\n'))
+  await observe(run, () => waitLines(run).length > 0 || run.stdout.includes('\n'))
   assert.equal(run.stdout, '', 'Vitest entered while the first runner was held open')
+  const line = waitLines(run)[0]
+  assert.match(line, /Waiting for the Windows Vitest gate/)
+  assertWaiter(line, run)
+  assert.match(line, /Another test run for this Windows account holds the gate/)
+  assert.match(line, /named-pipe API does not reveal its owner PID/)
+  assert.doesNotMatch(line, /(?:owner|holder) (?:PID|pid)\s*[=:]\s*\d/)
 }
 
 async function entered(run, cwd) {
@@ -93,23 +122,50 @@ for (const interrupt of [false, true]) {
     const holder = await entered(first, a)
     if (windows && !interrupt) {
       // Advance only a waiting probe process's clock. No timing or ownership
-      // override is exposed by the runner. Expiry must not start the bin or
-      // dislodge the first runner: the following contender still has to wait.
-      const expired = join(root, 'advance-clock')
+      // override is exposed by the runner. Cross the progress report, then the
+      // 30-minute deadline: expiry must not start the bin or dislodge the first
+      // runner, and the following contender still has to wait.
+      const clock = join(root, 'clock-offset')
       const preload = join(root, 'clock.mjs')
       await writeFile(preload, `
-        import { existsSync } from 'node:fs'
+        import { existsSync, readFileSync } from 'node:fs'
+        const offsetFile = ${JSON.stringify(clock)}
         const now = performance.now.bind(performance)
-        Object.defineProperty(performance, 'now', { value: () => now() + (existsSync(${JSON.stringify(expired)}) ? 86_400_000 : 0) })
+        Object.defineProperty(performance, 'now', { value: () => {
+          if (!existsSync(offsetFile)) return now()
+          const text = readFileSync(offsetFile, 'utf8')
+          if (!/^(?:0|[1-9]\\d*)$/.test(text)) throw new Error('Invalid probe clock offset')
+          const offset = Number(text)
+          if (!Number.isSafeInteger(offset)) throw new Error('Invalid probe clock offset')
+          return now() + offset
+        } })
       `)
       const waiter = start(b, holder.pid, ['--import', pathToFileURL(preload).href])
       runs.push(waiter)
       await observeWait(waiter)
-      await writeFile(expired, '')
-      await observe(waiter, () => waiter.closed)
-      assert.match(waiter.stderr, /Timed out waiting/)
+      await publishOffset(clock, 61_000)
+      await observe(waiter, () => stderrLines(waiter).some(line => line.includes('Still waiting for the Windows Vitest gate')))
+      const progress = stderrLines(waiter).find(line => line.includes('Still waiting for the Windows Vitest gate'))
+      const waited = assertWaiter(progress, waiter)
+      assert.ok(waited >= 60)
+      assert.match(progress, /Vitest has not started/)
       assert.equal(waiter.stdout, '')
-      assert.notEqual((await waiter.exit).code, 0)
+      await publishOffset(clock, 30 * 60_000 + 1_000)
+      await observe(waiter, () => waiter.closed)
+      assert.equal(waiter.stdout, '')
+      const timedOut = await waiter.exit
+      assert.notEqual(timedOut.code, 0)
+      assert.equal(timedOut.signal, null)
+      assert.ok(!waiter.stderr.includes('probe stderr'), 'timeout waiter entered Vitest')
+      for (const checkoutPath of [root, root.replaceAll('\\', '/'), pathToFileURL(root).href]) {
+        assert.ok(!waiter.stderr.includes(checkoutPath), `timeout stderr named the temporary checkout path: ${checkoutPath}`)
+      }
+      const timeout = stderrLines(waiter).find(line => line.startsWith('[test] Timed out waiting for the Windows Vitest gate'))
+      assert.ok(assertWaiter(timeout, waiter) >= 1_800)
+      assert.match(timeout, /Vitest was not started/)
+      assert.match(timeout, /only that another test run for this Windows account holds the gate/)
+      assert.match(timeout, /named-pipe API does not identify its owner process/)
+      assert.doesNotMatch(waiter.stderr, /(?:owner|holder) (?:PID|pid)\s*[=:]\s*\d/)
     }
     const second = start(b, holder.pid)
     runs.push(second)
@@ -118,7 +174,9 @@ for (const interrupt of [false, true]) {
     if (windows) {
       await observeWait(second)
     } else {
-      assert.equal((await entered(second, b)).previousAlive, true, 'POSIX must not queue')
+      const entry = await entered(second, b)
+      assert.equal(entry.previousAlive, true, 'POSIX must not queue')
+      assert.doesNotMatch(second.stderr, /Windows Vitest gate/)
     }
 
     if (interrupt) first.child.kill('SIGKILL')
@@ -128,10 +186,19 @@ for (const interrupt of [false, true]) {
     if (interrupt) assert.ok(exit.signal || exit.code !== 0)
     else assert.deepEqual(exit, { code: 23, signal: null })
 
-    if (windows) assert.equal((await entered(second, b)).previousAlive, false)
-    second.child.stdin.end('0')
+    // A runner that starts after waiting preserves its own independent exit code.
+    const secondExit = interrupt ? 23 : 0
+    if (windows) {
+      const entry = await entered(second, b)
+      assert.equal(entry.previousAlive, false)
+    }
+    second.child.stdin.end(String(secondExit))
     await observe(second, () => second.closed)
-    assert.deepEqual(await second.exit, { code: 0, signal: null })
+    const secondResult = await second.exit
+    if (interrupt) assert.notEqual(secondResult.code, 0)
+    assert.equal(secondResult.signal, null)
+    assert.equal(secondResult.code, secondExit)
     assert.match(second.stderr, /probe stderr/)
+    if (windows) assert.match(second.stderr, /Acquired the Windows Vitest gate/)
   })
 }

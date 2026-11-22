@@ -19,6 +19,8 @@ export const USER_ERRORS = {
   mandateRevoked: ['refused', 'The current policy no longer holds this ticket\'s mandate; new work needs an accept through orchestrator_route'],
   notRetryable: ['refused', 'Only an open ticket can be retried, and only when its worker last reported failed or blocked and no person has sent a message since, or when delivering an Input to its worker failed'],
   credentialBlocked: ['refused', 'This ticket waits for its credential check to pass.'],
+  quotaPaused: ['refused', 'This ticket is paused by its run limits.'],
+  panelOnlyRunLimits: ['refused', 'Only the operator can change worker concurrency or run limits in management settings.'],
   invalidCredentialAction: ['refused', 'Credential action refused: {reason}'],
   sourceThread: ['refused', 'This is the thread the ticket started on; it stays subscribed'],
   followedThread: ['refused', 'This thread is the ticket\'s own, such as its pull request\'s; it stays subscribed'],

@@ -9,6 +9,7 @@ import type { MainlineIntent } from './app/mainline-queue.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { SessionMeterState } from './app/session-meter.ts'
 import type { MeterSessionBinding } from './app/project-meter.ts'
+import type { BudgetLedger, PendingUsage } from './app/run-limits.ts'
 import type { TopicBindingRecord } from './app/topic-binding.ts'
 import type { CredentialBlocker } from './app/scoped-attention.ts'
 import type { SettingsSave } from './policy.ts'
@@ -44,6 +45,10 @@ export const KV = {
   meter: { state: family<SessionMeterState, [session: string]>('session-meter:') },
   /** Project meter: one append-only business identity per Session, with a cumulative set of roles. */
   projectMeter: { binding: family<MeterSessionBinding, [session: string]>('project-meter-binding:') },
+  /** Run-limit ledger: aggregate project pool, per-Ticket pools and unreceipted authorized calls. */
+  runLimits: { since: record<string>('run-limits-since'), project: record<BudgetLedger>('run-limits-project'),
+    ticket: family<BudgetLedger>('run-limits-ticket:'), pending: family<PendingUsage>('run-limits-pending:'),
+    projectHold: record<true>('run-limits-project-hold'), ticketHold: family<true>('run-limits-ticket-hold:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */
   queues: { relays: record<{ id: string; text: string }[]>('relay-queue'), unsubscribed: record<string[]>('subscription-results'),
     prompts: record<number | null>('prompt-notification'), settings: record<number | null>('settings-notification') },

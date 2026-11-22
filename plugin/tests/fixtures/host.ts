@@ -2,13 +2,14 @@
  * In-memory DSH host fixture (as in tests/runtime.spec.ts) running a configured Runtime with GitHub and Feishu sources,
  * allowed member Alice (`ou_alice`), listened chat `oc_team`, and `auto` eval mode. Stop it with `stop()`.
  */
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { execFileSync } from 'node:child_process'
 import { Context } from '@deepseek-ai/cordis'
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { vi, type Mock } from 'vitest'
-import type { UserMessage } from '@deepseek-ai/dsh-llm'
+import { markAgentLoopRequest, type GenerateOptions, type StreamChunk, type UserMessage } from '@deepseek-ai/dsh-llm'
 import type { SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 import { Runtime } from '../../src/app/runtime.ts'
@@ -213,9 +214,11 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   const sessionHeaders = new Map<string, SessionHeader>()
   /** Fork-inherited prefix lengths, which a real persistence backend stores beside the log. */
   const inheritedEvents = new Map<string, number>()
+  const modelContexts = new Map<string, { provider: string; model: string; contextWindow: number }>()
+  const initiator = new AsyncLocalStorage<FakeAgent>()
   let directMessageSequence = 0
   // DSH's agents service lists the Sessions still loaded; Sessions install reads it after a service restart.
-  Object.assign(agents, { list: () => [...agents.values()] })
+  Object.assign(agents, { list: () => [...agents.values()], currentInitiator: () => initiator.getStore() })
   /** Each Session's next step, which takes the messages that wait for one. */
   const steps = new Map<string, () => void>(), claims = new Map<string, () => void>()
   let reviewChildSequence = 0
@@ -275,7 +278,8 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
       sessionHistory.set(sessionId, sessionEvents)
       const header: SessionHeader = { id: sessionId as SessionId, version: 4, createdAt: 0, isSeeded: false, cwd: workspaceId, agentPreset }
       sessionHeaders.set(sessionId, header)
-      const session = { id: sessionId, header, inheritedEventCount: 0, snapshotEvents: () => sessionEvents, requestHeader: () => undefined, append: vi.fn() }
+      const session = { id: sessionId, header, inheritedEventCount: 0, snapshotEvents: () => sessionEvents,
+        requestHeader: () => undefined, requestContext: () => modelContexts.get(sessionId), append: vi.fn() }
       let status = 'idle'
       const idle: (() => void)[] = []
       // A cancel drops the inbox unless kept, and the turn it stops ends a moment later, which DSH says.
@@ -484,12 +488,25 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     rmSync(directory, { recursive: true, force: true })
     if (options.separateCheckout) rmSync(gitRoot, { recursive: true, force: true })
   }
+  /** Execute the host's public streaming waterfall, replacing only provider I/O. */
+  function modelRequest(sessionId: string, contextWindow: number, providerCall: () => AsyncIterable<StreamChunk>, signal?: AbortSignal) {
+    const model = { provider: 'fixture', model: 'fixture-model' }
+    modelContexts.set(sessionId, { ...model, contextWindow })
+    const request = Object.freeze({ ...model, sessionId: sessionId as SessionId, messages: [], ...(signal ? { signal } : {}) }) satisfies GenerateOptions
+    const stream = async () => {
+      const chunks: StreamChunk[] = []
+      for await (const chunk of ctx.waterfall(ctx.llm, 'llm/stream', markAgentLoopRequest(request), providerCall)) chunks.push(chunk)
+      return chunks
+    }
+    const agent = agents.get(sessionId)
+    return agent ? initiator.run(agent, stream) : stream()
+  }
   /** The Session's model takes its next step, which takes the messages steered in since its last. */
   const step = (sessionId: string) => { steps.get(sessionId)!() }
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
   return { get runtime() { return runtime }, get ctx() { return ctx }, get toolLimits() { return toolLimits }, restart, idlePlanning, idleRelay, directory, localGit, agents, tools, deliveries, relays, jsonRelays, candidates, runTool, sendUserMessage, record, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
-    jobs, subagents, reviewSubagent, useStoredLog, step, claim }
+    jobs, subagents, reviewSubagent, useStoredLog, step, claim, modelRequest }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>
 interface ManagedProject {

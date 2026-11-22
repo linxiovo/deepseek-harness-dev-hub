@@ -2,6 +2,7 @@
 import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { PromptConfig, Prompts } from './prompts.ts'
 import type { ProjectMeterView } from './project-meter.ts'
+import type { RunLimitStatus } from './run-limits.ts'
 import type { SessionMeterView } from './session-meter.ts'
 import type { PromptsView, StateView, TicketPageView } from './http.ts'
 import type { HistoryView } from './settings-history.ts'
@@ -64,6 +65,8 @@ export interface Api {
   'GET project/meter': { response: ProjectMeterView }
   'GET plans/:id/meter': { response: ProjectMeterView }
   'GET tickets/:id/meter': { response: ProjectMeterView }
+  'GET project/run-limits': { response: RunLimitStatus }
+  'GET tickets/:id/run-limits': { response: RunLimitStatus }
   'GET prompts': { query?: { revision?: number; offset?: number }; response: PromptsView }
   'PUT prompts': { body: { config: PromptConfig; baseRevision: number }; response: { revision: number; context_delivery: Delivery } }
   'POST prompts/preview': { body: PromptConfig; response: ReturnType<Prompts['preview']> }

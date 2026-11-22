@@ -8,12 +8,14 @@ import type { DshExecutor } from '../executor/dsh.ts'
 import type { Store } from './store.ts'
 import type { Plans } from './plans.ts'
 import type { CredentialAction, ScopedAttention } from './scoped-attention.ts'
+import type { DispatchLimits, RunLimits } from './run-limits.ts'
 
 export type PlanDispatchResult = {
   planId: string
   nodeId: string
   role: PlanRole
-  status: PlanNodeState['status'] | 'blocked' | 'waiting-for-slot'
+  limits: DispatchLimits
+  status: PlanNodeState['status'] | 'blocked' | 'waiting-for-slot' | 'quota-paused' | 'waiting-for-budget'
   reused: boolean
   claim?: PlanNodeClaim
   attention?: CredentialAction
@@ -27,6 +29,7 @@ interface PlanDispatcherHost {
   readonly engine: Pick<Engine, 'createPlanTicket'>
   readonly executor: Pick<DshExecutor, 'reserveLaunch' | 'releaseLaunch' | 'start'>
   readonly attention: Pick<ScopedAttention, 'forTicket' | 'blocked'>
+  readonly limits: Pick<RunLimits, 'forDispatch' | 'blocked'>
   bindWorker(ticketId: string, sessionId: string): void
   readonly now?: () => string
 }
@@ -41,18 +44,26 @@ export class PlanDispatcher {
     const node = plan.nodes.find(item => item.id === nodeId)
     if (!node) throw new UserError('unknownPlanNode', { id: planId, node: nodeId })
     if (!PLAN_ROLES.includes(node.role)) throw new UserError('invalidPlan', { detail: `Node ${planId}/${nodeId} has an untrusted execution role` })
+    const ticketId = key('plan-ticket', planId, nodeId), role = node.role
+    const { limits, block } = this.host.limits.forDispatch(ticketId, { planId, nodeId, role })
+    const request = { planId, nodeId, role, limits }
     const current = this.host.plans.state(planId, nodeId)
     if (current) {
       this.bindClaim(current, node.role)
-      return this.result(planId, nodeId, node.role, current, true)
+      const replay = this.result(request, current, true)
+      if (block && block.state !== 'reserved' && (current.status === 'claimed' || current.status === 'running' || current.status === 'awaiting-delivery')) {
+        return { ...replay, status: 'quota-paused', reason: `${block.scope} budget: ${block.state}` }
+      }
+      return replay
     }
     const waitingOn = this.host.plans.waitingOn(planId, node)
-    if (waitingOn.length) return { planId, nodeId, role: node.role, status: 'blocked', reused: false, waitingOn,
+    if (waitingOn.length) return { ...request, status: 'blocked', reused: false, waitingOn,
       reason: `Waiting for formal delivery of ${waitingOn.join(', ')}` }
 
-    const ticketId = key('plan-ticket', planId, nodeId)
+    if (block) return { ...request, status: block.state === 'reserved' ? 'waiting-for-budget' : 'quota-paused',
+      reused: false, reason: `${block.scope} budget: ${block.state}` }
     if (!this.host.executor.reserveLaunch(ticketId)) {
-      return { planId, nodeId, role: node.role, status: 'waiting-for-slot', reused: false, reason: 'No worker slot is free' }
+      return { ...request, status: 'waiting-for-slot', reused: false, reason: 'No worker slot is free' }
     }
     let committed = false
     try {
@@ -67,7 +78,7 @@ export class PlanDispatcher {
         this.host.bindWorker(ticket.id, claim.session)
       })
       committed = true
-      return this.result(planId, nodeId, node.role, state, false)
+      return this.result(request, state, false)
     } finally {
       if (!committed) this.host.executor.releaseLaunch(ticketId)
     }
@@ -101,6 +112,7 @@ export class PlanDispatcher {
         const state = this.host.plans.state(plan.id, node.id)
         if (!state || ['delivered', 'failed', 'stopped'].includes(state.status)) continue
         if (this.host.attention.blocked(state.claim.ticketId)) continue
+        if (this.host.limits.blocked(state.claim.ticketId)) continue
         const ticket = this.host.store.tickets.get(state.claim.ticketId)
         const assignment = ticket && latestAssignment(ticket)
         if (!ticket || !assignment || assignment.state !== 'pending') continue
@@ -111,8 +123,8 @@ export class PlanDispatcher {
     }
   }
 
-  private result(planId: string, nodeId: string, role: PlanNodeClaim['role'], state: PlanNodeState, reused: boolean): PlanDispatchResult {
+  private result(request: Pick<PlanDispatchResult, 'planId' | 'nodeId' | 'role' | 'limits'>, state: PlanNodeState, reused: boolean): PlanDispatchResult {
     const attention = this.host.attention.forTicket(state.claim.ticketId)
-    return { planId, nodeId, role, status: state.status, reused, claim: state.claim, ...(attention ? { attention } : {}) }
+    return { ...request, status: state.status, reused, claim: state.claim, ...(attention ? { attention } : {}) }
   }
 }

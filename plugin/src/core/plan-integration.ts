@@ -2,17 +2,21 @@
 export interface PlanVerificationConfig {
   projectId: string
   workflowId: string
+  identityJob: string
   jobs: readonly string[]
   artifactName: string
   configuration: string
   environment: string
 }
 
-export interface PlanVerificationRequest {
+export interface PlanIntegrationIdentity {
   repository: string
   ref: string
   sha: string
   context: string
+}
+
+export interface PlanVerificationRequest extends PlanIntegrationIdentity {
   verification: PlanVerificationConfig
 }
 
@@ -33,16 +37,11 @@ export type PlanActionsObservation =
   | { status: 'failed'; reason: PlanActionsFailure; run: PlanVerificationRun }
   | { status: 'passed'; run: PlanVerificationRun; artifact: PlanArtifact }
 
-export interface PlanIntegrationVersion {
-  repository: string
-  ref: string
-  sha: string
-  context: string
+export interface PlanIntegrationVersion extends PlanIntegrationIdentity {
   workflowId: string
   configuration: string
   environment: string
 }
-
 type PlanIntegrationBlock = PlanActionsFailure | 'verification_unconfigured' | 'integration_unavailable' | 'integration_not_on_target'
   | 'target_changed' | 'actions_unavailable' | 'dispatch_unconfirmed'
 

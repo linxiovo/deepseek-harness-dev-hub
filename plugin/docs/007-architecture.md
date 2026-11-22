@@ -32,7 +32,7 @@ flowchart TB
 
 Startup registers management routes, initializes the installation binding and runs Setup. After setup resolves, it installs Session and Executor hooks, ensures the main Session exists, syncs Policy, resumes handoffs and interrupted Assignments, and starts passes and effects. `Runtime.ready` marks completion of startup; the installation API can answer before that promise resolves.
 
-`PlanIntegration` rearms incomplete full-regression checks after formal Plan receipts are present. The verifier checks the real GitHub ref, binds a context to the project, commit and workflow configuration, dispatches once, and accepts only the matching run, jobs and attempt-specific artifact. Delivery status is available in the Hub and selected-project management route. See `017-plan-integration.md`.
+`PlanIntegration` owns the durable Plan-level verification effect and its final delivery status and relay. The interface and recovery contract are in `017-plan-integration.md`.
 
 Source plugins inject Runtime as the `orchestrator` service through the narrow `SourceHost` interface.
 Ticket review evidence is submitted only by a Worker descendant through `orchestrator_review_submit`; `Sessions` binds the real descendant Session ID, `DshExecutor` verifies the clean current worktree HEAD against the pinned base, and the Engine atomically records evidence on the current Assignment and writer generation. `ticket/<id>/reviews` returns current-generation evidence and pending when the live Worker lease, worktree HEAD or cleanliness no longer matches; `ticket/<id>/review/<review-id>` reads one persisted review.
@@ -545,6 +545,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
 | `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |
+| `tests/plan-integration-crash.spec.ts` | SIGKILL after GitHub accepts workflow dispatch but before the effect records a result; SQLite recovery observes the existing run without another dispatch |
 | `tests/mainline-queue.spec.ts` | Queue admission, versioned candidate CI, same-target serialization, code and Doc Tree conflicts, formal closure, recovery, Plan full regression and package delivery, and exactly-once notices and Frontier claims |
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
 | `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, review evidence and child-only review submission, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |

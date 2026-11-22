@@ -25,6 +25,7 @@ type PlanVerificationConfigInput = Omit<PlanVerificationConfig, 'jobs'> & { jobs
 const PlanVerificationConfigSchema: s<PlanVerificationConfigInput> = s.object({
   projectId: s.string().pattern(/^[a-f0-9]{32}$/).required(),
   workflowId: s.string().pattern(/^[1-9][0-9]*$/).required(),
+  identityJob: s.string().pattern(/^[^\p{Cc}\p{Cf}]{1,128}$/u).required(),
   jobs: s.array(s.string().pattern(/^[^\p{Cc}\p{Cf}]{1,128}$/u)).min(1).max(16).required(),
   artifactName: s.string().pattern(/^[a-zA-Z0-9_.-]{1,80}$/).required(),
   configuration: s.string().pattern(/^[a-zA-Z0-9_.-]{1,120}$/).required(),
@@ -79,8 +80,10 @@ export function machineOf(config: DeploymentConfig): Machine {
   }
   if (new Set(planVerification.map(check => check.projectId)).size !== planVerification.length)
     throw new Error('Duplicate Plan verification for the same project')
-  for (const { jobs } of planVerification) if (new Set(jobs).size !== jobs.length || jobs.some(job => !job.trim()))
-    throw new Error('Plan verification requires unique, non-blank full regression job names')
+  for (const { workflowId } of planVerification) if (!Number.isSafeInteger(Number(workflowId)))
+    throw new Error('Plan verification workflow ID must be a safe positive integer')
+  for (const { identityJob, jobs } of planVerification) if (!jobs.includes(identityJob) || new Set(jobs).size !== jobs.length || jobs.some(job => !job.trim()))
+    throw new Error('Plan verification requires a listed identity job and unique, non-blank full regression job names')
   return { stateDir, runtimeMode: runtimeMode ?? 'desktop', promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs,
     ...(credentialChecks.length ? { credentialChecks } : {}), ...(planVerification.length ? { planVerification } : {}) }
 }

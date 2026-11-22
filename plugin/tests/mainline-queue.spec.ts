@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { z } from 'zod'
-import { Commands } from '../src/infra/commands.ts'
+import { CliError, Commands } from '../src/infra/commands.ts'
 import { githubKind } from '../src/sources/github.ts'
 import { observePull } from '../src/sources/github-pull.ts'
 import { feishu, startManagedProject, startRuntime, type Host } from './fixtures/host.ts'
@@ -312,9 +312,14 @@ function actionsHost(beforeRuns?: (sha: string) => Promise<void>) {
     setPull: (value: Pull) => { pull = value; return pullResponse(value) } }
 }
 
-it.each(['not-authorized', 'authorized'] as const)('verifies the integrated package, recovers a lost dispatch receipt, and respects %s release scope', async release => {
+it.each([
+  { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const },
+  { release: 'authorized' as const, dispatchFailure: 'lost-response' as const },
+  { release: 'not-authorized' as const, dispatchFailure: 'forbidden' as const },
+] as const)('verifies the integrated package after $dispatchFailure and respects $release release scope', async ({ release, dispatchFailure }) => {
   await h.stop()
-  const verification = { workflowId: '44', jobs: ['integration-identity', 'windows', 'check', 'integration-bundle'], artifactName: 'plugin-bundle',
+  const verification = { workflowId: '44', identityJob: 'integration-identity',
+    jobs: ['integration-identity', 'windows', 'check', 'integration-bundle'], artifactName: 'plugin-bundle',
     configuration: 'plugin-check-v1', environment: 'github-hosted-node22-pnpm11-v1' }
   const mounted = await startManagedProject({ withFeishu: false, machine: project => ({ planVerification: [{ projectId: project.id, ...verification }] }) })
   h = mounted.host
@@ -349,7 +354,7 @@ it.each(['not-authorized', 'authorized'] as const)('verifies the integrated pack
     }
     return githubFallback.call(this, args)
   })
-  let loseDispatchReceipt = true
+  let loseDispatchReceipt = dispatchFailure === 'lost-response', rejectDispatch = dispatchFailure === 'forbidden'
   let dispatches = 0
   const command = vi.spyOn(Commands.prototype, 'run')
   const commandFallback = command.getMockImplementation()!
@@ -357,9 +362,11 @@ it.each(['not-authorized', 'authorized'] as const)('verifies the integrated pack
     if (args[0] === 'api' && args[1] === `repos/${slug}/actions/workflows/44/dispatches`) {
       const field = (name: string) => args.find(value => value.startsWith(`inputs[${name}]=`))?.split('=')[1]
       const sha = field('dsh_commit')!, context = field('dsh_context')!, branch = args[args.indexOf('-f') + 1]!.slice('ref='.length)
-      actionRuns.set(context, { id: 900 + ++dispatches, sha, branch, context })
+      const runId = 900 + ++dispatches
+      if (rejectDispatch) { rejectDispatch = false; throw new CliError('GitHub denied workflow dispatch', 403) }
+      actionRuns.set(context, { id: runId, sha, branch, context })
       if (loseDispatchReceipt) { loseDispatchReceipt = false; throw new Error('Dispatch response was lost') }
-      return JSON.stringify({ workflow_run_id: 900 + dispatches })
+      return JSON.stringify({ workflow_run_id: runId })
     }
     return commandFallback.call(this, program, args, cwd, input)
   })
@@ -388,11 +395,17 @@ it.each(['not-authorized', 'authorized'] as const)('verifies the integrated pack
     JSON.stringify({ ticketState: closedTicket.state, mainline: mainlinePage.items, tip: integration, intent }))
     .toMatchObject({ ticketState: 'merged', mainline: [expect.objectContaining({ status: 'verified' })] })
   expect(intent).toMatchObject({ candidate, base, status: 'queued' })
-  expect(await read(`plan/${id}/delivery`)).toMatchObject({ status: 'blocked', reason: 'dispatch_unconfirmed', version: { sha: integration } })
+  expect(await read(`plan/${id}/delivery`)).toMatchObject({ status: 'blocked',
+    reason: dispatchFailure === 'forbidden' ? 'actions_unavailable' : 'dispatch_unconfirmed', version: { sha: integration } })
   expect(dispatches).toBe(1)
 
   await h.restart()
   await h.runtime.idle()
+  if (dispatchFailure === 'forbidden') {
+    expect(await read(`plan/${id}/delivery`)).toMatchObject({ status: 'verifying' })
+    h.runtime.effects.enqueue('planIntegration', id, {})
+    await h.runtime.idle()
+  }
   const resource = await read(`plan/${id}/delivery`)
   expect(resource).toMatchObject({ planId: id, status: release === 'authorized' ? 'awaiting-release-verification' : 'delivered',
     version: { repository: slug, ref: targetRef, sha: integration, context: expect.stringMatching(/^[a-f0-9]{64}$/),
@@ -400,7 +413,7 @@ it.each(['not-authorized', 'authorized'] as const)('verifies the integrated pack
     run: { id: expect.any(Number), attempt: 1 },
     artifact: { id: expect.any(Number), name: `plugin-bundle-${integration}-1`, url: expect.stringContaining('/actions/runs/') },
     verifiedAt: expect.any(String) })
-  expect(dispatches).toBe(1)
+  expect(dispatches).toBe(dispatchFailure === 'forbidden' ? 2 : 1)
   const relays = h.jsonRelays(h.runtime.masterId, 'plan-delivered')
   if (release === 'authorized') expect(relays).toEqual([])
   else expect(relays).toEqual([expect.objectContaining({ planId: id, version: expect.objectContaining({ sha: integration }),
@@ -411,7 +424,7 @@ it.each(['not-authorized', 'authorized'] as const)('verifies the integrated pack
   await h.restart()
   await h.runtime.idle()
   expect(await read(`plan/${id}/delivery`)).toEqual(resource)
-  expect(dispatches).toBe(1)
+  expect(dispatches).toBe(dispatchFailure === 'forbidden' ? 2 : 1)
   expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toHaveLength(release === 'authorized' ? 0 : 1)
 }, 180_000)
 async function interruptedByRestart(lifetime: AbortSignal): Promise<never> {

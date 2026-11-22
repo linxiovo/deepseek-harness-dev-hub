@@ -1,15 +1,16 @@
 import { createHash } from 'node:crypto'
 import type { PlanActionsObservation, PlanIntegrationVersion, PlanIntegrationView, PlanVerificationConfig, PlanVerificationRequest } from '../core/plan-integration.ts'
 import type { MainlineTarget } from '../executor/mainline-git.ts'
+import { CliError } from '../infra/commands.ts'
 import { KV } from '../kv.ts'
-import { Later, type Effects } from './effects.ts'
+import { Later, Park, type Effects } from './effects.ts'
 import { projectPushRelay, type Relay } from './notices.ts'
 import type { Plans } from './plans.ts'
 import type { Handoffs } from './handoffs.ts'
 import type { Store } from './store.ts'
 
 interface IntegrationHost {
-  store: Pick<Store, 'atomic' | 'get' | 'set'>
+  store: Pick<Store, 'atomic' | 'get' | 'set' | 'delete'>
   effects: Pick<Effects, 'handle' | 'enqueue' | 'pending'>
   plans: Pick<Plans, 'list' | 'requiredDelivery'>
   handoffs: Pick<Handoffs, 'get'>
@@ -67,7 +68,7 @@ export class PlanIntegration {
     if (this.host.paused() || current?.ref !== target.ref || current.repository !== target.repository || current.slug !== target.slug) throw new Later()
   }
 
-  private async verify(planId: string): Promise<void> {
+  private async verify(planId: string): Promise<void | typeof Park> {
     const { host } = this, { store, verification } = host, slot = KV.plans.integration(planId)
     if (!verification || terminal(store.get(slot))) return
     const required = host.plans.requiredDelivery(planId), handoff = host.handoffs.get(planId)
@@ -117,8 +118,16 @@ export class PlanIntegration {
         })
         if (!first) throw new Later()
         try { await host.dispatch(request) }
-        catch {
+        catch (error) {
           this.active(target)
+          if (error instanceof CliError && error.code !== undefined && error.code >= 400 && error.code < 500 &&
+              ![408, 425, 429].includes(error.code)) {
+            store.atomic(() => {
+              store.delete(dispatch)
+              store.set(slot, { planId, status: 'blocked', reason: 'actions_unavailable', version })
+            })
+            return Park
+          }
           return retry({ planId, status: 'blocked', reason: 'dispatch_unconfirmed', version })
         }
         this.active(target)

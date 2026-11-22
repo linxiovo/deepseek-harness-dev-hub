@@ -112,7 +112,7 @@ The dispatch transaction reserves the existing `DshExecutor` launch slot synchro
 
 `plan/<id>` and `plan/<id>/node/<node-id>` join the immutable graph with the durable node state: `claimed`, `running`, `awaiting-delivery`, `delivered`, `failed` or `stopped`. The `delivery` receipt names the Ticket, delivering Assignment and generation, reviewed base and candidate, intent ID (`receiptId`), integration SHA, and actual tip observed at `verifiedAt`. A blocked node lists the remaining predecessors under `waiting_on`; after each formally closes, its receipt is readable on that predecessor. See [formal Plan closure](003-execution.md#formal-plan-closure).
 
-The graph summary points to `plan/<id>/delivery`, the Plan-level result after every registered node has a formal receipt. That resource reports the integrated commit, full-regression run and matching artifact; it is not a node receipt and does not change Frontier state. See `017-plan-integration.md`.
+`plan/<id>/delivery` is the Plan-level result after formal node receipts. It is separate from each node's `delivery` receipt and does not change Frontier state; details are in `017-plan-integration.md`.
 
 On restart, the dispatcher rearms the same pending Assignment and the Executor adopts a persisted Plan writer claim without issuing a new generation. Stable `assignment:<ticket>` delivery IDs prevent a second Worker message; a missing start receipt is completed when the existing Session is found and the Assignment start is recorded.
 

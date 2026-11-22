@@ -46,6 +46,27 @@ const PlanJob = z.looseObject({ id: z.number().int().positive().safe(), run_id: 
 const PlanArtifactEntry = z.looseObject({ id: z.number().int().positive().safe(), name: z.string(), expired: z.boolean(),
   size_in_bytes: z.number().int().nonnegative().safe(), workflow_run: z.looseObject({ id: z.number().int().positive().safe(), head_sha: z.string() }).nullish() })
 
+type AttemptOrder = { run_number: number; run_attempt: number }
+function isNewerRun(candidate: AttemptOrder, current: AttemptOrder): boolean {
+  return candidate.run_number > current.run_number || candidate.run_number === current.run_number && candidate.run_attempt > current.run_attempt
+}
+function latestRun<T extends AttemptOrder>(runs: readonly T[]): T | undefined {
+  let latest: T | undefined
+  for (const run of runs) if (!latest || isNewerRun(run, latest)) latest = run
+  return latest
+}
+
+function planRunView(run: z.infer<typeof PlanRun>, repository: string): PlanVerificationRun {
+  return { id: run.id, attempt: run.run_attempt, url: `https://github.com/${repository}/actions/runs/${run.id}`, checks: [] }
+}
+
+async function matchingPlanRuns(commands: Commands, request: PlanVerificationRequest, workflowId: string, branch: string, runName: string) {
+  const query = new URLSearchParams({ head_sha: request.sha, branch, event: 'workflow_dispatch' })
+  const runs = await actionPages(commands, `actions/workflows/${workflowId}/runs?${query}`, 'workflow_runs', PlanRun)
+  return runs.filter(run => String(run.workflow_id) === workflowId && run.event === 'workflow_dispatch' &&
+    run.head_branch === branch && run.head_sha === request.sha && run.display_title === runName)
+}
+
 function planInputs(request: PlanVerificationRequest, repository: string): { workflowId: string; branch: string } {
   const { verification } = request
   const workflowId = verification.workflowId
@@ -64,10 +85,9 @@ function planInputs(request: PlanVerificationRequest, repository: string): { wor
   }
   if (!/^[0-9a-f]{40}$/.test(request.sha)) throw new Error('A complete lowercase commit SHA is required')
   if (!/^[0-9a-f]{64}$/.test(request.context)) throw new Error('A 64-character lowercase plan context is required')
-  if (!verification.jobs.length || new Set(verification.jobs).size !== verification.jobs.length ||
-    verification.jobs.some(name => !name.trim()) || !verification.artifactName.trim() ||
-    !verification.configuration.trim() || !verification.environment.trim()) {
-    throw new Error('Plan verification requires configured jobs, artifact, configuration, and environment')
+  if (!verification.jobs.length || !verification.jobs.includes(verification.identityJob) || new Set(verification.jobs).size !== verification.jobs.length ||
+    verification.jobs.some(name => !name.trim()) || !verification.artifactName.trim() || !verification.configuration.trim() || !verification.environment.trim()) {
+    throw new Error('Plan verification requires a listed identity job, full regression jobs, artifact, configuration, and environment')
   }
   return { workflowId, branch }
 }
@@ -86,18 +106,12 @@ export async function observePlanActions(commands: Commands, request: PlanVerifi
   const { verification } = request
   const repository = commands.repository.toLowerCase()
   const runName = `dsh-plan-verification:${request.context}`
-  const query = new URLSearchParams({ head_sha: request.sha, branch, event: 'workflow_dispatch' })
-  const runs = await actionPages(commands, `actions/workflows/${workflowId}/runs?${query}`, 'workflow_runs', PlanRun)
-  const matching = runs.filter(run => String(run.workflow_id) === workflowId && run.event === 'workflow_dispatch' &&
-    run.head_branch === branch && run.head_sha === request.sha && run.display_title === runName)
-  if (!matching.length) return { status: 'missing' }
-  matching.sort((a, b) => b.run_number - a.run_number || b.run_attempt - a.run_attempt)
-  const latest = matching[0]!
-  const run: PlanVerificationRun = { id: latest.id, attempt: latest.run_attempt,
-    url: `https://github.com/${repository}/actions/runs/${latest.id}`, checks: [] }
+  const matching = await matchingPlanRuns(commands, request, workflowId, branch, runName)
+  const latest = latestRun(matching)
+  if (!latest) return { status: 'missing' }
+  const run = planRunView(latest, repository)
   if (latest.status !== 'completed') return { status: 'pending', run }
   if (latest.conclusion !== 'success') return { status: 'failed', reason: 'regression_failed', run }
-
   const jobs = await actionPages(commands, `actions/runs/${latest.id}/attempts/${latest.run_attempt}/jobs`, 'jobs', PlanJob)
   const exactJobs = jobs.filter(job => job.run_id === latest.id && (job.run_attempt == null || job.run_attempt === latest.run_attempt) && job.head_sha === request.sha)
   const requiredJobs = verification.jobs.map(name => ({ name, matches: exactJobs.filter(job => job.name === name) }))
@@ -118,6 +132,15 @@ export async function observePlanActions(commands: Commands, request: PlanVerifi
     artifact.workflow_run.head_sha === request.sha && artifact.expired === false && artifact.size_in_bytes > 0)
   if (exactArtifacts.length !== 1) return { status: 'failed', reason: 'artifact_unavailable', run }
   const artifact = exactArtifacts[0]!
+  const current = latestRun(await matchingPlanRuns(commands, request, workflowId, branch, runName))
+  if (!current) return { status: 'missing' }
+  const currentRun = planRunView(current, repository)
+  if (current.id !== latest.id || current.run_attempt !== latest.run_attempt)
+    return current.status === 'completed' && current.conclusion !== 'success'
+      ? { status: 'failed', reason: 'regression_failed', run: currentRun }
+      : { status: 'pending', run: currentRun }
+  if (current.status !== 'completed') return { status: 'pending', run: currentRun }
+  if (current.conclusion !== 'success') return { status: 'failed', reason: 'regression_failed', run: currentRun }
   return { status: 'passed', run, artifact: { id: artifact.id, name: artifact.name,
     url: `https://github.com/${repository}/actions/runs/${latest.id}/artifacts/${artifact.id}` } }
 }
@@ -171,8 +194,7 @@ export async function actionsEvidence(commands: Commands, work: EvidenceWork, sh
     }
     const previous = selected.get(workflowId)
     // A late update or rerun of an older execution does not supersede a newer run of this workflow.
-    if (!previous || run.run_number > previous.run_number ||
-      (run.run_number === previous.run_number && run.run_attempt > previous.run_attempt)) selected.set(workflowId, run)
+    if (!previous || isNewerRun(run, previous)) selected.set(workflowId, run)
   }
   const found = new Map<string, Map<string, ActionsEvidence['checks'][number]>>()
   for (const [workflowId, run] of selected) {

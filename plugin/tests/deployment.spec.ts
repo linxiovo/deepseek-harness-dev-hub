@@ -95,16 +95,20 @@ describe('configuration schema', () => {
     if (win32) expect(() => Config(minimal({ stateDir: 'C:relative' }))).toThrow()
   })
 
-it('requires one verifier per registered project and a complete unique job list', () => {
-  const verification = { projectId: 'a'.repeat(32), workflowId: '12345678', jobs: ['full-regression', 'bundle'],
-    artifactName: 'package', configuration: 'checks-v1', environment: 'hosted-ci-v1' }
-  expect(machineOf(Config(minimal({ planVerification: [verification] }))).planVerification).toEqual([verification])
-  expect(() => Config(minimal({ planVerification: [{ ...verification, projectId: 'invalid' }] }))).toThrow()
-  expect(() => machineOf(Config(minimal({ planVerification: [verification, verification] }))))
-    .toThrow('Duplicate Plan verification for the same project')
-  expect(() => machineOf(Config(minimal({ planVerification: [{ ...verification, jobs: ['full-regression', 'full-regression'] }] }))))
-    .toThrow('unique, non-blank full regression job names')
-})
+  it('requires one verifier per registered project, a listed identity job and safe unique configuration', () => {
+    const verification = { projectId: 'a'.repeat(32), workflowId: '12345678', identityJob: 'full-regression', jobs: ['full-regression', 'bundle'],
+      artifactName: 'package', configuration: 'checks-v1', environment: 'hosted-ci-v1' }
+    expect(machineOf(Config(minimal({ planVerification: [verification] }))).planVerification).toEqual([verification])
+    expect(() => Config(minimal({ planVerification: [{ ...verification, projectId: 'invalid' }] }))).toThrow()
+    expect(() => machineOf(Config(minimal({ planVerification: [verification, verification] }))))
+      .toThrow('Duplicate Plan verification for the same project')
+    expect(() => machineOf(Config(minimal({ planVerification: [{ ...verification, jobs: ['full-regression', 'full-regression'] }] }))))
+      .toThrow('unique, non-blank full regression job names')
+    expect(() => machineOf(Config(minimal({ planVerification: [{ ...verification, identityJob: 'missing' }] }))))
+      .toThrow('listed identity job')
+    expect(() => machineOf(Config(minimal({ planVerification: [{ ...verification, workflowId: '9007199254740992' }] }))))
+      .toThrow('safe positive integer')
+  })
 
   it('names keys the configuration does not define, and where the values of older keys live now', () => {
     const raw = minimal({ repository: 'acme/widgets', repositoryPath: '/srv/widgets', blockedCommands: [], author: { name: 'Alice' }, extra: 1 })

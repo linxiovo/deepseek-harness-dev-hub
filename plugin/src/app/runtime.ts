@@ -230,8 +230,9 @@ export class Runtime extends Service implements SourceHost {
         runLimitsChanged: () => runLimits.configurationChanged(),
         validate: (before, after) => {
           if (this.closing()) throw new InstallationError(409, 'switching')
-          if (project && (before.sources.github?.config.cli !== after.sources.github?.config.cli
-            || before.sources.github?.config.repository !== after.sources.github?.config.repository
+          const oldGithub = before.sources.github?.config, newGithub = after.sources.github?.config
+          if (project && ((oldGithub?.cli ?? '') !== (newGithub?.cli ?? '')
+            || (oldGithub?.repository ?? '') !== (newGithub?.repository ?? '')
             || before.executor.repository !== after.executor.repository || before.executor.directory !== after.executor.directory)) {
             throw new InstallationError(409, 'projectBindingImmutable')
           }

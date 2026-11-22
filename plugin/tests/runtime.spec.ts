@@ -375,6 +375,22 @@ it('keeps project binding, authorization, cursors and Hub sessions separate acro
   await mount('desktop', project.id)
   expect(runtime.masterId).toBe(project.hubSessionId)
   expect(sections.get(project.hubSessionId)!.text({})).toContain('acme/widgets')
+  const githubSettings = async () => {
+    const { body } = await api('GET', 'settings', undefined, project.id)
+    const { sources } = body as { sources: { id: string; revision: number; value: { enabled: boolean; config: Record<string, unknown> } }[] }
+    return sources.find(source => source.id === 'github')!
+  }
+  const github = await githubSettings()
+  const requiredChecks = [{ id: 'check', workflowId: '42' }]
+  const saveSource = (revision: number, config: Record<string, unknown>) => api('PUT', 'settings/source:github', {
+    revision, value: { ...github.value, config },
+  }, project.id)
+  expect(await saveSource(github.revision, { ...github.value.config, requiredChecks }))
+    .toMatchObject({ status: 200, body: { saved: true, restarting: false } })
+  const savedGithub = await githubSettings()
+  expect(savedGithub.value.config.requiredChecks).toEqual(requiredChecks)
+  expect(await saveSource(savedGithub.revision, { ...savedGithub.value.config, cli: 'other-gh' }))
+    .toMatchObject({ status: 409, body: { code: 'projectBindingImmutable' } })
   const firstSource = runtime.context(githubKind)
   firstSource.state.set(KV.github.since, '2026-09-01T00:00:00Z')
   const mention = (slug: string, login: string) => commentTrigger({ id: 900, body: '@agent-bot please fix the regression', user: { login },

@@ -10,6 +10,8 @@ Registration requires GitHub `owner/name`, push access for the verified account,
 
 Registration is reusable for the same canonical binding and initialization. Changing a new project's initial base or policy in a repeated registration conflicts. The first registration selects the project in the same catalog transaction. After that, use the select operation to activate a project. Selecting the already mounted project returns `restarting: false`. Managed settings refuse changes to `source:github`'s `cli` or `repository`, or to `executor.repository` or `executor.directory` (`409 projectBindingImmutable`). The base for future Tickets remains an Execution setting. Existing Ticket claims retain their pinned base.
 
+To configure required GitHub Actions jobs on a newly registered project, update `requiredChecks` in the current `source:github` block. The unused Source CLI stays unset; the operator-verified installation account remains the only account for the managed project.
+
 ### Explicit adoption
 
 If a legacy deployment has a GitHub repository configured, adopt it before registering another project. Startup verifies the legacy Source CLI through the same GitHub onboarding check and pins its numeric account ID; later Source CLI changes must verify as that account. Until adoption, the validated legacy repository may still run with a `null` managed project ID. To adopt it, register the existing repository and canonical workspace using its existing `executor.baseRef` and **omit** `policy`. Stored handoffs must match the repository and workspace too. Another binding is refused with `legacyProjectRequired`. An unverifiable legacy identity, mismatched base, explicit policy or mismatched handoff is refused with `legacyProjectMismatch`. Adoption keeps the root Store, existing settings and Hub Session ID in place.
@@ -63,6 +65,8 @@ Identity check failures such as `agentCliMissing`, `agentCliSignedOut`, `agentCl
 ### Project scope
 
 Project operations resolve records against the mounted Store. Send `x-orchestrator-project-id: <mounted ID>` on every mutation when a managed project is mounted. Missing scope returns `409 {error, code: "projectScopeRequired"}`. A mismatched scope returns `409 {error, code: "staleProject"}` even if the referenced record exists in the new project. The same mismatch check applies to GET requests and the read-only `POST /orchestrator/api/prompts/preview` when they supply a scope. With no managed mount, legacy operations do not require a header and a supplied scope is stale. The header checks whether the client is targeting the current mount.
+
+`GET settings` remains usable before a project is selected. During project selection or remount, it returns `409 switching` instead of exposing settings or a block revision from the outgoing mount. Fetch the block again with the active project ID before saving.
 
 Under `/orchestrator/api/`, scoped writes are `PUT settings/:block` and `PUT prompts`, plus `POST` to `sources/:id/labels`, `threads/:key/unsubscribe`, `triggers/:id/requeue`, `decisions/:id/dismiss`, `tickets/:id/retry`, `tickets/:id/stop`, `executor/pause`, `policy-sync/:id` and `setup/check`.
 

@@ -11,7 +11,7 @@ import { Later, type Effects } from './effects.ts'
 import type { Store } from './store.ts'
 
 /** Exact Actions lookup authorized before the Git write, independent of later PR state. */
-export type MainlineCiBinding = { pull: number } | { branch: string }
+export type MainlineCiBinding = { pull: number; runs: Record<string, number> } | { branch: string }
 
 export type DeliveryTargetObservation = { actual: string; verifiedAt: string } | { missing: string }
 export type CheckDeliveryTarget = (scope: DocTreeScope) => Promise<DeliveryTargetObservation>

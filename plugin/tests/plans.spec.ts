@@ -283,6 +283,33 @@ describe('managed project plan pause', () => {
     expect(await get()).toEqual(after)
   })
 
+  it('admits a native reviewer before its first skill call and charges its Worker ticket', async () => {
+    const { host, project, projectBrief } = await startManagedProject({ withFeishu: false })
+    managedHost = h = host
+    brief = savedProductsBrief(projectBrief)
+    const { id } = await registeredFanIn()
+    const settings = await readExecutorSettings()
+    expect(await h.api('PUT', 'settings/executor', { revision: settings.revision, value: {
+      ...settings.value, runLimits: { ticketTokens: 100, projectTokens: 100 },
+    } }, project.id)).toMatchObject({ status: 200 })
+    const worker = (await dispatchPlan(id, 'catalog')).claim!
+    await h.runtime.idle()
+    const reviewer = await h.reviewSubagent(worker.session, 'standards', undefined, true, [], async sessionId => {
+      expect(h.tools.get(sessionId)?.has('orchestrator_review_submit')).toBe(false)
+      await h.modelRequest(sessionId, 100, async function* (): AsyncGenerator<StreamChunk> {
+        for (const resource of ['project/run-limits', `ticket/${worker.ticketId}/run-limits`]) {
+          expect(await read(resource)).toMatchObject({ budget: { availableTokens: 0, reservedTokens: 100,
+            inFlight: [{ sessionId, ticketId: worker.ticketId, maximumTokens: 100 }] } })
+        }
+        yield { type: 'usage', usage: { inputTokens: 16, outputTokens: 4, totalTokens: 20 } }
+      })
+    })
+    expect(h.tools.get(reviewer)?.has('orchestrator_review_submit')).toBe(true)
+    expect(await read(`ticket/${worker.ticketId}/run-limits`)).toMatchObject({ budget: {
+      accountedTokens: 20, reportedCalls: 1, reservedTokens: 0, missing: [],
+    }, projectBudget: { accountedTokens: 20, reportedCalls: 1 } })
+  })
+
   it('reserves the last project balance before provider I/O and settles only observed usage', async () => {
     const { host, project, projectBrief } = await startManagedProject({ withFeishu: false })
     managedHost = h = host
@@ -321,6 +348,75 @@ describe('managed project plan pause', () => {
     expect(await read('project/run-limits')).toMatchObject({ budget: { accountedTokens: 77, availableTokens: 23, reportedCalls: 2 } })
     await expect(h.modelRequest(b.session, 24, later)).rejects.toMatchObject({ code: 'SUPERAGENT_RUN_LIMIT_CONFIGURATION' })
     expect(providerCalls).toBe(1)
+  })
+
+  it('cancels a model quota waiter before provider I/O without spending or closing its Ticket', async () => {
+    const { host, project, projectBrief } = await startManagedProject({ withFeishu: false })
+    managedHost = h = host
+    brief = savedProductsBrief(projectBrief)
+    const { id } = await registeredFanIn()
+    const settings = await readExecutorSettings()
+    expect(await h.api('PUT', 'settings/executor', { revision: settings.revision, value: {
+      ...settings.value, runLimits: { projectTokens: 100 },
+    } }, project.id)).toMatchObject({ status: 200 })
+    const catalog = (await dispatchPlan(id, 'catalog')).claim!
+    const accounts = (await dispatchPlan(id, 'accounts')).claim!
+    await h.runtime.idle()
+
+    const holding = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+    const cancel = new AbortController(), nextSignal = new AbortController()
+    const providerFailure = new Error('Provider disconnected after sending usage')
+    const holder = h.modelRequest(catalog.session, 100, async function* (): AsyncGenerator<StreamChunk> {
+      yield { type: 'usage', usage: { inputTokens: 60, outputTokens: 5, totalTokens: 65 } }
+      holding.resolve()
+      await release.promise
+      throw providerFailure
+    }).catch((error: unknown) => error)
+    try {
+      await Promise.race([holding.promise, holder.then(result => {
+        throw new Error('The first provider never reached its settlement gate', { cause: result })
+      })])
+      const usage: StreamChunk = { type: 'usage', usage: { inputTokens: 10, outputTokens: 1, totalTokens: 11 } }
+      const finish: StreamChunk = { type: 'finish', reason: { kind: 'stop' } }
+      const arrivals: string[] = []
+      const provider = (session: string) => async function* () { arrivals.push(session); yield usage; yield finish }
+      const hub = h.runtime.masterId
+      const cancelled = h.modelRequest(accounts.session, 35, provider(accounts.session), cancel.signal).catch((error: unknown) => error)
+      const next = h.modelRequest(hub, 35, provider(hub), nextSignal.signal).catch((error: unknown) => error)
+      const reserved = await read('project/run-limits')
+      expect(reserved).toMatchObject({ budget: { state: 'reserved', availableTokens: 0,
+        accountedTokens: null, reportedCalls: 0, missing: [], reservedTokens: 100,
+        inFlight: [{ sessionId: catalog.session, maximumTokens: 100 }],
+      } })
+      cancel.abort()
+      // A wait-specific refusal distinguishes this from cancellation before admission was reached.
+      expect(await cancelled).toMatchObject({ code: 'SUPERAGENT_RUN_LIMIT', message: expect.stringMatching(/cancelled while waiting for quota/) })
+      expect(await read('project/run-limits')).toEqual(reserved)
+      expect(arrivals).toEqual([])
+
+      release.resolve()
+      expect(await holder).toBe(providerFailure)
+      expect(await next).toEqual([usage, finish])
+      expect(arrivals).toEqual([hub])
+      expect(await read('project/run-limits')).toMatchObject({ budget: { state: 'available', availableTokens: 24,
+        accountedTokens: 76, reportedCalls: 2, missing: [], reservedTokens: 0, inFlight: [],
+      } })
+      expect(await read(`ticket/${accounts.ticketId}/run-limits`)).toMatchObject({ budget: {
+        accountedTokens: null, reportedCalls: 0, missing: [], reservedTokens: 0, inFlight: [],
+      } })
+      expect(await h.api('GET', `attention/summary?planId=${id}`, undefined, project.id)).toMatchObject({ status: 200,
+        body: { running: 2, awaitingHuman: 0, actions: [] } })
+      expect(await read(`ticket/${accounts.ticketId}`)).not.toHaveProperty('ended')
+      const node = await read(`plan/${id}/node/accounts`)
+      expect(node).toMatchObject({ status: 'running' })
+      expect(node).not.toHaveProperty('delivery')
+      await h.idleRelay()
+      expect(h.jsonRelays(hub, 'quota-paused')).toEqual([])
+    } finally {
+      cancel.abort()
+      nextSignal.abort()
+      release.resolve()
+    }
   })
 
   it.each(['usage-missing', 'exhausted'] as const)('keeps a %s quota pause local and reports it once across restart', async state => {
@@ -372,6 +468,46 @@ describe('managed project plan pause', () => {
     expect(await h.api('GET', 'attention/summary', undefined, project.id)).toMatchObject({ status: 200, body: { running: 1 } })
     expect(await read(`plan/${id}/node/catalog`)).not.toHaveProperty('delivery')
     expect(notices()).toHaveLength(1)
+  })
+  it('resumes the same quota-paused Plan claim after an operator raises its ticket limit', async () => {
+    const { host, project, projectBrief } = await startManagedProject({ withFeishu: false })
+    managedHost = h = host
+    brief = savedProductsBrief(projectBrief)
+    const { id } = await registeredFanIn()
+    const settings = await readExecutorSettings()
+    expect(await h.api('PUT', 'settings/executor', { revision: settings.revision, value: { ...settings.value,
+      maxWorkers: 1, runLimits: { ticketTokens: 40 },
+    } }, project.id)).toMatchObject({ status: 200 })
+
+    const initial = (await dispatchPlan(id, 'catalog')).claim!
+    expect(await dispatchPlan(id, 'accounts')).toMatchObject({ status: 'waiting-for-slot', reused: false })
+    await h.runtime.idle()
+    await h.modelRequest(initial.session, 40, async function* (): AsyncGenerator<StreamChunk> {
+      yield { type: 'usage', usage: { inputTokens: 34, outputTokens: 6, totalTokens: 40 } }
+    })
+    const identity = { ticketId: initial.ticketId, assignmentId: initial.assignmentId, session: initial.session }
+    expect(await dispatchPlan(id, 'catalog')).toMatchObject({ status: 'quota-paused', reused: true, claim: identity })
+    expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'] })
+
+    const current = await readExecutorSettings()
+    expect(await h.api('PUT', 'settings/executor', { revision: current.revision, value: { ...current.value,
+      runLimits: { ticketTokens: 80 },
+    } }, project.id)).toMatchObject({ status: 200 })
+    await h.runtime.idle()
+
+    expect(await dispatchPlan(id, 'catalog')).toMatchObject({ status: 'running', reused: true, claim: identity })
+    expect(await dispatchPlan(id, 'accounts')).toMatchObject({ status: 'waiting-for-slot', reused: false })
+    expect(await read(`plan/${id}/node/catalog`)).toMatchObject({ status: 'running', claim: identity })
+    expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'] })
+    // A recovery note can arrive without a second Assignment being sent.
+    const assignmentDeliveries = h.deliveries.mock.calls.filter(([delivery]) => delivery.sessionId === initial.session
+      && delivery.text.startsWith('{') && JSON.parse(delivery.text).ticket_id === initial.ticketId)
+    expect(assignmentDeliveries).toHaveLength(1)
+    await h.modelRequest(initial.session, 40, async function* (): AsyncGenerator<StreamChunk> {
+      yield { type: 'usage', usage: { inputTokens: 18, outputTokens: 2, totalTokens: 20 } }
+    })
+    expect(await read(`ticket/${initial.ticketId}/run-limits`)).toMatchObject({ budget: { state: 'available',
+      limitTokens: 80, accountedTokens: 60, availableTokens: 20 } })
   })
 
   it('recovers an interrupted provider reservation as missing, never as a free or still-live request', async () => {

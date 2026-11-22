@@ -26,7 +26,7 @@ export interface ActionsEvidence {
   reason?: 'required_checks_unconfigured' | 'required_workflow_unconfigured'
 }
 
-const Run = z.looseObject({ id: z.number(), head_sha: z.string(), run_attempt: z.number().int().positive(),
+const Run = z.looseObject({ id: z.number().int().positive(), head_sha: z.string(), run_attempt: z.number().int().positive(),
   status: z.string().nullable(), conclusion: z.string().nullable(), html_url: z.string(),
   event: z.string().optional(), head_branch: z.string().nullish(),
   workflow_id: z.number().int().positive(), run_number: z.number().int().positive(),
@@ -54,7 +54,8 @@ async function actionPages<T>(commands: Commands, path: string, field: 'workflow
 
 /** Reads Actions evidence for a commit; PR runs must match the current head and base, not a synthetic merge run SHA. */
 export async function actionsEvidence(commands: Commands, work: EvidenceWork, sha: string, required: readonly RequiredActionsCheck[],
-  pr?: { number: number; baseSha: string; mergeSha?: string }, candidateBranch?: string): Promise<ActionsEvidence> {
+  pr?: { number: number; baseSha: string; mergeSha?: string; boundRuns?: Readonly<Record<string, number>> },
+  candidateBranch?: string): Promise<ActionsEvidence> {
   if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error('A complete lowercase commit SHA is required')
   if (pr && (!Number.isSafeInteger(pr.number) || pr.number <= 0 || !/^[0-9a-f]{40}$/.test(pr.baseSha) ||
     (pr.mergeSha != null && !/^[0-9a-f]{40}$/.test(pr.mergeSha)))) {
@@ -76,8 +77,13 @@ export async function actionsEvidence(commands: Commands, work: EvidenceWork, sh
   for (const run of runs) {
     const workflowId = String(run.workflow_id)
     if (!workflows.has(workflowId) || run.head_sha !== sha ||
-      (candidateBranch !== undefined && (run.head_branch !== candidateBranch || !['push', 'workflow_dispatch'].includes(run.event ?? ''))) ||
-      (pr && !run.pull_requests?.some(link => link.number === pr.number && link.head.sha === sha && link.base.sha === pr.baseSha))) continue
+      (candidateBranch !== undefined && (run.head_branch !== candidateBranch || !['push', 'workflow_dispatch'].includes(run.event ?? '')))) continue
+    if (pr) {
+      const links = run.pull_requests
+      // GitHub can remove the association after the fast-forward. Only a run proved before that write can supply it.
+      const pinned = links?.length === 0 && pr.boundRuns?.[workflowId] === run.id
+      if (!pinned && !links?.some(link => link.number === pr.number && link.head.sha === sha && link.base.sha === pr.baseSha)) continue
+    }
     const previous = selected.get(workflowId)
     // A late update or rerun of an older execution does not supersede a newer run of this workflow.
     if (!previous || run.run_number > previous.run_number ||

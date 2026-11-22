@@ -2,6 +2,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { createReadStream } from 'node:fs'
+import { pipeline } from 'node:stream/promises'
 import { z } from 'zod'
 import { PROJECT_SCOPE_HEADER, THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
 import { InstallationError, type GithubIdentity, type InstallationApi, type OnboardingView, type ProjectView, type RuntimeView }
@@ -26,6 +28,7 @@ import type { SessionMeter } from './session-meter.ts'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
 import type { PlanIntegrationView } from '../core/plan-integration.ts'
+import { PlanArtifactFileSchema, type PlanArtifactFile } from './plan-artifacts.ts'
 import { actorIdPattern, TopicBindingError, type TopicBinding } from './topic-binding.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
 import type { Variable } from './execution-environment.ts'
@@ -57,6 +60,7 @@ export interface HttpHost {
   readonly projectMeter: Pick<ProjectMeter, 'read'>
   readonly runLimits?: { view(ticketId?: string): RunLimitStatus | undefined }
   readonly planIntegration?: { view(id: string): PlanIntegrationView | undefined }
+  readonly planArtifact?: (id: string) => Promise<PlanArtifactFile | undefined>
   readonly attention: Pick<ScopedAttention, 'summary' | 'entry' | 'verify'>
   readonly health: Record<string, Health>
   readonly machine: Machine
@@ -143,7 +147,8 @@ export type StateView = ReturnType<typeof stateView>
 function ticketPage(runtime: HttpHost, id: string) {
   const detail = ticketDetail(views(runtime), id), ticket = runtime.store.tickets.get(id)
   if (!detail || !ticket) throw new RouteError(404, 'Ticket not found')
-  return { ...detail, environment: runtime.configured() ? runtime.ticketEnvironment(ticket) : [] }
+  return { ...detail, ...(ticket.plan ? { planId: ticket.plan.planId } : {}),
+    environment: runtime.configured() ? runtime.ticketEnvironment(ticket) : [] }
 }
 export type TicketPageView = ReturnType<typeof ticketPage>
 function promptsView(runtime: HttpHost, revision: number | undefined, offset: number) {
@@ -163,7 +168,8 @@ interface Input<K extends keyof Api> {
   params: RouteParams<K>; query: Record<string, string>; body: (maxBytes?: number) => Promise<unknown>
   write<T>(operation: () => T | Promise<T>, verify?: () => Promise<void>): T | Promise<T>
 }
-type Routes = { [K in keyof Api]: (input: Input<K>) => ApiResponse<K> | Promise<ApiResponse<K>> }
+type RouteOutput<K extends keyof Api> = K extends 'GET plans/:id/artifact' ? PlanArtifactFile : ApiResponse<K>
+type Routes = { [K in keyof Api]: (input: Input<K>) => RouteOutput<K> | Promise<RouteOutput<K>> }
 const offset = z.coerce.number().int().nonnegative().catch(0)
 const limit = (fallback: number, max: number) => z.coerce.number().int().positive().catch(fallback).transform(value => Math.min(max, value))
 const TicketsQuery = z.object({ state: z.enum(TICKET_FILTERS).catch('open'), offset, limit: limit(20, 1000) })
@@ -254,7 +260,9 @@ const projectMeterRoutes: Partial<Record<keyof Api, true>> = {
   'GET project/meter': true, 'GET plans/:id/meter': true, 'GET tickets/:id/meter': true,
 }
 
-const requiredProjectRoutes: Partial<Record<keyof Api, true>> = { 'GET plans/:id/delivery': true }
+const requiredProjectRoutes: Partial<Record<keyof Api, true>> = {
+  'GET plans/:id/delivery': true, 'GET plans/:id/artifact': true,
+}
 
 const runLimitRoutes: Partial<Record<keyof Api, true>> = {
   'GET project/run-limits': true, 'GET tickets/:id/run-limits': true,
@@ -407,8 +415,13 @@ function routes(runtime: HttpHost): Routes {
     'GET project/meter': () => meter('project'),
     'GET plans/:id/delivery': ({ params }) => {
       const view = runtime.planIntegration?.view(params.id)
-      if (!view) throw new RouteError(404, 'Plan not found')
+      if (!view) throw new UserError('unknownPlan', { id: params.id })
       return view
+    },
+    'GET plans/:id/artifact': async ({ params }) => {
+      const artifact = await runtime.planArtifact?.(params.id)
+      if (!artifact) throw new UserError('planArtifactUnavailable', { id: params.id })
+      return artifact
     },
     'GET plans/:id/meter': ({ params }) => meter('plan', params.id),
     'GET tickets/:id/meter': ({ params }) => meter('ticket', params.id),
@@ -525,8 +538,15 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
           // Do not deliver a sample or credential receipt from a retiring or replaced mount.
           if (mountedRoute && readableMount(scope, requirement) !== mounted) throw new InstallationError(409, 'staleProject')
         }
-        json(res, 200, result)
+        if (route.key === 'GET plans/:id/artifact') {
+          const artifact = PlanArtifactFileSchema.parse(result)
+          res.writeHead(200, { 'content-type': artifact.contentType, 'cache-control': 'no-store',
+            'x-content-type-options': 'nosniff', 'content-length': artifact.size,
+            'content-disposition': `attachment; filename="${artifact.fileName}"`, 'x-artifact-sha256': artifact.sha256 })
+          await pipeline(createReadStream(artifact.path), res)
+        } else json(res, 200, result)
       } catch (error) {
+        if (res.headersSent) { res.destroy(error instanceof Error ? error : undefined); return }
         const respond = attentionRoute ? attentionFailure : installationRoute ? installationFailure : failure
         json(res, ...respond(error))
       }

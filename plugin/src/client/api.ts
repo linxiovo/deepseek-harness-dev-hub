@@ -30,7 +30,7 @@ export interface ApiMessages {
 const isUserError = (code: unknown): code is UserErrorCode => typeof code === 'string' && Object.hasOwn(USER_ERRORS, code)
 
 /** Calls one management endpoint; the `x-orchestrator-request` header marks the request as originating from this page. */
-async function api<T>(messages: ApiMessages, path: string, method: string, body?: unknown, projectId?: string): Promise<T> {
+async function api<T>(messages: ApiMessages, path: string, method: string, body?: unknown, projectId?: string, binary = false): Promise<T> {
   let response: Response
   const json = body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }
   try {
@@ -39,23 +39,21 @@ async function api<T>(messages: ApiMessages, path: string, method: string, body?
   } catch {
     throw new ApiError(messages.offline, 0, { unreachable: true })
   }
+  if (response.ok) return (binary ? await response.blob() : await response.json()) as T
   const text = await response.text()
   let value: unknown
   try { value = text ? JSON.parse(text) : {} } catch { value = undefined }
-  if (!response.ok) {
-    const failure = (value ?? {}) as { error?: unknown; issues?: unknown; setup?: SetupProblem; code?: unknown
-      values?: Record<string, string> }
-    const issues = Array.isArray(failure.issues) ? failure.issues as { path: string; message: string }[] : []
-    const user = isUserError(failure.code) ? { code: failure.code, values: failure.values ?? {} } : undefined
-    // dsh-superagent always responds with a body; an empty 404 comes from the DSH web server when dsh-superagent routes are unmounted during startup or restart.
-    const { status } = response
-    const message = failure.setup ? messages.setup(failure.setup) : user ? messages.user(user)
-      : typeof failure.error === 'string' ? failure.error : !text && status === 404 ? messages.notRunning
-      : status >= 500 ? messages.serverError(status) : messages.requestFailed(status)
-    throw new ApiError(message, status, { issues, ...failure.setup ? { setup: failure.setup } : {}, ...user ? { user } : {},
-      ...text ? {} : { unreachable: true } })
-  }
-  return value as T
+  const failure = (value ?? {}) as { error?: unknown; issues?: unknown; setup?: SetupProblem; code?: unknown
+    values?: Record<string, string> }
+  const issues = Array.isArray(failure.issues) ? failure.issues as { path: string; message: string }[] : []
+  const user = isUserError(failure.code) ? { code: failure.code, values: failure.values ?? {} } : undefined
+  // dsh-superagent always responds with a body; an empty 404 comes from the DSH web server when dsh-superagent routes are unmounted during startup or restart.
+  const { status } = response
+  const message = failure.setup ? messages.setup(failure.setup) : user ? messages.user(user)
+    : typeof failure.error === 'string' ? failure.error : !text && status === 404 ? messages.notRunning
+    : status >= 500 ? messages.serverError(status) : messages.requestFailed(status)
+  throw new ApiError(message, status, { issues, ...failure.setup ? { setup: failure.setup } : {}, ...user ? { user } : {},
+    ...text ? {} : { unreachable: true } })
 }
 
 const HIDDEN_FACTOR = 6
@@ -113,7 +111,7 @@ export function caller(messages: () => ApiMessages, projectId?: string): Call {
     const path = pattern.replace(/:(\w+)/g, (_match, name: string) => encodeURIComponent(String(values[name])))
     const query = Object.entries(values.query ?? {}).filter(([, value]) => value !== undefined && value !== '')
       .map(([name, value]) => `${name}=${encodeURIComponent(String(value))}`).join('&')
-    return api(messages(), query ? `${path}?${query}` : path, method, values.body, projectId)
+    return api(messages(), query ? `${path}?${query}` : path, method, values.body, projectId, route === 'GET plans/:id/artifact')
   }
 }
 

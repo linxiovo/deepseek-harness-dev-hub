@@ -145,6 +145,15 @@ export async function observePlanActions(commands: Commands, request: PlanVerifi
     url: `https://github.com/${repository}/actions/runs/${latest.id}/artifacts/${artifact.id}` } }
 }
 
+/** Rechecks the exact run after the package download, immediately before delivery is committed. */
+export async function isLatestPlanActions(commands: Commands, request: PlanVerificationRequest, expected: PlanVerificationRun): Promise<boolean> {
+  const { workflowId, branch } = planInputs(request, commands.repository)
+  const runName = `dsh-plan-verification:${request.context}`
+  const current = latestRun(await matchingPlanRuns(commands, request, workflowId, branch, runName))
+  return current?.id === expected.id && current.run_attempt === expected.attempt && current.head_sha === request.sha &&
+    current.status === 'completed' && current.conclusion === 'success'
+}
+
 
 /** Paginate GitHub's object-wrapped Actions collections without truncating required evidence. */
 async function actionPages<T>(commands: Commands, path: string, field: 'workflow_runs' | 'jobs' | 'artifacts', item: z.ZodType<T>): Promise<T[]> {

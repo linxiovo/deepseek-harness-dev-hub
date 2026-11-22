@@ -1,12 +1,13 @@
 /** Ticket detail page: stage and actions, Mandate details, undelivered/delivered Inputs, subscribed Threads, and Assignments. */
-import { useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { ApiError, usePoll, type TicketPageView } from './api.ts'
-import { DisclosureRow, Dot, Icon, Tag, type IconName, type TagTone } from './controls.tsx'
+import type { PlanIntegrationView } from '../core/plan-integration.ts'
+import { Button, DisclosureRow, Dot, Icon, Tag, type IconName, type TagTone } from './controls.tsx'
 import { decisionMark, reportDot, ticketMark } from './marks.ts'
-import { usePanel } from './provider.tsx'
+import { usePanel, usePanelData } from './provider.tsx'
 import { settingsRoute } from './route.ts'
 import { Earlier, ThreadLine, automatedRuns } from './rows.tsx'
-import { actorName, localized, readableMarkers, reasonLabel, valueLabel, when } from './text.ts'
+import { actorName, errorText, localized, readableMarkers, reasonLabel, valueLabel, when } from './text.ts'
 import { ActionLink, ConfirmButton, ExternalLink, Hint, KeyValues, LabelValue, LoadState, MarkdownLite, PageHead, Section, SessionButton,
   StageMark, When } from './widgets.tsx'
 
@@ -105,8 +106,97 @@ function MandateDetails({ ticket, actor }: { ticket: TicketPageView; actor: stri
   </Section>
 }
 
+function PlanDelivery({ planId }: { planId: string }) {
+  const { t, call, notify } = usePanel()
+  const { state } = usePanelData()
+  const selectedProject = state?.projectId
+  const currentProject = useRef(selectedProject)
+  currentProject.current = selectedProject
+  const mounted = useRef(true)
+  const [downloading, setDownloading] = useState(false)
+  const { data, error } = usePoll(() => call('GET plans/:id/delivery', { id: planId }), [call, planId])
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
+  const download = async () => {
+    if (!selectedProject || downloading || !data || !('artifact' in data)) return
+    const projectAtStart = selectedProject
+    setDownloading(true)
+    try {
+      const blob = await call('GET plans/:id/artifact', { id: planId })
+      if (!mounted.current || currentProject.current !== projectAtStart) return
+      const href = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = href
+      anchor.download = data.artifact.fileName
+      anchor.style.display = 'none'
+      document.body.append(anchor)
+      try {
+        anchor.click()
+        window.setTimeout(() => URL.revokeObjectURL(href), 0)
+      } catch (failure) {
+        URL.revokeObjectURL(href)
+        throw failure
+      } finally { anchor.remove() }
+    } catch (failure) {
+      if (mounted.current && currentProject.current === projectAtStart) notify(errorText(failure))
+    } finally {
+      if (mounted.current && currentProject.current === projectAtStart) setDownloading(false)
+    }
+  }
+  const statusLabel = (status: PlanIntegrationView['status']) => t(`planDelivery.status.${status}`)
+  const statusTone: TagTone = data?.status === 'delivered' ? 'success' : data?.status === 'blocked' ? 'danger'
+    : data?.status === 'verifying' ? 'info' : 'neutral'
+  const version = data && 'version' in data ? data.version : undefined
+  const run = data && 'run' in data ? data.run : undefined
+  const artifact = data && 'artifact' in data ? data.artifact : undefined
+  return <Section title={t('planDelivery.title')} icon="review">
+    {error && <LoadState error={error} loading={false} />}
+    {!data && !error && <LoadState loading />}
+    {data && <>
+      <div className="dt-row-meta"><Tag tone={statusTone}>{statusLabel(data.status)}</Tag>
+        {data.status === 'blocked' && <span>{t(`planDelivery.reason.${data.reason}`)}</span>}
+        {data.status === 'awaiting-tickets' && <span>{t('planDelivery.waitingFor', { nodes: data.waitingFor.join(', ') })}</span>}
+      </div>
+      {version && <KeyValues rows={[
+        [t('planDelivery.repository'), <span className="dt-mono">{version.repository}</span>],
+        [t('planDelivery.ref'), <span className="dt-mono">{version.ref}</span>],
+        [t('planDelivery.sha'), <span className="dt-mono">{version.sha}</span>],
+        [t('planDelivery.context'), <span className="dt-mono">{version.context}</span>],
+        [t('planDelivery.workflow'), <span className="dt-mono">{version.workflowId}</span>],
+        [t('planDelivery.configuration'), <span className="dt-mono">{version.configuration}</span>],
+        [t('planDelivery.environment'), <span className="dt-mono">{version.environment}</span>],
+      ]} />}
+      {run && <>
+        <KeyValues rows={[
+          [t('planDelivery.run'), <span className="dt-mono">{run.id} · {t('planDelivery.attempt', { attempt: run.attempt })}</span>],
+          [t('planDelivery.runStatus'), <span>{run.checks.map(check => `${check.name}: ${check.status}${check.conclusion ? ` / ${check.conclusion}` : ''}`).join(' · ') || t('empty')}</span>],
+        ]} />
+        <div className="dt-row-meta dt-actions">
+          <ActionLink href={run.url} icon="external">{t('planDelivery.openActions')}</ActionLink>
+          {run.checks.filter(check => check.url).map(check => <ExternalLink key={check.name} href={check.url!}>
+            {t('planDelivery.openCheck', { name: check.name })}</ExternalLink>)}
+        </div>
+      </>}
+      {artifact && <>
+        <KeyValues rows={[
+          [t('planDelivery.artifact'), <span className="dt-mono">{artifact.name} · {artifact.id}</span>],
+          [t('planDelivery.fileName'), <span className="dt-mono">{artifact.fileName}</span>],
+          [t('planDelivery.contentType'), <span className="dt-mono">{artifact.contentType}</span>],
+          [t('planDelivery.size'), <span>{artifact.size.toLocaleString()} {t('planDelivery.bytes')}</span>],
+        ]} />
+        <div className="dt-row-meta dt-actions"><Button variant="outline" size="sm" disabled={downloading || !selectedProject}
+          onClick={() => { void download() }}>{downloading ? t('loading') : t('planDelivery.download')}</Button></div>
+      </>}
+      {data.status === 'delivered' && <Hint>{t('planDelivery.deliveredAt', { time: when(data.verifiedAt, t('lang')) })}</Hint>}
+    </>}
+  </Section>
+}
+
 export function TicketPage({ id }: { id: string }) {
   const { t, call } = usePanel()
+  const { restarts } = usePanelData()
   const { data, error, reload } = usePoll(() => call('GET tickets/:id', { id }), [id])
   const after = async (request: Promise<unknown>) => { await request; await reload() }
   if (!data) return <><PageHead
@@ -185,6 +275,7 @@ export function TicketPage({ id }: { id: string }) {
     {showPreparationReason && <p className="dt-banner dt-danger dt-mono">
       <span className="dt-banner-label">{t('preparationRejectedPrefix')}</span>{preparationReason}
     </p>}
+    {data.planId && <PlanDelivery key={`${data.planId}:${restarts}`} planId={data.planId} />}
     {data.mainline && <Section title={t('mainlineTitle')} icon="pull">
       <KeyValues rows={[
         [t('mainlineStatus'), t(`mainline.${data.mainline.status}`)],

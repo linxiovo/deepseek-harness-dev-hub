@@ -27,16 +27,16 @@ export interface PlanVerificationRun {
   checks: { name: string; status: string; conclusion: string | null; url?: string }[]
 }
 
-/** Browser-download reference; GitHub still checks repo access when it is opened. */
-export interface PlanArtifact { id: number; name: string; url: string }
+export interface PlanArtifactReference { id: number; name: string; url: string }
+/** Downloadable file metadata; the service retains and checks the bytes before reporting delivery. */
+export interface PlanArtifact extends PlanArtifactReference { fileName: string; contentType: string; size: number; sha256: string }
 
 export type PlanActionsFailure = 'regression_failed' | 'full_regression_missing' | 'artifact_unavailable'
 export type PlanActionsObservation =
   | { status: 'missing' }
   | { status: 'pending'; run: PlanVerificationRun }
   | { status: 'failed'; reason: PlanActionsFailure; run: PlanVerificationRun }
-  | { status: 'passed'; run: PlanVerificationRun; artifact: PlanArtifact }
-
+  | { status: 'passed'; run: PlanVerificationRun; artifact: PlanArtifactReference }
 export interface PlanIntegrationVersion extends PlanIntegrationIdentity {
   workflowId: string
   configuration: string

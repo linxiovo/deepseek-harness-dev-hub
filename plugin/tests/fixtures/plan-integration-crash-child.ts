@@ -5,7 +5,8 @@ import { Effects } from '../../src/app/effects.ts'
 import type { Relay } from '../../src/app/notices.ts'
 import { PlanIntegration } from '../../src/app/plan-integration.ts'
 import { Store } from '../../src/app/store.ts'
-import type { PlanIntegrationView, PlanVerificationConfig, PlanVerificationRequest } from '../../src/core/plan-integration.ts'
+import type { PlanArtifactDraft } from '../../src/app/plan-artifacts.ts'
+import type { PlanIntegrationView, PlanVerificationConfig, PlanVerificationRequest, PlanVerificationRun } from '../../src/core/plan-integration.ts'
 import type { MainlineTarget } from '../../src/executor/mainline-git.ts'
 import { HealthBoard } from '../../src/infra/health.ts'
 
@@ -43,6 +44,14 @@ const integrationHost = {
         checks: verification.jobs.map(name => ({ name, status: 'completed', conclusion: 'success' })) },
       artifact: { id: 202, name: `package-${sha}-1`, url: 'https://github.com/acme/widgets/actions/runs/101/artifacts/202' } }
   },
+  isLatestRun: async (_request: PlanVerificationRequest, _run: PlanVerificationRun) => true,
+  downloadArtifact: async (_planId: string, _request: PlanVerificationRequest, _run: PlanVerificationRun,
+    artifact: { id: number; name: string; url: string }): Promise<PlanArtifactDraft> => ({ directory: '', finalDirectory: '',
+    artifact: { ...artifact, fileName: 'package.tgz', contentType: 'application/gzip', size: 1, sha256: 'd'.repeat(64) } }),
+  commitArtifact: (_draft: PlanArtifactDraft) => {},
+  discardArtifact: (_draft: PlanArtifactDraft) => {},
+  artifactAvailable: async () => true,
+  artifactExists: () => true,
   dispatch: async (request: PlanVerificationRequest) => {
     writeFileSync(runPath, JSON.stringify({ context: request.context, sha: request.sha }))
     writeFileSync(countPath, String(dispatchCount() + 1))
@@ -60,7 +69,7 @@ if (phase === 'crash') {
   effects.start()
   await Promise.withResolvers<void>().promise
 } else {
-  integrationAgent.resume()
+  await integrationAgent.resume()
   effects.start()
   await effects.idle()
   const view = integrationAgent.view(planId) as PlanIntegrationView

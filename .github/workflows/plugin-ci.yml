@@ -43,8 +43,9 @@ jobs:
           test "$ENVIRONMENT" = github-hosted-node22-pnpm11-v1
   check:
     name: check
-    needs: windows
-    if: ${{ !cancelled() }}
+    needs: [integration-identity, windows]
+    # Ordinary CI must still report a failed check if Windows fails.
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || needs.integration-identity.result == 'success') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -99,12 +100,12 @@ jobs:
       - name: Upload plugin build and commit identity
         uses: actions/upload-artifact@v7
         with:
-          name: plugin-check-${{ github.sha }}
+          name: ${{ github.event_name == 'workflow_dispatch' && format('plugin-check-{0}-{1}', github.sha, github.run_attempt) || format('plugin-check-{0}', github.sha) }}
           path: |
             plugin/lib
             plugin/ci-evidence
           if-no-files-found: error
-          overwrite: true
+          overwrite: ${{ github.event_name != 'workflow_dispatch' }}
 
   integration-bundle:
     if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -123,24 +124,77 @@ jobs:
           package_json_file: plugin/package.json
       - uses: actions/download-artifact@v8
         with:
-          name: plugin-check-${{ github.sha }}
-          path: plugin
-      - name: Package the bundle built by the full check
+          # A bundle-only rerun must not reuse a successful build from an earlier attempt.
+          name: plugin-check-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/plan-check
+      - name: Verify and stage the Ubuntu check build
         working-directory: plugin
         run: |
-          test -s lib/index.js
-          mkdir -p "$RUNNER_TEMP/plan-bundle"
+          node - <<'NODE'
+          const fs = require('node:fs')
+          const e = process.env
+          const identity = JSON.parse(fs.readFileSync(`${e.RUNNER_TEMP}/plan-check/ci-evidence/commit.json`, 'utf8'))
+          const expected = {
+            repository: e.GITHUB_REPOSITORY,
+            ref: e.GITHUB_REF,
+            sha: e.GITHUB_SHA,
+            run_id: e.GITHUB_RUN_ID,
+            run_attempt: e.GITHUB_RUN_ATTEMPT,
+          }
+          for (const [field, value] of Object.entries(expected)) {
+            if (identity[field] !== value) throw new Error(`Ubuntu check build identity mismatch: ${field}`)
+          }
+          NODE
+          test -s "$RUNNER_TEMP/plan-check/lib/index.js"
+          mv -T -- "$RUNNER_TEMP/plan-check/lib" lib
+      - name: Package the verified build and write artifact identity
+        working-directory: plugin
+        env:
+          VERIFICATION_CONTEXT: ${{ inputs.dsh_context }}
+          CONFIGURATION: ${{ inputs.dsh_configuration }}
+          ENVIRONMENT: ${{ inputs.dsh_environment }}
+        run: |
+          mkdir "$RUNNER_TEMP/plan-bundle"
           pnpm pack --pack-destination "$RUNNER_TEMP/plan-bundle"
-          cp ci-evidence/commit.json "$RUNNER_TEMP/plan-bundle/"
+          node --input-type=module - <<'NODE'
+          import { createHash } from 'node:crypto'
+          import { createReadStream, readdirSync, writeFileSync } from 'node:fs'
+          import { join } from 'node:path'
+
+          const e = process.env
+          const bundleDir = join(e.RUNNER_TEMP, 'plan-bundle')
+          const files = readdirSync(bundleDir, { withFileTypes: true })
+          const [pkg] = files
+          if (files.length !== 1 || !pkg.isFile() || !/^[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$/.test(pkg.name)) {
+            throw new Error('pnpm pack must produce exactly one .tgz file with a simple basename')
+          }
+          const fileName = pkg.name
+          const hash = createHash('sha256')
+          for await (const chunk of createReadStream(join(bundleDir, fileName))) hash.update(chunk)
+          writeFileSync(join(bundleDir, 'dsh-artifact.json'), JSON.stringify({
+            repository: e.GITHUB_REPOSITORY.toLowerCase(),
+            ref: e.GITHUB_REF,
+            sha: e.GITHUB_SHA,
+            context: e.VERIFICATION_CONTEXT,
+            configuration: e.CONFIGURATION,
+            environment: e.ENVIRONMENT,
+            runId: Number(e.GITHUB_RUN_ID),
+            attempt: Number(e.GITHUB_RUN_ATTEMPT),
+            fileName,
+            contentType: 'application/gzip',
+            sha256: hash.digest('hex'),
+          }, null, 2) + '\n')
+          NODE
       - uses: actions/upload-artifact@v7
         with:
           name: plugin-bundle-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/plan-bundle
           if-no-files-found: error
-          overwrite: true
 
   windows:
     name: windows
+    needs: integration-identity
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || needs.integration-identity.result == 'success') }}
     runs-on: windows-latest
     defaults:
       run:

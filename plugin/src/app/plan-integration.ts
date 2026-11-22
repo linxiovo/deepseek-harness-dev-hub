@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
-import type { PlanActionsObservation, PlanIntegrationVersion, PlanIntegrationView, PlanVerificationConfig, PlanVerificationRequest } from '../core/plan-integration.ts'
+import type { PlanActionsObservation, PlanArtifactReference, PlanIntegrationVersion, PlanIntegrationView, PlanVerificationConfig, PlanVerificationRequest, PlanVerificationRun } from '../core/plan-integration.ts'
+import type { PlanArtifactDraft } from './plan-artifacts.ts'
 import type { MainlineTarget } from '../executor/mainline-git.ts'
 import { CliError } from '../infra/commands.ts'
 import { KV } from '../kv.ts'
@@ -20,11 +21,17 @@ interface IntegrationHost {
   target(): MainlineTarget | undefined
   readTarget(target: MainlineTarget, integrations: readonly string[]): Promise<{ sha: string; includesIntegrations: boolean }>
   observe(request: PlanVerificationRequest): Promise<PlanActionsObservation>
+  isLatestRun(request: PlanVerificationRequest, run: PlanVerificationRun): Promise<boolean>
+  downloadArtifact(planId: string, request: PlanVerificationRequest, run: PlanVerificationRun, artifact: PlanArtifactReference): Promise<PlanArtifactDraft>
+  commitArtifact(draft: PlanArtifactDraft): void
+  discardArtifact(draft: PlanArtifactDraft): void
+  artifactAvailable(planId: string, view: Extract<PlanIntegrationView, { status: 'delivered' | 'awaiting-release-verification' }>): Promise<boolean>
+  artifactExists(planId: string, view: Extract<PlanIntegrationView, { status: 'delivered' | 'awaiting-release-verification' }>): boolean
   dispatch(request: PlanVerificationRequest): Promise<void>
   relay(message: Relay): void
 }
 
-const terminal = (view: PlanIntegrationView | undefined) =>
+const terminal = (view: PlanIntegrationView | undefined): view is Extract<PlanIntegrationView, { status: 'delivered' | 'awaiting-release-verification' }> =>
   view?.status === 'delivered' || view?.status === 'awaiting-release-verification'
 
 /** Owns Plan-wide integration evidence, durable Actions dispatch and the only final Plan push. */
@@ -38,7 +45,8 @@ export class PlanIntegration {
     if (!required) return undefined
     if (required.waitingFor.length) return { planId, status: 'awaiting-tickets', waitingFor: required.waitingFor }
     const prior = this.host.store.get(KV.plans.integration(planId))
-    if (terminal(prior)) return prior
+    if (terminal(prior)) return this.host.artifactExists(planId, prior) ? prior
+      : { planId, status: 'blocked', reason: 'artifact_unavailable', version: prior.version, run: prior.run }
     if (!this.host.verification) return { planId, status: 'blocked', reason: 'verification_unconfigured' }
     return prior ?? { planId, status: 'blocked', reason: 'integration_unavailable' }
   }
@@ -51,14 +59,17 @@ export class PlanIntegration {
       effects.enqueue('planIntegration', planId, {})
   }
 
-  /** Resume unfinished registered Plans, including those formally closed before verification was configured. */
-  resume(): void {
-    if (!this.host.verification) return
+  /** Reconcile terminal receipts with retained package bytes and rearm unfinished Plans. */
+  async resume(): Promise<void> {
     for (const { id } of this.host.plans.list()) {
-      if (!terminal(this.host.store.get(KV.plans.integration(id)))) {
-        const required = this.host.plans.requiredDelivery(id)
-        if (required && !required.waitingFor.length) this.host.effects.enqueue('planIntegration', id, {})
+      const slot = KV.plans.integration(id), prior = this.host.store.get(slot)
+      if (terminal(prior)) {
+        if (await this.host.artifactAvailable(id, prior)) continue
+        this.host.store.set(slot, { planId: id, status: 'blocked', reason: 'artifact_unavailable', version: prior.version, run: prior.run })
       }
+      if (!this.host.verification) continue
+      const required = this.host.plans.requiredDelivery(id)
+      if (required && !required.waitingFor.length) this.host.effects.enqueue('planIntegration', id, {})
     }
   }
 
@@ -119,7 +130,6 @@ export class PlanIntegration {
         if (!first) throw new Later()
         try { await host.dispatch(request) }
         catch (error) {
-          this.active(target)
           if (error instanceof CliError && error.code !== undefined && error.code >= 400 && error.code < 500 &&
               ![408, 425, 429].includes(error.code)) {
             store.atomic(() => {
@@ -128,25 +138,49 @@ export class PlanIntegration {
             })
             return Park
           }
+          this.active(target)
           return retry({ planId, status: 'blocked', reason: 'dispatch_unconfirmed', version })
         }
         this.active(target)
-        return retry({ planId, status: 'verifying', version })
+        host.effects.enqueue('planIntegration', planId, {})
+        return
       }
       case 'pending': return retry({ planId, status: 'verifying', version, run: observed.run })
       case 'failed': return retry({ planId, status: 'blocked', reason: observed.reason, version, run: observed.run })
       case 'passed': {
         const { run, artifact } = observed
-        const status = handoff.authorization.release === 'authorized' ? 'awaiting-release-verification' : 'delivered'
-        const verifiedAt = new Date().toISOString()
-        store.atomic(() => {
-          store.set(slot, { planId, status, version, run, artifact, verifiedAt })
-          if (status !== 'delivered') return
-          const relay = projectPushRelay({ id: `plan-delivered:${planId}`, kind: 'plan-delivered', payload: {
-            planId, version, artifact, verification: run.url, read: `plan/${planId}/delivery`,
-          } })
-          if (relay) host.relay(relay)
-        })
+        let draft: PlanArtifactDraft
+        try { draft = await host.downloadArtifact(planId, request, run, artifact) }
+        catch {
+          this.active(target)
+          return retry({ planId, status: 'blocked', reason: 'artifact_unavailable', version, run })
+        }
+        try {
+          await currentTip()
+          let latest: boolean
+          try { latest = await host.isLatestRun(request, run) }
+          catch {
+            this.active(target)
+            return retry({ planId, status: 'blocked', reason: 'actions_unavailable', version, run })
+          }
+          if (!latest) {
+            host.effects.enqueue('planIntegration', planId, {})
+            return
+          }
+          this.active(target)
+          try { host.commitArtifact(draft) }
+          catch { return retry({ planId, status: 'blocked', reason: 'artifact_unavailable', version, run }) }
+          const status = handoff.authorization.release === 'authorized' ? 'awaiting-release-verification' : 'delivered'
+          const verifiedAt = new Date().toISOString()
+          store.atomic(() => {
+            store.set(slot, { planId, status, version, run, artifact: draft.artifact, verifiedAt })
+            if (status !== 'delivered') return
+            const relay = projectPushRelay({ id: `plan-delivered:${planId}`, kind: 'plan-delivered', payload: {
+              planId, version, artifact: draft.artifact, verification: run.url, read: `plan/${planId}/delivery`,
+            } })
+            if (relay) host.relay(relay)
+          })
+        } finally { host.discardArtifact(draft) }
       }
     }
   }

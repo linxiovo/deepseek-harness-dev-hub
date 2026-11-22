@@ -65,6 +65,7 @@ export interface Api {
   'GET sessions/:id/meter': { response: SessionMeterView }
   'GET project/meter': { response: ProjectMeterView }
   'GET plans/:id/meter': { response: ProjectMeterView }
+  'GET plans/:id/artifact': { response: Blob }
   'GET plans/:id/delivery': { response: PlanIntegrationView }
   'GET tickets/:id/meter': { response: ProjectMeterView }
   'GET project/run-limits': { response: RunLimitStatus }

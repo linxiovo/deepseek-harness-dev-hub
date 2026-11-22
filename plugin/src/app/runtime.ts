@@ -47,7 +47,8 @@ import { projectNavigationLink } from '../navigation.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
-import { dispatchPlanActions, observePlanActions } from '../sources/actions-evidence.ts'
+import { dispatchPlanActions, isLatestPlanActions, observePlanActions } from '../sources/actions-evidence.ts'
+import { cleanupPlanArtifactStaging, commitPlanArtifact, discardPlanArtifact, downloadPlanArtifact, openPlanArtifact, planArtifactExists } from './plan-artifacts.ts'
 import { pullEndNotices, recoverPulls } from '../sources/github-pull.ts'
 import { HealthBoard } from '../infra/health.ts'
 import { Outbox } from './outbox.ts'
@@ -143,6 +144,7 @@ export class Runtime extends Service implements SourceHost {
           handoff.project.repository.toLowerCase() === repository.toLowerCase() && sameDirectory(handoff.project.workspace, workspace)) })
       const project = installation.project
       const projectMachine = this.machine = { ...machine, stateDir: installation.stateDir }
+      cleanupPlanArtifactStaging(projectMachine.stateDir)
       const store = opened = this.store = new Store(projectDatabase(installation), report)
       if (project?.initial && store.get(KV.settings.revision) === undefined) {
         const { baseRef, policy } = project.initial
@@ -233,6 +235,11 @@ export class Runtime extends Service implements SourceHost {
         },
         readTarget: (target, integrations) => readPlanIntegrationTarget(commands, target, integrations),
         observe: request => observePlanActions(commands, request),
+        isLatestRun: (request, run) => isLatestPlanActions(commands, request, run),
+        downloadArtifact: (planId, request, run, artifact) => downloadPlanArtifact(commands, machine.stateDir, planId, request, run, artifact),
+        commitArtifact: commitPlanArtifact, discardArtifact: discardPlanArtifact,
+        artifactAvailable: async (planId, view) => !!await openPlanArtifact(machine.stateDir, planId, view),
+        artifactExists: (planId, view) => planArtifactExists(machine.stateDir, planId, view),
         dispatch: request => dispatchPlanActions(commands, request),
         relay: message => sessions.relay(message.id, message.text),
       })
@@ -547,10 +554,11 @@ export class Runtime extends Service implements SourceHost {
     if (this.closing()) return
     if (project && !await this.reconcilePulls()) return
     for (const id of this.settings.syncable()) await this.settings.sync(id).catch(() => { /* sync() records its failure in health. */ })
-    // If stop() was called while awaiting setup, session creation, or policy sync, do not start background loops.
+    // Reconcile the package receipt before restarting other Plan work or background loops.
+    if (this.closing()) return
+    await this.planIntegration.resume()
     if (this.closing()) return
     this.planDispatcher.resume()
-    this.planIntegration.resume()
     this.planning.resume()
     this.executor.resume()
     this.passes.start()
@@ -588,6 +596,10 @@ export class Runtime extends Service implements SourceHost {
       projectMeter } = this
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, projectMeter, installation,
       attention: this.attention, runLimits: this.runLimits, planIntegration: this.planIntegration,
+      planArtifact: async id => {
+        const view = this.planIntegration.view(id)
+        return view && await openPlanArtifact(machine.stateDir, id, view)
+      },
       meter: { read: (id, signal) => this.readScopedMeter(id, signal) },
       topicBinding: this.topicBinding, verifyTopicBinding: () => this.verifyTopicBinding(),
       get ready() { return runtime.ready }, assertNewWork: () => installation.assertNewWork(),

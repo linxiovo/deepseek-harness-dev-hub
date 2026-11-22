@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -315,8 +316,9 @@ function actionsHost(beforeRuns?: (sha: string) => Promise<void>) {
 it.each([
   { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const },
   { release: 'authorized' as const, dispatchFailure: 'lost-response' as const },
-  { release: 'not-authorized' as const, dispatchFailure: 'forbidden' as const },
-] as const)('verifies the integrated package after $dispatchFailure and respects $release release scope', async ({ release, dispatchFailure }) => {
+  { release: 'not-authorized' as const, dispatchFailure: 'forbidden' as const, pauseOnRefusal: true },
+  { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, rerunDuringDownload: true },
+] as const)('verifies the integrated package after $dispatchFailure and respects $release release scope', async ({ release, dispatchFailure, pauseOnRefusal, rerunDuringDownload }) => {
   await h.stop()
   const verification = { workflowId: '44', identityJob: 'integration-identity',
     jobs: ['integration-identity', 'windows', 'check', 'integration-bundle'], artifactName: 'plugin-bundle',
@@ -327,6 +329,7 @@ it.each([
   const ci = actionsHost()
   await configureCI()
   const actionRuns = new Map<string, { id: number; sha: string; branch: string; context: string }>()
+  let latestAttempt = 1
   const github = vi.spyOn(Commands.prototype, 'gh')
   const githubFallback = github.getMockImplementation()!
   github.mockImplementation(async function (this: Commands, args) {
@@ -337,7 +340,7 @@ it.each([
       const runs = [...actionRuns.values()].filter(run => run.sha === path.searchParams.get('head_sha') &&
         run.branch === path.searchParams.get('branch'))
       return { total_count: runs.length, workflow_runs: runs.map(run => ({ id: run.id, workflow_id: 44, run_number: run.id,
-        run_attempt: 1, head_sha: run.sha, head_branch: run.branch, event: 'workflow_dispatch',
+        run_attempt: latestAttempt, head_sha: run.sha, head_branch: run.branch, event: 'workflow_dispatch',
         display_title: `dsh-plan-verification:${run.context}`, status: 'completed', conclusion: 'success' })) }
     }
     const jobs = path.pathname.match(new RegExp(`/actions/runs/(\\d+)/attempts/(\\d+)/jobs$`))
@@ -349,7 +352,7 @@ it.each([
     const artifacts = path.pathname.match(new RegExp(`/actions/runs/(\\d+)/artifacts$`))
     if (artifacts) {
       const run = [...actionRuns.values()].find(value => value.id === Number(artifacts[1]))
-      if (run) return { total_count: 1, artifacts: [{ id: run.id * 100, name: `${verification.artifactName}-${run.sha}-1`,
+      if (run) return { total_count: 1, artifacts: [{ id: run.id * 100, name: `${verification.artifactName}-${run.sha}-${latestAttempt}`,
         expired: false, size_in_bytes: 1200, workflow_run: { id: run.id, head_sha: run.sha } }] }
     }
     return githubFallback.call(this, args)
@@ -359,11 +362,28 @@ it.each([
   const command = vi.spyOn(Commands.prototype, 'run')
   const commandFallback = command.getMockImplementation()!
   command.mockImplementation(async function (this: Commands, program, args, cwd, input) {
+    if (args[0] === 'run' && args[1] === 'download') {
+      const runId = Number(args[2]), attempt = latestAttempt, artifactName = args[args.indexOf('--name') + 1]!
+      const destination = args[args.indexOf('--dir') + 1]!, run = [...actionRuns.values()].find(value => value.id === runId)!
+      const packageName = 'dsh-superagent-0.1.0.tgz', bytes = Buffer.from(`${run.sha}-${attempt}`)
+      mkdirSync(destination, { recursive: true })
+      writeFileSync(join(destination, packageName), bytes)
+      writeFileSync(join(destination, 'dsh-artifact.json'), JSON.stringify({ repository: slug, ref: targetRef, sha: run.sha,
+        context: run.context, configuration: verification.configuration, environment: verification.environment,
+        runId, attempt, fileName: packageName, contentType: 'application/gzip', sha256: createHash('sha256').update(bytes).digest('hex') }))
+      if (rerunDuringDownload && attempt === 1) latestAttempt = 2
+      expect(artifactName).toBe(`${verification.artifactName}-${run.sha}-${attempt}`)
+      return ''
+    }
     if (args[0] === 'api' && args[1] === `repos/${slug}/actions/workflows/44/dispatches`) {
       const field = (name: string) => args.find(value => value.startsWith(`inputs[${name}]=`))?.split('=')[1]
       const sha = field('dsh_commit')!, context = field('dsh_context')!, branch = args[args.indexOf('-f') + 1]!.slice('ref='.length)
       const runId = 900 + ++dispatches
-      if (rejectDispatch) { rejectDispatch = false; throw new CliError('GitHub denied workflow dispatch', 403) }
+      if (rejectDispatch) {
+        rejectDispatch = false
+        if (pauseOnRefusal) await h.runtime.settings.pause(true, 'panel')
+        throw new CliError('GitHub denied workflow dispatch', 403)
+      }
       actionRuns.set(context, { id: runId, sha, branch, context })
       if (loseDispatchReceipt) { loseDispatchReceipt = false; throw new Error('Dispatch response was lost') }
       return JSON.stringify({ workflow_run_id: runId })
@@ -395,23 +415,30 @@ it.each([
     JSON.stringify({ ticketState: closedTicket.state, mainline: mainlinePage.items, tip: integration, intent }))
     .toMatchObject({ ticketState: 'merged', mainline: [expect.objectContaining({ status: 'verified' })] })
   expect(intent).toMatchObject({ candidate, base, status: 'queued' })
-  expect(await read(`plan/${id}/delivery`)).toMatchObject({ status: 'blocked',
+  const beforeRecovery = await read(`plan/${id}/delivery`)
+  expect(beforeRecovery).toMatchObject({ status: 'blocked',
     reason: dispatchFailure === 'forbidden' ? 'actions_unavailable' : 'dispatch_unconfirmed', version: { sha: integration } })
   expect(dispatches).toBe(1)
+  if (dispatchFailure === 'forbidden') {
+    const refusedContext = z.object({ version: z.object({ context: z.string() }) }).parse(beforeRecovery).version.context
+    expect(h.runtime.store.get(KV.plans.integrationDispatch(refusedContext))).toBeUndefined()
+    await h.runtime.settings.pause(false, 'panel')
+  }
 
   await h.restart()
   await h.runtime.idle()
-  if (dispatchFailure === 'forbidden') {
-    expect(await read(`plan/${id}/delivery`)).toMatchObject({ status: 'verifying' })
-    h.runtime.effects.enqueue('planIntegration', id, {})
-    await h.runtime.idle()
-  }
-  const resource = await read(`plan/${id}/delivery`)
+  const initial = await read(`plan/${id}/delivery`)
+  const initialView = z.object({ version: z.object({ context: z.string() }) }).parse(initial)
+  expect(h.runtime.store.get(KV.plans.integrationDispatch(initialView.version.context))).toBe(true)
+  const attempts = rerunDuringDownload ? 2 : 1
+  const resource = await read(`plan/${id}/delivery`), packageBytes = Buffer.from(`${integration}-${attempts}`)
   expect(resource).toMatchObject({ planId: id, status: release === 'authorized' ? 'awaiting-release-verification' : 'delivered',
     version: { repository: slug, ref: targetRef, sha: integration, context: expect.stringMatching(/^[a-f0-9]{64}$/),
       configuration: verification.configuration, environment: verification.environment },
-    run: { id: expect.any(Number), attempt: 1 },
-    artifact: { id: expect.any(Number), name: `plugin-bundle-${integration}-1`, url: expect.stringContaining('/actions/runs/') },
+    run: { id: expect.any(Number), attempt: attempts },
+    artifact: { id: expect.any(Number), name: `plugin-bundle-${integration}-${attempts}`, url: expect.stringContaining('/actions/runs/'),
+      fileName: 'dsh-superagent-0.1.0.tgz', contentType: 'application/gzip', size: packageBytes.length,
+      sha256: createHash('sha256').update(packageBytes).digest('hex') },
     verifiedAt: expect.any(String) })
   expect(dispatches).toBe(dispatchFailure === 'forbidden' ? 2 : 1)
   const relays = h.jsonRelays(h.runtime.masterId, 'plan-delivered')

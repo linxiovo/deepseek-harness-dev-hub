@@ -35,6 +35,8 @@ export interface SessionsHost {
   readonly health: HealthEntry
   readonly masterId: string
   readonly lifetime: AbortSignal
+  /** Called immediately before delivering an ordered relay to the Hub inbox. */
+  relayAvailable(requestId: string): boolean
   closing(): boolean
   readonly boundWorkspace?: string | undefined
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
@@ -144,6 +146,8 @@ const REVIEW_TOOLS = ['read', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'web
  */
 const DEV_MCP_TOOLS = ['mcp__context7__resolve-library-id', 'mcp__context7__query-docs']
 
+const withdrawnRelay = Symbol('withdrawn relay')
+
 /**
  * Creates and decorates orchestrator and worker DSH `Agent` sessions with role models, system prompt sections from `Prompts`, runtime skills, and restricted tool sets.
  * `Runtime`, `DshExecutor`, `MasterAssessor`, `Settings`, and management routes/tools use it to ensure sessions, deliver deduplicated messages via `AgentDelivery`, and process ordered `relay` and `notice` effects.
@@ -160,7 +164,7 @@ export class Sessions {
     this.ctx = host.context
     this.agentDelivery = new AgentDelivery(host.context)
     // Deliver relays and notices to the main Session in the order they were queued.
-    host.effects.handle('relay', ({ text }, requestId) => this.prompt(host.masterId, requestId, text, 'steer'), { ordered: true })
+    host.effects.handle('relay', ({ text }, requestId) => this.deliverRelay(requestId, text), { ordered: true })
     host.effects.handle('notice', ({ value, summary }, name) => this.inject(name, value, summary), { ordered: true })
   }
   /** Subscribes to host agent and session events so newly created sessions are decorated and model-budget retries are reflected in health. Call once at startup. */
@@ -324,6 +328,15 @@ export class Sessions {
   promptedId(requestId: string): MessageId { return messageId(key(requestId)) }
   /** Enqueues a steering relay to the main Session; relays are durable and retried by `Effects` until delivered, at most once per `requestId`. */
   relay(requestId: string, text: string): void { this.host.effects.enqueue('relay', requestId, { text }) }
+  private async deliverRelay(requestId: string, text: string): Promise<void> {
+    const result = await this.ctx.sessionController.resolveAgent(this.host.masterId as SessionId)
+    if ('error' in result) throw result.error
+    try {
+      await this.agentDelivery.send(result.agent, key(requestId), text, 'steer', this.host.lifetime, () => {
+        if (!this.host.relayAvailable(requestId)) throw withdrawnRelay
+      })
+    } catch (error) { if (error !== withdrawnRelay) throw error }
+  }
   /** Enqueues a durable background notice for injection into the main Session; a new notice with the same `name` replaces a still-waiting notice of that `name`. */
   notify(name: string, value: Record<string, unknown>, summary: string): void { this.host.effects.enqueue('notice', name, { value, summary }) }
   /** Waits for currently runnable `notice` effects to settle and returns `'injected'` if notice `name` has reached the main Session or `'pending'` if it is still queued. */

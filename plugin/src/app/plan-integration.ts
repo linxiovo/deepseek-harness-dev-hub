@@ -33,7 +33,8 @@ interface IntegrationHost {
   cancelRelay(id: string): void
 }
 
-const deliveryRelayId = (planId: string): string => `plan-delivered:${planId}`
+const deliveryRelayPrefix = 'plan-delivered:'
+const deliveryRelayId = (planId: string): string => deliveryRelayPrefix + planId
 const terminal = (view: PlanIntegrationView | undefined): view is Extract<PlanIntegrationView, { status: 'delivered' | 'awaiting-release-verification' }> =>
   view?.status === 'delivered' || view?.status === 'awaiting-release-verification'
 
@@ -62,21 +63,38 @@ export class PlanIntegration {
       effects.enqueue('planIntegration', planId, {})
   }
 
-  /** Reconcile terminal receipts with retained package bytes and rearm unfinished Plans. */
+  /** Check a Plan push at the Hub inbox boundary, after the Session and its history are ready. */
+  relayAvailable(requestId: string): boolean {
+    if (!requestId.startsWith(deliveryRelayPrefix)) return true
+    const planId = requestId.slice(deliveryRelayPrefix.length)
+    const prior = this.host.store.get(KV.plans.integration(planId))
+    if (prior?.status !== 'delivered') return false
+    if (this.host.artifactExists(planId, prior)) return true
+    this.invalidateArtifact(prior)
+    return false
+  }
+
+  /** Reconcile terminal receipts with retained package bytes before any queued effects start. */
   async resume(): Promise<void> {
     for (const { id } of this.host.plans.list()) {
-      const slot = KV.plans.integration(id), prior = this.host.store.get(slot)
-      if (terminal(prior)) {
-        if (await this.host.artifactAvailable(id, prior)) continue
-        this.host.store.atomic(() => {
-          this.host.store.set(slot, { planId: id, status: 'blocked', reason: 'artifact_unavailable', version: prior.version, run: prior.run })
-          this.host.cancelRelay(deliveryRelayId(id))
-        })
-      }
-      if (!this.host.verification) continue
-      const required = this.host.plans.requiredDelivery(id)
-      if (required && !required.waitingFor.length) this.host.effects.enqueue('planIntegration', id, {})
+      const prior = this.host.store.get(KV.plans.integration(id))
+      if (!terminal(prior)) this.rearm(id)
+      else if (!await this.host.artifactAvailable(id, prior)) this.invalidateArtifact(prior)
     }
+  }
+
+  private invalidateArtifact(prior: Extract<PlanIntegrationView, { status: 'delivered' | 'awaiting-release-verification' }>): void {
+    const { planId, version, run } = prior, { store } = this.host
+    store.atomic(() => {
+      store.set(KV.plans.integration(planId), { planId, status: 'blocked', reason: 'artifact_unavailable', version, run })
+      this.host.cancelRelay(deliveryRelayId(planId))
+      this.rearm(planId)
+    })
+  }
+
+  private rearm(planId: string): void {
+    const { verification, plans, effects } = this.host
+    if (verification && plans.requiredDelivery(planId)?.waitingFor.length === 0) effects.enqueue('planIntegration', planId, {})
   }
 
   private active(target: MainlineTarget): void {
@@ -104,8 +122,8 @@ export class PlanIntegration {
     this.active(target)
     if (!includesIntegrations) return retry({ planId, status: 'blocked', reason: 'integration_not_on_target' })
     const repository = target.slug.toLowerCase(), { ref } = target
-    const { workflowId, jobs, artifactName, configuration, environment } = verification
-    const context = createHash('sha256').update(JSON.stringify([1, verification.projectId, repository, ref, sha, workflowId,
+    const { workflowId, identityJob, jobs, artifactName, configuration, environment } = verification
+    const context = createHash('sha256').update(JSON.stringify([1, verification.projectId, repository, ref, sha, workflowId, identityJob,
       [...jobs].sort(), artifactName, configuration, environment])).digest('hex')
     const version: PlanIntegrationVersion = { repository, ref, sha, context, workflowId, configuration, environment }
     const request: PlanVerificationRequest = { repository, ref, sha, context, verification }
@@ -162,18 +180,22 @@ export class PlanIntegration {
           return retry({ planId, status: 'blocked', reason: 'artifact_unavailable', version, run })
         }
         try {
-          await currentTip()
-          let latest: boolean
-          try { latest = await host.isLatestRun(request, run) }
-          catch {
+          const confirmLatest = async (): Promise<boolean> => {
+            let latest: boolean
+            try { latest = await host.isLatestRun(request, run) }
+            catch {
+              this.active(target)
+              return retry({ planId, status: 'blocked', reason: 'actions_unavailable', version, run })
+            }
             this.active(target)
-            return retry({ planId, status: 'blocked', reason: 'actions_unavailable', version, run })
+            if (!latest) host.effects.enqueue('planIntegration', planId, {})
+            return latest
           }
-          if (!latest) {
-            host.effects.enqueue('planIntegration', planId, {})
-            return
-          }
+          // The pre-download target read and these checks bracket the same Git/Actions identity.
+          if (!await confirmLatest()) return
           await currentTip()
+          if (!await confirmLatest()) return
+          this.active(target)
           try { host.commitArtifact(draft) }
           catch { return retry({ planId, status: 'blocked', reason: 'artifact_unavailable', version, run }) }
           const status = handoff.authorization.release === 'authorized' ? 'awaiting-release-verification' : 'delivered'

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { CliError, Commands } from '../src/infra/commands.ts'
@@ -11,6 +11,7 @@ import { feishu, startManagedProject, startRuntime, type Host } from './fixtures
 import { KV } from '../src/kv.ts'
 import type { MainlineRepair } from '../src/core/model.ts'
 import type { MainlineIntent } from '../src/app/mainline-queue.ts'
+import { openPlanArtifact } from '../src/app/plan-artifacts.ts'
 
 let h: Host
 beforeEach(async () => { h = await startRuntime() })
@@ -319,8 +320,10 @@ it.each([
   { release: 'not-authorized' as const, dispatchFailure: 'forbidden' as const, pauseOnRefusal: true },
   { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, rerunDuringDownload: true },
   { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, advanceTargetDuringFinalRunLookup: true },
- ] as const)('verifies the integrated package after $dispatchFailure and respects $release release scope',
-  async ({ release, dispatchFailure, pauseOnRefusal, rerunDuringDownload, advanceTargetDuringFinalRunLookup }) => {
+  { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, rerunDuringFinalTargetRead: true },
+  { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, loseArtifactBeforeRelay: true },
+ ] as const)('verifies the integrated package: %j',
+  async ({ release, dispatchFailure, pauseOnRefusal, rerunDuringDownload, advanceTargetDuringFinalRunLookup, rerunDuringFinalTargetRead, loseArtifactBeforeRelay }) => {
   await h.stop()
   const verification = { workflowId: '44', identityJob: 'integration-identity',
     jobs: ['integration-identity', 'windows', 'check', 'integration-bundle'], artifactName: 'plugin-bundle',
@@ -333,6 +336,7 @@ it.each([
   const actionRuns = new Map<string, { id: number; sha: string; branch: string; context: string }>()
   let latestAttempt = 1
   let artifactDownloadStarted = false, targetAdvanced = false
+  let finalRunObserved = false, downloadUnavailable = false
   const advanceTarget = () => {
     git('-C', repository, 'fetch', '--no-tags', remote, targetRef)
     git('-C', repository, 'checkout', '--detach', 'FETCH_HEAD')
@@ -351,6 +355,7 @@ it.each([
       const runs = [...actionRuns.values()].filter(run => run.sha === path.searchParams.get('head_sha') &&
         run.branch === path.searchParams.get('branch'))
       if (advanceTargetDuringFinalRunLookup && artifactDownloadStarted && !targetAdvanced) advanceTarget()
+      if (artifactDownloadStarted) finalRunObserved = true
       return { total_count: runs.length, workflow_runs: runs.map(run => ({ id: run.id, workflow_id: 44, run_number: run.id,
         run_attempt: latestAttempt, head_sha: run.sha, head_branch: run.branch, event: 'workflow_dispatch',
         display_title: `dsh-plan-verification:${run.context}`, status: 'completed', conclusion: 'success' })) }
@@ -375,6 +380,7 @@ it.each([
   const commandFallback = command.getMockImplementation()!
   command.mockImplementation(async function (this: Commands, program, args, cwd, input) {
     if (args[0] === 'run' && args[1] === 'download') {
+      if (downloadUnavailable) throw new CliError('The fixture artifact is no longer downloadable', 404)
       const runId = Number(args[2]), attempt = latestAttempt, artifactName = args[args.indexOf('--name') + 1]!
       const destination = args[args.indexOf('--dir') + 1]!, run = [...actionRuns.values()].find(value => value.id === runId)!
       const packageName = 'dsh-superagent-0.1.0.tgz', bytes = Buffer.from(`${run.sha}-${attempt}`)
@@ -405,6 +411,7 @@ it.each([
   })
   const localGit = vi.spyOn(Commands.prototype, 'git')
   localGit.mockImplementation(async function (this: Commands, args, cwd) {
+    if (rerunDuringFinalTargetRead && finalRunObserved && latestAttempt === 1 && args.includes(canonicalUrl) && args.includes('fetch')) latestAttempt = 2
     return runGit(this, args, cwd)
   })
 
@@ -437,6 +444,16 @@ it.each([
     expect(h.runtime.store.get(KV.plans.integrationDispatch(refusedContext))).toBeUndefined()
     await h.runtime.settings.pause(false, 'panel')
   }
+  if (loseArtifactBeforeRelay) h.controller.resolveAgent.mockImplementation(async sessionId => {
+    const view = h.runtime.store.get(KV.plans.integration(id))
+    if (sessionId === h.runtime.masterId && !downloadUnavailable && view?.status === 'delivered') {
+      const file = await openPlanArtifact(h.runtime.machine.stateDir, id, view)
+      if (!file) throw new Error('The fixture had no retained artifact before relay')
+      downloadUnavailable = true
+      rmSync(file.path)
+    }
+    return h.resolveDefault(sessionId)
+  })
 
   await h.restart()
   await h.runtime.idle()
@@ -449,7 +466,16 @@ it.each([
     expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toEqual([])
     return
   }
-  const attempts = rerunDuringDownload ? 2 : 1
+  if (loseArtifactBeforeRelay) {
+    expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toEqual([])
+    expect(initial).toMatchObject({ status: 'blocked', reason: 'artifact_unavailable' })
+    expect(downloadUnavailable).toBe(true)
+    h.controller.resolveAgent.mockImplementation(h.resolveDefault)
+    downloadUnavailable = false
+    await h.restart()
+    await h.runtime.idle()
+  }
+  const attempts = rerunDuringDownload || rerunDuringFinalTargetRead ? 2 : 1
   const resource = await read(`plan/${id}/delivery`), packageBytes = Buffer.from(`${integration}-${attempts}`)
   expect(resource).toMatchObject({ planId: id, status: release === 'authorized' ? 'awaiting-release-verification' : 'delivered',
     version: { repository: slug, ref: targetRef, sha: integration, context: expect.stringMatching(/^[a-f0-9]{64}$/),
@@ -466,6 +492,20 @@ it.each([
     verification: expect.stringContaining('/actions/runs/'), artifact: expect.objectContaining({ url: expect.stringContaining('/artifacts/') }),
     harness: expect.stringContaining(`superagentTicket=${worker.ticketId}`), read: `plan/${id}/delivery` })])
   expect(await h.api('GET', `plans/${id}/delivery`, undefined, mounted.project.id)).toMatchObject({ status: 200, body: resource })
+  if (loseArtifactBeforeRelay) {
+    const view = h.runtime.store.get(KV.plans.integration(id))!
+    const file = await openPlanArtifact(h.runtime.machine.stateDir, id, view)
+    if (!file) throw new Error('The fixture had no repaired artifact')
+    h.step(h.runtime.masterId)
+    const runSlot = dirname(file.path)
+    rmSync(runSlot, { recursive: true })
+    writeFileSync(runSlot, 'not a directory')
+    await h.restart()
+    await h.runtime.idle()
+    expect(await read(`plan/${id}/delivery`)).toMatchObject({ status: 'delivered', version: { sha: integration } })
+    expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toHaveLength(1)
+    return
+  }
 
   await h.restart()
   await h.runtime.idle()

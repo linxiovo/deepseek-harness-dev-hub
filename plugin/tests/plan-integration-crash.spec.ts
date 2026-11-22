@@ -1,5 +1,5 @@
 import { fork, type ChildProcess } from 'node:child_process'
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -10,7 +10,10 @@ import { KV } from '../src/kv.ts'
 import { Effects } from '../src/app/effects.ts'
 import { HealthBoard } from '../src/infra/health.ts'
 import type { PlanIntegrationView } from '../src/core/plan-integration.ts'
-type ChildMessage = { kind: 'accepted'; context: string } | { kind: 'recovered'; view: PlanIntegrationView; retained?: PlanIntegrationView; dispatches: number; relays: number }
+
+type ChildPhase = 'crash' | 'crash-before-post' | 'recover' | 'recover-missing'
+type ChildMessage = { kind: 'accepted' | 'before-post'; context: string }
+  | { kind: 'recovered'; view?: PlanIntegrationView; retained?: PlanIntegrationView; dispatches: number; relays: number }
 
 const fixture = fileURLToPath(new URL('./fixtures/plan-integration-crash-child.ts', import.meta.url))
 const entry = 'plan-integration-crash-child.mjs'
@@ -32,59 +35,101 @@ function receive(child: ChildProcess): Promise<ChildMessage> {
   return promise
 }
 
-async function receiveWithin(child: ChildProcess, timeoutMessage: string): Promise<ChildMessage> {
-  const { promise, resolve, reject } = Promise.withResolvers<ChildMessage>()
-  const timeout = setTimeout(() => reject(new Error(timeoutMessage)), 15_000)
-  receive(child).then(resolve, reject)
-  try { return await promise }
-  finally { clearTimeout(timeout) }
-}
-
 function closed(child: ChildProcess): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
   const { promise, resolve } = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>()
   child.once('close', (code, signal) => resolve({ code, signal }))
   return promise
 }
 
+async function runChild(root: string, phase: ChildPhase): Promise<ChildMessage> {
+  const child = fork(join(bundleDir, entry), [phase, root], { execArgv: [], stdio: ['ignore', 'ignore', 'inherit', 'ipc'] })
+  const finished = closed(child)
+  const deadline = Promise.withResolvers<never>()
+  const timer = setTimeout(() => deadline.reject(new Error(`Crash fixture did not finish for ${phase}`)), 15_000)
+  try {
+    const report = await Promise.race([receive(child), deadline.promise])
+    if (phase === 'crash' || phase === 'crash-before-post') {
+      expect(report.kind).toBe(phase === 'crash' ? 'accepted' : 'before-post')
+      expect(child.kill('SIGKILL')).toBe(true)
+      expect(await Promise.race([finished, deadline.promise])).toEqual({ code: null, signal: 'SIGKILL' })
+    } else {
+      expect(report.kind).toBe('recovered')
+      expect(await Promise.race([finished, deadline.promise])).toEqual({ code: 0, signal: null })
+    }
+    return report
+  } finally {
+    clearTimeout(timer)
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    await finished
+  }
+}
+
+function markedVersion(root: string, context: string) {
+  const persisted = new Store(join(root, 'plan.sqlite'))
+  try {
+    const view = persisted.get(KV.plans.integration('plan-crash'))
+    if (view?.status !== 'verifying') throw new Error('Dispatch did not persist a verifying version before the crash')
+    expect(view.version).toMatchObject({ repository: 'acme/widgets', ref: 'refs/heads/main', sha: 'a'.repeat(40), context })
+    expect(persisted.get(KV.plans.integrationDispatch(context))).toBe(true)
+    return view.version
+  } finally { persisted.close() }
+}
+
 it('recovers an accepted workflow dispatch after SIGKILL before its local receipt', async () => {
   const root = mkdtempSync(join(realpathSync.native(tmpdir()), 'plan-integration-crash-'))
-  let crashing: ChildProcess | undefined
-  let recovering: ChildProcess | undefined
   try {
-    const crashClosed = crashing = fork(join(bundleDir, entry), ['crash', root], { execArgv: [], stdio: ['ignore', 'pipe', 'pipe', 'ipc'] })
-    const crashFinished = closed(crashClosed)
-    const accepted = await receiveWithin(crashClosed, 'No dispatch reached the crash point')
+    const accepted = await runChild(root, 'crash')
     if (accepted.kind !== 'accepted') throw new Error('Crash fixture did not report accepted dispatch')
-    expect(crashClosed.kill('SIGKILL')).toBe(true)
-    expect(await crashFinished).toEqual({ code: null, signal: 'SIGKILL' })
-    crashing = undefined
+    const version = markedVersion(root, accepted.context)
 
-    const persisted = new Store(join(root, 'plan.sqlite'))
-    try {
-      const view = persisted.get(KV.plans.integration('plan-crash'))
-      expect(view).toMatchObject({ status: 'verifying', version: { context: accepted.context } })
-      expect(persisted.get(KV.plans.integrationDispatch(accepted.context))).toBe(true)
-    } finally { persisted.close() }
-
-    const recovery = recovering = fork(join(bundleDir, entry), ['recover', root], { execArgv: [], stdio: ['ignore', 'pipe', 'pipe', 'ipc'] })
-    const recoveryClosed = closed(recovery)
-    const recovered = await receiveWithin(recovery, 'Recovery did not finish')
-    if (recovered.kind !== 'recovered') throw new Error('Recovery fixture did not report its final state')
+    const recovered = await runChild(root, 'recover')
     expect(recovered).toMatchObject({ dispatches: 1, relays: 1,
-      view: { planId: 'plan-crash', status: 'delivered', version: { context: accepted.context, sha: 'a'.repeat(40) } } })
-    expect(await recoveryClosed).toEqual({ code: 0, signal: null })
-    recovering = undefined
+      view: { planId: 'plan-crash', status: 'delivered', version } })
     expect(readFileSync(join(root, 'dispatch-count'), 'utf8')).toBe('1')
   } finally {
-    if (crashing && crashing.exitCode === null && crashing.signalCode === null) crashing.kill('SIGKILL')
-    if (recovering && recovering.exitCode === null && recovering.signalCode === null) recovering.kill('SIGKILL')
     rmSync(root, { recursive: true, force: true })
   }
 }, 45_000)
 
+it('waits for an exact manual Actions run after SIGKILL before the workflow dispatch POST', async () => {
+  const root = mkdtempSync(join(realpathSync.native(tmpdir()), 'plan-integration-before-post-'))
+  try {
+    const crash = await runChild(root, 'crash-before-post')
+    if (crash.kind !== 'before-post') throw new Error('Crash fixture did not stop before POST')
+    const version = markedVersion(root, crash.context)
+    const runPath = join(root, 'accepted-run.json'), countPath = join(root, 'dispatch-count')
+    expect(existsSync(runPath)).toBe(false)
+    expect(existsSync(countPath)).toBe(false)
+
+    const blocked = { planId: 'plan-crash', status: 'blocked', reason: 'dispatch_unconfirmed', version }
+    expect(await runChild(root, 'recover')).toMatchObject({ dispatches: 0, relays: 0, view: blocked, retained: blocked })
+
+    // External operator runs bypass the agent's POST counter. Return green near-misses before the exact run is available.
+    const { workflowId: _workflowId, ...identity } = version
+    const nearMisses = [
+      { ...identity, id: 103, context: '0'.repeat(64) },
+      { ...identity, id: 104, sha: 'c'.repeat(40) },
+      { ...identity, id: 105, ref: 'refs/heads/other' },
+    ]
+    writeFileSync(runPath, JSON.stringify(nearMisses))
+    expect(await runChild(root, 'recover')).toMatchObject({ dispatches: 0, relays: 0, view: blocked, retained: blocked })
+
+    writeFileSync(runPath, JSON.stringify([...nearMisses, { ...identity, id: 102 }]))
+    const delivered = { planId: 'plan-crash', status: 'delivered', version, run: { id: 102, attempt: 1 }, artifact: { fileName: 'package.tgz' } }
+    expect(await runChild(root, 'recover')).toMatchObject({ dispatches: 0, relays: 1, view: delivered, retained: delivered })
+    expect(await runChild(root, 'recover')).toMatchObject({ dispatches: 0, relays: 1, view: delivered, retained: delivered })
+    expect(existsSync(countPath)).toBe(false)
+    const relay = JSON.parse(readFileSync(join(root, 'relay.jsonl'), 'utf8'))
+    expect(relay.id).toBe('plan-delivered:plan-crash')
+    expect(JSON.parse(relay.text)).toMatchObject({ kind: 'plan-delivered', planId: 'plan-crash', version,
+      verification: 'https://github.com/acme/widgets/actions/runs/102' })
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+}, 90_000)
+
 it('withdraws a queued delivery relay when restart finds its package missing', async () => {
   const root = mkdtempSync(join(realpathSync.native(tmpdir()), 'plan-integration-missing-'))
-  let recovering: ChildProcess | undefined
   try {
     const store = new Store(join(root, 'plan.sqlite'))
     try {
@@ -101,15 +146,8 @@ it('withdraws a queued delivery relay when restart finds its package missing', a
       })
     } finally { store.close() }
 
-    const recovery = recovering = fork(join(bundleDir, entry), ['recover-missing', root], { execArgv: [], stdio: ['ignore', 'pipe', 'pipe', 'ipc'] })
-    const recoveryClosed = closed(recovery)
-    const recovered = await receiveWithin(recovery, 'Missing-package recovery did not finish')
-    if (recovered.kind !== 'recovered') throw new Error('Recovery fixture did not report its final state')
-    expect(recovered).toMatchObject({ relays: 0, retained: { status: 'blocked', reason: 'artifact_unavailable' } })
-    expect(await recoveryClosed).toEqual({ code: 0, signal: null })
-    recovering = undefined
+    expect(await runChild(root, 'recover-missing')).toMatchObject({ relays: 0, retained: { status: 'blocked', reason: 'artifact_unavailable' } })
   } finally {
-    if (recovering && recovering.exitCode === null && recovering.signalCode === null) recovering.kill('SIGKILL')
     rmSync(root, { recursive: true, force: true })
   }
 }, 45_000)

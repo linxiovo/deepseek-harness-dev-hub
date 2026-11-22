@@ -32,6 +32,8 @@ flowchart TB
 
 Startup registers management routes, initializes the installation binding and runs Setup. After setup resolves, it installs Session and Executor hooks, ensures the main Session exists, syncs Policy, resumes handoffs and interrupted Assignments, and starts passes and effects. `Runtime.ready` marks completion of startup; the installation API can answer before that promise resolves.
 
+`PlanIntegration` rearms incomplete full-regression checks after formal Plan receipts are present. The verifier checks the real GitHub ref, binds a context to the project, commit and workflow configuration, dispatches once, and accepts only the matching run, jobs and attempt-specific artifact. Delivery status is available in the Hub and selected-project management route. See `017-plan-integration.md`.
+
 Source plugins inject Runtime as the `orchestrator` service through the narrow `SourceHost` interface.
 Ticket review evidence is submitted only by a Worker descendant through `orchestrator_review_submit`; `Sessions` binds the real descendant Session ID, `DshExecutor` verifies the clean current worktree HEAD against the pinned base, and the Engine atomically records evidence on the current Assignment and writer generation. `ticket/<id>/reviews` returns current-generation evidence and pending when the live Worker lease, worktree HEAD or cleanliness no longer matches; `ticket/<id>/review/<review-id>` reads one persisted review.
 
@@ -190,6 +192,7 @@ Failures retry with exponential backoff. Throwing `Later` defers work without co
 | `splitting` | Planning | Gives a published spec to its splitter; the durable intent is retired with Plan registration | 1 | 2 s doubling to 60 s for delivery failures; resumes unfinished work on restart |
 | `delivery` | DshExecutor | Hands a Ticket's waiting Inputs to its running Assignment, in order | 4, none while paused | 2 s doubling to 60 s; one that waits for a worker slot tries again after 2 s |
 | `mainlineDelivery` | MainlineQueue | Rechecks one verified intent for [formal Plan closure](003-execution.md#formal-plan-closure) | 8, only when configured | Resumes pending work on restart; evidence gaps stay on the Ticket until rechecked |
+| `planIntegration` | PlanIntegration | Verifies the actual target, full regression jobs and the attempt-matched package after all formal Plan receipts exist | 4, only when configured and unpaused | Persists the exact revision/configuration before dispatch; resumes by observing that context |
 | `relay` | Sessions | Steers a worker's report or question, or a person's follow-up, into the main Session's turn | 1, in queue order | 2 s doubling to 60 s |
 | `notice` | Sessions | Injects a notice into the main Session without waking it | 1, in queue order | 2 s doubling to 60 s |
 | `reply` | Outbox | Sends a message for a Channel through its Source, after the earlier messages of its Ticket to its conversation that have not failed three times; withdrawing the message cancels it | 1, none while paused | 5 s doubling to 300 s; one whose Source is off, or behind an earlier message, tries again after 5 s |
@@ -389,8 +392,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/ids.ts` | `key`: ids derived from their inputs, equal for equal inputs |
 | `src/core/handoff.ts` | The handoff records: `ProjectRef`, `HandoffInput`, `HandoffQuestion`, `SpecInput`, `Spec` and `Handoff`, with the fields and statuses 009 Handoff describes |
 | `src/core/plan.ts` | Plan DAG records and domain validation: role separation, acceptance coverage and explicit dependencies |
+| `src/core/plan-integration.ts` | The read-only record types for Plan full-regression configuration, workflow evidence, artifact and delivery status |
 | `src/core/memory.ts` | `MemoryRepositories`: the Store's repositories in memory, in the Store's order and with its nested rollback, for domain tests |
-| `src/core/index.ts` | The core's exports, including `TakeUp` |
+| `src/core/index.ts` | The core's exports, including `TakeUp` and the Plan integration evidence contract |
 | `src/app/runtime.ts` | The Runtime, the composition root, with its start and stop |
 | `src/app/installation-api.ts` | Installation route contract, public views and typed refusals |
 | `src/app/installation.ts` | GitHub onboarding, project registration and selection, and runtime lifecycle view |
@@ -409,6 +413,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/plans.ts` | `Plans`: validates and atomically registers authorized Plan DAGs; keeps plan background separate from node instructions |
 | `src/app/plan-dispatch.ts` | `PlanDispatcher`: validates Frontier predecessors, reserves a launch slot, atomically claims a node into a stable Ticket/Assignment, and rearms the same claim on restart |
 | `src/app/mainline-queue.ts` | Durable per-target FIFO, Ticket attempts, Worker repair, actual Git verification and formal closure coordination |
+| `src/app/plan-integration.ts` | Durable Plan-wide verification after formal Ticket receipts, exact Actions run/artifact matching, completion relay and release-promise hold |
 | `src/app/scoped-attention.ts` | `ScopedAttention`: durable Plan Ticket credential blockers, deduplicated Hub relays, shared management and Hub projections, and verified continuation; contract in `plugin/docs/015-scoped-attention.md` |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
@@ -468,7 +473,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/github-pull.ts` | The pull request rules: which pull requests a Ticket follows (`claimPull`, `observePull`), the closes it reports to the Engine, and `pullEndNotices`, the chat notice of a Ticket that ended merged or closed |
 | `src/sources/github-channel.ts` | The GitHub Channel: comments and review thread replies, `sent` or `gone` |
 | `src/sources/github-read.ts` | CI snapshots, repository reads, the `github/` resources, and `githubThreadContext`: an Issue's or pull request's conversation by page |
-| `src/sources/actions-evidence.ts` | The shared GitHub Actions evidence provider: `EvidenceWork`, `ActionsEvidence` and `actionsEvidence`, which read one complete candidate commit's workflow runs (with optional PR provenance filtering), latest-attempt jobs and artifacts, and never logs |
+| `src/sources/actions-evidence.ts` | Shared GitHub Actions provider: existing Ticket candidate CI, plus exact-context Plan dispatch and same-attempt full-regression job and artifact verification |
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers: live `reply_to` and history/topic `parent_id` identify the direct parent, not the topic root (`root_id`) |
 | `src/sources/feishu-loops.ts` | The Feishu event consumer, including Windows batch-wrapper launch and process-tree cancellation, history recovery, chat names and polling of subscribed topics. Event-processing errors stay visible for that consumer run even if readiness arrives later |
@@ -540,7 +545,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
 | `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |
-| `tests/mainline-queue.spec.ts` | Queue admission, versioned CI, same-target serialization, code and Doc Tree conflicts, formal closure, restart recovery and exactly-once Frontier claims |
+| `tests/mainline-queue.spec.ts` | Queue admission, versioned candidate CI, same-target serialization, code and Doc Tree conflicts, formal closure, recovery, Plan full regression and package delivery, and exactly-once notices and Frontier claims |
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
 | `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, review evidence and child-only review submission, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |

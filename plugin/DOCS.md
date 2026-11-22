@@ -35,3 +35,4 @@
 | 014 项目计量接口 | 项目、计划与票的 HTTP 和 Hub 查询、归属与共享开销、采样范围及错误契约 | [docs/014-project-metering.md](docs/014-project-metering.md) |
 | 015 计划注意力 | 计划与项目待处理摘要、测试账号验证、单票暂停及原工作树恢复 | [docs/015-scoped-attention.md](docs/015-scoped-attention.md) |
 | 016 运行限额 | 生效预设、在途准入、独立工单额度及管理与 Hub 查询接口契约 | [docs/016-run-limits.md](docs/016-run-limits.md) |
+| 017 计划集成交付 | 正式票据关闭后的主干验证、Actions 全量回归、产物契约和 Harness 查询接口 | [docs/017-plan-integration.md](docs/017-plan-integration.md) |

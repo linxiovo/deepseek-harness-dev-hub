@@ -48,6 +48,7 @@ const TEXT = {
   'health.mainline': ['主干合入队列', 'Mainline merge queue'],
   'health.mainlineRepair': ['主干修复派工', 'Mainline repair dispatch'],
   'health.mainlineDelivery': ['正式交付核验', 'Formal delivery verification'],
+  'health.planIntegration': ['计划集成验证', 'Plan integration verification'],
   'health.relay': ['转达给主 Session 的消息', 'Relays to the main Session'],
   'health.notice': ['给主 Session 的通知', 'Notices to the main Session'],
   'health.reply': ['发往渠道的消息', 'Messages to Channels'],

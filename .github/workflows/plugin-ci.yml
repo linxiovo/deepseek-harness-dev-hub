@@ -1,15 +1,46 @@
 name: Plugin CI
 
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('dsh-plan-verification:{0}', inputs.dsh_context) || '' }}
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      dsh_commit:
+        type: string
+        required: true
+      dsh_context:
+        type: string
+        required: true
+      dsh_configuration:
+        type: string
+        required: true
+      dsh_environment:
+        type: string
+        required: true
 
 permissions:
   contents: read
 
 jobs:
+  integration-identity:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the exact integration revision and declared regression profile
+        env:
+          REQUESTED_SHA: ${{ inputs.dsh_commit }}
+          VERIFICATION_CONTEXT: ${{ inputs.dsh_context }}
+          CONFIGURATION: ${{ inputs.dsh_configuration }}
+          ENVIRONMENT: ${{ inputs.dsh_environment }}
+        run: |
+          test "$REQUESTED_SHA" = "$GITHUB_SHA"
+          [[ $VERIFICATION_CONTEXT =~ ^[a-f0-9]{64}$ ]]
+          test "$CONFIGURATION" = plugin-check-v1
+          test "$ENVIRONMENT" = github-hosted-node22-pnpm11-v1
   check:
     name: check
     needs: windows
@@ -72,6 +103,39 @@ jobs:
           path: |
             plugin/lib
             plugin/ci-evidence
+          if-no-files-found: error
+          overwrite: true
+
+  integration-bundle:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: [integration-identity, check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.19.0'
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.7.0
+          package_json_file: plugin/package.json
+      - uses: actions/download-artifact@v8
+        with:
+          name: plugin-check-${{ github.sha }}
+          path: plugin
+      - name: Package the bundle built by the full check
+        working-directory: plugin
+        run: |
+          test -s lib/index.js
+          mkdir -p "$RUNNER_TEMP/plan-bundle"
+          pnpm pack --pack-destination "$RUNNER_TEMP/plan-bundle"
+          cp ci-evidence/commit.json "$RUNNER_TEMP/plan-bundle/"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: plugin-bundle-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/plan-bundle
           if-no-files-found: error
           overwrite: true
 

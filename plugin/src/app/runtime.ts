@@ -36,16 +36,18 @@ import { Installation, projectDatabase, projectHubId } from './installation.ts'
 import { InstallationError } from './installation-api.ts'
 import { Planning } from './planning.ts'
 import { Plans, planDeliveryWriter } from './plans.ts'
+import { PlanIntegration } from './plan-integration.ts'
 import { ScopedAttention } from './scoped-attention.ts'
 import { PlanDispatcher } from './plan-dispatch.ts'
 import { MainlineQueue } from './mainline-queue.ts'
-import { advanceMainline, precedes, prepareMainline, readMainline, verifyDeliveryOnTarget } from '../executor/mainline-git.ts'
+import { advanceMainline, precedes, prepareMainline, readMainline, readPlanIntegrationTarget, verifyDeliveryOnTarget } from '../executor/mainline-git.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import { projectNavigationLink } from '../navigation.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
+import { dispatchPlanActions, observePlanActions } from '../sources/actions-evidence.ts'
 import { pullEndNotices, recoverPulls } from '../sources/github-pull.ts'
 import { HealthBoard } from '../infra/health.ts'
 import { Outbox } from './outbox.ts'
@@ -84,6 +86,7 @@ export class Runtime extends Service implements SourceHost {
   readonly handoffs: Handoffs
   readonly topicBinding?: TopicBinding
   readonly plans: Plans
+  private readonly planIntegration: PlanIntegration
   readonly planDispatcher: PlanDispatcher
   readonly attention: ScopedAttention
   readonly planning: Planning
@@ -221,6 +224,18 @@ export class Runtime extends Service implements SourceHost {
         tools: (agent, ticket, role) => role === 'planner' ? plannerTools(this.toolHost, agent)
           : role === 'splitter' ? splitterTools(this.toolHost, agent)
           : ticket ? executorTools(this.toolHost, ticket, agent.id, role === 'review') : mainTools(this.toolHost, agent) })
+      const planIntegration = this.planIntegration = new PlanIntegration({ store, effects, plans, handoffs, lifetime: this.lifetime,
+        verification: project && machine.planVerification?.find(check => check.projectId === project.id),
+        paused: () => this.paused(), target: () => {
+          if (!project || !setup.configured()) return undefined
+          const ref = store.settings().executor.baseRef?.trim()
+          return ref?.startsWith('refs/heads/') ? { repository: project.workspace, slug: project.repository, ref } : undefined
+        },
+        readTarget: (target, integrations) => readPlanIntegrationTarget(commands, target, integrations),
+        observe: request => observePlanActions(commands, request),
+        dispatch: request => dispatchPlanActions(commands, request),
+        relay: message => sessions.relay(message.id, message.text),
+      })
       const verifyProjectBinding = installation.validateWorkspace.bind(installation)
       this.planning = new Planning({ handoffs, plans, effects, sessions, verifyProjectBinding,
         paused: () => this.paused(), closing: () => this.closing() })
@@ -332,6 +347,7 @@ export class Runtime extends Service implements SourceHost {
           try {
             authorizeMainline(resources, ticketId, approval)
             planDelivery.deliver(plan.planId, plan.nodeId, receipt)
+            planIntegration.enqueue(plan.planId)
           } catch (error) {
             if (error instanceof UserError) {
               if (error.code === 'mainlineRefused') return 'delivery_target_changed'
@@ -381,7 +397,7 @@ export class Runtime extends Service implements SourceHost {
           return passes.receive(trigger)
         } }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, mainline, planDispatcher: this.planDispatcher, settings: this.settings,
-        assessor, resources, projectMeter, runLimits, attention, handoffs, plans, lifetime: this.lifetime,
+        assessor, resources, projectMeter, runLimits, attention, handoffs, plans, planIntegration, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
@@ -534,6 +550,7 @@ export class Runtime extends Service implements SourceHost {
     // If stop() was called while awaiting setup, session creation, or policy sync, do not start background loops.
     if (this.closing()) return
     this.planDispatcher.resume()
+    this.planIntegration.resume()
     this.planning.resume()
     this.executor.resume()
     this.passes.start()
@@ -570,7 +587,7 @@ export class Runtime extends Service implements SourceHost {
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, setup, passes, installation,
       projectMeter } = this
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, projectMeter, installation,
-      attention: this.attention, runLimits: this.runLimits,
+      attention: this.attention, runLimits: this.runLimits, planIntegration: this.planIntegration,
       meter: { read: (id, signal) => this.readScopedMeter(id, signal) },
       topicBinding: this.topicBinding, verifyTopicBinding: () => this.verifyTopicBinding(),
       get ready() { return runtime.ready }, assertNewWork: () => installation.assertNewWork(),

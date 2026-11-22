@@ -409,6 +409,7 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET sessions/:id/meter': { answer: ({ params }) => server.meters[params.id] ?? refuse(404, 'Session not found') },
   'GET tickets/:id/meter': { answer: () => refuse(404, 'Ticket meter not available in the panel fixture') },
   'GET plans/:id/meter': { answer: () => refuse(404, 'Plan meter not available in the panel fixture') },
+  'GET plans/:id/delivery': { answer: () => refuse(404, 'Plan not found') },
   'GET project/meter': { answer: () => refuse(404, 'Project meter not available in the panel fixture') },
   'GET project/run-limits': { answer: () => refuse(404, 'Project run limits not available in the panel fixture') },
   'GET tickets/:id/run-limits': { answer: () => refuse(404, 'Ticket run limits not available in the panel fixture') },

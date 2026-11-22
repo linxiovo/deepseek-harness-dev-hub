@@ -1,5 +1,6 @@
-/** Read-only GitHub Actions job and artifact evidence for an owned commit. */
+/** GitHub Actions evidence for owned commits and dedicated plan verification. */
 import { z } from 'zod'
+import type { PlanActionsObservation, PlanVerificationRequest, PlanVerificationRun } from '../core/plan-integration.ts'
 import type { Commands } from '../infra/commands.ts'
 
 export type EvidenceWork = { kind: 'ticket' | 'plan'; id: string }
@@ -37,6 +38,90 @@ const Job = z.looseObject({ id: z.number(), run_id: z.number(), head_sha: z.stri
 const Artifact = z.looseObject({ id: z.number(), name: z.string(), archive_download_url: z.string(), expired: z.boolean(),
   workflow_run: z.looseObject({ id: z.number(), head_sha: z.string() }).nullish() })
 const CountedPage = z.looseObject({ total_count: z.number().int().nonnegative() })
+const PlanRun = z.looseObject({ id: z.number().int().positive().safe(), workflow_id: z.number().int().positive().safe(),
+  run_number: z.number().int().positive().safe(), run_attempt: z.number().int().positive().safe(), head_sha: z.string(),
+  head_branch: z.string().nullish(), event: z.string(), display_title: z.string(), status: z.string(), conclusion: z.string().nullable() })
+const PlanJob = z.looseObject({ id: z.number().int().positive().safe(), run_id: z.number().int().positive().safe(),
+  run_attempt: z.number().int().positive().safe().optional(), head_sha: z.string(), name: z.string(), status: z.string(), conclusion: z.string().nullable() })
+const PlanArtifactEntry = z.looseObject({ id: z.number().int().positive().safe(), name: z.string(), expired: z.boolean(),
+  size_in_bytes: z.number().int().nonnegative().safe(), workflow_run: z.looseObject({ id: z.number().int().positive().safe(), head_sha: z.string() }).nullish() })
+
+function planInputs(request: PlanVerificationRequest, repository: string): { workflowId: string; branch: string } {
+  const { verification } = request
+  const workflowId = verification.workflowId
+  if (request.repository.toLowerCase() !== repository.toLowerCase() || !/^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(request.repository) ||
+    request.repository.split('/').some(part => part === '.' || part === '..')) {
+    throw new Error('Plan verification repository must match the configured GitHub repository')
+  }
+  if (!/^[1-9][0-9]*$/.test(workflowId) || !Number.isSafeInteger(Number(workflowId))) {
+    throw new Error('A configured numeric workflow ID is required')
+  }
+  if (!/^refs\/heads\//.test(request.ref)) throw new Error('Plan verification requires a branch ref')
+  const branch = request.ref.slice('refs/heads/'.length)
+  if (!branch || branch === '@' || branch.startsWith('/') || branch.endsWith('/') || branch.endsWith('.') || branch.includes('..') ||
+    branch.includes('//') || branch.includes('@{') || /[\\~^:?*\[\x00-\x20\x7f]/.test(branch) || branch.split('/').some(part => part.startsWith('.') || part.endsWith('.lock'))) {
+    throw new Error('Plan verification requires a valid plain branch ref')
+  }
+  if (!/^[0-9a-f]{40}$/.test(request.sha)) throw new Error('A complete lowercase commit SHA is required')
+  if (!/^[0-9a-f]{64}$/.test(request.context)) throw new Error('A 64-character lowercase plan context is required')
+  if (!verification.jobs.length || new Set(verification.jobs).size !== verification.jobs.length ||
+    verification.jobs.some(name => !name.trim()) || !verification.artifactName.trim() ||
+    !verification.configuration.trim() || !verification.environment.trim()) {
+    throw new Error('Plan verification requires configured jobs, artifact, configuration, and environment')
+  }
+  return { workflowId, branch }
+}
+
+/** Dispatches the dedicated non-production verification workflow for one exact branch and commit. */
+export async function dispatchPlanActions(commands: Commands, request: PlanVerificationRequest): Promise<void> {
+  const { workflowId, branch } = planInputs(request, commands.repository)
+  await commands.api(`actions/workflows/${workflowId}/dispatches`, '--method', 'POST', '-H', 'X-GitHub-Api-Version: 2026-03-10',
+    '-f', `ref=${branch}`, '-f', `inputs[dsh_commit]=${request.sha}`, '-f', `inputs[dsh_context]=${request.context}`,
+    '-f', `inputs[dsh_configuration]=${request.verification.configuration}`, '-f', `inputs[dsh_environment]=${request.verification.environment}`)
+}
+
+/** Reads only the latest exact-context run; this function never dispatches or reruns workflows. */
+export async function observePlanActions(commands: Commands, request: PlanVerificationRequest): Promise<PlanActionsObservation> {
+  const { workflowId, branch } = planInputs(request, commands.repository)
+  const { verification } = request
+  const repository = commands.repository.toLowerCase()
+  const runName = `dsh-plan-verification:${request.context}`
+  const query = new URLSearchParams({ head_sha: request.sha, branch, event: 'workflow_dispatch' })
+  const runs = await actionPages(commands, `actions/workflows/${workflowId}/runs?${query}`, 'workflow_runs', PlanRun)
+  const matching = runs.filter(run => String(run.workflow_id) === workflowId && run.event === 'workflow_dispatch' &&
+    run.head_branch === branch && run.head_sha === request.sha && run.display_title === runName)
+  if (!matching.length) return { status: 'missing' }
+  matching.sort((a, b) => b.run_number - a.run_number || b.run_attempt - a.run_attempt)
+  const latest = matching[0]!
+  const run: PlanVerificationRun = { id: latest.id, attempt: latest.run_attempt,
+    url: `https://github.com/${repository}/actions/runs/${latest.id}`, checks: [] }
+  if (latest.status !== 'completed') return { status: 'pending', run }
+  if (latest.conclusion !== 'success') return { status: 'failed', reason: 'regression_failed', run }
+
+  const jobs = await actionPages(commands, `actions/runs/${latest.id}/attempts/${latest.run_attempt}/jobs`, 'jobs', PlanJob)
+  const exactJobs = jobs.filter(job => job.run_id === latest.id && (job.run_attempt == null || job.run_attempt === latest.run_attempt) && job.head_sha === request.sha)
+  const requiredJobs = verification.jobs.map(name => ({ name, matches: exactJobs.filter(job => job.name === name) }))
+  run.checks = requiredJobs.map(({ name, matches }) => {
+    const job = matches.length === 1 ? matches[0] : undefined
+    return { name, status: job?.status ?? (matches.length ? 'ambiguous' : 'missing'), conclusion: job?.conclusion ?? null,
+      ...(job ? { url: `https://github.com/${repository}/actions/runs/${latest.id}/job/${job.id}` } : {}) }
+  })
+  if (run.checks.some(check => check.status !== 'completed' || check.conclusion !== 'success')) {
+    const missingOrSkipped = run.checks.some(check => check.status === 'missing' || check.status === 'ambiguous' ||
+      check.status === 'completed' && check.conclusion === 'skipped')
+    return { status: 'failed', reason: missingOrSkipped ? 'full_regression_missing' : 'regression_failed', run }
+  }
+
+  const artifactName = `${verification.artifactName}-${request.sha}-${latest.run_attempt}`
+  const artifacts = await actionPages(commands, `actions/runs/${latest.id}/artifacts`, 'artifacts', PlanArtifactEntry)
+  const exactArtifacts = artifacts.filter(artifact => artifact.name === artifactName && artifact.workflow_run?.id === latest.id &&
+    artifact.workflow_run.head_sha === request.sha && artifact.expired === false && artifact.size_in_bytes > 0)
+  if (exactArtifacts.length !== 1) return { status: 'failed', reason: 'artifact_unavailable', run }
+  const artifact = exactArtifacts[0]!
+  return { status: 'passed', run, artifact: { id: artifact.id, name: artifact.name,
+    url: `https://github.com/${repository}/actions/runs/${latest.id}/artifacts/${artifact.id}` } }
+}
+
 
 /** Paginate GitHub's object-wrapped Actions collections without truncating required evidence. */
 async function actionPages<T>(commands: Commands, path: string, field: 'workflow_runs' | 'jobs' | 'artifacts', item: z.ZodType<T>): Promise<T[]> {

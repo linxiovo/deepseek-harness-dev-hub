@@ -32,6 +32,16 @@ it('mounts the Mainline queue tool on the Hub but not on a Worker', async () => 
   await expect(queue(ticket.id, args.candidate)).rejects.toThrow(/registered Plan Ticket/i)
 })
 
+it('keeps Plan completion waiting for formally delivered Tickets', async () => {
+  const { id, workers: { trim } } = await registerPlan({ start: ['trim'] })
+  const resource = `plan/${id}/delivery`
+  await h.runTool(trim.session, 'orchestrator_report', { state: 'ready', summary: 'Local checks are green.' })
+  await h.runtime.idle()
+  expect(await read(resource)).toMatchObject({ planId: id, status: 'awaiting-tickets',
+    waitingFor: ['trim', 'lowercase', 'combined-check'] })
+  expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toEqual([])
+}, 90_000)
+
 const claimIdentity = z.object({ ticketId: z.string(), assignmentId: z.string(), session: z.string() })
 type Worker = z.infer<typeof claimIdentity> & { directory: string }
 type Pull = { sha: string; base: string; branch: string; closed: boolean }
@@ -113,6 +123,29 @@ async function registerPlan<Node extends LabelNode>({ start, checkDependsOn = la
     return [node, { ...claim, directory: String(directory) }] as const
   }))
   return { id, workers: Object.fromEntries(workers) as Record<Node, Worker>, dispatch }
+}
+
+async function registerSingleIntegrationPlan(release: 'authorized' | 'not-authorized' = 'not-authorized') {
+  const acceptance = [{ statement: 'Trim display labels', observable: 'A padded label has no surrounding spaces', delivery: 'backend' }]
+  const brief = { project: { repository: slug, workspace: h.localGit!.repository }, goal: 'Trim display labels.', constraints: [],
+    acceptanceScope: [acceptance[0]!.statement], authorization: { scope: 'Trim display labels', release } }
+  const confirmation = JSON.stringify({ confirmed: true, brief })
+  h.sendUserMessage(h.runtime.masterId, confirmation)
+  const { id } = await hub('orchestrator_handoff_confirm', { ...brief, confirmation }) as { id: string }
+  await h.idlePlanning()
+  const { spec } = await h.runTool(`planner-${id}`, 'orchestrator_spec_publish', { handoffId: id, body: brief.goal, acceptance,
+    testInterfaces: [{ seam: 'label()', kind: 'existing', note: 'Call the public formatter.' }], outOfScope: [] }) as { spec: { id: string } }
+  await h.runtime.idle()
+  await h.runTool(`splitter-${id}`, 'orchestrator_plan_register', { handoffId: id, specId: spec.id,
+    features: [{ id: 'integration', kind: 'backend' }],
+    nodes: [{ id: 'integration', featureId: 'integration', title: 'integration', role: 'backend', acceptance: [1],
+      demonstration: 'Run the public formatter.', blockedBy: [] }] })
+  const result = await hub('orchestrator_plan_dispatch', { planId: id, nodeId: 'integration' })
+  const claim = claimIdentity.parse(result.claim)
+  await h.runtime.idle()
+  const ticket = await read(`ticket/${claim.ticketId}`)
+  expect(ticket.directory).toEqual(expect.any(String))
+  return { id, worker: { ...claim, directory: String(ticket.directory) } as Worker }
 }
 
 async function delivered(plan: string, nodeId: string, worker: Worker, intent: Record<string, unknown>, base: string, candidate: string, integration: string, actual = integration) {
@@ -279,6 +312,108 @@ function actionsHost(beforeRuns?: (sha: string) => Promise<void>) {
     setPull: (value: Pull) => { pull = value; return pullResponse(value) } }
 }
 
+it.each(['not-authorized', 'authorized'] as const)('verifies the integrated package, recovers a lost dispatch receipt, and respects %s release scope', async release => {
+  await h.stop()
+  const verification = { workflowId: '44', jobs: ['integration-identity', 'windows', 'check', 'integration-bundle'], artifactName: 'plugin-bundle',
+    configuration: 'plugin-check-v1', environment: 'github-hosted-node22-pnpm11-v1' }
+  const mounted = await startManagedProject({ withFeishu: false, machine: project => ({ planVerification: [{ projectId: project.id, ...verification }] }) })
+  h = mounted.host
+  const { git, base, tip, runGit } = mainlineRepository()
+  const ci = actionsHost()
+  await configureCI()
+  const actionRuns = new Map<string, { id: number; sha: string; branch: string; context: string }>()
+  const github = vi.spyOn(Commands.prototype, 'gh')
+  const githubFallback = github.getMockImplementation()!
+  github.mockImplementation(async function (this: Commands, args) {
+    const [method, endpoint] = args
+    if (method !== 'api' || !endpoint) return githubFallback.call(this, args)
+    const path = new URL(`/${endpoint}`, 'https://github.com')
+    if (path.pathname === `/repos/${slug}/actions/workflows/44/runs`) {
+      const runs = [...actionRuns.values()].filter(run => run.sha === path.searchParams.get('head_sha') &&
+        run.branch === path.searchParams.get('branch'))
+      return { total_count: runs.length, workflow_runs: runs.map(run => ({ id: run.id, workflow_id: 44, run_number: run.id,
+        run_attempt: 1, head_sha: run.sha, head_branch: run.branch, event: 'workflow_dispatch',
+        display_title: `dsh-plan-verification:${run.context}`, status: 'completed', conclusion: 'success' })) }
+    }
+    const jobs = path.pathname.match(new RegExp(`/actions/runs/(\\d+)/attempts/(\\d+)/jobs$`))
+    if (jobs) {
+      const run = [...actionRuns.values()].find(value => value.id === Number(jobs[1]))
+      if (run) return { total_count: verification.jobs.length, jobs: verification.jobs.map((name, index) => ({ id: run.id * 10 + index,
+        run_id: run.id, run_attempt: Number(jobs[2]), head_sha: run.sha, name, status: 'completed', conclusion: 'success' })) }
+    }
+    const artifacts = path.pathname.match(new RegExp(`/actions/runs/(\\d+)/artifacts$`))
+    if (artifacts) {
+      const run = [...actionRuns.values()].find(value => value.id === Number(artifacts[1]))
+      if (run) return { total_count: 1, artifacts: [{ id: run.id * 100, name: `${verification.artifactName}-${run.sha}-1`,
+        expired: false, size_in_bytes: 1200, workflow_run: { id: run.id, head_sha: run.sha } }] }
+    }
+    return githubFallback.call(this, args)
+  })
+  let loseDispatchReceipt = true
+  let dispatches = 0
+  const command = vi.spyOn(Commands.prototype, 'run')
+  const commandFallback = command.getMockImplementation()!
+  command.mockImplementation(async function (this: Commands, program, args, cwd, input) {
+    if (args[0] === 'api' && args[1] === `repos/${slug}/actions/workflows/44/dispatches`) {
+      const field = (name: string) => args.find(value => value.startsWith(`inputs[${name}]=`))?.split('=')[1]
+      const sha = field('dsh_commit')!, context = field('dsh_context')!, branch = args[args.indexOf('-f') + 1]!.slice('ref='.length)
+      actionRuns.set(context, { id: 900 + ++dispatches, sha, branch, context })
+      if (loseDispatchReceipt) { loseDispatchReceipt = false; throw new Error('Dispatch response was lost') }
+      return JSON.stringify({ workflow_run_id: 900 + dispatches })
+    }
+    return commandFallback.call(this, program, args, cwd, input)
+  })
+  const localGit = vi.spyOn(Commands.prototype, 'git')
+  localGit.mockImplementation(async function (this: Commands, args, cwd) {
+    return runGit(this, args, cwd)
+  })
+
+  const { id, worker } = await registerSingleIntegrationPlan(release)
+  formatLabel(worker.directory, 'value.trim()', 'Trim surrounding whitespace')
+  const candidate = commit(worker.directory, 'Trim display labels')
+  const branch = git('-C', worker.directory, 'branch', '--show-current')
+  await recordEvidence(worker, id, base, candidate, '1', 'ALERT')
+  ci.publish(candidate, undefined, branch)
+  await h.runTool(worker.session, 'orchestrator_report', { state: 'ready', summary: 'The checked candidate is ready.' })
+  const candidateEvidence = await delivery(worker.ticketId)
+  expect(candidateEvidence).toMatchObject({ base, candidate, ready: true, ci_status: 'passed' })
+  await expect(h.runTool(worker.session, 'orchestrator_read', { resource: `plan/${id}/delivery` }))
+    .rejects.toThrow('This resource belongs to the main Session')
+
+  const intent = await queue(worker.ticketId, candidate)
+  await h.runtime.idle()
+  const integration = tip()
+  const closedTicket = await read(`ticket/${worker.ticketId}`), mainlinePage = await read(`ticket/${worker.ticketId}/mainline`)
+  expect({ ticketState: closedTicket.state, mainline: mainlinePage.items, tip: integration, intent },
+    JSON.stringify({ ticketState: closedTicket.state, mainline: mainlinePage.items, tip: integration, intent }))
+    .toMatchObject({ ticketState: 'merged', mainline: [expect.objectContaining({ status: 'verified' })] })
+  expect(intent).toMatchObject({ candidate, base, status: 'queued' })
+  expect(await read(`plan/${id}/delivery`)).toMatchObject({ status: 'blocked', reason: 'dispatch_unconfirmed', version: { sha: integration } })
+  expect(dispatches).toBe(1)
+
+  await h.restart()
+  await h.runtime.idle()
+  const resource = await read(`plan/${id}/delivery`)
+  expect(resource).toMatchObject({ planId: id, status: release === 'authorized' ? 'awaiting-release-verification' : 'delivered',
+    version: { repository: slug, ref: targetRef, sha: integration, context: expect.stringMatching(/^[a-f0-9]{64}$/),
+      configuration: verification.configuration, environment: verification.environment },
+    run: { id: expect.any(Number), attempt: 1 },
+    artifact: { id: expect.any(Number), name: `plugin-bundle-${integration}-1`, url: expect.stringContaining('/actions/runs/') },
+    verifiedAt: expect.any(String) })
+  expect(dispatches).toBe(1)
+  const relays = h.jsonRelays(h.runtime.masterId, 'plan-delivered')
+  if (release === 'authorized') expect(relays).toEqual([])
+  else expect(relays).toEqual([expect.objectContaining({ planId: id, version: expect.objectContaining({ sha: integration }),
+    verification: expect.stringContaining('/actions/runs/'), artifact: expect.objectContaining({ url: expect.stringContaining('/artifacts/') }),
+    read: `plan/${id}/delivery` })])
+  expect(await h.api('GET', `plans/${id}/delivery`, undefined, mounted.project.id)).toMatchObject({ status: 200, body: resource })
+
+  await h.restart()
+  await h.runtime.idle()
+  expect(await read(`plan/${id}/delivery`)).toEqual(resource)
+  expect(dispatches).toBe(1)
+  expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toHaveLength(release === 'authorized' ? 0 : 1)
+}, 180_000)
 async function interruptedByRestart(lifetime: AbortSignal): Promise<never> {
   if (!lifetime.aborted) {
     const stopped = Promise.withResolvers<void>()

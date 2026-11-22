@@ -15,6 +15,7 @@ import type { CreateProjectInput, CreateProjectResult, OnboardingView, ProjectsV
   VerifyGithubInput } from './installation-api.ts'
 import type { TopicBindingView } from './topic-binding.ts'
 import type { ScopedAttention } from './scoped-attention.ts'
+import type { PlanIntegrationView } from '../core/plan-integration.ts'
 
 export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
 export const THREAD_FILTERS = ['subscribed', 'evaluating', 'recent', 'all'] as const
@@ -64,6 +65,7 @@ export interface Api {
   'GET sessions/:id/meter': { response: SessionMeterView }
   'GET project/meter': { response: ProjectMeterView }
   'GET plans/:id/meter': { response: ProjectMeterView }
+  'GET plans/:id/delivery': { response: PlanIntegrationView }
   'GET tickets/:id/meter': { response: ProjectMeterView }
   'GET project/run-limits': { response: RunLimitStatus }
   'GET tickets/:id/run-limits': { response: RunLimitStatus }

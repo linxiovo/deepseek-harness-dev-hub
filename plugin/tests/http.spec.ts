@@ -1,3 +1,4 @@
+import type { PlanIntegrationView } from '../src/core/plan-integration.ts'
 import { expect, it } from 'vitest'
 import { z } from 'zod'
 import { registerHttp } from '../src/app/http.ts'
@@ -159,6 +160,37 @@ it('answers the Session meter view the Hub reads, decoded from the path, and 404
   expect(asked).toEqual([view.session_id, 'worker-t9'])
 })
 
+it('serves stored Plan delivery only within the required project scope', async () => {
+  const view: PlanIntegrationView = { planId: 'plan-a', status: 'delivered',
+    version: { repository: 'org/repo', ref: 'refs/heads/main', sha: 'a'.repeat(40), context: 'b'.repeat(64),
+      workflowId: 'ci.yml', configuration: 'Release', environment: 'production' },
+    run: { id: 17, attempt: 1, url: 'https://github.com/org/repo/actions/runs/17', checks: [] },
+    artifact: { id: 5, name: 'release', url: 'https://github.com/org/repo/actions/runs/17/artifacts/5' },
+    verifiedAt: '2026-11-22T12:00:00.000Z' }
+  const lookedUp: string[] = []
+  const call = serve({ installation: bindingInstallation(),
+    planIntegration: { view: (id: string) => { lookedUp.push(id); return id === view.planId ? view : undefined } } })
+  expect(await call('GET', 'plans/plan-a/delivery', undefined, projectHeader(alpha.id)))
+    .toEqual({ status: 200, body: view })
+  expect(lookedUp).toEqual(['plan-a'])
+  expect(await call('GET', 'plans/plan-a/delivery')).toEqual({ status: 409, body: expect.objectContaining({ code: 'projectScopeRequired' }) })
+  expect(await call('GET', 'plans/plan-a/delivery', undefined, projectHeader(beta.id)))
+    .toEqual({ status: 409, body: { error: 'The request does not target the mounted project.', code: 'staleProject' } })
+  expect(await call('GET', 'plans/plan-a/delivery?refresh=1', undefined, projectHeader(alpha.id)))
+    .toEqual({ status: 400, body: { error: 'Invalid plan delivery query' } })
+  expect(await call('GET', 'plans/unknown/delivery', undefined, projectHeader(alpha.id)))
+    .toEqual({ status: 404, body: { error: 'Plan not found' } })
+  expect(await call('GET', 'plans/plan-a/delivery', undefined,
+    { ...projectHeader(alpha.id), 'x-orchestrator-request': undefined }))
+    .toEqual({ status: 403, body: { error: 'Same-origin management request required' } })
+  expect(lookedUp).toEqual(['plan-a', 'unknown'])
+})
+
+it('returns the established unknown-plan response when plan integration is unavailable', async () => {
+  const call = serve({ installation: bindingInstallation() })
+  expect(await call('GET', 'plans/plan-a/delivery', undefined, projectHeader(alpha.id)))
+    .toEqual({ status: 404, body: { error: 'Plan not found' } })
+})
 it('answers a corrupt Session log with 500 instead of claiming the Session is missing', async () => {
   const read = async (id: string): Promise<SessionMeterView | undefined> => {
     throw new Error(`Session log for ${id} is corrupt`)

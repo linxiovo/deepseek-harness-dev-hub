@@ -1,2 +1,2 @@
 Mainline queue status changed: {status}.
-Read {resource} for the actual target and verification. A repair is delegated to the Ticket's Worker; queue its new SHA once its delivery-check is ready. Mainline verification is not formal delivery.
+Read {resource} for actual Git results and {delivery} for the formal receipt or missing evidence. For a repair, queue the Worker's new SHA once its delivery-check is ready. After formal delivery, read the Plan's Frontier and dispatch only ready nodes. Keep routine Ticket updates internal.

@@ -84,7 +84,7 @@ export function followupOwners(trigger: Pick<Trigger, 'id' | 'human' | 'threads'
   if (!reached.length || records.threads.get(threadKey(trigger.threads[0]!))?.evaluating?.triggerIds.includes(trigger.id)) return []
   return reached.filter(id => {
     const ticket = records.tickets.get(id)
-    return !!ticket && (liveTicket(ticket) || (ticket.ended?.by !== 'human'
+    return !!ticket && (liveTicket(ticket) || (ticket.ended?.by === 'executor'
       && ticket.inputs.some(input => input.kind === 'trigger' && input.triggerId === trigger.id && ticket.undelivered.includes(input.id))))
   })
 }
@@ -305,7 +305,7 @@ export interface PolicyEffect {
   requester?: ActorRef
 }
 
-export type TicketEndBy = 'executor' | 'human'
+export type TicketEndBy = 'executor' | 'human' | 'delivery'
 /** How a ticket ended: with its result, with its pull request merged or closed unmerged, with nothing to do, or stopped by a person. */
 export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
 /** A question for a person; `triggerId` is the human message that raised it, whose conversation it goes back to. */

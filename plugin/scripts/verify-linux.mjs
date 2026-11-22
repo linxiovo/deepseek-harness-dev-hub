@@ -568,11 +568,9 @@ async function resolveGitTarget(repoRoot, requestedRef) {
   }
   const pkg = JSON.parse(pkgShow.stdout)
   const targets = ['plugin']
-  // The offline docs and ticket tests also read these committed repository paths.
-  for (const path of ['DOCS.md', 'meta/.scratch/super-agent-implementation']) {
-    const present = await runBuffered('git', ['-C', repoRoot, 'cat-file', '-e', `${sha}:${path}`], { env })
-    if (present.code === 0) targets.push(path)
-  }
+  // The offline docs test also reads the committed root DOCS.md.
+  const docs = await runBuffered('git', ['-C', repoRoot, 'cat-file', '-e', `${sha}:DOCS.md`], { env })
+  if (docs.code === 0) targets.push('DOCS.md')
   return {
     sha,
     ref,

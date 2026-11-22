@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { z } from 'zod'
 import { Commands } from '../src/infra/commands.ts'
 import { githubKind } from '../src/sources/github.ts'
 import { observePull } from '../src/sources/github-pull.ts'
@@ -31,13 +32,15 @@ it('mounts the Mainline queue tool on the Hub but not on a Worker', async () => 
   await expect(queue(ticket.id, args.candidate)).rejects.toThrow(/registered Plan Ticket/i)
 })
 
-type Worker = { ticketId: string; session: string; directory: string }
+const claimIdentity = z.object({ ticketId: z.string(), assignmentId: z.string(), session: z.string() })
+type Worker = z.infer<typeof claimIdentity> & { directory: string }
 type Pull = { sha: string; base: string; branch: string; closed: boolean }
 
 const write = (dir: string, path: string, body: string) => writeFileSync(join(dir, path), body)
 const routeDoc = 'docs/labels.md'
 const contractDoc = 'docs/label-contract.md'
 const labelFile = 'label.mjs'
+const exampleFile = 'label.example.json'
 
 /** One overlapping line in code and one in the actual Doc Tree navigation route. */
 function formatLabel(directory: string, expression: string, contract: string) {
@@ -53,7 +56,28 @@ function commit(directory: string, message: string) {
   return git('-C', directory, 'rev-parse', 'HEAD')
 }
 
-async function registerPlan() {
+function mainlineRepository() {
+  const { repository, git } = h.localGit!
+  mkdirSync(join(repository, 'docs'))
+  write(repository, 'DOCS.md', '# Documentation\n\n- [Label documentation](docs/labels.md)\n')
+  formatLabel(repository, 'value', 'Display labels unchanged')
+  const base = commit(repository, 'Define the original label contract')
+  const remote = join(h.directory, 'remote.git')
+  git('init', '-q', '--bare', '--initial-branch=main', remote)
+  git('push', remote, `HEAD:${targetRef}`)
+  const tip = () => git('-C', remote, 'rev-parse', targetRef)
+  const runGit = (commands: Commands, args: string[], cwd: string) => runCommand.call(commands, 'git',
+    args.includes(canonicalUrl) ? ['-c', 'protocol.file.allow=always', ...args.map(arg => arg === canonicalUrl ? remote : arg)] : args, cwd)
+  return { repository, git, base, remote, tip, runGit }
+}
+
+const labelNodes = ['trim', 'lowercase'] as const
+type LabelNode = typeof labelNodes[number]
+
+async function registerPlan<Node extends LabelNode>({ start, checkDependsOn = labelNodes }: {
+  start: readonly Node[]
+  checkDependsOn?: readonly LabelNode[]
+}) {
   const criteria = [
     { statement: 'Trim label whitespace', observable: 'A padded label loses its surrounding spaces', delivery: 'backend' },
     { statement: 'Lowercase labels', observable: 'A mixed-case label becomes lowercase', delivery: 'backend' },
@@ -72,24 +96,53 @@ async function registerPlan() {
   const nodes = [
     { id: 'trim', acceptance: [1], blockedBy: [] },
     { id: 'lowercase', acceptance: [2], blockedBy: [] },
-    { id: 'combined-check', acceptance: [3], blockedBy: ['trim', 'lowercase'] },
+    { id: 'combined-check', acceptance: [3], blockedBy: checkDependsOn },
   ].map(node => ({ ...node, featureId: node.id, title: node.id, role: 'backend', demonstration: 'Call the public label formatter.' }))
   await h.runTool(`splitter-${id}`, 'orchestrator_plan_register', { handoffId: id, specId: spec.id,
     features: nodes.map(node => ({ id: node.id, kind: 'backend' })), nodes })
 
   const dispatch = (nodeId: string) => hub('orchestrator_plan_dispatch', { planId: id, nodeId })
-  const claims = await Promise.all(['trim', 'lowercase'].map(async node => {
+  const claims = await Promise.all(start.map(async node => {
     const result = await dispatch(node)
-    expect(result).toMatchObject({ claim: { ticketId: expect.any(String), session: expect.any(String) } })
-    return result.claim as Pick<Worker, 'ticketId' | 'session'>
+    return { node, claim: claimIdentity.parse(result.claim) }
   }))
   await h.runtime.idle()
-  const workers = await Promise.all(claims.map(async claim => {
+  const workers = await Promise.all(claims.map(async ({ node, claim }) => {
     const { directory } = await read(`ticket/${claim.ticketId}`)
     expect(directory).toEqual(expect.any(String))
-    return { ...claim, directory: String(directory) }
+    return [node, { ...claim, directory: String(directory) }] as const
   }))
-  return { id, a: workers[0]!, b: workers[1]!, dispatch }
+  return { id, workers: Object.fromEntries(workers) as Record<Node, Worker>, dispatch }
+}
+
+async function delivered(plan: string, nodeId: string, worker: Worker, intent: Record<string, unknown>, base: string, candidate: string, integration: string, actual = integration) {
+  const { ended, state } = await read(`ticket/${worker.ticketId}`)
+  expect(state).toBe('merged')
+  expect(ended).toMatchObject({ by: 'delivery', at: expect.any(String) })
+  expect(intent.generation).toEqual(expect.any(Number))
+  const node = await read(`plan/${plan}/node/${nodeId}`)
+  expect(node).toMatchObject({ status: 'delivered', delivery: { receiptId: intent.id, ticketId: worker.ticketId, assignmentId: worker.assignmentId,
+    base, generation: intent.generation, candidate, integration, actual, verifiedAt: expect.any(String) } })
+  expect(await delivery(worker.ticketId)).toMatchObject({ formal_delivery: { status: 'delivered', receipt: node.delivery } })
+  return { ended, receipt: node.delivery }
+}
+
+// Count what actually arrived, including unexpected launches into a second Worker Session.
+const combinedAssignments = () => h.deliveries.mock.calls.flatMap(([call]) => {
+  if (!call.sessionId.startsWith('worker-') || !call.text.startsWith('{')) return []
+  const message = JSON.parse(call.text)
+  return message.title === 'combined-check' ? [{ ticketId: message.ticket_id, session: call.sessionId }] : []
+})
+
+async function claimCombined(plan: string, dispatch: (nodeId: string) => Promise<Record<string, unknown>>) {
+  const [first, replay] = await Promise.all([dispatch('combined-check'), dispatch('combined-check')])
+  const claim = claimIdentity.parse(first.claim)
+  expect([first.reused, replay.reused].sort()).toEqual([false, true])
+  expect(replay).toMatchObject({ claim })
+  await h.runtime.idle()
+  expect(await read(`plan/${plan}/node/combined-check`)).toMatchObject({ status: 'running', claim })
+  expect(combinedAssignments()).toEqual([{ ticketId: claim.ticketId, session: claim.session }])
+  return claim
 }
 
 const accept = ({ session }: Worker, candidate: string, criterion: string, evidence: string) =>
@@ -104,28 +157,55 @@ const runLabelCheck = (directory: string, input: string, output: string) => {
   return `node --input-type=module -e ${JSON.stringify(check)}`
 }
 
-async function recordEvidence(worker: Worker, plan: string, base: string, candidate: string, criterion: string, expected: string, staleTest?: string) {
-  const { session, directory } = worker
-  const call = (tool: string, input: object) => h.runTool(session, tool, { candidate, ...input })
+async function reviewAndTest(worker: Worker, plan: string, base: string, candidate: string, expected: string) {
   for (const axis of ['standards', 'spec'] as const) {
+    const { session } = worker
     const reviewer = await h.reviewSubagent(session, axis)
     const result = await h.runTool(reviewer, 'orchestrator_review_submit', { candidate, axis,
       basis: [axis === 'standards' ? 'DOCS.md' : `spec/${plan}`], conclusion: 'passed',
       summary: 'Checked the public formatter and its documented contract.', blockers: [] })
     expect(result).toMatchObject({ evidence: { base, candidate, reviewer_session: reviewer } })
   }
-  const command = runLabelCheck(directory, '  ALERT  ', expected)
-  const test = await call('orchestrator_test_evidence', { scope: 'focused', reason: 'The label() export is the only changed behavior.', red: null,
+  const command = runLabelCheck(worker.directory, '  ALERT  ', expected)
+  const test = await h.runTool(worker.session, 'orchestrator_test_evidence', { candidate, scope: 'focused', reason: 'The label() export is the only changed behavior.', red: null,
     checks: [{ directory: '.', command, status: 'passed', observed: 'exit 0' }] })
   expect(test).toMatchObject({ base, candidate, result: 'reported_passed', read: expect.any(String) })
-  await expect(call('orchestrator_doc_impact', { root: 'DOCS.md', routes: [routeDoc], leaves: [contractDoc],
-    impact: { kind: 'updated', documents: [routeDoc, contractDoc], contracts: [contractDoc] } }))
-    .resolves.toMatchObject({ base, candidate, structure: 'checked', issues: [] })
-  await call('orchestrator_retro_evidence', { kind: 'first-retro', findings: [] })
-  if (staleTest) await expect(accept(worker, candidate, criterion, staleTest)).rejects.toThrow(/match the current revision/i)
-  await accept(worker, candidate, criterion, String(test.read))
-  await call('orchestrator_retro_evidence', { kind: 'final-retro', findings: [] })
   return String(test.read)
+}
+
+const inspectDocs = (worker: Worker, candidate: string) => h.runTool(worker.session, 'orchestrator_doc_impact', {
+  candidate, root: 'DOCS.md', routes: [routeDoc], leaves: [contractDoc],
+  impact: { kind: 'updated', documents: [routeDoc, contractDoc], contracts: [contractDoc] },
+})
+
+const retro = (worker: Worker, candidate: string, event: object) => h.runTool(worker.session, 'orchestrator_retro_evidence', { candidate, ...event })
+
+async function recordEvidence(worker: Worker, plan: string, base: string, candidate: string, criterion: string, expected: string, staleTest?: string) {
+  const test = await reviewAndTest(worker, plan, base, candidate, expected)
+  await expect(inspectDocs(worker, candidate)).resolves.toMatchObject({ base, candidate, structure: 'checked', issues: [] })
+  // A same-base repair carries its first retro; the affected tests, route, acceptance and final retro must be fresh.
+  if (!staleTest) await retro(worker, candidate, { kind: 'first-retro', findings: [] })
+  if (staleTest) await expect(accept(worker, candidate, criterion, staleTest)).rejects.toThrow(/match the current revision/i)
+  await accept(worker, candidate, criterion, test)
+  await retro(worker, candidate, { kind: 'final-retro', findings: [] })
+  return test
+}
+
+// Fault setup only: the API intentionally has no eraser for a verified observation. Each replay starts
+// with the same authentic history, minus exactly one record; keep old candidate records in place.
+function evidenceLoss(worker: Worker, candidate: string, findingCandidate: string) {
+  const { tickets } = h.runtime.store
+  const baseline = tickets.get(worker.ticketId)!
+  const ledger = baseline.deliveryCheck!
+  const reviews = baseline.assignments.find(item => item.id === worker.assignmentId)!.reviews!
+  return (omit?: 'standards' | 'spec' | 'acceptance' | 'docs' | 'tests' | 'repair' | 'first-retro' | 'final-retro') => {
+    const ticket = tickets.get(worker.ticketId)!
+    const assignment = ticket.assignments.find(item => item.id === worker.assignmentId)!
+    assignment.reviews = { ...reviews, evidence: reviews.evidence.filter(item => item.candidate !== candidate || item.axis !== omit) }
+    ticket.deliveryCheck = { events: ledger.events.filter(item => item.kind !== omit ||
+      item.revision.candidate !== (omit === 'first-retro' ? findingCandidate : candidate)) }
+    tickets.save(ticket)
+  }
 }
 
 async function configureCI() {
@@ -136,7 +216,7 @@ async function configureCI() {
 }
 
 /** Keep hosting responses tied to the specific revisions explicitly published by the test. */
-function actionsHost() {
+function actionsHost(beforeRuns?: (sha: string) => Promise<void>) {
   const runs = new Map<string, { id: number; sha: string; base?: string; branch?: string }>()
   let pull: Pull | undefined
   const number = 29
@@ -159,7 +239,9 @@ function actionsHost() {
     if (path === `repos/${slug}/pulls/${number}` && pull) return pullResponse(pull)
     const query = new URL(`/${path}`, 'https://github.com')
     if (query.pathname === `/repos/${slug}/actions/runs`) {
-      const run = runs.get(query.searchParams.get('head_sha') ?? '')
+      const sha = query.searchParams.get('head_sha') ?? ''
+      if (beforeRuns) await beforeRuns(sha)
+      const run = runs.get(sha)
       const workflow_runs = run ? [{ id: run.id, workflow_id: 4, run_number: run.id, head_sha: run.sha, run_attempt: 1,
         status: 'completed', conclusion: 'success', html_url: `${url}/actions/runs/${run.id}`, event: run.base ? 'pull_request' : 'push',
         head_branch: run.branch,
@@ -177,8 +259,19 @@ function actionsHost() {
     throw new Error(`Unexpected hosting request: ${path}`)
   })
   return { number, publish: (sha: string, base?: string, branch?: string) => runs.set(sha, { id: ++runId, sha, base, branch }),
+    withdraw: (sha: string) => runs.delete(sha),
     stopDiscovery: () => { discoveryAvailable = false },
     setPull: (value: Pull) => { pull = value; return pullResponse(value) } }
+}
+
+async function interruptedByRestart(lifetime: AbortSignal): Promise<never> {
+  if (!lifetime.aborted) {
+    const stopped = Promise.withResolvers<void>()
+    lifetime.addEventListener('abort', () => stopped.resolve(), { once: true })
+    await stopped.promise
+  }
+  lifetime.throwIfAborted()
+  throw new Error('Unexpected continuation past the interruption')
 }
 /** Move a real Plan Ticket's durable queue projection into repair without adding a test-only production hook. */
 function repairIntent(ticketId: string): MainlineIntent {
@@ -192,7 +285,7 @@ function repairIntent(ticketId: string): MainlineIntent {
 }
 
 it('clears a failed durable repair reason after a restart resumes the same repair intent', async () => {
-  const { id: planId, a } = await registerPlan()
+  const { id: planId, workers: { trim: a } } = await registerPlan({ start: ['trim'] })
   const intent = repairIntent(a.ticketId)
   h.runtime.store.set(KV.mainline.ticket(a.ticketId), [intent])
   const calls: { ticketId: string; repairId: string }[] = []
@@ -226,7 +319,7 @@ it('clears a failed durable repair reason after a restart resumes the same repai
 }, 90_000)
 
 it('does not let a repair callback clear failure state for a different ticket or superseded intent', async () => {
-  const { a, b } = await registerPlan()
+  const { workers: { trim: a, lowercase: b } } = await registerPlan({ start: labelNodes })
   const intent = repairIntent(a.ticketId)
   h.runtime.store.set(KV.mainline.ticket(a.ticketId), [intent])
   const entered = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>()
@@ -256,32 +349,28 @@ it('does not let a repair callback clear failure state for a different ticket or
 })
 
 it('serializes two reviewed Plan candidates, then verifies a conflict repair only with fresh evidence', async () => {
-  const { repository, git } = h.localGit!
-  mkdirSync(join(repository, 'docs'))
-  write(repository, 'DOCS.md', '# Documentation\n\n- [Label documentation](docs/labels.md)\n')
-  formatLabel(repository, 'value', 'Display labels unchanged')
-  const base = commit(repository, 'Define the original label contract')
-  const remote = join(h.directory, 'remote.git')
-  git('init', '-q', '--bare', '--initial-branch=main', remote)
-  git('push', remote, `HEAD:${targetRef}`)
-  const tip = () => git('-C', remote, 'rev-parse', targetRef)
+  const { repository, git, base, remote, tip, runGit } = mainlineRepository()
   const firstPush = Promise.withResolvers<void>()
   const releasePush = Promise.withResolvers<void>()
   let pausedPush = false
   const writes: string[][] = []
+  let afterPush: (() => void) | undefined
   // Change only the transport destination. All Git inspection, ancestry checks, writes and verification still run real commands.
   vi.spyOn(Commands.prototype, 'git').mockImplementation(async function (this: Commands, args, cwd) {
-    if (!args.includes(canonicalUrl)) return runCommand.call(this, 'git', args, cwd)
+    if (!args.includes(canonicalUrl)) return runGit(this, args, cwd)
     if (args.includes('push')) {
       writes.push(args)
       if (!pausedPush) { pausedPush = true; firstPush.resolve(); await releasePush.promise }
     }
-    return runCommand.call(this, 'git', ['-c', 'protocol.file.allow=always', ...args.map(arg => arg === canonicalUrl ? remote : arg)], cwd)
+    const result = await runGit(this, args, cwd)
+    if (args.includes('push')) afterPush?.()
+    return result
   })
 
-  const ci = actionsHost()
+  let actionsReads = 0
+  const ci = actionsHost(async () => { actionsReads++ })
   await configureCI()
-  const { id, a, b, dispatch } = await registerPlan()
+  const { id, workers: { trim: a, lowercase: b }, dispatch } = await registerPlan({ start: labelNodes })
   formatLabel(a.directory, 'value.trim()', 'Trim leading and trailing whitespace')
   const shaA = commit(a.directory, 'Trim display labels')
   formatLabel(b.directory, 'value.toLowerCase()', 'Convert letters to lowercase')
@@ -299,7 +388,7 @@ it('serializes two reviewed Plan candidates, then verifies a conflict repair onl
   ci.publish(shaA, undefined, branchA)
   ci.publish(shaB, base)
   ci.setPull({ sha: shaB, base, branch: branchB, closed: false })
-  await h.runTool(b.session, 'orchestrator_report', { state: 'progress', pr_number: ci.number, summary: 'Verified the lowercase formatter.' })
+  await h.runTool(b.session, 'orchestrator_report', { state: 'ready', pr_number: ci.number, summary: 'delivery-check passed: ready for delivery.' })
 
   const target = { repository, slug, ref: targetRef }
   const show = async (worker: Worker, mainline: object) => {
@@ -313,11 +402,14 @@ it('serializes two reviewed Plan candidates, then verifies a conflict repair onl
   const assertNoReceipt = async () => {
     for (const node of ['trim', 'lowercase']) expect(await read(`plan/${id}/node/${node}`)).not.toHaveProperty('delivery')
     expect(await dispatch('combined-check')).toMatchObject({ status: 'blocked', waitingOn: ['trim', 'lowercase'] })
+    expect(combinedAssignments()).toEqual([])
   }
   for (const [worker, candidate] of [[a, shaA], [b, shaB]] as const) {
     expect(await delivery(worker.ticketId)).toMatchObject({ ready: true, base, candidate, ci_status: 'passed', mainline: { status: 'pending_merge' } })
+    expect(await delivery(worker.ticketId)).toMatchObject({ formal_delivery: { status: 'blocked', missing: expect.arrayContaining(['mainline_verification']) } })
   }
   await expect(h.runTool(b.session, 'orchestrator_queue_merge', { ticket_id: b.ticketId, candidate: shaB })).rejects.toThrow(/not registered/i)
+  await assertNoReceipt()
 
   await observePull(h.runtime.context(githubKind), ci.setPull({ sha: shaB, base, branch: branchB, closed: true }))
   expect(await delivery(b.ticketId)).toMatchObject({ ready: false, missing: expect.arrayContaining(['required_ci']), mainline: { status: 'pending_merge' } })
@@ -347,6 +439,10 @@ it('serializes two reviewed Plan candidates, then verifies a conflict repair onl
   expect(git('rev-parse', `${integratedA}^`)).toBe(shaA)
   expect(git('rev-parse', `${integratedA}^{tree}`)).toBe(git('rev-parse', `${shaA}^{tree}`))
   await show(a, { status: 'verified', id: queuedA.id, base, candidate: shaA, actual: integratedA, integration: integratedA, target, verification })
+  const closedA = await delivered(id, 'trim', a, queuedA, base, shaA, integratedA)
+  expect(await dispatch('combined-check')).toMatchObject({ status: 'blocked', waitingOn: ['lowercase'] })
+  expect(await read(`plan/${id}/node/lowercase`)).not.toHaveProperty('delivery')
+  expect(combinedAssignments()).toEqual([])
   const repairedTicket = await show(b, { status: 'repair', id: queuedB.id, base, candidate: shaB, actual: integratedA, target })
   expect(repairedTicket.mainline).not.toHaveProperty('verification')
   expect(repairedTicket).toMatchObject({ execution: { base: { sha: integratedA, ref: targetRef } } })
@@ -363,11 +459,27 @@ it('serializes two reviewed Plan candidates, then verifies a conflict repair onl
   expect(() => git('-C', b.directory, 'merge', '--no-edit', integratedA)).toThrow()
   expect(git('-C', b.directory, 'diff', '--name-only', '--diff-filter=U').split(/\r?\n/)).toEqual([contractDoc, routeDoc, labelFile])
   formatLabel(b.directory, 'value.trim().toLowerCase()', 'Trim surrounding whitespace and convert letters to lowercase')
-  const fresh = commit(b.directory, 'Resolve code and Doc Tree conflicts')
-  expect(git('-C', b.directory, 'show', '-s', '--format=%P', fresh)).toBe(`${shaB} ${integratedA}`)
-  expect(await delivery(b.ticketId)).toMatchObject({ ready: false, base: integratedA, candidate: fresh,
+  write(b.directory, routeDoc, '# Labels\n\n[Contract](missing-contract.md)\n')
+  const broken = commit(b.directory, 'Resolve formatter conflict but leave a broken documentation route')
+  expect(git('-C', b.directory, 'show', '-s', '--format=%P', broken)).toBe(`${shaB} ${integratedA}`)
+  expect(await delivery(b.ticketId)).toMatchObject({ ready: false, base: integratedA, candidate: broken,
     missing: expect.arrayContaining(['dual-review', 'acceptance', 'docs', 'tests', 'required_ci']) })
-  await expect(queue(b.ticketId, fresh)).rejects.toThrow(/Candidate is not ready to queue/i)
+  await expect(queue(b.ticketId, broken)).rejects.toThrow(/Candidate is not ready to queue/i)
+  await reviewAndTest(b, id, integratedA, broken, 'alert')
+  const brokenRoute = await inspectDocs(b, broken)
+  expect(brokenRoute).toMatchObject({ candidate: broken, structure: 'issues', issues: expect.arrayContaining([
+    expect.objectContaining({ kind: 'broken-link', path: routeDoc, target: 'missing-contract.md' }),
+  ]) })
+  const finding = 'combined-contract-route'
+  await retro(b, broken, { kind: 'first-retro', findings: [{ id: finding, category: 'standard',
+    summary: 'The combined formatter contract is unreachable.', evidence: [brokenRoute.read], affects: ['docs'] }] })
+  expect(await delivery(b.ticketId)).toMatchObject({ ready: false, missing: expect.arrayContaining(['docs', `repair:${finding}`]) })
+  await expect(queue(b.ticketId, broken)).rejects.toThrow(/repair:combined-contract-route/)
+  expect(await dispatch('combined-check')).toMatchObject({ status: 'blocked', waitingOn: ['lowercase'] })
+
+  formatLabel(b.directory, 'value.trim().toLowerCase()', 'Trim surrounding whitespace and convert letters to lowercase')
+  const fresh = commit(b.directory, 'Restore the route to the combined label contract')
+  await retro(b, fresh, { kind: 'repair', fixes: [{ id: finding, evidence: [`https://github.com/${slug}/commit/${fresh}`] }] })
 
   await recordEvidence(b, id, integratedA, fresh, '2', 'alert', priorTest)
   git('-C', b.directory, 'push', remote, `HEAD:refs/heads/${branchB}`)
@@ -376,6 +488,8 @@ it('serializes two reviewed Plan candidates, then verifies a conflict repair onl
   await expect(queue(b.ticketId, fresh)).rejects.toThrow(/required_ci/)
   ci.publish(fresh, integratedA)
   expect(await delivery(b.ticketId)).toMatchObject({ ready: true, base: integratedA, candidate: fresh, ci_status: 'passed' })
+  // The queue admission and final prewrite check see good CI. Lose only this run after the real Git write.
+  afterPush = () => { ci.withdraw(fresh) }
   const retried = await queue(b.ticketId, fresh)
   expect(retried).toMatchObject({ status: 'queued', id: expect.any(String), base: integratedA, candidate: fresh, target })
   expect(retried.id).not.toBe(queuedB.id)
@@ -384,57 +498,260 @@ it('serializes two reviewed Plan candidates, then verifies a conflict repair onl
   expect(git('rev-parse', `${integratedB}^`)).toBe(fresh)
   await show(b, { status: 'verified', id: retried.id, base: integratedA, candidate: fresh, actual: integratedB, integration: integratedB, target, verification })
   expect(writes).toHaveLength(2)
-  await assertNoReceipt()
+  const assertFormalBlock = async (reason: string, ciSkipped = false) => {
+    const page = await read(`ticket/${b.ticketId}/mainline`)
+    const latest = z.array(z.looseObject({ id: z.string(), delivery_missing: z.array(z.string()).optional() })).parse(page.items)[0]
+    expect(latest).toMatchObject({ id: retried.id, status: 'verified', delivery_missing: expect.arrayContaining([reason]) })
+    const check = await delivery(b.ticketId)
+    expect(check).toMatchObject({ formal_delivery: { status: 'blocked', missing: expect.arrayContaining([reason]) } })
+    if (ciSkipped) {
+      expect.soft(latest?.delivery_missing, reason).not.toContain('required_ci')
+      expect.soft(check.formal_delivery, reason).toMatchObject({ missing: expect.not.arrayContaining(['required_ci']) })
+    }
+    expect(await read(`ticket/${b.ticketId}`)).not.toHaveProperty('ended')
+    expect(await read(`plan/${id}/node/lowercase`)).not.toHaveProperty('delivery')
+    expect(await dispatch('combined-check')).toMatchObject({ status: 'blocked', waitingOn: ['lowercase'] })
+    expect(combinedAssignments()).toEqual([])
+    expect(writes).toHaveLength(2)
+  }
+  const recheck = async () => {
+    expect(await queue(b.ticketId, fresh)).toMatchObject({ id: retried.id, status: 'verified' })
+    await h.runtime.idle()
+  }
+  await assertFormalBlock('required_ci')
+  ci.publish(fresh, integratedA)
+  const lose = evidenceLoss(b, fresh, broken)
+  for (const [observation, missing] of [
+    ['acceptance', 'acceptance:2'], ['standards', 'dual-review:standards'], ['spec', 'dual-review:spec'],
+    ['tests', 'tests'], ['docs', 'docs'], ['first-retro', 'first-retro'], ['final-retro', 'final-retro'], ['repair', `repair:${finding}`],
+  ] as const) {
+    lose(observation)
+    const readsBefore = actionsReads
+    await recheck()
+    expect(actionsReads, `Formal CI queried despite missing ${observation}`).toBe(readsBefore)
+    await assertFormalBlock(missing, true)
+  }
+  lose()
+  // Even a previously verified attempt is not enough if an external write removed its integration.
+  git('-C', remote, 'update-ref', targetRef, fresh, integratedB)
+  await recheck()
+  await assertFormalBlock('mainline_verification')
+  git('-C', remote, 'update-ref', targetRef, integratedB, fresh)
+  await recheck()
+  const closedB = await delivered(id, 'lowercase', b, retried, integratedA, fresh, integratedB)
+  const c = await claimCombined(id, dispatch)
   await h.restart()
   await h.runtime.idle()
   await show(a, { status: 'verified', id: queuedA.id, candidate: shaA, actual: integratedA, verification })
   await show(b, { status: 'verified', id: retried.id, candidate: fresh, actual: integratedB, verification })
   expect(writes).toHaveLength(2)
-  await assertNoReceipt()
-}, 90_000)
+  await Promise.all([queue(a.ticketId, shaA), queue(b.ticketId, fresh)])
+  expect(await dispatch('combined-check')).toMatchObject({ reused: true, claim: c })
+  await h.runtime.idle()
+  expect(await delivered(id, 'trim', a, queuedA, base, shaA, integratedA)).toEqual(closedA)
+  expect(await delivered(id, 'lowercase', b, retried, integratedA, fresh, integratedB)).toEqual(closedB)
+  expect(combinedAssignments()).toEqual([{ ticketId: c.ticketId, session: c.session }])
+  expect(writes).toHaveLength(2)
+}, 240_000)
 
-it.each(['intent stored', 'Git advanced', 'candidate already present', 'external advance during write'] as const)('reconciles mainline when %s', async point => {
-  const { repository, git } = h.localGit!
-  mkdirSync(join(repository, 'docs'))
-  write(repository, 'DOCS.md', '# Documentation\n\n- [Label documentation](docs/labels.md)\n')
-  formatLabel(repository, 'value', 'Display labels unchanged')
-  const base = commit(repository, 'Define the original label contract')
-  const remote = join(h.directory, 'recovery.git')
-  git('init', '-q', '--bare', '--initial-branch=main', remote)
-  git('push', remote, `HEAD:${targetRef}`)
-  const tip = () => git('-C', remote, 'rev-parse', targetRef)
+/** B is C's last prerequisite. The one authorized push succeeded, but its Actions run disappeared before closure. */
+async function verifiedLowercaseWithoutCI(linkExample = false) {
+  const { git, base, remote, tip, runGit } = mainlineRepository()
   const ci = actionsHost()
   await configureCI()
-  const { id, a } = await registerPlan()
+  const { id, workers: { lowercase: b }, dispatch } = await registerPlan({ start: ['lowercase'], checkDependsOn: ['lowercase'] })
+  formatLabel(b.directory, 'value.toLocaleLowerCase()', 'Convert letters to lowercase')
+  if (linkExample) {
+    write(b.directory, exampleFile, '{"label":"alert"}\n')
+    write(b.directory, contractDoc, `# Public label formatter\n\nConvert letters to lowercase.\n\n[An example](../${exampleFile})\n`)
+  }
+  const candidate = commit(b.directory, 'Lowercase display labels')
+  const branch = git('-C', b.directory, 'branch', '--show-current')
+  await recordEvidence(b, id, base, candidate, '2', '  alert  ')
+  ci.publish(candidate, undefined, branch)
+
+  const transport: { writes: number; afterFetch?: () => void } = { writes: 0 }
+  vi.spyOn(Commands.prototype, 'git').mockImplementation(async function (this: Commands, args, cwd) {
+    if (!args.includes(canonicalUrl)) return runGit(this, args, cwd)
+    if (args.includes('push')) transport.writes++
+    const result = await runGit(this, args, cwd)
+    if (args.includes('push')) ci.withdraw(candidate)
+    if (args.includes('fetch')) transport.afterFetch?.()
+    return result
+  })
+  const intent = await queue(b.ticketId, candidate)
+  expect(intent).toMatchObject({ status: 'queued', id: expect.any(String), candidate, base })
+  await h.runtime.idle()
+  const integration = tip()
+  expect(git('rev-parse', `${integration}^`)).toBe(candidate)
+  const blocked = async () => {
+    expect(await read(`ticket/${b.ticketId}`)).not.toHaveProperty('ended')
+    expect(await read(`plan/${id}/node/lowercase`)).not.toHaveProperty('delivery')
+    expect(await dispatch('combined-check')).toMatchObject({ status: 'blocked', waitingOn: ['lowercase'] })
+    expect(combinedAssignments()).toEqual([])
+    expect(transport.writes).toBe(1)
+  }
+  const formalBlock = async (reason: string | RegExp) => {
+    const missing = expect.arrayContaining([typeof reason === 'string' ? reason : expect.stringMatching(reason)])
+    expect(await delivery(b.ticketId)).toMatchObject({ formal_delivery: { status: 'blocked', missing },
+      mainline: { status: 'verified', id: intent.id, candidate, integration, delivery_missing: missing } })
+    await blocked()
+  }
+  await formalBlock('required_ci')
+  ci.publish(candidate, undefined, branch)
+  const replay = async () => {
+    expect(await queue(b.ticketId, candidate)).toMatchObject({ id: intent.id, status: 'verified' })
+    await h.runtime.idle()
+    expect(transport.writes).toBe(1)
+  }
+  return { git, base, remote, tip, ci, id, b, dispatch, branch, candidate, integration, intent, transport, blocked, formalBlock, replay }
+}
+
+it('rechecks the Worker checkout after the real target fetch before closing a verified intent', async () => {
+  const { git, id, b, dispatch, base, intent, candidate, integration, transport, formalBlock, replay } = await verifiedLowercaseWithoutCI()
+  expect(git('-C', b.directory, 'status', '--porcelain')).toBe('')
+  // Only the external transport changes the checkout; there is no tool call or SQLite mutation to invalidate the approval.
+  transport.afterFetch = () => write(b.directory, labelFile, 'export const label = () => "wrong"\n')
+  await replay()
+  delete transport.afterFetch
+  expect(git('-C', b.directory, 'rev-parse', 'HEAD')).toBe(candidate)
+  expect(git('-C', b.directory, 'diff', '--name-only')).toBe(labelFile)
+  await formalBlock(/^(clean_worktree|delivery_target_changed)$/)
+
+  git('-C', b.directory, 'restore', '--', labelFile)
+  await replay()
+  await delivered(id, 'lowercase', b, intent, base, candidate, integration)
+  await claimCombined(id, dispatch)
+}, 180_000)
+
+it('checks the ticket Doc Tree at the actual descendant and receipts an unrelated advance', async () => {
+  const { git, base, remote, tip, id, b, dispatch, candidate, integration, intent, formalBlock, replay } = await verifiedLowercaseWithoutCI(true)
+  const upstream = join(h.directory, 'upstream')
+  h.localGit!.worktree(upstream, 'upstream', integration)
+  const advance = (message: string) => {
+    const sha = commit(upstream, message)
+    git('-C', upstream, 'push', remote, `HEAD:${targetRef}`)
+    expect(tip()).toBe(sha)
+    return sha
+  }
+  // Both bad heads fast-forward the actual integration. Neither changes the verified Worker checkout.
+  write(upstream, routeDoc, '# Labels\n\n- [Contract](missing-contract.md)\n')
+  advance('Break the navigation route on main')
+  await replay()
+  await formalBlock('mainline_docs')
+  git('-C', upstream, 'restore', '--source', integration, '--', routeDoc)
+  git('-C', upstream, 'rm', '--', contractDoc)
+  advance('Restore navigation but remove its contract on main')
+  await replay()
+  await formalBlock('mainline_docs')
+
+  git('-C', upstream, 'restore', '--source', integration, '--staged', '--worktree', '--', contractDoc)
+  git('-C', upstream, 'rm', '--', exampleFile)
+  const missingExample = advance('Restore the contract but remove its linked example')
+  expect(git('diff', '--name-only', integration, missingExample)).toBe(exampleFile)
+  await replay()
+  await formalBlock('mainline_docs')
+
+  git('-C', upstream, 'restore', '--source', integration, '--staged', '--worktree', '--', exampleFile)
+  write(upstream, labelFile, 'export const label = value => value\n')
+  const revertedCode = advance('Restore the example but revert the reviewed behavior')
+  expect(git('diff', '--name-only', integration, revertedCode)).toBe(labelFile)
+  await replay()
+  await formalBlock('mainline_candidate_changed')
+
+  git('-C', upstream, 'restore', '--source', integration, '--worktree', '--', labelFile)
+  write(upstream, 'release-notes.txt', 'Unrelated release housekeeping.\n')
+  const actual = advance('Restore the contract and add unrelated release notes')
+  expect(git('diff', '--name-only', integration, actual)).toBe('release-notes.txt')
+  await replay()
+  await delivered(id, 'lowercase', b, intent, base, candidate, integration, actual)
+  await claimCombined(id, dispatch)
+}, 180_000)
+
+it('admits a fresh candidate after verified-but-unclosed delivery and requests repair on the actual integration', async () => {
+  const { git, base, tip, ci, id, b, dispatch, branch, candidate, integration, intent, transport, blocked } = await verifiedLowercaseWithoutCI()
+  formatLabel(b.directory, 'value.toLowerCase()', 'Convert letters to lowercase independently of the host locale')
+  const replacement = commit(b.directory, 'Make lowercasing independent of the host locale')
+  await recordEvidence(b, id, base, replacement, '2', '  alert  ')
+  ci.publish(replacement, undefined, branch)
+  expect(await delivery(b.ticketId)).toMatchObject({ ready: true, base, candidate: replacement, ci_status: 'passed' })
+  const next = await queue(b.ticketId, replacement)
+  expect(next).toMatchObject({ id: expect.any(String), status: 'queued', base, candidate: replacement })
+  expect(next.id).not.toBe(intent.id)
+  await h.runtime.idle()
+  expect(tip()).toBe(integration)
+  expect(await read(`ticket/${b.ticketId}`)).toMatchObject({ mainline: { id: next.id, status: 'repair', actual: integration,
+    repair_requested: true, candidate: replacement }, execution: { base: { sha: integration, ref: targetRef } } })
+  const input = await read(`ticket/${b.ticketId}/input/${String(next.id)}`)
+  expect(JSON.parse(String(input.text))).toMatchObject({ kind: 'mainline-repair', id: next.id, base: integration, candidate: replacement, ref: targetRef })
+  await blocked()
+
+  git('-C', b.directory, 'merge', '--no-edit', integration)
+  const repaired = git('-C', b.directory, 'rev-parse', 'HEAD')
+  await recordEvidence(b, id, integration, repaired, '2', '  alert  ')
+  ci.publish(repaired, undefined, branch)
+  const final = await queue(b.ticketId, repaired)
+  expect(final).toMatchObject({ status: 'queued', base: integration, candidate: repaired })
+  await h.runtime.idle()
+  const actual = tip()
+  expect(git('rev-parse', `${actual}^`)).toBe(repaired)
+  const closed = await delivered(id, 'lowercase', b, final, integration, repaired, actual)
+  await claimCombined(id, dispatch)
+  await expect(queue(b.ticketId, candidate)).rejects.toThrow()
+  await h.runtime.idle()
+  expect(await delivered(id, 'lowercase', b, final, integration, repaired, actual)).toEqual(closed)
+  expect(tip()).toBe(actual)
+  expect(transport.writes).toBe(2)
+}, 240_000)
+
+it.each(['intent stored', 'Git advanced', 'candidate already present', 'external advance during write'] as const)('reconciles mainline when %s', async point => {
+  const { git, base, remote, tip, runGit } = mainlineRepository()
+  // For the post-push crash, interrupt recovery once more inside the formal gate's external CI read.
+  const inFormalCheck = Promise.withResolvers<void>()
+  let interruptCI = false
+  const ci = actionsHost(async sha => {
+    if (!interruptCI || sha !== candidate) return
+    interruptCI = false
+    const signal = h.runtime.lifetime
+    inFormalCheck.resolve()
+    await interruptedByRestart(signal)
+  })
+  await configureCI()
+  // Isolate recovery of the last prerequisite here; the serialization scenario above covers the two-way join.
+  const { id, workers: { trim: a }, dispatch } = await registerPlan({ start: ['trim'], checkDependsOn: ['trim'] })
   formatLabel(a.directory, 'value.trim()', 'Trim leading and trailing whitespace')
   const candidate = commit(a.directory, 'Trim display labels')
   await recordEvidence(a, id, base, candidate, '1', 'ALERT')
   ci.publish(candidate, undefined, git('-C', a.directory, 'branch', '--show-current'))
-  await h.runTool(a.session, 'orchestrator_report', { state: 'ready', summary: 'Verified the formatter.' })
+  await h.runTool(a.session, 'orchestrator_report', { state: 'ready', summary: 'delivery-check passed; the formatter is delivered.' })
   await h.runtime.idle()
+  const blocked = async () => {
+    expect(await read(`ticket/${a.ticketId}`)).not.toHaveProperty('ended')
+    expect(await read(`plan/${id}/node/trim`)).not.toHaveProperty('delivery')
+    expect(await dispatch('combined-check')).toMatchObject({ status: 'blocked', waitingOn: ['trim'] })
+    expect(combinedAssignments()).toEqual([])
+  }
+  await blocked()
 
   const reached = Promise.withResolvers<void>(), lifetime = h.runtime.lifetime
   let interrupted = false, writes = 0
   vi.spyOn(Commands.prototype, 'git').mockImplementation(async function (this: Commands, args, cwd) {
-    if (!args.includes(canonicalUrl)) return runCommand.call(this, 'git', args, cwd)
+    if (!args.includes(canonicalUrl)) return runGit(this, args, cwd)
     const push = args.includes('push')
     if (push) writes++
     const breakHere = !interrupted && (point === 'intent stored' ? args.includes('fetch') : point !== 'candidate already present' && push)
-    const run = () => runCommand.call(this, 'git', ['-c', 'protocol.file.allow=always', ...args.map(arg => arg === canonicalUrl ? remote : arg)], cwd)
+    const run = () => runGit(this, args, cwd)
     if (!breakHere) return run()
     if (point === 'external advance during write') git('-C', a.directory, 'push', remote, `${candidate}:${targetRef}`)
-    else if (push) await run()
+    else await run() // Interrupt after the real fetch or push, before its result reaches the host.
     interrupted = true
     reached.resolve()
-    const stopped = Promise.withResolvers<void>()
-    if (!lifetime.aborted) {
-      lifetime.addEventListener('abort', () => stopped.resolve(), { once: true })
-      await stopped.promise
-    }
-    lifetime.throwIfAborted()
-    throw new Error('Unexpected continuation past the interruption')
+    return interruptedByRestart(lifetime)
   })
-  if (point === 'candidate already present') git('-C', a.directory, 'push', remote, `${candidate}:${targetRef}`)
+  if (point === 'candidate already present') {
+    git('-C', a.directory, 'push', remote, `${candidate}:${targetRef}`)
+    await blocked() // Candidate present before a Hub intent exists is not a delivery.
+  }
 
   const intent = await queue(a.ticketId, candidate)
   expect(intent).toMatchObject({ status: 'queued', base, candidate })
@@ -444,8 +761,18 @@ it.each(['intent stored', 'Git advanced', 'candidate already present', 'external
     const integration = inFlight && typeof inFlight === 'object' && 'integration' in inFlight ? inFlight.integration : undefined
     expect(tip()).toBe(point === 'Git advanced' ? integration : point === 'intent stored' ? base : candidate)
     expect(inFlight).toMatchObject({ id: intent.id, status: point === 'intent stored' ? 'queued' : 'applying', candidate })
+    expect(inFlight).not.toHaveProperty('verification')
+    await blocked()
     ci.stopDiscovery()
+    interruptCI = point === 'Git advanced'
     await h.restart()
+    if (point === 'Git advanced') {
+      await Promise.race([inFormalCheck.promise, h.runtime.idle().then(() => { throw new Error('Recovery did not reach the formal CI check') })])
+      expect(await read(`ticket/${a.ticketId}`)).toMatchObject({ mainline: { id: intent.id, status: 'verified', integration: tip() } })
+      await blocked()
+      expect(writes).toBe(1)
+      await h.restart()
+    }
   }
   await h.runtime.idle()
   const { mainline } = await read(`ticket/${a.ticketId}`)
@@ -454,10 +781,20 @@ it.each(['intent stored', 'Git advanced', 'candidate already present', 'external
     expect(mainline).toMatchObject({ status: 'waiting', actual: candidate })
     expect(mainline).not.toHaveProperty('verification')
     expect(writes).toBe(point === 'candidate already present' ? 0 : 1)
+    await blocked()
   } else {
     expect(git('rev-parse', `${tip()}^`)).toBe(candidate)
     expect(mainline).toMatchObject({ id: intent.id, status: 'verified', candidate, actual: tip(), integration: tip(), verification: { status: 'passed' } })
     expect(writes).toBe(1)
+    const closed = await delivered(id, 'trim', a, intent, base, candidate, tip())
+    const c = await claimCombined(id, dispatch)
+    await h.restart()
+    await h.runtime.idle()
+    expect(await queue(a.ticketId, candidate)).toMatchObject({ id: intent.id, status: 'verified' })
+    expect(await dispatch('combined-check')).toMatchObject({ reused: true, claim: c })
+    await h.runtime.idle()
+    expect(await delivered(id, 'trim', a, intent, base, candidate, tip())).toEqual(closed)
+    expect(combinedAssignments()).toEqual([{ ticketId: c.ticketId, session: c.session }])
+    expect(writes).toBe(1)
   }
-  expect(await read(`plan/${id}/node/trim`)).not.toHaveProperty('delivery')
-}, 90_000)
+}, 120_000)

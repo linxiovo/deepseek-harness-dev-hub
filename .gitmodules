@@ -1,6 +1,0 @@
-[submodule "References/Projects/dsh-superagent-prototype"]
-	path = meta/References/Projects/dsh-superagent-prototype
-	url = https://github.com/deepseek-ai/dsh-superagent-prototype.git
-[submodule "References/Skills/mattpocock"]
-	path = meta/References/Skills/mattpocock
-	url = https://github.com/mattpocock/skills.git

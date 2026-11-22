@@ -215,24 +215,37 @@ it('reacquires changed evidence after the final retro and only queues with curre
         basis: [axis === 'standards' ? 'Repository guidance' : `spec/${id}`], conclusion: 'passed', blockers: [], reuses })
     }))
   }
-  const tests = async (candidate: string, check: string) => {
+  const tests = async (candidate: string, check: string, status: 'passed' | 'failed' | 'not_run' = 'passed') => {
     const code = `import assert from 'node:assert/strict'; import { label } from './label.mjs'; ${check}`
-    const run = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: directory, encoding: 'utf8' })
-    expect(run.status, run.stderr).toBe(0)
+    if (status !== 'not_run') {
+      const run = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: directory, encoding: 'utf8' })
+      expect(run.status, run.stderr).toBe(status === 'passed' ? 0 : 1)
+      if (status === 'failed') expect(run.stderr).toMatch(/AssertionError/)
+    }
     return h.runTool(session, 'orchestrator_test_evidence', { candidate, scope: 'focused', reason: 'Only label() changed.', red: null,
-      checks: [{ directory: '.', command: `node --input-type=module -e ${JSON.stringify(code)}`, status: 'passed', observed: 'exit 0' }] })
+      checks: [{ directory: '.', command: `node --input-type=module -e ${JSON.stringify(code)}`, status,
+        observed: status === 'not_run' ? 'Not executed.' : status === 'passed' ? 'exit 0' : 'exit 1' }] })
   }
   const acceptance = (criteria: string[], ref: unknown) => ({ kind: 'acceptance', results: criteria.map(id => ({ id, status: 'passed', evidence: [ref] })) })
   const before = commit('export const label = value => value.trimStart()\n')
   await review(before)
   const original = await tests(before, "assert.equal(label(' alert'), 'alert'); assert.equal(label(''), '')")
+  const failed = await tests(before, "assert.equal(label(' alert '), 'alert')", 'failed')
+  const unrun = await tests(before, "assert.equal(label(''), '')", 'not_run')
+  const brokenDocs = await h.runTool(session, 'orchestrator_doc_impact', { candidate: before,
+    root: 'missing-navigation.md', routes: [], leaves: [], impact: { kind: 'unchanged', reason: 'No changes to navigation.' } })
+  expect(brokenDocs).toMatchObject({ structure: 'issues', read: expect.any(String) })
+  const latest = await tests(before, "assert.equal(label(' alert'), 'alert'); assert.equal(label(''), '')")
   await submit(before, { kind: 'first-retro', findings: [{ id: 'improve-direction', category: 'optional',
     summary: 'Consider a localized future mode.', evidence: [original.read] }] })
   expect(await read('retro-followups')).toMatchObject({ items: [{ ticket_id: ticketId, id: expect.any(String), summary: 'Consider a localized future mode.' }] })
   await h.runTool(session, 'orchestrator_doc_impact', { candidate: before, root: null, routes: [], leaves: [],
     impact: { kind: 'unchanged', reason: 'No change to documented inputs or outputs.' } })
-  await expect(submit(before, acceptance(['1', 'invented'], original.read))).rejects.toThrow(/canonical/i)
-  await submit(before, acceptance(['1', '2'], original.read))
+  for (const ref of [failed.read, unrun.read, brokenDocs.read]) {
+    await expect(submit(before, acceptance(['1'], ref))).rejects.toThrow(/successful test or Doc Tree/i)
+  }
+  await expect(submit(before, acceptance(['1', 'invented'], latest.read))).rejects.toThrow(/canonical/i)
+  await submit(before, acceptance(['1', '2'], latest.read))
   await submit(before, { kind: 'final-retro', findings: [{ id: 'trailing-spaces', category: 'correctness',
     summary: 'Trailing spaces still leak into the label.', evidence: [original.read], affects: ['acceptance:1', 'tests'] }] })
   expect(await inspect()).toMatchObject({ ready: false, status: 'return_for_recheck', candidate: before })
@@ -265,6 +278,7 @@ it('reacquires changed evidence after the final retro and only queues with curre
     await expect(submit(candidate, acceptance(['1'], current))).resolves.toMatchObject({ recorded: 'acceptance', candidate })
   }
   await submit(candidate, { kind: 'final-retro', findings: [] })
+  await tests(candidate, "assert.equal(label(' alert '), 'alert'); assert.equal(label(''), '')")
   git('reset', '--keep', before)
   await expect(submit(before, { kind: 'first-retro', findings: [] })).rejects.toThrow(/repair lineage/i)
   git('reset', '--keep', candidate)
@@ -315,6 +329,34 @@ it('reacquires changed evidence after the final retro and only queues with curre
       acceptance: [{ id: '1', result: { revision: { candidate } } }, { id: '2', result: { revision: { candidate: before } } }] },
     ci: { evidence: { sha: candidate, satisfied: true, checks: [{ run: { url } }] } },
   })
+  // Fault injection only: normal Workers cannot rewrite committed observations. Keep a later PASS in every case.
+  const { tickets } = h.runtime.store
+  const persisted = tickets.get(ticketId)!
+  const ledger = persisted.deliveryCheck!
+  const fixedIndex = Number(String(fixed.read).split('/').at(-1))
+  for (const events of [
+    ledger.events.filter((_, index) => index !== fixedIndex),
+    ledger.events.map(event => event.kind === 'acceptance' && event.revision.candidate === candidate
+      ? { ...event, results: event.results.map(result => ({ ...result, evidence: [String(original.read)] })) } : event),
+  ]) {
+    tickets.save({ ...persisted, deliveryCheck: { events } })
+    const replay = await inspect()
+    expect(replay).toMatchObject({ ready: false, missing: expect.arrayContaining(['acceptance:1']) })
+    expect(replay.missing).not.toContain('tests')
+    expect(replay.missing).not.toContain('dual-review')
+  }
+  for (const events of [
+    ledger.events.filter(event => event.kind !== 'repair'),
+    ledger.events.map(event => event.kind === 'repair'
+      ? { ...event, fixes: event.fixes.map(fix => ({ ...fix, id: 'another-finding' })) } : event),
+  ]) {
+    tickets.save({ ...persisted, deliveryCheck: { events } })
+    const replay = await inspect()
+    expect(replay).toMatchObject({ ready: false, missing: expect.arrayContaining(['repair:trailing-spaces']) })
+    expect(replay.missing).not.toContain('dual-review')
+  }
+  tickets.save(persisted)
+  expect(await inspect()).toMatchObject({ ready: true })
   expect(await read(`plan/${id}/node/labels`)).not.toHaveProperty('delivery')
   await h.runTool(session, 'orchestrator_report', { state: 'progress', pr_number: 29, summary: 'Review and acceptance recorded for this PR.' })
   expect(await inspect()).toMatchObject({ ready: true })
@@ -332,8 +374,13 @@ it('reacquires changed evidence after the final retro and only queues with curre
   const changed = commit('export const label = value => value.trim().toLowerCase()\n')
   releaseCi.resolve()
   expect(await delivery).toMatchObject({ ready: false, candidate: changed, missing: expect.arrayContaining(['delivery_target_changed']) })
+  await review(changed)
+  const regression = await tests(changed, "assert.equal(label(' ALERT '), 'ALERT')", 'failed')
+  await submit(changed, { kind: 'first-retro', findings: [] })
+  await expect(submit(changed, { kind: 'acceptance', results: [{ id: '1', status: 'failed', evidence: [regression.read] }] }))
+    .resolves.toMatchObject({ recorded: 'acceptance', candidate: changed })
   await h.restart(); await h.runtime.idle()
-  expect(await inspect()).toMatchObject({ ready: false, status: 'return_for_recheck' })
+  expect(await inspect()).toMatchObject({ ready: false, status: 'return_for_recheck', missing: expect.arrayContaining(['repair:1']) })
   expect(await read(`plan/${id}/node/labels`)).not.toHaveProperty('delivery')
 }, 90_000)
 

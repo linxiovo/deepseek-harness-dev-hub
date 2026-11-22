@@ -6,6 +6,7 @@ import { UserError, key, latestReport, reached, reviewStatus, runningAssignment,
   type Trigger } from '../core/index.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { inspectWorktree } from '../executor/worktree.ts'
+import { docTreeImpactSchema, docTreeScopeSchema } from '../executor/doc-tree.ts'
 import { readGithub } from '../sources/github-read.ts'
 import { actionsEvidence, type ActionsEvidence } from '../sources/actions-evidence.ts'
 import { githubKind, type GithubConfig } from '../sources/github.ts'
@@ -23,8 +24,9 @@ import { CliError, type Commands } from '../infra/commands.ts'
 import { sameDirectory } from '../infra/environment.ts'
 import { KV } from '../kv.ts'
 import type { Handoffs } from './handoffs.ts'
-import type { Plans } from './plans.ts'
-import { mainlineAttempts, mainlineIntent, type MainlineIntent, type MergeApproval } from './mainline-queue.ts'
+import { PlanDeliveryReceiptSchema, type Plans } from './plans.ts'
+import { mainlineAttempts, mainlineIntent, type CheckDeliveryTarget, type DeliveryTargetObservation,
+  type MainlineCiBinding, type MainlineIntent, type MergeApproval } from './mainline-queue.ts'
 import type { ProjectMeter } from './project-meter.ts'
 import type { ScopedAttention } from './scoped-attention.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
@@ -48,9 +50,9 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'plan/<id>/node/<node-id>', holds: 'node claim or waiting reason, delivery and instructions' },
   { name: 'plan/<id>/attention', holds: 'Plan status counts and credential actions' },
   { name: 'ticket/<id>', holds: 'ticket, claim, worktree, active writer and work history', executor: true },
-  { name: 'ticket/<id>/mainline', holds: 'mainline attempts and actual Git verification, not delivery', executor: true },
+  { name: 'ticket/<id>/mainline', holds: 'mainline attempts, actual Git verification and formal delivery blockers (not a receipt)', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
-  { name: 'ticket/<id>/delivery-check', holds: 'current candidate queue readiness and paginated canonical acceptance, ordered evidence and required CI; never formal delivery', executor: true },
+  { name: 'ticket/<id>/delivery-check', holds: 'candidate queue readiness, separate formal_delivery status for Plan tickets, and paginated acceptance, evidence and required CI', executor: true },
   { name: 'ticket/<id>/delivery-observation/<n>', holds: 'one durable delivery observation', executor: true },
   { name: 'retro-followups', holds: 'optional retro backlog, independent of Plan delivery' },
   { name: 'ticket/<id>/reviews', holds: 'reviews', executor: true },
@@ -218,10 +220,11 @@ function ticketPull(host: ResourceHost, ticket: Ticket): TicketPull | undefined 
 
 /** The delivery reader supplies its pinned base and already-verified worktree candidate, not a caller SHA. */
 async function ticketActions(commands: Commands, ticket: Ticket, sha: string, required: RequiredChecks,
-  associatedPull: TicketPull | undefined, base?: string, checkout?: DeliveryCheckout): Promise<ActionsEvidence> {
+  associatedPull: TicketPull | undefined, base?: string, checkout?: DeliveryCheckout): Promise<{ evidence: ActionsEvidence; ci?: MainlineCiBinding }> {
   const work = { kind: 'ticket', id: ticket.id } as const
   if (!associatedPull || base !== undefined) await verifyCheckout(commands, ticket.execution?.directory, sha, 'ticket')
-  if (!associatedPull) return actionsEvidence(commands, work, sha, required, undefined, checkout?.branch)
+  if (!associatedPull) return { evidence: await actionsEvidence(commands, work, sha, required, undefined, checkout?.branch),
+    ...checkout ? { ci: { branch: checkout.branch } } : {} }
   const { number } = associatedPull
   if (typeof number !== 'number' || !Number.isSafeInteger(number) || number <= 0) throw new Error('Ticket has no verifiable pull request')
   const readPull = () => commands.api(pullEvidence, `pulls/${number}`)
@@ -239,7 +242,7 @@ async function ticketActions(commands: Commands, ticket: Ticket, sha: string, re
       || current.head.repo?.full_name !== pull.head.repo.full_name || !matchesTarget(current))
       throw new Error('Pull request changed while checking delivery CI')
   }
-  return evidence
+  return { evidence, ci: { pull: number } }
 }
 
 interface DeliveryState {
@@ -279,7 +282,7 @@ interface DeliveryCheckout {
 }
 
 /** Read actual Git identities rather than using a previously reported candidate or PR status. */
-async function deliveryCheckout(commands: Commands, { ticket, assignment }: DeliveryState, signal?: AbortSignal): Promise<DeliveryCheckout | undefined> {
+async function deliveryCheckout(commands: Commands, { ticket, assignment }: DeliveryState, signal?: AbortSignal, formal?: true): Promise<DeliveryCheckout | undefined> {
   const { execution } = ticket
   const ownership = execution?.ownership, session = assignment?.writer?.session
   if (!execution || !ownership?.verified || !assignment || !session || execution.preparation?.state !== 'verified' ||
@@ -290,8 +293,11 @@ async function deliveryCheckout(commands: Commands, { ticket, assignment }: Deli
     const checkout = await inspectWorktree(commands, { ...identity, directory: identity.worktree, ticket: ticket.id,
       assignment: assignment.id, session, mode: 'reuse',
       previous: { ...identity, ticket: ownership.ticket, assignment: assignment.id, generation: ownership.generation, verified: true } })
-    const clean = !(await commands.git(['status', '--porcelain=v1', '--untracked-files=all'], checkout.worktree)).trim()
-    if ((await commands.git(['rev-parse', '--verify', 'HEAD'], checkout.worktree)).trim() !== checkout.head) return undefined
+    if (formal) await verifyCheckout(commands, checkout.worktree, checkout.head, 'ticket')
+    // Sample branch, candidate and cleanliness together, after every other checkout read.
+    const status = (await commands.git(['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all'], checkout.worktree)).split('\0')
+    if (!status.includes(`# branch.oid ${checkout.head}`) || !status.includes(`# branch.head ${checkout.branch}`)) return undefined
+    const clean = status.every(record => record === '' || record.startsWith('# '))
     return { worktree: checkout.worktree, base: checkout.base.sha, baseRef: checkout.base.ref, candidate: checkout.head,
       branch: checkout.branch, clean }
   } catch (error) {
@@ -304,18 +310,26 @@ async function deliveryCheckout(commands: Commands, { ticket, assignment }: Deli
 /** Compare the same ticket and checkout observations before and after remote evidence collection. */
 const deliveryStamp = (state: DeliveryState, checkout: DeliveryCheckout | undefined) => JSON.stringify([state.stamp, checkout])
 
-async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSignal, replay?: MainlineIntent) {
+const ciBinding = z.union([z.strictObject({ pull: z.number().int().positive() }), z.strictObject({ branch: z.string().min(1) })])
+
+const scopedDocuments = z.object({ scope: docTreeScopeSchema, impact: docTreeImpactSchema })
+
+async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSignal,
+  scope?: { replay: MainlineIntent | undefined; formal?: never } | { replay: MainlineIntent; formal: true; verify: CheckDeliveryTarget }) {
+  const replay = scope?.replay, formal = scope?.formal
   const commands = host.commands.withSignal(signal)
   let state = deliveryState(host, id)
-  let checkout = await deliveryCheckout(commands, state, signal)
+  let checkout = await deliveryCheckout(commands, state, signal, formal)
   signal?.throwIfAborted()
   let latest = deliveryState(host, id)
   let changed = state.stamp !== latest.stamp
 
   const local = () => {
     const { ticket, assignment, generation, criteria, paused } = state
-    const ownsLease = generation !== undefined && generation === assignment?.writer?.generation &&
-      generation === ticket.execution?.ownership?.generation
+    const writer = assignment?.writer, active = ticket.execution?.active_writer
+    const ownsLease = generation !== undefined && generation === writer?.generation &&
+      generation === ticket.execution?.ownership?.generation &&
+      (!formal || (writer.state === 'active' && active?.assignment === assignment?.id && active?.session === writer.session))
     // For an existing queued intent only, the exact originally approved pair can resume after the same writer was
     // confirmed idle. A held or replaced lease cannot stand in for a live generation.
     const idleReplay = replay && assignment?.id === replay.assignment && checkout?.base === replay.base &&
@@ -325,7 +339,7 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
     const target = checkout?.clean && approvedGeneration !== undefined ?
       { base: checkout.base, candidate: checkout.candidate, generation: approvedGeneration } : undefined
     const reviews = ticket.assignments.flatMap(item => item.reviews?.evidence ?? [])
-    const view = viewDelivery(ticket.deliveryCheck, target, reviews, criteria)
+    const view = viewDelivery(ticket.deliveryCheck, target, reviews, criteria, id)
     const missing = new Set(view.missing)
     if (!view.ready && missing.size === 0) missing.add('delivery_evidence')
     if (!criteria.length) missing.add('registered_acceptance')
@@ -345,22 +359,51 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
     if (outcome || report === 'failed' || report === 'blocked' || report === 'dropped') {
       missing.add('ticket_not_queueable')
     }
+    if (scope?.formal) {
+      const { replay } = scope
+      if ((checkout && (checkout.base !== replay.base || checkout.candidate !== replay.candidate)) ||
+          assignment?.id !== replay.assignment || writer?.generation !== replay.generation) missing.add('delivery_target_changed')
+      if ((checkout && checkout.baseRef !== replay.target.ref) || ticket.execution?.ownership?.identity.repository !== replay.target.repository ||
+          host.commands.repository.toLowerCase() !== replay.target.slug.toLowerCase()) missing.add('mainline_target')
+      if (target && missing.has('dual-review')) {
+        for (const axis of ['standards', 'spec'] as const) {
+          const lane = view.reviews.find(review => review.axis === axis)
+          if (!lane || lane !== view.reviews.findLast(review => review.axis === axis) ||
+              lane.conclusion !== 'passed' || lane.blockers.length) missing.add(`dual-review:${axis}`)
+        }
+      }
+    }
     return { view, missing, target }
   }
 
   if (changed) { state = latest; checkout = undefined }
   let result = local()
   let actions: ActionsEvidence | undefined
+  let ci: MainlineCiBinding | undefined
   let ciFailure: { code?: number; exit_code?: number } | undefined
   let ciStatus = state.required.length ? 'pending_local_gate' : 'required_checks_unconfigured'
+  let observation: DeliveryTargetObservation | undefined
   if (result.target && result.view.ready && result.missing.size === 0 && state.required.length) {
     const { base, candidate } = result.target
     try {
       if (!state.required.every(check => check.workflowId)) ciStatus = 'required_workflow_unconfigured'
       else if (!commitSha.safeParse(candidate).success || !commitSha.safeParse(base).success) ciStatus = 'unsupported_revision'
       else {
-        actions = await ticketActions(commands, state.ticket, candidate, state.required, state.pull, base, checkout)
-        ciStatus = actions.satisfied ? 'passed' : 'not_passed'
+        if (scope?.formal) {
+          // Only the final prewrite binding may select evidence. A push can itself close the PR or advance its base.
+          const fixed = ciBinding.safeParse(scope.replay.ci)
+          if (fixed.success) {
+            const work = { kind: 'ticket', id } as const
+            if ('pull' in fixed.data) actions = await actionsEvidence(commands, work, candidate, state.required,
+              { number: fixed.data.pull, baseSha: scope.replay.base })
+            else if (fixed.data.branch === checkout?.branch) actions = await actionsEvidence(commands, work, candidate, state.required,
+              undefined, fixed.data.branch)
+            if (actions) ci = fixed.data
+          }
+        } else {
+          ({ evidence: actions, ci } = await ticketActions(commands, state.ticket, candidate, state.required, state.pull, base, checkout))
+        }
+        ciStatus = actions?.satisfied ? 'passed' : 'not_passed'
       }
     } catch (error) {
       signal?.throwIfAborted()
@@ -369,10 +412,17 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
       if (error instanceof CliError) ciFailure = { ...error.code === undefined ? {} : { code: error.code },
         ...error.exitCode === undefined ? {} : { exit_code: error.exitCode } }
     }
-    // An Actions response is only usable if the ticket, lease, settings and clean checkout are still the same.
+    if (ciStatus === 'passed' && scope?.formal) {
+      const docs = scopedDocuments.safeParse(result.view.docs?.evidence)
+      if (docs.success) {
+        const { scope: reviewed, impact } = docs.data
+        observation = await scope.verify(impact.kind === 'updated' ? { ...reviewed, documents: impact.documents } : reviewed)
+      } else observation = { missing: 'docs' }
+    }
+    // Re-read the worktree and lease after all external evidence, including the final Git target observation.
     const prior = deliveryStamp(state, checkout)
     latest = deliveryState(host, id)
-    checkout = await deliveryCheckout(commands, latest, signal)
+    checkout = await deliveryCheckout(commands, latest, signal, formal)
     signal?.throwIfAborted()
     state = deliveryState(host, id)
     if (latest.stamp !== state.stamp) checkout = undefined
@@ -385,8 +435,14 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
       ciStatus = 'stale'
     }
   }
-  if (ciStatus !== 'passed') result.missing.add('required_ci')
-  return { state, checkout, local: result.view, revision: result.target, missing: [...result.missing], actions, ciStatus, ciFailure }
+  if (observation && 'missing' in observation) result.missing.add(observation.missing)
+  if (ciStatus !== 'passed' && (!formal || (ciStatus !== 'pending_local_gate' && ciStatus !== 'stale'))) result.missing.add('required_ci')
+  const identity = state.ticket.execution?.ownership?.identity
+  const approval: MergeApproval | undefined = scope && result.missing.size === 0 && checkout && identity && result.target && state.assignment && ci
+    ? { target: { repository: identity.repository, slug: commands.repository, ref: checkout.baseRef }, base: checkout.base,
+      candidate: checkout.candidate, generation: result.target.generation, assignment: state.assignment.id, stamp: state.stamp, ci }
+    : undefined
+  return { state, checkout, local: result.view, missing: [...result.missing], actions, ciStatus, ciFailure, approval, observation }
 }
 
 /** Obtain the actual queue authorization from fresh, version-matched evidence, never from a read page or Worker report. */
@@ -394,13 +450,17 @@ export async function approveMainline(host: ResourceHost, id: string, candidate:
   replay?: MainlineIntent): Promise<MergeApproval> {
   const initial = deliveryState(host, id)
   if (!initial.ticket.plan) throw new UserError('mainlineRefused', { reason: 'Only candidates of registered Plan Tickets may enter the mainline queue' })
-  const { state, checkout, revision, missing } = await inspectDelivery(host, id, signal, replay)
-  const identity = state.ticket.execution?.ownership?.identity
-  if (!checkout || !identity || !revision || !state.assignment || checkout.candidate !== candidate || missing.length) {
+  const { approval, missing } = await inspectDelivery(host, id, signal, { replay })
+  if (!approval || approval.candidate !== candidate) {
     throw new UserError('mainlineNotReady', { missing: missing.join(', ') || 'candidate changed' })
   }
-  return { target: { repository: identity.repository, slug: host.commands.repository, ref: checkout.baseRef },
-    base: checkout.base, candidate, generation: revision.generation, assignment: state.assignment.id, stamp: state.stamp }
+  return approval
+}
+
+/** Bind the mainline observation to fresh candidate evidence before authorizing the closing transaction. */
+export async function inspectFormalDelivery(host: ResourceHost, intent: MainlineIntent, verify: CheckDeliveryTarget, signal?: AbortSignal) {
+  const { missing, approval, observation } = await inspectDelivery(host, intent.ticket_id, signal, { replay: intent, formal: true, verify })
+  return { missing, ...(approval ? { approval } : {}), ...(observation ? { observation } : {}) }
 }
 
 /** Recheck non-Git authorization synchronously at the point that starts the Git write. */
@@ -409,6 +469,26 @@ export function authorizeMainline(host: ResourceHost, id: string, approval: Merg
   if (state.stamp !== approval.stamp || host.commands.repository.toLowerCase() !== approval.target.slug.toLowerCase()) {
     throw new UserError('mainlineRefused', { reason: 'Mainline approval changed before the write' })
   }
+}
+
+function formalDeliverySummary(host: ResourceHost, ticket: Ticket, attempt: MainlineIntent | undefined, missing: string[]) {
+  const plan = ticket.plan
+  if (!plan) return undefined
+  // Worker readers need no Plan administration access. A node receipt on its own cannot prove the ticket was closed.
+  if (ticket.ended?.by === 'delivery' && ticket.ended.outcome === 'merged') {
+    const node = host.store.get(KV.plans.node(plan.planId, plan.nodeId))
+    if (node?.status === 'delivered' && node.planId === plan.planId && node.nodeId === plan.nodeId &&
+        node.claim?.ticketId === ticket.id && node.claim.planId === plan.planId && node.claim.nodeId === plan.nodeId) {
+      const receipt = PlanDeliveryReceiptSchema.safeParse(node.delivery)
+      if (receipt.success && receipt.data.ticketId === ticket.id && receipt.data.assignmentId === ticket.assignments.at(-1)?.id) {
+        return { status: 'delivered' as const, receipt: receipt.data }
+      }
+    }
+    return { status: 'blocked' as const, missing: ['plan_claim'] }
+  }
+  if (attempt?.delivery_missing !== undefined) return { status: 'blocked' as const, missing: attempt.delivery_missing }
+  if (attempt?.status === 'verified') return { status: 'pending' as const }
+  return { status: 'blocked' as const, missing: [...missing, 'mainline_verification'] }
 }
 
 async function deliveryPage(read: Read, id: string) {
@@ -421,12 +501,17 @@ async function deliveryPage(read: Read, id: string) {
     return text(read, cached)
   }
   const { state, checkout, local, missing, actions, ciStatus, ciFailure } = await inspectDelivery(host, id, signal)
-  const mainline = mainlineIntent(host.store, id) ?? { status: 'pending_merge' as const }
-  const ready = missing.length === 0
+  const attempt = mainlineIntent(host.store, id)
+  const mainline = attempt ?? { status: 'pending_merge' as const }
+  // Read the ticket and receipt together: the formal gate can finish while the paginated candidate observation awaits Actions.
+  const ticket = state.ticket.plan ? host.store.tickets.get(id) : state.ticket
+  if (!ticket) throw new UserError('unknownTicket')
+  const formal = formalDeliverySummary(host, ticket, attempt, missing)
+  const ready = missing.length === 0 && ticket.ended?.by !== 'delivery'
   const header = { ticket_id: id, assignment_id: state.assignment?.id ?? null,
     base: checkout?.base ?? state.ticket.execution?.base?.sha ?? null, candidate: checkout?.candidate ?? null,
     generation: state.generation ?? null, clean: checkout?.clean ?? false, missing, ready, ci_status: ciStatus,
-    status: ready ? 'ready_to_queue' as const : 'return_for_recheck' as const, mainline }
+    status: ready ? 'ready_to_queue' as const : 'return_for_recheck' as const, mainline, ...formal ? { formal_delivery: formal } : {} }
   const body = JSON.stringify({ observed_at: new Date().toISOString(), ticket_id: id, assignment_id: header.assignment_id,
     base: header.base, candidate: header.candidate, generation: header.generation, mainline: header.mainline,
     criteria: state.criteria, local,
@@ -613,7 +698,7 @@ const ROUTES: readonly Route[] = [
     const commands = host.commands.withSignal(read.signal)
     const required = githubKind.schema.parse(host.store.settings().sources.github?.config ?? {}).requiredChecks
     return sourcePage(read, 'github', async () => {
-      if (ticket) return ticketActions(commands, ticket, sha, required, ticketPull(host, ticket))
+      if (ticket) return (await ticketActions(commands, ticket, sha, required, ticketPull(host, ticket))).evidence
       if (handoff) {
         if (handoff.project.repository.toLowerCase() !== commands.repository.toLowerCase()) throw new Error('Handoff repository differs from configured repository')
         await verifyCheckout(commands, handoff.project.workspace, sha, kind)

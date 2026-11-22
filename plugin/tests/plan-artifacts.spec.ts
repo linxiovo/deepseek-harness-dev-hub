@@ -65,7 +65,7 @@ it('rejects extra files in a downloaded artifact instead of serving an ambiguous
     writeFileSync(join(destination, 'unexpected.txt'), 'extra')
   })
   await expect(downloadPlanArtifact(cli.value as never, root, 'plan-a', request, run,
-    { id: 42, name: `plugin-bundle-${request.sha}-2`, url: `${run.url}/artifacts/42` })).rejects.toThrow(/exactly a package/)
+    { id: 42, name: `plugin-bundle-${request.sha}-2`, url: `${run.url}/artifacts/42` })).rejects.toThrow(/exactly one file/)
 })
 
 it('rejects package bytes that do not match the identity manifest checksum', async () => {
@@ -79,6 +79,18 @@ it('accepts a safely named executable artifact with its declared content type', 
   const draft = await downloadPlanArtifact(cli.value as never, root, 'plan-a', request, run,
     { id: 42, name: `plugin-bundle-${request.sha}-${run.attempt}`, url: `${run.url}/artifacts/42` })
   expect(draft.artifact).toMatchObject({ fileName: 'worker.exe', contentType, sha256 })
+})
+it('distinguishes an absent retained file from an unexpected I/O error', async () => {
+  const view = { status: 'delivered' as const, planId: 'plan-a',
+    version: { repository: request.repository, ref: request.ref, sha: request.sha, context: request.context,
+      workflowId: request.verification.workflowId, configuration: request.verification.configuration,
+      environment: request.verification.environment }, run,
+    artifact: { id: 42, name: 'release', url: run.url, fileName, contentType: 'application/gzip', size: packageBytes.length, sha256 },
+    verifiedAt: new Date().toISOString() }
+  await expect(openPlanArtifact(root, 'plan-a', view)).resolves.toBeUndefined()
+  const inaccessibleRoot = join(root, 'not-a-directory')
+  writeFileSync(inaccessibleRoot, 'file')
+  await expect(openPlanArtifact(inaccessibleRoot, 'plan-a', view)).rejects.toThrow()
 })
 
 it('removes staging directories left by a process restart', () => {

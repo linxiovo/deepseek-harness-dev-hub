@@ -13,7 +13,7 @@ import type { Store } from './store.ts'
 interface IntegrationHost {
   store: Pick<Store, 'atomic' | 'get' | 'set' | 'delete'>
   effects: Pick<Effects, 'handle' | 'enqueue' | 'pending'>
-  plans: Pick<Plans, 'list' | 'requiredDelivery'>
+  plans: Pick<Plans, 'list' | 'get' | 'state' | 'requiredDelivery'>
   handoffs: Pick<Handoffs, 'get'>
   lifetime: AbortSignal
   verification?: PlanVerificationConfig
@@ -28,6 +28,7 @@ interface IntegrationHost {
   artifactAvailable(planId: string, view: Extract<PlanIntegrationView, { status: 'delivered' | 'awaiting-release-verification' }>): Promise<boolean>
   artifactExists(planId: string, view: Extract<PlanIntegrationView, { status: 'delivered' | 'awaiting-release-verification' }>): boolean
   dispatch(request: PlanVerificationRequest): Promise<void>
+  deliveryLink(planId: string): string
   relay(message: Relay): void
 }
 
@@ -167,7 +168,7 @@ export class PlanIntegration {
             host.effects.enqueue('planIntegration', planId, {})
             return
           }
-          this.active(target)
+          await currentTip()
           try { host.commitArtifact(draft) }
           catch { return retry({ planId, status: 'blocked', reason: 'artifact_unavailable', version, run }) }
           const status = handoff.authorization.release === 'authorized' ? 'awaiting-release-verification' : 'delivered'
@@ -177,6 +178,7 @@ export class PlanIntegration {
             if (status !== 'delivered') return
             const relay = projectPushRelay({ id: `plan-delivered:${planId}`, kind: 'plan-delivered', payload: {
               planId, version, artifact: draft.artifact, verification: run.url, read: `plan/${planId}/delivery`,
+              harness: host.deliveryLink(planId),
             } })
             if (relay) host.relay(relay)
           })

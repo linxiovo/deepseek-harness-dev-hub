@@ -419,6 +419,7 @@ function routes(runtime: HttpHost): Routes {
       return view
     },
     'GET plans/:id/artifact': async ({ params }) => {
+      if (!runtime.planIntegration?.view(params.id)) throw new UserError('unknownPlan', { id: params.id })
       const artifact = await runtime.planArtifact?.(params.id)
       if (!artifact) throw new UserError('planArtifactUnavailable', { id: params.id })
       return artifact
@@ -500,6 +501,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
       let installationRoute = false
       let attentionRoute = false
       let mounted: string | null = null
+      let artifactLease = false
       try {
         const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
         if (!route) throw new RouteError(404, 'Unknown operation')
@@ -527,6 +529,11 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
           && req.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') {
           throw new RouteError(400, 'Expected Content-Type: application/json')
         }
+        if (route.key === 'GET plans/:id/artifact') {
+          if (writing) throw new InstallationError(409, 'projectConflict')
+          writing = 'project'
+          artifactLease = true
+        }
         let result: unknown
         try {
           result = await route.run({ params: route.params as never, query, body: async maxBytes => {
@@ -539,7 +546,9 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
           if (mountedRoute && readableMount(scope, requirement) !== mounted) throw new InstallationError(409, 'staleProject')
         }
         if (route.key === 'GET plans/:id/artifact') {
-          const artifact = PlanArtifactFileSchema.parse(result)
+          const transfer = PlanArtifactFileSchema.safeParse(result)
+          if (!transfer.success) throw new Error('Plan artifact transfer metadata is invalid')
+          const artifact = transfer.data
           res.writeHead(200, { 'content-type': artifact.contentType, 'cache-control': 'no-store',
             'x-content-type-options': 'nosniff', 'content-length': artifact.size,
             'content-disposition': `attachment; filename="${artifact.fileName}"`, 'x-artifact-sha256': artifact.sha256 })
@@ -549,6 +558,8 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         if (res.headersSent) { res.destroy(error instanceof Error ? error : undefined); return }
         const respond = attentionRoute ? attentionFailure : installationRoute ? installationFailure : failure
         json(res, ...respond(error))
+      } finally {
+        if (artifactLease) writing = undefined
       }
     } })]
   return async () => {

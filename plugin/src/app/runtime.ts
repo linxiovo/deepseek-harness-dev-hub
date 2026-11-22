@@ -43,7 +43,7 @@ import { MainlineQueue } from './mainline-queue.ts'
 import { advanceMainline, precedes, prepareMainline, readMainline, readPlanIntegrationTarget, verifyDeliveryOnTarget } from '../executor/mainline-git.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
-import { projectNavigationLink } from '../navigation.ts'
+import { projectNavigationLink, ticketNavigationLink } from '../navigation.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
@@ -236,11 +236,17 @@ export class Runtime extends Service implements SourceHost {
         readTarget: (target, integrations) => readPlanIntegrationTarget(commands, target, integrations),
         observe: request => observePlanActions(commands, request),
         isLatestRun: (request, run) => isLatestPlanActions(commands, request, run),
-        downloadArtifact: (planId, request, run, artifact) => downloadPlanArtifact(commands, machine.stateDir, planId, request, run, artifact),
+        downloadArtifact: (planId, request, run, artifact) => downloadPlanArtifact(commands, projectMachine.stateDir, planId, request, run, artifact),
         commitArtifact: commitPlanArtifact, discardArtifact: discardPlanArtifact,
-        artifactAvailable: async (planId, view) => !!await openPlanArtifact(machine.stateDir, planId, view),
-        artifactExists: (planId, view) => planArtifactExists(machine.stateDir, planId, view),
+        artifactAvailable: async (planId, view) => !!await openPlanArtifact(projectMachine.stateDir, planId, view),
+        artifactExists: (planId, view) => planArtifactExists(projectMachine.stateDir, planId, view),
         dispatch: request => dispatchPlanActions(commands, request),
+        deliveryLink: planId => {
+          const ticketId = plans.get(planId)?.nodes.map(node => plans.state(planId, node.id)?.claim.ticketId).find(Boolean)
+          const origin = `http://127.0.0.1:${ctx.webServer.port}`
+          return project && ticketId ? ticketNavigationLink(origin, project.id, ticketId)
+            : project ? projectNavigationLink(origin, project.id, 'project') : origin
+        },
         relay: message => sessions.relay(message.id, message.text),
       })
       const verifyProjectBinding = installation.validateWorkspace.bind(installation)

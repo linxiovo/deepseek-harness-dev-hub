@@ -1,7 +1,7 @@
 /** Downloads and verifies the file attached to the latest successful Plan regression run. */
 import { createHash } from 'node:crypto'
 import { closeSync, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { z } from 'zod'
 import type { PlanArtifact, PlanArtifactReference, PlanIntegrationView, PlanVerificationRequest, PlanVerificationRun } from '../core/plan-integration.ts'
 import type { Commands } from '../infra/commands.ts'
@@ -40,6 +40,19 @@ function regularFile(path: string): number {
   if (!info.isFile() || info.isSymbolicLink()) throw new Error('Plan artifact contains a non-regular file')
   return info.size
 }
+function missingFile(path: string, error: unknown): boolean {
+  if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'ENOENT') return false
+  let ancestor = dirname(path)
+  for (;;) {
+    try { return lstatSync(ancestor).isDirectory() }
+    catch (failure) {
+      if (!failure || typeof failure !== 'object' || !('code' in failure) || failure.code !== 'ENOENT') throw failure
+      const parent = dirname(ancestor)
+      if (parent === ancestor) return true
+      ancestor = parent
+    }
+  }
+}
 /** Cheap synchronous check for the project panel; the actual download verifies the checksum again. */
 export function planArtifactExists(stateDir: string, planId: string, view: PlanIntegrationView): boolean {
   if (view.status !== 'delivered' && view.status !== 'awaiting-release-verification' || !fileNameSchema.safeParse(view.artifact.fileName).success ||
@@ -54,7 +67,7 @@ export function planArtifactExists(stateDir: string, planId: string, view: PlanI
     const valid = digestSync(path) === view.artifact.sha256
     verifiedArtifacts.set(path, { size: info.size, mtimeMs: info.mtimeMs, ino: info.ino, sha256: valid ? view.artifact.sha256 : '' })
     return valid
-  } catch { return false }
+  } catch (error) { if (missingFile(path, error)) return false; throw error }
 }
 function digestSync(path: string): string {
   const descriptor = openSync(path, 'r'), hash = createHash('sha256'), buffer = Buffer.allocUnsafe(64 * 1024)
@@ -138,5 +151,5 @@ export async function openPlanArtifact(stateDir: string, planId: string, view: P
     if (current.size !== info.size || current.mtimeMs !== info.mtimeMs || current.ino !== info.ino) return undefined
     verifiedArtifacts.set(path, { size: current.size, mtimeMs: current.mtimeMs, ino: current.ino, sha256: artifact.sha256 })
     return { path, fileName: artifact.fileName, contentType: artifact.contentType, size: artifact.size, sha256: artifact.sha256 }
-  } catch { return undefined }
+  } catch (error) { if (missingFile(path, error)) return undefined; throw error }
 }

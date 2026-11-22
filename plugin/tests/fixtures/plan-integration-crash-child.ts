@@ -60,6 +60,7 @@ const integrationHost = {
       await Promise.withResolvers<void>().promise
     }
   },
+  deliveryLink: () => 'http://127.0.0.1:3082/?superagentProject=test&superagentTicket=test',
   relay: (message: Relay) => appendFileSync(join(root, 'relay.jsonl'), `${JSON.stringify(message)}\n`),
 } as never
 

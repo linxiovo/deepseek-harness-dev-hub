@@ -318,18 +318,29 @@ it.each([
   { release: 'authorized' as const, dispatchFailure: 'lost-response' as const },
   { release: 'not-authorized' as const, dispatchFailure: 'forbidden' as const, pauseOnRefusal: true },
   { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, rerunDuringDownload: true },
-] as const)('verifies the integrated package after $dispatchFailure and respects $release release scope', async ({ release, dispatchFailure, pauseOnRefusal, rerunDuringDownload }) => {
+  { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, advanceTargetDuringFinalRunLookup: true },
+ ] as const)('verifies the integrated package after $dispatchFailure and respects $release release scope',
+  async ({ release, dispatchFailure, pauseOnRefusal, rerunDuringDownload, advanceTargetDuringFinalRunLookup }) => {
   await h.stop()
   const verification = { workflowId: '44', identityJob: 'integration-identity',
     jobs: ['integration-identity', 'windows', 'check', 'integration-bundle'], artifactName: 'plugin-bundle',
     configuration: 'plugin-check-v1', environment: 'github-hosted-node22-pnpm11-v1' }
   const mounted = await startManagedProject({ withFeishu: false, machine: project => ({ planVerification: [{ projectId: project.id, ...verification }] }) })
   h = mounted.host
-  const { git, base, tip, runGit } = mainlineRepository()
+  const { repository, git, base, remote, tip, runGit } = mainlineRepository()
   const ci = actionsHost()
   await configureCI()
   const actionRuns = new Map<string, { id: number; sha: string; branch: string; context: string }>()
   let latestAttempt = 1
+  let artifactDownloadStarted = false, targetAdvanced = false
+  const advanceTarget = () => {
+    git('-C', repository, 'fetch', '--no-tags', remote, targetRef)
+    git('-C', repository, 'checkout', '--detach', 'FETCH_HEAD')
+    write(repository, 'after-validation.txt', 'The target advanced during the final Actions read.\n')
+    commit(repository, 'Advance the target during final Actions read')
+    git('-C', repository, 'push', remote, `HEAD:${targetRef}`)
+    targetAdvanced = true
+  }
   const github = vi.spyOn(Commands.prototype, 'gh')
   const githubFallback = github.getMockImplementation()!
   github.mockImplementation(async function (this: Commands, args) {
@@ -339,6 +350,7 @@ it.each([
     if (path.pathname === `/repos/${slug}/actions/workflows/44/runs`) {
       const runs = [...actionRuns.values()].filter(run => run.sha === path.searchParams.get('head_sha') &&
         run.branch === path.searchParams.get('branch'))
+      if (advanceTargetDuringFinalRunLookup && artifactDownloadStarted && !targetAdvanced) advanceTarget()
       return { total_count: runs.length, workflow_runs: runs.map(run => ({ id: run.id, workflow_id: 44, run_number: run.id,
         run_attempt: latestAttempt, head_sha: run.sha, head_branch: run.branch, event: 'workflow_dispatch',
         display_title: `dsh-plan-verification:${run.context}`, status: 'completed', conclusion: 'success' })) }
@@ -372,6 +384,7 @@ it.each([
         context: run.context, configuration: verification.configuration, environment: verification.environment,
         runId, attempt, fileName: packageName, contentType: 'application/gzip', sha256: createHash('sha256').update(bytes).digest('hex') }))
       if (rerunDuringDownload && attempt === 1) latestAttempt = 2
+      artifactDownloadStarted = true
       expect(artifactName).toBe(`${verification.artifactName}-${run.sha}-${attempt}`)
       return ''
     }
@@ -430,6 +443,12 @@ it.each([
   const initial = await read(`plan/${id}/delivery`)
   const initialView = z.object({ version: z.object({ context: z.string() }) }).parse(initial)
   expect(h.runtime.store.get(KV.plans.integrationDispatch(initialView.version.context))).toBe(true)
+  if (advanceTargetDuringFinalRunLookup) {
+    expect(await read(`plan/${id}/delivery`)).toMatchObject({ status: 'blocked', reason: 'target_changed', version: { sha: integration } })
+    expect(dispatches).toBe(1)
+    expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toEqual([])
+    return
+  }
   const attempts = rerunDuringDownload ? 2 : 1
   const resource = await read(`plan/${id}/delivery`), packageBytes = Buffer.from(`${integration}-${attempts}`)
   expect(resource).toMatchObject({ planId: id, status: release === 'authorized' ? 'awaiting-release-verification' : 'delivered',
@@ -445,7 +464,7 @@ it.each([
   if (release === 'authorized') expect(relays).toEqual([])
   else expect(relays).toEqual([expect.objectContaining({ planId: id, version: expect.objectContaining({ sha: integration }),
     verification: expect.stringContaining('/actions/runs/'), artifact: expect.objectContaining({ url: expect.stringContaining('/artifacts/') }),
-    read: `plan/${id}/delivery` })])
+    harness: expect.stringContaining(`superagentTicket=${worker.ticketId}`), read: `plan/${id}/delivery` })])
   expect(await h.api('GET', `plans/${id}/delivery`, undefined, mounted.project.id)).toMatchObject({ status: 200, body: resource })
 
   await h.restart()

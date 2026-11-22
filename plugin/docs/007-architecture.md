@@ -189,6 +189,7 @@ Failures retry with exponential backoff. Throwing `Later` defers work without co
 | `planning` | Planning | Sends the confirmed brief or recorded answer to the planner Session | 1 | 2 s doubling to 60 s; defers while paused |
 | `splitting` | Planning | Gives a published spec to its splitter; the durable intent is retired with Plan registration | 1 | 2 s doubling to 60 s for delivery failures; resumes unfinished work on restart |
 | `delivery` | DshExecutor | Hands a Ticket's waiting Inputs to its running Assignment, in order | 4, none while paused | 2 s doubling to 60 s; one that waits for a worker slot tries again after 2 s |
+| `mainlineDelivery` | MainlineQueue | Rechecks one verified intent for [formal Plan closure](003-execution.md#formal-plan-closure) | 8, only when configured | Resumes pending work on restart; evidence gaps stay on the Ticket until rechecked |
 | `relay` | Sessions | Steers a worker's report or question, or a person's follow-up, into the main Session's turn | 1, in queue order | 2 s doubling to 60 s |
 | `notice` | Sessions | Injects a notice into the main Session without waking it | 1, in queue order | 2 s doubling to 60 s |
 | `reply` | Outbox | Sends a message for a Channel through its Source, after the earlier messages of its Ticket to its conversation that have not failed three times; withdrawing the message cancels it | 1, none while paused | 5 s doubling to 300 s; one whose Source is off, or behind an earlier message, tries again after 5 s |
@@ -407,7 +408,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/planning.ts` | `Planning`: durable `planning` and `splitting` effects for the specification planner and the Plan DAG splitter |
 | `src/app/plans.ts` | `Plans`: validates and atomically registers authorized Plan DAGs; keeps plan background separate from node instructions |
 | `src/app/plan-dispatch.ts` | `PlanDispatcher`: validates Frontier predecessors, reserves a launch slot, atomically claims a node into a stable Ticket/Assignment, and rearms the same claim on restart |
-| `src/app/mainline-queue.ts` | Durable per-target FIFO, Ticket attempts, Worker repair handoff, and actual Git verification before recording merge evidence |
+| `src/app/mainline-queue.ts` | Durable per-target FIFO, Ticket attempts, Worker repair, actual Git verification and formal closure coordination |
 | `src/app/scoped-attention.ts` | `ScopedAttention`: durable Plan Ticket credential blockers, deduplicated Hub relays, shared management and Hub projections, and verified continuation; contract in `plugin/docs/015-scoped-attention.md` |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
@@ -539,7 +540,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
 | `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |
-| `tests/mainline-queue.spec.ts` | Hub queue admission, versioned CI, same-target serialization, crash-boundary restart, real code/Doc Tree conflicts in the Worker worktree and fresh verification without Frontier release |
+| `tests/mainline-queue.spec.ts` | Queue admission, versioned CI, same-target serialization, code and Doc Tree conflicts, formal closure, restart recovery and exactly-once Frontier claims |
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
 | `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, review evidence and child-only review submission, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
@@ -600,7 +601,7 @@ A generated column is computed from its row's JSON and is empty outside its set,
 | Main Session | `master-id` |
 | Session prompt history | `session-prompts:<session id>` |
 | Session meter | `session-meter:<session id>`: the durable meter state, whose `cursor` is the exclusive upper bound of the folded own events and the next read's first seq |
-| Mainline intent | `mainline-ticket:<ticket id>` versioned attempts and `mainline-pending:<target>` pending Ticket order; effect rows are committed alongside the relevant queue or repair transition |
+| Mainline intent | `mainline-ticket:<ticket id>` versioned attempts and `mainline-pending:<target>` pending Ticket order; effect rows commit with the relevant queue, repair or verified-merge transition |
 | Source state | Read positions such as `github-cursor:<number>`, PR CI fingerprints and seen Feishu-topic messages; keys begin with the kind or `thread-` plus a Thread key |
 | Display names | `source-labels:<source id>` |
 

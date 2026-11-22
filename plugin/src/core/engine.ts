@@ -201,6 +201,16 @@ export class Engine {
     })
   }
 
+  /** Close an open Plan Ticket only from the host's formal delivery transaction. */
+  closePlanTicket(ticketId: string): void {
+    this.repo.atomic(() => {
+      const ticket = this.repo.tickets.get(ticketId)
+      if (!ticket?.plan || ticket.ended) throw new UserError('ticketEnded')
+      if (this.options.credentialBlocked?.(ticketId)) throw new UserError('credentialBlocked')
+      this.tickets.end(ticketId, 'delivery', 'merged')
+    })
+  }
+
   // The Executor
 
   /** Resume the same live Assignment, inside the trusted credential verification transaction. */

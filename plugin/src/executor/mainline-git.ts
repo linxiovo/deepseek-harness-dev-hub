@@ -5,6 +5,7 @@ import { isAbsolute, join } from 'node:path'
 import { CliError, type Commands } from '../infra/commands.ts'
 import { credentialHelper, sameDirectory } from '../infra/environment.ts'
 import { validateRepositoryIdentity } from './repository-identity.ts'
+import { inspectDocuments, type DocTreeScope } from './doc-tree.ts'
 import { WorktreeRejected } from './worktree.ts'
 
 /** A configured clone, the deployment's GitHub owner/name, and a full refs/heads/... name. */
@@ -115,6 +116,26 @@ export function readMainline(commands: Commands, target: MainlineTarget): Promis
 /** Prove commit ancestry from complete local objects; false means a proven non-ancestor, while every Git error rejects. */
 export function precedes(commands: Commands, target: MainlineTarget, ancestor: string, descendant: string): Promise<boolean> {
   return inScratch(commands, target, scratch => contains(scratch, ancestor, descendant))
+}
+
+export type DeliveryTargetResult = 'passed' | 'mainline_verification' | 'mainline_docs' | 'mainline_candidate_changed'
+
+/** Verify that a later target still contains the reviewed change and its scoped Doc Tree. */
+export function verifyDeliveryOnTarget(commands: Commands, target: MainlineTarget, base: string, integration: string, actual: string,
+  scope: DocTreeScope): Promise<DeliveryTargetResult> {
+  return inScratch(commands, target, async scratch => {
+    if (!await contains(scratch, integration, actual)) return 'mainline_verification'
+    const paths = ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none']
+    const afterIntegration = await scratch.git('compare delivered and observed trees', [...paths, integration, actual, '--'])
+    if (!afterIntegration) return 'passed'
+    const changed = new Set(afterIntegration.split('\0'))
+    if ((scope.root !== null && changed.has(scope.root)) || scope.routes.some(path => changed.has(path)) ||
+        scope.leaves.some(path => changed.has(path)) || scope.documents?.some(path => changed.has(path))) return 'mainline_docs'
+    const issues = await inspectDocuments((...args) => scratch.git('check delivered Doc Tree links', ['--literal-pathspecs', ...args]), actual, scope, changed)
+    if (issues.length) return 'mainline_docs'
+    const duringIntegration = await scratch.git('identify reviewed changes', [...paths, base, integration, '--'])
+    return duringIntegration.split('\0').some(path => path && changed.has(path)) ? 'mainline_candidate_changed' : 'passed'
+  })
 }
 
 /** Create a reproducible intent-specific commit with the exact reviewed tree and candidate as its only parent. */

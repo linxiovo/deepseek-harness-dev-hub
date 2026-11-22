@@ -135,6 +135,14 @@ After interruption, a queued intent can continue at the original base if the exa
 
 A current Plan credential blocker prevents a new mainline write or a new repair dispatch for that Ticket. It does not erase an integration already observed on the target.
 
+## Formal Plan closure
+
+The host records the verified merge and enqueues closure in the same transaction. The closing check uses the same Ticket, Assignment, writer generation, base, candidate and target as the verified intent. The host rechecks acceptance, both reviews, tests, required repairs, Doc Tree and required CI (see `plugin/docs/013-development-verification.md`). It fetches the target and requires the intent's integration commit, which has the exact candidate tree. A later tip must preserve the reviewed changes and scoped Doc Tree, including its local links; changes to that scope or broken links report `mainline_docs`, and changes to the other reviewed paths report `mainline_candidate_changed`. After reading the target, the host samples the worktree branch, candidate and cleanliness together. An unrelated write that only puts the candidate on the branch does not qualify.
+
+The host ends the Ticket (`by: delivery`, `outcome: merged`) and records the Plan receipt atomically. It revokes the Worker grant and stops its work on commit. The Ticket cannot reopen on a later Thread message. Closure is internal; it neither closes a GitHub issue nor sends a per-Ticket external notice.
+
+If the evidence no longer passes, the Ticket stays open and `mainline.delivery_missing` names the blockers on the verified attempt. Restart resumes pending checks. Replaying the same SHA rechecks closure without advancing Git; a fresh checked SHA can enter the queue after a refused closure and follows the normal actual-baseline repair flow. After closure, replay returns the existing intent without closing or claiming again.
+
 ## How a Ticket ends
 
 - **Standalone ready without a pull request:** a `ready` Report ends a non-Plan Ticket as completed. Plan ready reports remain open.

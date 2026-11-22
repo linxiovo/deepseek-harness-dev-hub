@@ -69,12 +69,15 @@ function dual(reviews: readonly ReviewEvidence[]): boolean {
 }
 
 /** Only an explicit repair of open issues can carry anything. Reviewers reaffirm each key on EACH hop; the original stamp never changes. */
-function afterRepair(previous: Cycle, revision: DeliveryRevision, reviews: readonly ReviewEvidence[]): Cycle {
+function afterRepair(previous: Cycle, revision: DeliveryRevision, reviews: readonly ReviewEvidence[] | undefined): Cycle {
   const next = emptyCycle(revision)
-  next.repaired = [...previous.repaired, ...previous.blockers]
+  next.repaired = previous.repaired.length && previous.blockers.length ? [...previous.repaired, ...previous.blockers]
+    : previous.repaired.length ? previous.repaired : previous.blockers
   if (!previous.revision || !sameLease(previous.revision, revision)) return next
   next.first = previous.first
-  if (!dual(reviews)) return next
+  if (!reviews) return next
+  const matching = currentReviews(reviews, revision)
+  if (!dual(matching)) return next
   const affected = new Set<string>()
   let allCriteria = false
   for (const issue of next.repaired) {
@@ -83,9 +86,9 @@ function afterRepair(previous: Cycle, revision: DeliveryRevision, reviews: reado
     for (const key of issue.affects) affected.add(key)
     if (!issue.affects.some(key => key.startsWith('acceptance:'))) allCriteria = true
   }
-  const keep = (key: string) => !affected.has(key) && reviews.every(r => r.reuses?.includes(key))
-  if (previous.tests?.result === 'reported_passed' && keep('tests')) next.tests = previous.tests
-  if (previous.docs && ['checked', 'not-applicable'].includes(previous.docs.structure) && keep('docs')) next.docs = previous.docs
+  const keep = (key: string) => !affected.has(key) && matching.every(r => r.reuses?.includes(key))
+  if (previous.tests && observationPassed(previous.tests) && keep('tests')) next.tests = previous.tests
+  if (previous.docs && observationPassed(previous.docs) && keep('docs')) next.docs = previous.docs
   if (!allCriteria) for (const [id, result] of previous.results) {
     if (result.status === 'passed' && keep(keyOf(id))) next.results.set(id, result)
   }
@@ -99,23 +102,65 @@ function complete(state: Cycle, expected: readonly Criterion[]): boolean {
   }) && expected.some(({ id }) => matches(state.results.get(id)?.revision, state.revision))
 }
 
+/** Only ledger addresses can be resolved here. Other evidence remains openable under the existing reference convention. */
+function referenceError(refs: readonly string[], events: readonly Entry[], before: number, ticketId: string,
+  revision?: DeliveryRevision, requirePass = false): string | undefined {
+  for (const ref of refs) {
+    if (ref === `ticket/${ticketId}/delivery-check` || ref === `task/${ticketId}/delivery-check`)
+      return 'Cite the original observation, not the delivery-check package itself'
+    if (!(ref.startsWith('ticket/') || ref.startsWith('task/')) || !ref.includes('/delivery-observation/')) continue
+    const match = /^(?:ticket|task)\/([^/]+)\/delivery-observation\/(0|[1-9]\d*)$/.exec(ref)
+    const index = match?.[1] === ticketId ? Number(match[2]) : Infinity
+    const observation = index < before ? events[index] : undefined
+    if (!observation) return 'Delivery observation is missing or belongs to another ticket'
+    if (revision && !matches(observation.revision, revision)) return 'Acceptance observation must match the current revision'
+    if (requirePass && !observationPassed(observation)) return 'Passing acceptance must cite a successful test or Doc Tree observation'
+  }
+}
+
+const needsRepair = (active: Cycle, revision?: DeliveryRevision) => active.revision?.candidate !== revision?.candidate
+  && (active.blockers.length > 0 || active.repaired.length > 0)
+
+function repairError(active: Cycle, revision: DeliveryRevision, fixes: readonly { id: string; evidence: readonly string[] }[],
+  events: readonly Entry[], before: number, ticketId: string): string | undefined {
+  const invalid = 'Repair requires a changed candidate and evidence for exactly all outstanding mandatory IDs'
+  if (!active.revision || active.revision.candidate === revision.candidate || !fixes.length) return invalid
+  const pending = new Set<string>()
+  for (const issue of active.blockers) pending.add(issue.id)
+  for (const issue of active.repaired) pending.add(issue.id)
+  if (fixes.length !== pending.size) return invalid
+  for (const fix of fixes) {
+    if (!pending.delete(fix.id) || !cited(fix.evidence)) return invalid
+    const error = referenceError(fix.evidence, events, before, ticketId)
+    if (error) return error
+  }
+}
+
 /** Rebuild, in append order, from the same persisted facts on writes, reads, and recovery. No mutable readiness bit. */
-function project(ledger: DeliveryLedger | undefined, reviews: readonly ReviewEvidence[]) {
+function project(events: readonly Entry[], reviews: readonly ReviewEvidence[], ticketId: string) {
   let active = emptyCycle()
   const followups: (Finding & Stamp)[] = []
   const mandatoryIds = new Set<string>()
-  for (const entry of ledger?.events ?? []) {
+  for (let index = 0; index < events.length; index++) {
+    const entry = events[index]!
     const { revision, at } = entry
     if (entry.kind === 'repair') {
-      // Reviews written before the repair was recorded cannot reaffirm the frozen set of original reports.
-      active = afterRepair(active, revision, entry.reviewsBeforeRepair?.length ? [] : currentReviews(reviews, revision))
+      if (!repairError(active, revision, entry.fixes, events, index, ticketId)) {
+        // Reviews written before the repair was recorded cannot reaffirm the frozen set of original reports.
+        active = afterRepair(active, revision, entry.reviewsBeforeRepair?.length ? undefined : reviews)
+      }
       continue
     }
+    // A missing or invalid repair must not let later reports erase the outstanding obligations.
+    if (needsRepair(active, revision)) continue
     active = forRevision(active, revision)
     switch (entry.kind) {
       case 'first-retro': case 'final-retro': {
         if (entry.kind === 'first-retro') active.first = { revision, at }
-        else { active.final = { revision, at }; active.repaired = [] }
+        else if (!active.blockers.length && active.first && complete(active, active.expected)) {
+          active.final = { revision, at }
+          active.repaired = []
+        }
         for (const finding of entry.findings) {
           const item = { ...finding, revision, at }
           if (finding.category === 'optional') followups.push(item)
@@ -126,6 +171,11 @@ function project(ledger: DeliveryLedger | undefined, reviews: readonly ReviewEvi
       case 'acceptance':
         active.expected = entry.expected
         for (const result of entry.results) {
+          const passed = result.status === 'passed'
+          if ((passed && !cited(result.evidence)) || referenceError(result.evidence, events, index, ticketId, revision, passed)) {
+            active.results.delete(result.id)
+            continue
+          }
           const criterion = entry.expected.find(c => c.id === result.id)!
           active.results.set(result.id, { ...result, text: criterion.text, revision, at })
           if (result.status === 'failed') {
@@ -145,6 +195,19 @@ function distinct(items: readonly { id: string }[]) {
     throw new Error('Evidence IDs must be nonblank, unique and unambiguous')
 }
 
+function passingRuns(report: Tests): boolean {
+  const { checks, red } = report.evidence
+  const observed = (run: Run) => nonblank(run.command) && nonblank(run.directory) && nonblank(run.observed)
+  return checks.length > 0 && checks.every(c => c.status === 'passed' && observed(c))
+    && (red === null || red.length > 0 && red.every(r => nonblank(r.revision) && observed(r)
+      && checks.some(c => c.directory === r.directory && c.command === r.command)))
+}
+
+function observationPassed(event: DeliveryEvent): boolean {
+  return event.kind === 'tests' ? event.result === 'reported_passed' && passingRuns(event)
+    : event.kind === 'docs' && (event.structure === 'checked' || event.structure === 'not-applicable')
+}
+
 function validateReport(report: Tests | Docs) {
   if (!nonblank(report.reference)) throw new Error('A report must cite its original evidence')
   if (report.kind === 'docs') {
@@ -152,32 +215,25 @@ function validateReport(report: Tests | Docs) {
       || !Object.keys(report.evidence).length) throw new Error('Document report requires observed evidence')
     return
   }
-  const { reason, checks, red } = report.evidence
-  if (!nonblank(reason)) throw new Error('Test evidence requires a selection reason')
-  if (report.result !== 'reported_passed') return
-  const observed = (run: Run) => nonblank(run.command) && nonblank(run.directory) && nonblank(run.observed)
-  const green = checks.length > 0 && checks.every(c => c.status === 'passed' && observed(c))
-  const redCovered = red === null || red.length > 0 && red.every(r => nonblank(r.revision) && observed(r)
-    && checks.some(c => c.directory === r.directory && c.command === r.command))
-  if (!green || !redCovered) throw new Error('Passed tests require observed passing checks and matching red runs when declared')
+  if (!nonblank(report.evidence.reason)) throw new Error('Test evidence requires a selection reason')
+  if (report.result === 'reported_passed' && !passingRuns(report))
+    throw new Error('Passed tests require observed passing checks and matching red runs when declared')
 }
 
 /** Append one observed event. Revision, clock, previous ledger, review authority and canonical criteria come from trusted adapters. */
 export function advanceDelivery(ledger: DeliveryLedger | undefined, revision: DeliveryRevision, reviews: readonly ReviewEvidence[],
-  event: DeliveryEvent, at: string): DeliveryLedger {
+  event: DeliveryEvent, at: string, ticketId: string): DeliveryLedger {
   if (!nonblank(revision.base) || !nonblank(revision.candidate) || !Number.isSafeInteger(revision.generation) || revision.generation < 0 || !nonblank(at))
     throw new Error('Delivery evidence requires a verified revision, generation and timestamp')
-  const { active, mandatoryIds } = project(ledger, reviews)
-  const state = forRevision(active, revision)
+  const events = ledger?.events ?? []
+  const { active, mandatoryIds } = project(events, reviews, ticketId)
   if (event.kind === 'repair') {
-    distinct(event.fixes)
-    const pending = new Set([...active.blockers, ...active.repaired].map(i => i.id))
-    if (!active.revision || active.revision.candidate === revision.candidate || !pending.size || event.fixes.length !== pending.size
-      || event.fixes.some(f => !pending.has(f.id) || !cited(f.evidence)))
-      throw new Error('Repair requires a changed candidate and evidence for exactly all outstanding mandatory IDs')
+    const error = repairError(active, revision, event.fixes, events, events.length, ticketId)
+    if (error) throw new Error(error)
   } else {
-    if (active.revision?.candidate !== revision.candidate && (active.blockers.length || active.repaired.length))
+    if (needsRepair(active, revision))
       throw new Error('Repair outstanding mandatory issues before changing candidate')
+    const state = forRevision(active, revision)
     if (event.kind === 'tests' || event.kind === 'docs') {
       validateReport(event)
     } else {
@@ -191,6 +247,10 @@ export function advanceDelivery(ledger: DeliveryLedger | undefined, revision: De
           throw new Error('Acceptance results require canonical criteria and concrete evidence')
         if (state.expected.length && (state.expected.length !== event.expected.length || state.expected.some(c => !event.expected.some(e => c.id === e.id && c.text === e.text))))
           throw new Error('Acceptance criteria changed within a delivery cycle')
+        for (const result of event.results) {
+          const error = referenceError(result.evidence, events, events.length, ticketId, revision, result.status === 'passed')
+          if (error) throw new Error(error)
+        }
       } else {
         if (event.kind === 'first-retro' && state.first) throw new Error('First retro was already recorded in this cycle')
         if (event.kind === 'first-retro' && !state.tests?.evidence.checks.some(check => check.status === 'passed' || check.status === 'failed'))
@@ -201,19 +261,22 @@ export function advanceDelivery(ledger: DeliveryLedger | undefined, revision: De
           if (!['correctness', 'security', 'standard', 'optional'].includes(f.category) || !nonblank(f.summary) || !cited(f.evidence)
             || f.affects?.some(key => !validImpactKey(key)) || f.category === 'optional' && (mandatoryIds.has(f.id) || f.affects?.length))
             throw new Error('Invalid finding category, evidence, impact key, or attempted downgrade of a mandatory issue')
+          const error = referenceError(f.evidence, events, events.length, ticketId)
+          if (error) throw new Error(error)
         }
       }
     }
   }
   const entry: Entry = { ...event, revision, at }
   if (event.kind === 'repair') entry.reviewsBeforeRepair = currentReviews(reviews, revision).map(r => r.id)
-  return { events: [...(ledger?.events ?? []), structuredClone(entry)] }
+  return { events: [...events, structuredClone(entry)] }
 }
 
 /** A local evidence view, not CI, a merge receipt, or formal delivery. Missing/dirty worktrees have no active evidence. */
 export function viewDelivery(ledger: DeliveryLedger | undefined, revision: DeliveryRevision | undefined, reviews: readonly ReviewEvidence[],
-  acceptance: readonly Criterion[]) {
-  const { active, followups } = project(ledger, reviews)
+  acceptance: readonly Criterion[], ticketId: string) {
+  const events = ledger?.events ?? []
+  const { active, followups } = project(events, reviews, ticketId)
   const state = forRevision(active, revision)
   const matching = currentReviews(reviews, revision)
   const missing: string[] = []
@@ -229,9 +292,9 @@ export function viewDelivery(ledger: DeliveryLedger | undefined, revision: Deliv
   })
   if (!state.final) missing.push('final-retro')
   for (const issue of active.blockers) missing.push(`repair:${issue.id}`)
-  if (active.revision?.candidate !== revision?.candidate) for (const issue of active.repaired) missing.push(`repair:${issue.id}`)
-  if (state.tests?.result !== 'reported_passed') missing.push('tests')
-  if (!state.docs || !['checked', 'not-applicable'].includes(state.docs.structure)) missing.push('docs')
-  return { revision: revision ?? null, events: ledger?.events ?? [], reviews: matching, blockers: active.blockers, repaired: active.repaired,
+  if (needsRepair(active, revision)) for (const issue of active.repaired) missing.push(`repair:${issue.id}`)
+  if (!state.tests || !observationPassed(state.tests)) missing.push('tests')
+  if (!state.docs || !observationPassed(state.docs)) missing.push('docs')
+  return { revision: revision ?? null, events, reviews: matching, blockers: active.blockers, repaired: active.repaired,
     followups, acceptance: items, tests: state.tests ?? null, docs: state.docs ?? null, missing, ready: missing.length === 0 }
 }

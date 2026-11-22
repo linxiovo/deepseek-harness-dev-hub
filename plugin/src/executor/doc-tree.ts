@@ -2,6 +2,7 @@ import { posix } from 'node:path'
 import { decodeHTML } from 'entities'
 import GithubSlugger from 'github-slugger'
 import { Marked, Parser } from 'marked'
+import { z } from 'zod'
 import { CliError, type Commands } from '../infra/commands.ts'
 
 export interface DocTreeIssue {
@@ -11,7 +12,7 @@ export interface DocTreeIssue {
   detail?: string
 }
 
-interface DocTreeScope {
+export interface DocTreeScope {
   root: string | null
   routes: readonly string[]
   leaves: readonly string[]
@@ -33,7 +34,16 @@ type GitRead = (...args: string[]) => Promise<string>
 const fullSha = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i
 const unsafePathCharacter = /[\u0000-\u001f\u007f\\]/
 const maxLinkTargets = 512
-export const isMarkdownDocument = (path: string): boolean => /\.(?:md|markdown)$/i.test(path)
+const isMarkdownDocument = (path: string): boolean => /\.(?:md|markdown)$/i.test(path)
+
+const markdownPath = z.string().refine(path => path.length <= 512 && isMarkdownDocument(path) && !/[\\:\x00-\x1f\x7f]/.test(path)
+  && path.split('/').every(part => part !== '' && part !== '.' && part !== '..'), 'Expected a repository-relative Markdown path')
+const docPaths = z.array(markdownPath).refine(paths => paths.length <= 100, 'At most 100 paths may be declared')
+export const docTreeScopeSchema = z.strictObject({ root: markdownPath.nullable(), routes: docPaths, leaves: docPaths })
+export const docTreeImpactSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('updated'), documents: docPaths.refine(paths => paths.length > 0), contracts: docPaths }),
+  z.strictObject({ kind: z.literal('unchanged'), reason: z.string().trim().min(1).max(1000) }),
+])
 
 function nulRecords(output: string): string[] {
   if (!output) return []
@@ -97,7 +107,8 @@ function localTarget(from: string, href: string): { path: string; directory: boo
 const regularFile = (entry: TreeEntry | undefined): entry is TreeEntry =>
   entry?.mode === '100644' || entry?.mode === '100755'
 
-async function inspectDocuments(git: GitRead, candidate: string, scope: DocTreeScope, changed: ReadonlySet<string>): Promise<DocTreeIssue[]> {
+/** Check a scoped Doc Tree and its link targets in an already verified immutable Git snapshot. */
+export async function inspectDocuments(git: GitRead, candidate: string, scope: DocTreeScope, changed: ReadonlySet<string>): Promise<DocTreeIssue[]> {
   const { root, routes, leaves } = scope
   const issues: DocTreeIssue[] = []
   const entries = new Map<string, TreeEntry | undefined>()

@@ -35,11 +35,11 @@ import { TopicBinding } from './topic-binding.ts'
 import { Installation, projectDatabase, projectHubId } from './installation.ts'
 import { InstallationError } from './installation-api.ts'
 import { Planning } from './planning.ts'
-import { Plans } from './plans.ts'
+import { Plans, planDeliveryWriter } from './plans.ts'
 import { ScopedAttention } from './scoped-attention.ts'
 import { PlanDispatcher } from './plan-dispatch.ts'
 import { MainlineQueue } from './mainline-queue.ts'
-import { advanceMainline, precedes, prepareMainline, readMainline } from '../executor/mainline-git.ts'
+import { advanceMainline, precedes, prepareMainline, readMainline, verifyDeliveryOnTarget } from '../executor/mainline-git.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import { projectNavigationLink } from '../navigation.ts'
@@ -61,7 +61,7 @@ import { restoreReviewBindings } from './meter-recovery.ts'
 import { PLANNER_PRESET, ROUTER_PRESET, Sessions, splitterSessionId, WORKER_PRESET } from './sessions.ts'
 import { Settings } from './settings.ts'
 import { sourceContextOf, type SourceContextDeps } from './source-context.ts'
-import { approveMainline, authorizeMainline, type ResourceHost } from './resources.ts'
+import { approveMainline, authorizeMainline, inspectFormalDelivery, type ResourceHost } from './resources.ts'
 import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { plannerTools, type PlannerToolsHost } from './tools/planner.ts'
 import { splitterTools, type SplitterToolsHost } from './tools/splitter.ts'
@@ -309,6 +309,7 @@ export class Runtime extends Service implements SourceHost {
         } })
       this.planDispatcher = new PlanDispatcher({ store, plans, engine, executor, attention, limits: runLimits,
         bindWorker: (ticket, id) => sessions.bindWorker(ticket, id) })
+      const planDelivery = planDeliveryWriter(plans, id => engine.closePlanTicket(id))
       const mainline = new MainlineQueue({ store, effects, lifetime: this.lifetime,
         available: () => this.configured() && !this.closing(), paused: () => this.paused(),
         approve: async (id, candidate, signal, replay) => {
@@ -319,13 +320,38 @@ export class Runtime extends Service implements SourceHost {
           if (!this.configured() || this.closing()) throw new Error('The project is not available for mainline writes')
           authorizeMainline(resources, id, approval)
         },
+        inspectDelivery: async (intent, verify) => {
+          await executor.settleMainlineWriter(intent.ticket_id)
+          return inspectFormalDelivery(resources, intent, verify, this.lifetime)
+        },
+        closeDelivery: (approval, receipt) => {
+          if (!this.configured() || this.closing()) return 'delivery_target_changed'
+          const { ticketId } = receipt, plan = store.tickets.get(ticketId)?.plan
+          if (!plan) return 'plan_claim'
+          try {
+            authorizeMainline(resources, ticketId, approval)
+            planDelivery.deliver(plan.planId, plan.nodeId, receipt)
+          } catch (error) {
+            if (error instanceof UserError) {
+              if (error.code === 'mainlineRefused') return 'delivery_target_changed'
+              if (error.code === 'invalidPlan' || error.code === 'unknownPlan' || error.code === 'unknownPlanNode') return 'plan_claim'
+            }
+            throw error
+          }
+          return undefined
+        },
         read: target => readMainline(commands, target),
         precedes: (target, ancestor, descendant) => precedes(commands, target, ancestor, descendant),
+        verifyDelivery: (target, base, integration, actual, scope) => verifyDeliveryOnTarget(commands, target, base, integration, actual, scope),
         prepare: (target, candidate, intent, queuedAt) => prepareMainline(commands, target, candidate, intent, queuedAt),
         advance: (target, base, candidate, authorize) => advanceMainline(commands, target, base, candidate, authorize),
         repair: (id, repair) => executor.requestMainlineRepair(id, repair),
-        changed: intent => sessions.relay(key('mainline', intent.id), fill(promptFile('mainline-relay'),
-          { status: intent.status, resource: `ticket/${intent.ticket_id}/mainline` })),
+        changed: (intent, delivered) => {
+          const status = delivered ? 'delivered' : intent.delivery_missing ? 'delivery_blocked' : intent.status
+          sessions.relay(key('mainline', intent.id, status), fill(promptFile('mainline-relay'), {
+            status, resource: `ticket/${intent.ticket_id}/mainline`, delivery: `ticket/${intent.ticket_id}/delivery-check`,
+          }))
+        },
       })
       // Reconcile historical dispatch receipts before serving even paused/setup-pending reads. This grants no tools or writer lease.
       this.planDispatcher.restoreBindings()

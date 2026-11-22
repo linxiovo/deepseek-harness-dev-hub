@@ -3,7 +3,6 @@ import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { z } from 'zod'
 import { resolve } from 'node:path'
 import { KV } from '../src/kv.ts'
-import { planDeliveryWriter } from '../src/app/plans.ts'
 import { startManagedProject, startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host
@@ -726,7 +725,7 @@ it('delivers one direct Harness answer to the Plan ticket that asked the questio
 
 const receiptFor = (nodeId: string, claim: Pick<z.infer<typeof PlanDispatchClaimSchema>, 'ticketId' | 'assignmentId'>) => ({
   ticketId: claim.ticketId, assignmentId: claim.assignmentId, receiptId: `delivery-${nodeId}`,
-  candidate: `commit-${nodeId}`, verifiedAt: '2026-11-17T11:00:47Z',
+  base: '1'.repeat(40), generation: 1, candidate: '2'.repeat(40), integration: '3'.repeat(40), actual: '3'.repeat(40), verifiedAt: '2026-11-17T11:00:47Z',
 })
 
 it('rejects formal delivery from Hub and Worker tools and keeps receipt-looking reports blocked after restart', async () => {
@@ -737,6 +736,7 @@ it('rejects formal delivery from Hub and Worker tools and keeps receipt-looking 
     await h.runTool(claim.session, 'orchestrator_report', { state: 'ready', summary: JSON.stringify(args) })
   }
   await h.runtime.idle()
+  for (const claim of [catalogClaim, accountsClaim]) expect(await read(`ticket/${claim.ticketId}`)).not.toHaveProperty('ended')
   expect(await read(`plan/${id}/node/catalog`)).toMatchObject({ status: 'awaiting-delivery' })
   await expect(h.runTool(h.runtime.masterId, 'orchestrator_plan_deliver', {
     planId: id, nodeId: 'catalog', receipt: receiptFor('catalog', catalogClaim),
@@ -750,28 +750,38 @@ it('rejects formal delivery from Hub and Worker tools and keeps receipt-looking 
     expect.objectContaining({ id: 'accounts', status: 'awaiting-delivery' }),
   ]) })
   expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'] })
+  // Model an old executor that persisted a successful close without the Plan transaction. There is
+  // deliberately no public tool for producing this state today. Recovery must not infer a receipt.
+  const legacy = h.runtime.store.tickets.get(catalogClaim.ticketId)!
+  const at = new Date().toISOString()
+  legacy.ended = { by: 'executor', outcome: 'completed', at }
+  const assignment = legacy.assignments.at(-1)!
+  assignment.state = 'ended'; assignment.endedAt = at
+  h.runtime.store.tickets.save(legacy)
+  await h.restart()
+  await h.runtime.idle()
+  expect(await read(`ticket/${catalogClaim.ticketId}`)).toMatchObject({ state: 'completed', ended: { by: 'executor' } })
+  expect(await read(`plan/${id}/node/catalog`)).not.toHaveProperty('delivery')
+  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'] })
 })
 
-it('keeps the internal delivery writer claim-bound and requires both predecessor receipts', async () => {
+it('does not deliver a failed, stopped or dropped predecessor', async () => {
   const { id, catalogClaim, accountsClaim } = await dispatchedFanIn()
-  for (const claim of [catalogClaim, accountsClaim]) {
-    await h.runTool(claim.session, 'orchestrator_report', { state: 'ready', summary: 'Worker finished its local implementation.' })
+  const blocked = async () => {
+    for (const node of ['catalog', 'accounts']) expect(await read(`plan/${id}/node/${node}`)).not.toHaveProperty('delivery')
+    expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'] })
   }
+  await h.runTool(catalogClaim.session, 'orchestrator_report', { state: 'failed', summary: 'The catalog lookup failed.' })
   await h.runtime.idle()
-  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'] })
-  const writer = planDeliveryWriter(h.runtime.plans)
-  const receipt = receiptFor('catalog', catalogClaim)
-  expect(() => writer.deliver(id, 'catalog', receiptFor('accounts', accountsClaim))).toThrow(/does not belong/)
-  const delivered = writer.deliver(id, 'catalog', receipt)
-  expect(delivered).toMatchObject({ status: 'delivered', delivery: receipt })
-  expect(writer.deliver(id, 'catalog', receipt)).toEqual(delivered)
-  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['accounts'] })
-  writer.deliver(id, 'accounts', receiptFor('accounts', accountsClaim))
-  expect((await read(`plan/${id}/node/dashboard`)).status).toBe('waiting-for-slot')
-  expect(await read(`plan/${id}`)).toMatchObject({ nodes: expect.arrayContaining([
-    expect.objectContaining({ id: 'catalog', status: 'delivered' }), expect.objectContaining({ id: 'accounts', status: 'delivered' }),
-  ]) })
-  expect((await read(`plan/${id}`)).frontier).toContain('dashboard')
+  expect(await read(`ticket/${catalogClaim.ticketId}`)).toMatchObject({ state: 'person/failed' })
+  await blocked()
+
+  expect(await h.api('POST', `tickets/${catalogClaim.ticketId}/stop`, {})).toMatchObject({ status: 200, body: { stopped: true } })
+  await h.runTool(accountsClaim.session, 'orchestrator_report', { state: 'dropped', summary: 'Cancelled before delivery.' })
+  await h.runtime.idle()
+  expect(await read(`ticket/${catalogClaim.ticketId}`)).toMatchObject({ state: 'stopped', ended: { by: 'human' } })
+  expect(await read(`ticket/${accountsClaim.ticketId}`)).toMatchObject({ state: 'dropped', ended: { by: 'executor' } })
+  await blocked()
 })
 
 it('replays a durable claim after restart without creating a second Worker delivery', async () => {

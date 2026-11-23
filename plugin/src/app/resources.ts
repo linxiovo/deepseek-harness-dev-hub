@@ -4,6 +4,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { UserError, key, latestReport, reached, reviewStatus, runningAssignment, threadKey, viewDelivery, type Assignment, type Ticket,
   type Trigger } from '../core/index.ts'
+import { failedCheckObligations } from '../core/delivery-check.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { inspectWorktree } from '../executor/worktree.ts'
 import { docTreeImpactSchema, docTreeScopeSchema } from '../executor/doc-tree.ts'
@@ -26,7 +27,7 @@ import { sameDirectory } from '../infra/environment.ts'
 import { KV } from '../kv.ts'
 import type { Handoffs } from './handoffs.ts'
 import { PlanDeliveryReceiptSchema, type PlanRepairSource, type Plans } from './plans.ts'
-import { unrepairedChecks, type PlanStagnation } from './plan-stagnation.ts'
+import type { PlanStagnation } from './plan-stagnation.ts'
 import type { PlanRequirements } from './plan-requirements.ts'
 import { mainlineAttempts, mainlineIntent, type CheckDeliveryTarget, type DeliveryTargetObservation,
   type MainlineCiBinding, type MainlineIntent, type MergeApproval } from './mainline-queue.ts'
@@ -63,6 +64,7 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'ticket/<id>/mainline', holds: 'mainline attempts, actual Git verification and formal delivery blockers (not a receipt)', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
   { name: 'ticket/<id>/delivery-check', holds: 'candidate queue readiness, separate formal_delivery status for Plan tickets, and paginated acceptance, evidence and required CI', executor: true },
+  { name: 'ticket/<id>/failed-checks', holds: 'original failed checks and matching Worker reruns, without either review verdict', executor: true },
   { name: 'ticket/<id>/delivery-observation/<n>', holds: 'one durable delivery observation', executor: true },
   { name: 'retro-followups', holds: 'optional retro backlog, independent of Plan delivery' },
   { name: 'ticket/<id>/reviews', holds: 'reviews', executor: true },
@@ -356,6 +358,20 @@ const ciBinding = z.union([
 
 const scopedDocuments = z.object({ scope: docTreeScopeSchema, impact: docTreeImpactSchema })
 
+function deliveryTarget({ ticket, assignment, generation }: DeliveryState, checkout: DeliveryCheckout | undefined,
+  replay?: MainlineIntent, formal?: true) {
+  const writer = assignment?.writer, active = ticket.execution?.active_writer
+  const ownsLease = generation !== undefined && generation === writer?.generation && generation === ticket.execution?.ownership?.generation
+    && (!formal || (writer.state === 'active' && active?.assignment === assignment?.id && active?.session === writer.session))
+  // Only an already queued, exact pair can resume after the same writer was confirmed idle.
+  const idleReplay = replay && assignment?.id === replay.assignment && checkout?.base === replay.base && checkout.candidate === replay.candidate
+    && writer?.state === 'idle' && !active && writer.generation === replay.generation && ticket.execution?.ownership?.generation === replay.generation
+  const approvedGeneration = ownsLease ? generation : idleReplay ? replay.generation : undefined
+  const target = checkout?.clean && approvedGeneration !== undefined
+    ? { base: checkout.base, candidate: checkout.candidate, generation: approvedGeneration } : undefined
+  return { approvedGeneration, target }
+}
+
 async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSignal,
   scope?: { replay: MainlineIntent | undefined; formal?: never } | { replay: MainlineIntent; formal: true; verify: CheckDeliveryTarget }) {
   const replay = scope?.replay, formal = scope?.formal
@@ -367,26 +383,14 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
   let changed = state.stamp !== latest.stamp
 
   const local = () => {
-    const { ticket, assignment, generation, criteria, paused } = state
-    const writer = assignment?.writer, active = ticket.execution?.active_writer
-    const ownsLease = generation !== undefined && generation === writer?.generation &&
-      generation === ticket.execution?.ownership?.generation &&
-      (!formal || (writer.state === 'active' && active?.assignment === assignment?.id && active?.session === writer.session))
-    // For an existing queued intent only, the exact originally approved pair can resume after the same writer was
-    // confirmed idle. A held or replaced lease cannot stand in for a live generation.
-    const idleReplay = replay && assignment?.id === replay.assignment && checkout?.base === replay.base &&
-      checkout.candidate === replay.candidate && assignment.writer?.state === 'idle' && !ticket.execution?.active_writer &&
-      assignment.writer.generation === replay.generation && ticket.execution?.ownership?.generation === replay.generation
-    const approvedGeneration = ownsLease ? generation : idleReplay ? replay.generation : undefined
-    const target = checkout?.clean && approvedGeneration !== undefined ?
-      { base: checkout.base, candidate: checkout.candidate, generation: approvedGeneration } : undefined
+    const { ticket, assignment, criteria, paused } = state, writer = assignment?.writer
+    const { target, approvedGeneration } = deliveryTarget(state, checkout, replay, formal)
     const reviews = ticket.assignments.flatMap(item => item.reviews?.evidence ?? [])
-    const view = viewDelivery(ticket.deliveryCheck, target, reviews, criteria, id)
+    const view = viewDelivery(ticket.deliveryCheck, target, reviews, criteria, id, state.repair?.checks)
     const missing = new Set(view.missing)
     if (!view.ready && missing.size === 0) missing.add('delivery_evidence')
     if (!criteria.length) missing.add('registered_acceptance')
     if (approvedGeneration === undefined) missing.add('assignment_lease')
-    if (ticket.plan && target && unrepairedChecks(ticket, target, state.repair?.checks).length) missing.add('failed_checks_require_recheck')
     if (!checkout) missing.add('verified_worktree')
     else if (!checkout.clean) missing.add('clean_worktree')
     if (checkout && ticket.plan) {
@@ -868,11 +872,18 @@ const ROUTES: readonly Route[] = [
       const { planId, nodeId } = ticket.plan
       const definition = host.plans?.definition(planId, nodeId)
       if (!definition) throw new UserError('unknownPlanNode', { id: planId, node: nodeId })
-      const { node, goal, constraints, authorization, retired, testInterfaces } = definition
+      const { node, goal, constraints, authorization, retired, testInterfaces, acceptanceScope, outOfScope } = definition
       const repair = host.plans?.repairSource(planId, nodeId)
       return { planId, nodeId, goal, constraints, authorizedScope: authorization.scope, role: node.role,
         demonstration: node.demonstration, interfaceContract: node.interfaceContract, acceptance: deliveryAcceptance(host, ticket), testInterfaces,
+        acceptanceScope, outOfScope,
         ...(repair ? { repair } : {}), ...(retired ? { superseded: retired } : {}), evidence: `ticket/${id}/delivery-check` }
+    }
+    if (section === 'failed-checks' && part === undefined) {
+      const before = deliveryState(host, id), checkout = await deliveryCheckout(host.commands.withSignal(signal), before, signal)
+      const current = deliveryState(host, id), { target } = deliveryTarget(current, before.stamp === current.stamp ? checkout : undefined)
+      const checks = failedCheckObligations(id, current.ticket.deliveryCheck, target, current.repair?.checks)
+      return { revision: target ?? null, ...list(read, (offset, count) => checks.slice(offset, offset + count)) }
     }
     if (section === 'delivery-check') {
       if (part !== undefined) throw new Error('Unknown context resource')

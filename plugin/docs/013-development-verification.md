@@ -124,6 +124,14 @@ The output keeps skill names and call/result sequence references, fixture assert
 
 The delivery-check gate applies to Tickets linked to a registered Plan and the acceptance contract of their active or superseded node. A missing Plan contract leaves the gate incomplete. Tickets without a Plan keep their own acceptance criteria, candidate verification, required CI and ordinary report/PR handoff; they do not receive canonical Plan IDs or a `ready_to_queue` result.
 
+### Failed-check continuity
+
+`ticket/<id>/failed-checks` lists the recorded failures, including declared red runs, and their most recent matching Worker reruns on the active candidate and writer generation. An authenticated independent review child can read this paginated resource for its own Ticket, without seeing the other lane's decisions. `ticket/<id>/delivery-check` adds each confirmed axis in `local.failed_checks`.
+
+For each failure, both reviewers inspect the original assertion, its counterpart in the new commit, and the actual rerun of the same command. Submit `retainedChecks: [{failure, rerun, originalPath, currentPath, rationale}]` with `orchestrator_review_submit`. Use the exact IDs from the resource and repository-relative committed file paths. The host resolves both paths to Git blobs; the review rationale must establish that the assertion still runs and the criterion has not been weakened. Blob identity and a matching command do not prove assertion equivalence or execution. Unknown proof blocks rather than granting readiness. A previously passing lane may append a confirmation for a new pair, but cannot replace a blocked review or use the other lane's signer.
+
+Queue, replay and formal closure require both current confirmations; they report `failed_checks_require_recheck` after a new failure or a different rerun until the evidence is current again. Technical repair Tickets inherit earlier failures. An explicit product revision instead keeps superseded evidence on the original Ticket and requires fresh evidence under the approved contract.
+
 ### Retro and acceptance
 
 The active Worker writes `orchestrator_retro_evidence` for the full lowercase `candidate` SHA at the clean worktree HEAD. Read `ticket/<id>/delivery-check` through `orchestrator_read` for the evidence order, current gaps and canonical criteria. A Plan criterion ID is the decimal string of the node's one-based Spec acceptance reference; use exactly the IDs returned, not local numbering or replacements.

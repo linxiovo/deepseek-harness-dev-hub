@@ -1,1 +1,3 @@
-Preview the effect of an explicit product request; apply only the latest direct Hub user's exact approval of that preview. A technical recommendation, relay or plain assent is not approval.
+Direct Harness operator JSON: `{"intent":"change-plan-requirements","planId":"…","authorizedScope":"…","changes":[{"criterion":1,"statement":"…","observable":"…"}]}`. Use the original scope verbatim. Optional `goal` affects all nodes; goal-only uses `changes:[]`. Call `{"mode":"preview"}`.
+
+Show changed terms, retained scope/exclusions, affected tickets, invalid evidence and rechecks. Require separate direct `{"approved":true,"proposalId":"…","requestMessageId":"…","scopeDecision":"within-handoff"}` before `{"mode":"apply","proposalId":"…"}`. Stale preview: new direct request. Wider scope or excluded work: new handoff. No relay, technical advice or assent as authority.

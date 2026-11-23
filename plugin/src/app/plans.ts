@@ -11,7 +11,7 @@ import { KV } from '../kv.ts'
 import type { Effects } from './effects.ts'
 import type { Handoffs } from './handoffs.ts'
 import { mainlineIntent } from './mainline-queue.ts'
-import { unrepairedChecks, type PlanCheck } from './plan-stagnation.ts'
+import { failedCheckObligations, type FailedCheck } from '../core/delivery-check.ts'
 import type { Store } from './store.ts'
 
 const SlugSchema = z.string().max(80).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Expected a lowercase slug')
@@ -69,7 +69,7 @@ type PlanVersion = { plan: Plan; revision: number; goal: string; acceptance: Spe
 type ReplanCause = { kind: 'technical'; nodeId: string; failureId: string; reason: string; scope: string[]; repair?: true }
   | { kind: 'requirements'; proposalId: string; approval: PlanMessage; goal: string; acceptance: Spec['acceptance'] }
 export type PlanRevision = Omit<PlanVersion, 'plan'> & PlanTopology & { at: string; cause: ReplanCause }
-export interface PlanRepairSource { nodeId: string; ticketId: string; failureId: string; summary: string; checks: PlanCheck[] }
+export interface PlanRepairSource { nodeId: string; ticketId: string; failureId: string; summary: string; checks: FailedCheck[] }
 
 type PlanNodeView = PlanNode & {
   status: PlanNodeState['status'] | 'blocked' | 'waiting-for-slot' | 'superseded'
@@ -152,7 +152,7 @@ export class Plans {
             throw new UserError('invalidPlan', { detail: 'A repair must preserve one active node and its recorded failure' })
           }
           source = { nodeId: oldId, ticketId: oldTicket.id, failureId: failure.id, summary: failure.summary.slice(0, 500),
-            checks: unrepairedChecks(oldTicket, undefined) }
+            checks: failedCheckObligations(oldTicket.id, oldTicket.deliveryCheck, undefined, source?.checks).map(item => item.failure) }
         }
         for (const successor of successorIds) {
           if (!next.has(successor) || previous.has(successor) || this.store.get(KV.plans.retired(id, successor)) || this.state(id, successor)) {
@@ -205,7 +205,8 @@ export class Plans {
     const node = version?.plan.nodes.find(item => item.id === nodeId)
     const handoff = version && this.handoffs.get(version.plan.handoffId)
     return node && version && handoff?.spec ? { node, goal: version.goal, acceptance: version.acceptance, retired,
-      constraints: handoff.constraints, authorization: handoff.authorization, testInterfaces: handoff.spec.testInterfaces } : undefined
+      constraints: handoff.constraints, authorization: handoff.authorization, acceptanceScope: handoff.acceptanceScope,
+      testInterfaces: handoff.spec.testInterfaces, outOfScope: handoff.spec.outOfScope } : undefined
   }
 
   /** The repair's immutable source of failed checks and audit history. */

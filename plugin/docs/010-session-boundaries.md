@@ -14,7 +14,7 @@ The Hub's coordination tools are registered by `mainTools` in `src/app/tools/mai
 
 If DeepSeek Harness selects another preset for the main Session before its first turn, `Sessions` selects `ROUTER_PRESET` again. A main Session the host creates or reloads is decorated with the runtime restriction, so it cannot recover shell, job or write tools even when the profile mounts one.
 
-The Hub also owns `orchestrator_handoff_confirm`, `orchestrator_handoff_answer`, `orchestrator_plan_context` and `orchestrator_plan_answer`. Neither planning Session owns these tools. [009 Handoff](009-handoff.md) describes the planner and splitter scopes; they can submit only their own planning artifact, never issue a Channel reply or start a Worker. Planner questions still use `orchestrator_handoff_answer`.
+The Hub also owns `orchestrator_handoff_confirm`, `orchestrator_handoff_answer`, `orchestrator_plan_context`, `orchestrator_plan_question` and `orchestrator_plan_answer`. Neither planning Session owns these tools. [009 Handoff](009-handoff.md) describes the planner and splitter scopes; they submit only their own planning artifact, never issue a Channel reply or start a Worker. Planner questions still use `orchestrator_handoff_answer`.
 
 `orchestrator_plan_replan` and `orchestrator_plan_requirements` are also Hub-only. Technical recovery does not confer product authority, and requirement changes require a direct Harness approval after preview. Workers can read their own `ticket/<id>/plan-scope`, not the Plan's approvals or graph history. See `018-plan-replanning.md`.
 
@@ -41,13 +41,13 @@ Acceptance is different from Worker take-up: when a Ticket is created with an ac
 
 ### Reports and questions
 
-`orchestrator_report` records progress, `ready`, `blocked`, `failed` or `dropped` and an optional `human_action` question. For a Plan Ticket, ordinary reports stay on the Ticket; a concrete question for a person relays to the Hub as `human-action`. A report with `reply_to_trigger_id` that the Engine accepts as an answer to a reached human question still relays as `worker_report` with `answer_to`, for a solicited reply to that original question. Review evidence alone is not a proactive receipt. Non-Plan reports retain the legacy relay policy. The Hub owns `orchestrator_reply` (`answer`, `result` or `attention`) for Channel sends. Host-side acceptance acknowledgement is a separate outbox path; no Worker tool exposes a Channel send path.
+`orchestrator_report` records progress, `ready`, `blocked`, `failed` or `dropped` and an optional `human_action` question. A Plan Worker's question is an internal proposal, not an operator request; only the Hub can confirm it as a missing product decision. A report with `reply_to_trigger_id` that the Engine accepts as an answer to a reached human question still relays as `worker_report` with `answer_to`. Review evidence alone is not a proactive receipt. Non-Plan reports retain the legacy relay policy. The Hub owns `orchestrator_reply` (`answer`, `result` or `attention`) for Channel sends; host-side acceptance acknowledgement has a separate outbox path.
 
 Only the current root Worker of a Plan Ticket has `orchestrator_credential_blocked`. It registers a blocker with an identifier, not a secret, and routes the operator action to the Hub. No Session tool verifies the account; verification is a scoped management operation. The Hub's `project/attention` and `plan/<id>/attention` reads are not Worker or planner resources. See `015-scoped-attention.md` for the role, replay and management contracts.
 
 ### Direct Harness answers to Plan Workers
 
-When the Plan Ticket has no reply Channel, the Hub asks the question in its normal Harness reply; it does not call `orchestrator_reply` or guess a destination. The `human-action` question relay supplies `ticket.ticket_id`, `ticket.attention.id` and `ticket.attention.question`. Questions raised by a specific Source message keep their existing original-Channel route.
+Plan product questions and addressed answers stay in Harness; see the question and answer contract in `015-scoped-attention.md`. The Hub does not use `orchestrator_reply` or guess a Channel destination for them.
 
 `orchestrator_plan_answer` is Hub-only. Its strict input is `{"ticket_id":"<ticket id>","question_id":"<attention id>","answer":"<verbatim answer>"}`: all three fields are required, nonblank strings and no extra fields are accepted. The latest direct `user/message` in the Hub must itself be that JSON object, with all three decoded strings equal to the tool arguments. JSON whitespace and key order do not matter; plain text, code fences, paraphrases, source relays and earlier direct messages are not proof. The Hub cannot construct an answer on the user's behalf.
 

@@ -15,13 +15,16 @@ import { promptFile } from './skill-files.ts'
 import type { Store } from './store.ts'
 
 const Text = z.string().max(4000).regex(/\S/, 'Expected non-blank text')
-export const RequirementRequestSchema = z.strictObject({
+const RequirementRequestSchema = z.strictObject({
+  intent: z.literal('change-plan-requirements'),
   planId: Text,
+  authorizedScope: z.string().min(1),
   goal: Text.optional(),
   changes: z.array(z.strictObject({ criterion: z.number().int().positive(), statement: Text, observable: Text })).max(100),
 })
-export type RequirementRequest = z.infer<typeof RequirementRequestSchema>
-export const RequirementApprovalSchema = z.strictObject({ approved: z.literal(true), proposalId: z.uuid() })
+const RequirementApprovalSchema = z.strictObject({ approved: z.literal(true), proposalId: z.uuid(),
+  requestMessageId: Text, scopeDecision: z.enum(['within-handoff', 'new-handoff']) })
+type OperatorMessage = PlanMessage & { seq: number }
 
 const PROPOSAL_TTL = 30 * 60_000
 const targetQuestion = promptFile('plan-requirements-target')
@@ -55,6 +58,9 @@ type AffectedNode = Pick<PlanNode, 'featureId' | 'role' | 'interfaceContract'> &
 export type RequirementPreview = {
   proposalId: string
   ownerSession: string
+  requestMessageId: string
+  requestSequence: number
+  requestDigest: string
   planId: string
   handoffId: string
   expectedRevision: number
@@ -64,7 +70,9 @@ export type RequirementPreview = {
   goal: string
   invalidated: CriterionChange[]
   affected: AffectedNode[]
-  retained: { handoff: string; testInterfaces: string }
+  retained: Pick<Handoff, 'authorization' | 'constraints' | 'acceptanceScope'> & Pick<Spec, 'testInterfaces' | 'outOfScope'> & {
+    handoff: string; spec: string
+  }
   evidenceFingerprint: string
 } & ({ status: 'preview' } | {
   status: 'applied'; revision: number; appliedAt: string; approvedBy: Pick<PlanMessage, 'sessionId' | 'messageId'>
@@ -81,16 +89,17 @@ type Host = {
   stop: (ticketId: string, reason: string) => void
   authorize: () => void
 }
-type ActivePlan = { plan: Plan; revision: number; goal: string; acceptance: Spec['acceptance']; handoff: Handoff; waitingFor: string[] }
+type ActivePlan = { plan: Plan; revision: number; goal: string; acceptance: Spec['acceptance']; handoff: Handoff; spec: Spec; waitingFor: string[] }
 
 function refuse(detail: string): never { throw new UserError('invalidPlan', { detail }) }
 
-function checkApproval(proposalId: string, message: PlanMessage): void {
-  let input: unknown
-  try { input = JSON.parse(message.text) } catch { refuse('Explicit approval must identify the requirement proposal') }
-  const approval = RequirementApprovalSchema.safeParse(input)
-  if (!approval.success || approval.data.proposalId !== proposalId || !Text.safeParse(message.sessionId).success ||
-      !Text.safeParse(message.messageId).success) refuse('Explicit approval must identify the requirement proposal')
+function operatorPayload<T>(schema: z.ZodType<T>, message: OperatorMessage, detail: string): T {
+  if (!message.sessionId || !message.messageId || !Number.isSafeInteger(message.seq) || message.seq < 0) refuse(detail)
+  let raw: unknown
+  try { raw = JSON.parse(message.text) } catch { refuse(detail) }
+  const result = schema.safeParse(raw)
+  if (!result.success) refuse(detail)
+  return result.data
 }
 
 function evidenceRefs(ticket: Ticket, state: PlanNodeState | undefined, attempts: MainlineIntent[]): EvidenceRef[] {
@@ -162,23 +171,39 @@ export class PlanRequirements {
 
   get(proposalId: string): RequirementPreview | undefined { return this.host.store.get(KV.planRequirements.preview(proposalId)) }
 
-  preview(request: RequirementRequest, ownerSession: string): PendingPreview | NeedsTarget {
-    const { planId, goal, changes } = RequirementRequestSchema.parse(request)
-    return this.host.store.atomic(() => {
+  preview(message: OperatorMessage): RequirementPreview | NeedsTarget {
+    const { planId, authorizedScope, goal, changes } = operatorPayload(RequirementRequestSchema, message,
+      'The latest direct Harness operator message must be an explicit, structured product change request')
+    const { store } = this.host, ownerSession = message.sessionId
+    const requestKey = KV.planRequirements.request(ownerSession, message.messageId)
+    const requestDigest = createHash('sha256').update(message.text).digest('hex')
+    return store.atomic(() => {
+      const priorId = store.get(requestKey)
+      if (priorId !== undefined) {
+        const prior = this.get(priorId)
+        if (!prior || prior.ownerSession !== ownerSession || prior.planId !== planId || prior.requestMessageId !== message.messageId ||
+            prior.requestSequence !== message.seq || prior.requestDigest !== requestDigest) refuse('Product request does not match its recorded preview')
+        this.requireOwner(prior.handoffId, ownerSession)
+        return prior
+      }
       const active = this.active(planId, ownerSession)
-      const previousGoal = active.goal, nextGoal = goal?.trim() ?? previousGoal
-      if (!changes.length || changes.some(item => item.criterion > active.acceptance.length)) {
+      if (authorizedScope !== active.handoff.authorization.scope) refuse('Changing the authorized scope requires a new handoff')
+      const previousGoal = active.goal, nextGoal = goal ?? previousGoal
+      const globalChange = nextGoal !== previousGoal
+      if ((!changes.length && !globalChange) || changes.some(item => item.criterion > active.acceptance.length)) {
         return { status: 'needs-target', planId, question: targetQuestion,
           criteria: active.acceptance.map(({ statement }, index) => ({ criterion: index + 1, statement })) }
       }
-      const seen = new Set<number>(), invalidated: CriterionChange[] = []
-      for (const item of changes) {
-        if (seen.has(item.criterion)) refuse(`Acceptance criterion ${item.criterion} appears more than once`)
-        seen.add(item.criterion)
-        const before = active.acceptance[item.criterion - 1]!
-        const statement = item.statement.trim(), observable = item.observable.trim()
-        if (nextGoal !== previousGoal || statement !== before.statement || observable !== before.observable) {
-          invalidated.push({ criterion: item.criterion, before, after: { ...before, statement, observable } })
+      const edits = new Map<number, Spec['acceptance'][number]>()
+      for (const { criterion, statement, observable } of changes) {
+        if (edits.has(criterion)) refuse(`Acceptance criterion ${criterion} appears more than once`)
+        edits.set(criterion, { ...active.acceptance[criterion - 1]!, statement, observable })
+      }
+      const invalidated: CriterionChange[] = []
+      for (const [index, before] of active.acceptance.entries()) {
+        const criterion = index + 1, after = edits.get(criterion) ?? before
+        if (globalChange || after.statement !== before.statement || after.observable !== before.observable) {
+          invalidated.push({ criterion, before, after })
         }
       }
       if (!invalidated.length) refuse('The proposed requirements make no change to the current Plan')
@@ -187,40 +212,50 @@ export class PlanRequirements {
       const { affected, evidenceFingerprint } = this.impact(active, invalidated, nextGoal, proposalId)
       const preview: PendingPreview = {
         status: 'preview', proposalId, ownerSession, planId, handoffId: active.handoff.id,
+        requestMessageId: message.messageId, requestSequence: message.seq, requestDigest,
         expectedRevision: active.revision, createdAt: new Date(now).toISOString(), expiresAt: new Date(now + PROPOSAL_TTL).toISOString(),
         previousGoal, goal: nextGoal, invalidated, affected, evidenceFingerprint,
-        retained: { handoff: `handoff/${active.handoff.id}`, testInterfaces: `spec/${active.handoff.id}` },
+        retained: { handoff: `handoff/${active.handoff.id}`, spec: `spec/${active.handoff.id}`,
+          authorization: active.handoff.authorization, constraints: active.handoff.constraints, acceptanceScope: active.handoff.acceptanceScope,
+          testInterfaces: active.spec.testInterfaces, outOfScope: active.spec.outOfScope },
       }
-      this.host.store.set(KV.planRequirements.preview(proposalId), preview)
+      store.set(KV.planRequirements.preview(proposalId), preview)
+      store.set(requestKey, proposalId)
       return preview
     })
   }
 
-  apply(proposalId: string, message: PlanMessage): AppliedPreview {
-    checkApproval(proposalId, message)
+  apply(proposalId: string, message: OperatorMessage): AppliedPreview {
+    const approval = operatorPayload(RequirementApprovalSchema, message,
+      'The latest direct Harness operator approval must identify the preview, source request and scope decision')
+    if (approval.proposalId !== proposalId) refuse('Approval identifies a different requirement preview')
+    if (approval.scopeDecision !== 'within-handoff') refuse('A change outside the authorized scope requires a new handoff')
     const { store, plans } = this.host
     return store.atomic(() => {
       const preview = this.get(proposalId)
       if (!preview) refuse('Unknown requirement proposal')
       this.requireOwner(preview.handoffId, message.sessionId)
       if (preview.ownerSession !== message.sessionId) refuse('Requirement proposal belongs to another Session')
+      if (approval.requestMessageId !== preview.requestMessageId || message.messageId === preview.requestMessageId ||
+          message.seq <= preview.requestSequence || store.get(KV.planRequirements.request(message.sessionId, approval.requestMessageId)) !== proposalId) {
+        refuse('Approval must be a separate, later direct message bound to this preview and its original product request')
+      }
       const approvalKey = KV.planRequirements.approval(message.sessionId, message.messageId)
       const priorApproval = store.get(approvalKey)
       if (priorApproval !== undefined && priorApproval !== proposalId) refuse('This user event already approved another requirement proposal')
       if (preview.status === 'applied') {
-        // A repeated approval can read the receipt, but never becomes a new approving event for an old revision.
-        if (priorApproval === undefined && preview.approvedBy.messageId === message.messageId) store.set(approvalKey, proposalId)
+        if (priorApproval !== proposalId || preview.approvedBy.messageId !== message.messageId) refuse('A different event already approved this preview')
         return preview
       }
       const expires = Date.parse(preview.expiresAt), now = Date.now()
-      if (!Number.isFinite(expires) || now >= expires) refuse('Requirement proposal expired; preview the changes again')
+      if (!Number.isFinite(expires) || now >= expires) refuse('Requirement proposal expired; send a new explicit product change request')
       const active = this.active(preview.planId, message.sessionId)
       if (active.revision !== preview.expectedRevision || active.handoff.id !== preview.handoffId) {
-        refuse('Plan revision changed after the preview; preview the changes again')
+        refuse('Plan revision changed after the preview; send a new explicit product change request')
       }
       const observed = this.impact(active, preview.invalidated, preview.goal, proposalId)
       if (observed.evidenceFingerprint !== preview.evidenceFingerprint || !isDeepStrictEqual(observed.affected, preview.affected)) {
-        refuse('Plan evidence or in-flight state changed after the preview; preview the changes again')
+        refuse('Plan evidence or in-flight state changed after the preview; send a new explicit product change request')
       }
       this.host.authorize()
       const { affected } = preview
@@ -273,7 +308,8 @@ export class PlanRequirements {
     const handoff = this.requireOwner(active.plan.handoffId, ownerSession)
     const required = this.host.plans.requiredDelivery(planId)
     if (!required?.waitingFor.length) refuse('A fully delivered Plan cannot be replanned')
-    return { ...active, handoff, waitingFor: required.waitingFor }
+    if (!handoff.spec) refuse('The original published Specification is required for a product change')
+    return { ...active, handoff, spec: handoff.spec, waitingFor: required.waitingFor }
   }
 
   private impact(active: ActivePlan, changes: CriterionChange[], goal: string, proposalId: string) {
@@ -289,7 +325,7 @@ export class PlanRequirements {
     }
     const fingerprint = createHash('sha256')
     fingerprint.update(JSON.stringify([plan, active.goal, active.acceptance, active.handoff.constraints, active.handoff.authorization,
-      active.handoff.acceptanceScope, active.handoff.spec?.testInterfaces, active.handoff.spec?.outOfScope,
+      active.handoff.acceptanceScope, active.spec.testInterfaces, active.spec.outOfScope,
       store.get(KV.plans.background(plan.id))]))
     const observations = new Map<string, { state: PlanNodeState | undefined; ticket: AffectedTicket | undefined }>()
     const observe = (nodeId: string, inScope: boolean) => {

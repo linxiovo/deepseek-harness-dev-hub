@@ -627,6 +627,17 @@ export class Tickets extends EnginePart {
     this.addInput(ticket, { id, kind: 'note', text, at, ...(diagnosisFor !== undefined && { diagnosisFor }) })
     return this.require(ticketId)
   }
+  /** Keep the Input history and its delivery ID even if a send just crossed the withdrawal boundary. */
+  withdrawPlanDiagnosis(ticketId: string, assignmentId: string, inputId: string): void {
+    const ticket = this.repo.tickets.get(ticketId)
+    if (!ticket?.plan || !liveTicket(ticket)) return
+    const assignment = latestAssignment(ticket)
+    if (assignment?.id !== assignmentId || assignment.state !== 'running') return
+    const index = ticket.undelivered.indexOf(inputId)
+    if (index < 0 || !ticket.inputs.some(input => input.id === inputId && input.kind === 'note' && input.diagnosisFor === assignmentId)) return
+    ticket.undelivered.splice(index, 1)
+    this.repo.tickets.save(ticket)
+  }
   /**
    * Subscribe an open ticket to a Thread its Executor found related, for context: see `Thread.context`.
    * @returns false when the ticket follows the Thread already.

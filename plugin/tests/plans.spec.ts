@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { spawnSync } from 'node:child_process'
+import { unlinkSync, writeFileSync } from 'node:fs'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { z } from 'zod'
 import { resolve } from 'node:path'
@@ -835,24 +837,42 @@ async function dispatchedFanIn() {
   return { id, catalogClaim, accountsClaim }
 }
 
-it('delivers one direct Harness answer to the Plan ticket that asked the question', async () => {
+it('keeps Worker requests internal until the Hub confirms a product question for the right criterion', async () => {
   const { id, catalogClaim, accountsClaim } = await dispatchedFanIn()
   h.deliveries.mockClear()
+  await h.runTool(catalogClaim.session, 'orchestrator_report', {
+    state: 'failed', summary: 'The catalog check returned 500', human_action: 'Please fix the failing check.',
+  })
+  await h.runtime.idle()
+  expect(h.jsonRelays(h.runtime.masterId, 'human-action')).toEqual([])
+  expect(await read(`plan/${id}/node/catalog`)).toMatchObject({ recovery: { attempts: 1 } })
+  expect(await read(`plan/${id}/attention`)).toMatchObject({ awaitingHuman: 0 })
   const report = await h.runTool(accountsClaim.session, 'orchestrator_report', {
     state: 'blocked', summary: 'Need the product decision', human_action: 'Should the profile support password login?',
-  }) as { attention: { id: string } }
+  }) as { question_proposal: { id: string } }
   await h.runtime.idle()
-  expect(h.relays(h.runtime.masterId)).toEqual([expect.objectContaining({ kind: 'human-action',
-    ticket: expect.objectContaining({ attention: expect.objectContaining({ id: report.attention.id }) }) })])
+  expect(h.jsonRelays(h.runtime.masterId, 'human-action')).toEqual([])
+  expect(await read(`plan/${id}/attention`)).toMatchObject({ awaitingHuman: 0 })
   const master = h.runtime.masterId
-  const args = { ticket_id: accountsClaim.ticketId, question_id: report.attention.id, answer: 'Use sign-in links only.' }
+  const question = { ticket_id: accountsClaim.ticketId, question_id: report.question_proposal.id, criterion: 2 }
+  const ask = (args: typeof question, session = master) => h.runTool(session, 'orchestrator_plan_question', args)
+  await expect(ask(question, accountsClaim.session)).rejects.toThrow(/not registered/i)
+  await expect(ask({ ...question, criterion: 1 })).rejects.toThrow(/criterion/i)
+  expect(await ask(question)).toMatchObject({ question_id: question.question_id, reused: false })
+  expect(await ask(question)).toMatchObject({ question_id: question.question_id, reused: true })
+  await h.runtime.idle()
+  expect(h.jsonRelays(master, 'human-action')).toEqual([expect.objectContaining({
+    ticket: expect.objectContaining({ attention: expect.objectContaining({ id: question.question_id }) }),
+  })])
+  const args = { ticket_id: accountsClaim.ticketId, question_id: question.question_id, answer: 'Use sign-in links only.' }
   await expect(h.runTool(master, 'orchestrator_plan_answer', args)).rejects.toThrow()
   const wrongTicket = { ...args, ticket_id: catalogClaim.ticketId }
   h.sendUserMessage(master, JSON.stringify(wrongTicket))
   await expect(h.runTool(master, 'orchestrator_plan_answer', wrongTicket)).rejects.toThrow()
   h.sendUserMessage(master, JSON.stringify(args))
-  expect(await h.runTool(master, 'orchestrator_plan_answer', args)).toMatchObject({ ticket_id: accountsClaim.ticketId, question_id: report.attention.id })
+  expect(await h.runTool(master, 'orchestrator_plan_answer', args)).toMatchObject({ ticket_id: accountsClaim.ticketId, question_id: question.question_id })
   await expect(h.runTool(master, 'orchestrator_plan_answer', args)).rejects.toThrow()
+  await expect(ask(question)).rejects.toThrow(/question/i)
   await h.runtime.idle()
   const delivered = h.deliveries.mock.calls.map(([call]) => call).filter(call => call.text === args.answer)
   expect(delivered).toEqual([expect.objectContaining({ sessionId: accountsClaim.session })])
@@ -1025,14 +1045,31 @@ it('replans by replacing the Assignment but requires the failed check to actuall
   await h.restart()
   await h.runtime.idle()
   expect((await assignments()).items).toHaveLength(2)
+  const hubPrompt = h.runtime.sessions.prompt.bind(h.runtime.sessions)
+  const held = vi.spyOn(h.runtime.sessions, 'prompt').mockImplementation(async (...args) => {
+    if (args[2].includes('"kind":"plan-replan-review"')) throw new Error('Hub unavailable before receipt')
+    return hubPrompt(...args)
+  })
+  const recovery = () => read(`plan/${id}/node/catalog/recovery`)
+  const notices = () => h.jsonRelays(h.runtime.masterId, 'plan-replan-review')
   await recordCheck(check, 'failed', 'Expected HTTP 200; replacement run received 502.')
   await h.runtime.pump()
   await h.runtime.idle()
-  const notices = () => h.jsonRelays(h.runtime.masterId, 'plan-replan-review')
-  expect(notices()).toHaveLength(1)
-  await h.runtime.pump()
-  await h.runtime.idle()
-  expect(notices()).toHaveLength(1)
+  const first = await recovery()
+  expect(first).toMatchObject({ status: 'stalled' })
+  expect(notices()).toHaveLength(0)
+  const newest = 'Expected HTTP 200; a later run received 504.'
+  await recordCheck(check, 'failed', newest)
+  const latest = await recovery()
+  expect(latest.failureId).not.toBe(first.failureId)
+  await recordCheck(check, 'failed', newest)
+  expect(await recovery()).toMatchObject({ failureId: latest.failureId, attempts: latest.attempts })
+  await h.restart()
+  held.mockRestore()
+  await vi.waitFor(() => expect(notices()).toEqual([expect.objectContaining({
+    failure: `plan/${id}/node/catalog/recovery/${latest.failureId}`,
+  })]), { timeout: 20_000 })
+  expect(await read(`plan/${id}/node/catalog/recovery/${first.failureId}`)).toMatchObject({ id: first.failureId })
   expect(h.jsonRelays(h.runtime.masterId, 'human-action')).toEqual([])
   const original = await read(`plan/${id}/node/catalog/recovery`)
   setRequiredChecks([])
@@ -1055,7 +1092,9 @@ it('replans by replacing the Assignment but requires the failed check to actuall
   await h.runtime.idle()
   expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: [repairNode, 'accounts'] })
   expect(await h.runTool(replacement.session, 'orchestrator_read', { resource: `ticket/${replacement.ticketId}/plan-scope` }))
-    .toMatchObject({ repair: { ticketId: claim.ticketId, failureId: original.failureId, checks: [{ directory: '.', command: check }] } })
+    .toMatchObject({ repair: { ticketId: claim.ticketId, failureId: original.failureId, checks: expect.arrayContaining([
+      expect.objectContaining({ directory: '.', command: check }),
+    ]) } })
   const delivery = () => read(`ticket/${replacement.ticketId}/delivery-check`)
   expect(JSON.parse(String((await delivery()).text))).toMatchObject({ ci: { required } })
   await recordCheck('pnpm test unrelated', 'failed', 'The independent check failed on its first run.', replacement.session)
@@ -1064,9 +1103,78 @@ it('replans by replacing the Assignment but requires the failed check to actuall
   expect(await read(`plan/${id}/node/${repairNode}/recovery`)).toMatchObject({ attempts: 1 })
   await recordCheck(check, 'failed', 'Expected HTTP 200, but received 500.', replacement.session)
   await recordCheck(check, 'passed', 'The diagnostic check received HTTP 200.', replacement.session)
-  expect((await delivery()).missing).not.toContain('failed_checks_require_recheck')
+  expect((await delivery()).missing).toContain('failed_checks_require_recheck')
   await recordCheck(check, 'failed', 'Expected HTTP 200, but received 500.', replacement.session)
   expect((await delivery()).missing).toContain('failed_checks_require_recheck')
+}, 60_000)
+
+it('requires both pinned reviewers to verify a failed check survived a green rerun', async () => {
+  const { id } = await registeredFanIn()
+  const claim = (await dispatchPlan(id, 'catalog')).claim!
+  await h.runtime.idle()
+  const { directory } = await read(`ticket/${claim.ticketId}`)
+  const work = String(directory), fixture = 'catalog-contract.test.cjs'
+  const git = (...args: string[]) => h.localGit!.git('-C', work, ...args)
+  const commit = (title: string) => { git('add', '-A'); git('commit', '-m', title); return git('rev-parse', 'HEAD') }
+  const run = () => spawnSync(process.execPath, ['--test'], { cwd: work, encoding: 'utf8', timeout: 10_000 })
+  const status = resolve(work, 'catalog-status.txt'), testFile = resolve(work, fixture)
+  const source = "require('node:test')('catalog returns 200', () => require('node:assert/strict').equal(require('node:fs').readFileSync('catalog-status.txt', 'utf8'), '200'))\n"
+  writeFileSync(testFile, source)
+  writeFileSync(status, '500')
+  const red = commit('记录失败的目录契约检查')
+  const record = (candidate: string, status: 'failed' | 'passed', observed: string, reference?: string) =>
+    h.runTool(claim.session, 'orchestrator_test_evidence', { candidate, scope: 'focused', reason: 'Catalog status contract', red: null,
+      checks: [{ directory: '.', command: 'node --test', status, observed }], ...(reference ? { reference } : {}) })
+  const failed = run()
+  expect(failed.stdout).toContain("'500' !== '200'")
+  expect(failed.status).toBe(1)
+  await record(red, 'failed', 'catalog returns 200: received 500')
+  const resource = `ticket/${claim.ticketId}/failed-checks`
+  const delivery = () => read(`ticket/${claim.ticketId}/delivery-check`)
+  const missing = 'failed_checks_require_recheck'
+  const review = async (axis: 'standards' | 'spec', candidate: string, retained = false) => {
+    const reviewer = await h.reviewSubagent(claim.session, axis)
+    const { items } = await h.runTool(reviewer, 'orchestrator_read', { resource }) as unknown as {
+      items: { failure: { id: string }; rerun: { id: string } | null }[]
+    }
+    const input = { candidate, axis, conclusion: 'passed', blockers: [], summary: 'Checked the committed catalog test and rerun.', basis: [fixture],
+      ...(retained ? { retainedChecks: items.map(({ failure, rerun }) => ({ failure: failure.id, rerun: rerun!.id,
+        originalPath: fixture, currentPath: fixture, rationale: 'The same catalog assertion runs under node --test and now observes 200.' })) } : {}) }
+    return () => h.runTool(reviewer, 'orchestrator_review_submit', input)
+  }
+
+  unlinkSync(testFile)
+  const shortcut = commit('移除有失败的检查')
+  const empty = run()
+  expect(empty.status).toBe(0)
+  expect(empty.stdout).not.toContain('catalog returns 200')
+  await record(shortcut, 'passed', 'node --test exited 0 with no catalog assertion')
+  await (await review('standards', shortcut))()
+  await (await review('spec', shortcut))()
+  await expect((await review('standards', shortcut, true))()).rejects.toThrow()
+  expect((await delivery()).missing).toContain(missing)
+
+  writeFileSync(testFile, source)
+  writeFileSync(status, '200')
+  const fixed = commit('恢复并修正目录契约检查')
+  const passed = run()
+  expect(passed.status).toBe(0)
+  expect(passed.stdout).toContain('catalog returns 200')
+  await record(fixed, 'passed', 'catalog returns 200: passed')
+  const originalStandards = await review('standards', fixed, true)
+  await originalStandards()
+  expect((await delivery()).missing).toContain(missing)
+  await (await review('spec', fixed, true))()
+  expect((await delivery()).missing).not.toContain(missing)
+  await record(fixed, 'failed', 'catalog status returned 502 on a later run')
+  expect((await delivery()).missing).toContain(missing)
+  expect(run().status).toBe(0)
+  await record(fixed, 'passed', 'catalog returns 200: passed', 'command-result/catalog-fresh-rerun')
+  await expect(originalStandards()).rejects.toThrow(/current matching rerun/)
+  await (await review('standards', fixed, true))()
+  expect((await delivery()).missing).toContain(missing)
+  await (await review('spec', fixed, true))()
+  expect((await delivery()).missing).not.toContain(missing)
 }, 60_000)
 
 it('previews a product replan before applying an exact, durable direct approval', async () => {
@@ -1074,16 +1182,32 @@ it('previews a product replan before applying an exact, durable direct approval'
   const hub = h.runtime.masterId
   const requirements = (args: unknown, session = hub) => h.runTool(session, 'orchestrator_plan_requirements', args)
   const changed = { criterion: 1, statement: 'Search matches product prefixes.', observable: 'The catalog API excludes non-prefix matches.' }
-  const request = { planId: id, goal: 'Show catalog prefix matches and account details.', changes: [changed] }
-  const preview = () => requirements({ mode: 'preview', request }) as Promise<{ proposalId: string; affected: { nodeId: string; replacementId: string }[] }>
-  expect(await requirements({ mode: 'preview', request: { ...request, changes: [] } })).toMatchObject({ status: 'needs-target' })
-  await expect(requirements({ mode: 'preview', request: { ...request, release: 'authorized' } })).rejects.toThrow()
-  await expect(requirements({ mode: 'preview', request }, catalogClaim.session)).rejects.toThrow(/not registered/)
+  const request = { intent: 'change-plan-requirements', planId: id, authorizedScope: brief.authorization.scope, changes: [changed] }
+  const send = (value: unknown) => h.sendUserMessage(hub, JSON.stringify(value))
+  type Proposal = { proposalId: string; requestMessageId: string; affected: { nodeId: string; replacementId: string }[] }
+  const preview = () => requirements({ mode: 'preview' }) as unknown as Promise<Proposal>
+  const approval = (p: Proposal, scopeDecision = 'within-handoff') => ({ approved: true, proposalId: p.proposalId,
+    requestMessageId: p.requestMessageId, scopeDecision })
+  const apply = ({ proposalId }: Proposal) => requirements({ mode: 'apply', proposalId })
+  h.sendUserMessage(hub, 'Please investigate the failing test.')
+  h.record(hub, [{ type: 'user/message', data: { role: 'user', source: { kind: 'tool-jobs', form: 'notice' },
+    content: [{ type: 'text', text: JSON.stringify(request) }] } }])
+  await expect(preview()).rejects.toThrow(/product change|JSON/i)
+  send({ ...request, changes: [] })
+  expect(await preview()).toMatchObject({ status: 'needs-target' })
+  send({ ...request, authorizedScope: 'Deploy changed code to production' })
+  await expect(preview()).rejects.toThrow(/new handoff/i)
+  await expect(requirements({ mode: 'preview' }, catalogClaim.session)).rejects.toThrow(/not registered/)
+  send(request)
+  const stale = await preview()
   const failed = await h.runTool(catalogClaim.session, 'orchestrator_test_evidence', {
     candidate: h.localGit!.base.sha, scope: 'focused', reason: 'Catalog request check', red: null,
     checks: [{ directory: '.', command: 'pnpm test catalog', status: 'failed', observed: 'The catalog check still returns 500.' }],
   })
-  const proposal = await preview(), stale = await preview()
+  send(approval(stale))
+  await expect(apply(stale)).rejects.toThrow(/evidence|in-flight state/i)
+  send(request)
+  const proposal = await preview()
   expect(proposal).toMatchObject({ status: 'preview', invalidated: [{ criterion: 1,
     after: { statement: changed.statement, observable: changed.observable } }], affected: [
     { nodeId: 'catalog', impact: 'direct', tickets: [{ ticketId: catalogClaim.ticketId, evidence: expect.arrayContaining([
@@ -1093,20 +1217,24 @@ it('previews a product replan before applying an exact, durable direct approval'
   ] })
   const { proposalId } = proposal
   expect(await read(`plan/${id}`)).toMatchObject({ revision: 1, goal: fanInSpec.body })
-  const approve = (id: string) => JSON.stringify({ approved: true, proposalId: id })
-  const message = approve(proposalId), apply = () => requirements({ mode: 'apply', proposalId, message })
-  await expect(apply()).rejects.toThrow(/latest direct Hub user approval/)
-  h.sendUserMessage(hub, 'I recommend a catalog change.')
-  await expect(apply()).rejects.toThrow(/latest direct Hub user approval/)
+  await expect(apply(proposal)).rejects.toThrow()
   await h.restart()
   await h.runtime.idle()
+  expect(await preview()).toMatchObject({ status: 'preview', proposalId, requestMessageId: proposal.requestMessageId })
   expect(await read(`plan-requirement/${proposalId}`)).toMatchObject({ status: 'preview', affected: proposal.affected })
-  h.sendUserMessage(hub, message)
+  send({ approved: true, proposalId })
+  await expect(apply(proposal)).rejects.toThrow()
+  send(approval(proposal, 'new-handoff'))
+  await expect(apply(proposal)).rejects.toThrow(/new handoff/i)
+  h.record(hub, [{ type: 'user/message', data: { role: 'user', source: { kind: 'tool-jobs', form: 'notice' },
+    content: [{ type: 'text', text: JSON.stringify(approval(proposal)) }] } }])
+  await expect(apply(proposal)).rejects.toThrow(/new handoff/i)
+  send(approval(proposal))
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, runLimits: {
     ticketOverrides: [{ planId: id, nodeId: 'catalog', tokens: 0 }],
   } } })
-  await expect(apply()).rejects.toThrow(/quota-paused.*exhausted/)
+  await expect(apply(proposal)).rejects.toThrow(/quota-paused.*exhausted/)
   expect(await read(`plan/${id}`)).toMatchObject({ revision: 1 })
   expect(await read(`ticket/${catalogClaim.ticketId}`)).not.toHaveProperty('ended')
   h.runtime.store.saveSettings(settings)
@@ -1123,10 +1251,10 @@ it('previews a product replan before applying an exact, durable direct approval'
   })
   const job = h.jobs.run(catalogClaim.session), stopStarted = Promise.withResolvers<string>()
   h.jobs.service.kill.mockImplementationOnce(jobId => { stopStarted.resolve(jobId); return 'requested' })
-  expect(await apply()).toMatchObject({ status: 'applied', revision: 2 })
-  expect(await apply()).toMatchObject({ revision: 2 })
-  h.sendUserMessage(hub, approve(stale.proposalId))
-  await expect(requirements({ mode: 'apply', proposalId: stale.proposalId, message: approve(stale.proposalId) })).rejects.toThrow(/revision changed/)
+  expect(await apply(proposal)).toMatchObject({ status: 'applied', revision: 2 })
+  expect(await apply(proposal)).toMatchObject({ revision: 2 })
+  send(approval(stale))
+  await expect(apply(stale)).rejects.toThrow(/revision changed/)
   const newCatalog = proposal.affected.find(node => node.nodeId === 'catalog')!.replacementId
   const newDashboard = proposal.affected.find(node => node.nodeId === 'dashboard')!.replacementId
   expect(await dispatchPlan(id, newCatalog)).toMatchObject({ status: 'blocked', waitingOn: ['catalog'] })
@@ -1147,7 +1275,8 @@ it('previews a product replan before applying an exact, durable direct approval'
   const replacement = (await dispatchPlan(id, newCatalog)).claim!
   await h.runtime.idle()
   expect(await h.runTool(replacement.session, 'orchestrator_read', { resource: `ticket/${replacement.ticketId}/plan-scope` }))
-    .toMatchObject({ goal: request.goal, acceptance: [{ id: '1', text: expect.stringContaining(changed.observable) }] })
+    .toMatchObject({ goal: fanInSpec.body, authorizedScope: brief.authorization.scope, acceptanceScope: brief.acceptanceScope,
+      outOfScope: fanInSpec.outOfScope, acceptance: [{ id: '1', text: expect.stringContaining(changed.observable) }] })
   expect(await read(`plan/${id}/meter`)).toMatchObject({ sessions: expect.arrayContaining([
     expect.objectContaining({ ticket_id: catalogClaim.ticketId, plan_id: id }),
     expect.objectContaining({ ticket_id: replacement.ticketId, plan_id: id }),
@@ -1166,12 +1295,18 @@ it('refuses a product replan while the affected writer launch has yet to be conf
       timeout: 20_000,
     })
     const hub = h.runtime.masterId
-    const { proposalId } = await h.runTool(hub, 'orchestrator_plan_requirements', { mode: 'preview', request: { planId: id,
-      changes: [{ criterion: 1, statement: 'Search by prefix.', observable: 'Search results share the requested prefix.' }] },
-    }) as { proposalId: string }
-    const message = JSON.stringify({ approved: true, proposalId })
-    h.sendUserMessage(hub, message)
-    await expect(h.runTool(hub, 'orchestrator_plan_requirements', { mode: 'apply', proposalId, message })).rejects.toThrow(/unconfirmed Worker launch/)
+    h.sendUserMessage(hub, JSON.stringify({ intent: 'change-plan-requirements', planId: id,
+      authorizedScope: brief.authorization.scope, goal: 'Offer prefix search and account details.',
+      changes: [{ criterion: 1, statement: 'Search by prefix.', observable: 'Search results share the requested prefix.' }],
+    }))
+    const { proposalId, requestMessageId, affected } = await h.runTool(hub, 'orchestrator_plan_requirements', { mode: 'preview' })
+    expect(affected).toEqual([
+      expect.objectContaining({ nodeId: 'catalog', impact: 'direct' }),
+      expect.objectContaining({ nodeId: 'accounts', impact: 'direct', status: 'unclaimed' }),
+      expect.objectContaining({ nodeId: 'dashboard', impact: 'direct' }),
+    ])
+    h.sendUserMessage(hub, JSON.stringify({ approved: true, proposalId, requestMessageId, scopeDecision: 'within-handoff' }))
+    await expect(h.runTool(hub, 'orchestrator_plan_requirements', { mode: 'apply', proposalId })).rejects.toThrow(/unconfirmed Worker launch/)
     expect(await read(`plan/${id}`)).toMatchObject({ revision: 1 })
     expect(await read(`ticket/${claim!.ticketId}`)).not.toHaveProperty('ended')
   } finally { prepare.resolve() }
@@ -1202,6 +1337,16 @@ it('replans pending slices under their original obligations and refuses the same
   const replan = (revision: number, change: unknown) => h.runTool(h.runtime.masterId, 'orchestrator_plan_replan', {
     planId: id, nodeId: 'catalog', revision, failureId, reason: 'Separate the empty-state check from the dashboard integration', change,
   })
+  const funded = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...funded, executor: { ...funded.executor, runLimits: {
+    ...funded.executor.runLimits, ticketOverrides: [{ planId: id, nodeId: 'catalog', tokens: 40 }, { planId: id, nodeId: 'dashboard', tokens: 0 }],
+  } } })
+  await expect(replan(1, { kind: 'split', nodeId: 'dashboard', groups: [[3], [4]] })).rejects.toThrow(/dashboard.*exhausted/)
+  await expect(replan(1, { kind: 'dependencies', updates: [{ nodeId: 'dashboard', blockedBy: ['catalog', 'accounts', 'summary'] }] }))
+    .rejects.toThrow(/dashboard.*exhausted/)
+  expect(await read(`plan/${id}`)).toMatchObject({ revision: 1 })
+  expect(await read(`plan/${id}/node/catalog/recovery/${failureId}`)).toMatchObject({ id: failureId })
+  h.runtime.store.saveSettings(funded)
   await expect(replan(1, { kind: 'dependencies', updates: [{ nodeId: 'dashboard', blockedBy: ['catalog', 'accounts', 'summary'] }] }))
     .rejects.toThrow(/cycle/i)
   await expect(replan(1, { kind: 'merge', nodeIds: ['dashboard', 'summary'] })).rejects.toThrow(/different budget pools/i)

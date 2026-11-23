@@ -1,5 +1,5 @@
 /** Bounded technical recovery of an already authorized Plan Ticket; never a grant or a delivery receipt. */
-import type { DeliveryRevision } from '../core/delivery-check.ts'
+import { failedCheckObligations } from '../core/delivery-check.ts'
 import type { Engine } from '../core/engine.ts'
 import { key } from '../core/ids.ts'
 import { latestAssignment, type Assignment, type Ticket } from '../core/model.ts'
@@ -11,33 +11,8 @@ import { promptFile } from './skill-files.ts'
 import type { Store } from './store.ts'
 
 const diagnosis = promptFile('plan-stagnation')
-export type PlanCheck = { directory: string; command: string }
 type TestObservation = { candidate: string; result: 'failed' | 'reported_passed' | 'unverified';
-  checks: readonly (PlanCheck & { status: string; observed: string })[]; read: string; reference?: string }
-
-/** A passing summary is not a rerun. Every historically failing command needs a later observed pass on the exact approval revision. */
-export function unrepairedChecks(ticket: Ticket, target: DeliveryRevision | undefined, inherited: readonly PlanCheck[] = []): PlanCheck[] {
-  const required = new Map<string, PlanCheck>(), seen = new Set<string>()
-  for (const check of inherited) required.set(JSON.stringify([check.directory, check.command]), check)
-  for (const entry of ticket.deliveryCheck?.events ?? []) {
-    if (entry.kind !== 'tests') continue
-    const { revision } = entry
-    const exact = target && revision.candidate === target.candidate && revision.generation === target.generation && revision.base === target.base
-    for (const check of entry.evidence.checks) {
-      const id = JSON.stringify([check.directory, check.command])
-      if (check.status === 'failed') {
-        required.set(id, { directory: check.directory, command: check.command })
-      } else if (exact && entry.result === 'reported_passed' && check.status === 'passed') {
-        // Replaying an old pass cannot clear a failure recorded since that pass.
-        const run = key(id, check.observed, entry.reference)
-        if (seen.has(run)) continue
-        seen.add(run)
-        required.delete(id)
-      }
-    }
-  }
-  return [...required.values()]
-}
+  checks: readonly { directory: string; command: string; status: string; observed: string }[]; read: string; reference?: string }
 
 interface Failure { id: string; kind: 'tests' | 'report' | 'idle'; assignmentId: string; at: string; summary: string; read: string; candidate?: string }
 type Stage = 'watching' | 'diagnose' | 'reassigned' | 'stalled'
@@ -55,6 +30,9 @@ export interface StagnationRecord {
   diagnosisDeliveredAt?: string
   /** Replaying an old pass cannot reset the idle clock or erase a subsequent failure report. */
   passes: string[]
+  progressId?: string
+  /** The current stalled failure for which the recovery-review effect was durably scheduled. */
+  reviewFailureId?: string
   diagnosisInputId?: string
   reason?: string
 }
@@ -72,11 +50,11 @@ interface Host {
   store: Pick<Store, 'tickets' | 'atomic' | 'get' | 'set'>
   plans: Pick<Plans, 'state' | 'repairSource'>
   limits: Pick<RunLimits, 'forDispatch' | 'blocked'>
-  engine: Pick<Engine, 'retryTicket' | 'note'>
+  engine: Pick<Engine, 'retryTicket' | 'note' | 'withdrawPlanDiagnosis'>
   paused(): boolean
   /** Active graph, credential authority and exclusive mainline ownership; affects actions, not retained observations. */
   eligible(ticket: Ticket): boolean
-  routeReplan?(ticket: Ticket, failureId: string): void
+  replaceReview(ticketId: string, previous: string | undefined, current: string | undefined): void
   now?: () => string
 }
 type Hold = Pick<StagnationView, 'status' | 'reason'>
@@ -99,10 +77,19 @@ export class PlanStagnation {
     if (saved?.assignmentId === assignment.id) return saved
     return { assignmentId: assignment.id, stage: 'watching', roundAt: assignment.startedAt ?? assignment.createdAt,
       attempts: saved?.attempts ?? 0, roundAttempts: saved?.attempts ?? 0, failures: saved?.failures ?? [],
-      openTests: saved?.openTests ?? false, passes: saved?.passes ?? [] }
+      openTests: saved?.openTests ?? false, passes: saved?.passes ?? [], progressId: saved?.progressId, reviewFailureId: saved?.reviewFailureId }
   }
 
-  private save(ticket: Ticket, record: StagnationRecord) { this.host.store.set(KV.planStagnation.ticket(ticket.id), record) }
+  private save(ticket: Ticket, record: StagnationRecord) {
+    const current = record.stage === 'stalled' ? record.failures.at(-1)?.id : undefined
+    const previous = record.reviewFailureId
+    if (current !== previous) {
+      if (current) record.reviewFailureId = current
+      else delete record.reviewFailureId
+      this.host.replaceReview(ticket.id, previous, current)
+    }
+    this.host.store.set(KV.planStagnation.ticket(ticket.id), record)
+  }
 
   private admission(ticket: Ticket, plan: NonNullable<Ticket['plan']>, record?: StagnationRecord): { limits: DispatchLimits; hold?: Hold } {
     const { limits, block } = this.host.limits.forDispatch(ticket.id, plan)
@@ -126,27 +113,31 @@ export class PlanStagnation {
     if (!ticket.plan || !this.claimed(ticket)) return false
     const record = this.host.store.get(KV.planStagnation.ticket(ticket.id))
     if (!record || latestAssignment(ticket)?.id !== record.assignmentId || this.admission(ticket, ticket.plan, record).hold) return false
-    return inputId === undefined ? record.stage === 'reassigned' : record.stage === 'diagnose' && record.diagnosisInputId === inputId
+    return inputId === undefined ? record.stage === 'reassigned'
+      : record.stage === 'diagnose' && record.diagnosisInputId === inputId && ticket.undelivered.includes(inputId)
   }
 
-  private addFailure(ticket: Ticket, record: StagnationRecord, failure: Failure): void {
-    if (record.failures.some(previous => previous.id === failure.id)) return
+  private addFailure(record: StagnationRecord, failure: Failure): boolean {
+    if (record.failures.some(previous => previous.id === failure.id)) return false
     record.failures.push(failure)
     if (failure.kind !== 'idle') record.attempts++
-    this.save(ticket, record)
+    return true
   }
 
   observeReport(ticket: Ticket): void {
     const assignment = latestAssignment(ticket), report = assignment?.report
     if (!assignment || !report || (report.state !== 'failed' && report.state !== 'blocked') || ticket.attention || !this.claimed(ticket)) return
     const record = this.record(ticket, assignment)
-    const id = key('report', assignment.id, report.state, report.at, report.summary)
-    if (record.technicalReportId === id) return
-    record.technicalReportId = id
-    // Once a check is red, reports describe it; only distinct run evidence counts another attempt for it.
-    if (record.openTests) this.save(ticket, record)
-    else this.addFailure(ticket, record, { id, kind: 'report', assignmentId: assignment.id, at: report.at,
-      summary: report.summary, read: `ticket/${ticket.id}/report/${assignment.id}` })
+    const reportId = key('report', assignment.id, report.state, report.at, report.summary)
+    // Reports describe an outstanding check failure; only a distinct check run counts another attempt for it.
+    const added = !record.openTests && this.addFailure(record, {
+      id: key('technical-report', assignment.id, record.progressId ?? '', report.state, report.summary),
+      kind: 'report', assignmentId: assignment.id, at: report.at, summary: report.summary, read: `ticket/${ticket.id}/report/${assignment.id}`,
+    })
+    // Equivalent reports only update attestation for the current report, not the attempt or review identity.
+    if (!added && record.technicalReportId === reportId) return
+    record.technicalReportId = reportId
+    this.save(ticket, record)
   }
 
   observeTests(ticketId: string, observation: TestObservation): void {
@@ -161,23 +152,24 @@ export class PlanStagnation {
     const failed = entry.result === 'failed'
     const checks = entry.evidence.checks.filter(check => check.status === (failed ? 'failed' : 'passed'))
     if (!checks.length) return
-    // Resource indices vary on replay. A new candidate, actual output, or original run reference distinguishes attempts.
+    // Index and time vary on replay. Only a distinct observation within a progress episode counts as another failure.
     const id = key('check-run', entry.result, entry.revision.candidate, entry.revision.base, String(entry.revision.generation), entry.reference,
-      ...(failed && record.passes.length ? [record.passes.at(-1)!] : []),
-      ...checks.map(c => JSON.stringify([c.directory, c.command, c.observed])).sort())
+      ...(failed && record.progressId ? [record.progressId] : []), ...checks.map(c => JSON.stringify([c.directory, c.command, c.observed])).sort())
     if (failed) {
+      if (!this.addFailure(record, { id, kind: 'tests', at: entry.at, assignmentId: assignment.id, candidate: entry.revision.candidate,
+        summary: `${checks[0]!.directory}: ${checks[0]!.command}: ${checks[0]!.observed}`, read: observation.read })) return
       record.openTests = true
-      this.addFailure(ticket, record, { id, kind: 'tests', at: entry.at, assignmentId: assignment.id, candidate: entry.revision.candidate,
-        summary: `${checks[0]!.directory}: ${checks[0]!.command}: ${checks[0]!.observed}`, read: observation.read })
+      this.save(ticket, record)
       return
     }
     if (record.passes.includes(id)) return
     record.passes.push(id)
     const plan = ticket.plan
     const inherited = plan && this.host.plans.repairSource(plan.planId, plan.nodeId)?.checks
-    if (!unrepairedChecks(ticket, entry.revision, inherited).length) {
+    if (!failedCheckObligations(ticket.id, ticket.deliveryCheck, entry.revision, inherited).some(obligation => !obligation.rerun)) {
       this.withdraw(ticket, record)
       record.attempts = 0; record.roundAttempts = 0; record.roundAt = entry.at; record.stage = 'watching'; record.openTests = false
+      record.progressId = id
       delete record.reason
     }
     this.save(ticket, record)
@@ -185,11 +177,7 @@ export class PlanStagnation {
 
   /** Withdraw only our obsolete pending intent. Its original Input, identity and evidence stay in Ticket history. */
   private withdraw(ticket: Ticket, record: StagnationRecord): void {
-    const id = record.diagnosisInputId
-    if (id && ticket.undelivered.includes(id)) {
-      ticket.undelivered = ticket.undelivered.filter(pending => pending !== id)
-      this.host.store.tickets.save(ticket)
-    }
+    if (record.diagnosisInputId) this.host.engine.withdrawPlanDiagnosis(ticket.id, record.assignmentId, record.diagnosisInputId)
     delete record.diagnosisInputId
     delete record.diagnosisDeliveredAt
   }
@@ -204,7 +192,11 @@ export class PlanStagnation {
     const assignment = latestAssignment(ticket)
     if (!ticket.plan || !assignment || !this.claimed(ticket)) return
     const record = this.record(ticket, assignment)
-    if (record.stage === 'stalled') return
+    if (record.stage === 'stalled') {
+      // Reconcile a persisted stall recorded before the current failure had a review effect.
+      if (record.reviewFailureId !== record.failures.at(-1)?.id) this.save(ticket, record)
+      return
+    }
     const { limits, hold } = this.admission(ticket, ticket.plan, record)
     if (hold) return
     // Waiting for initial launch capacity is not a failed Worker attempt; ready is never a formal delivery receipt.
@@ -222,7 +214,7 @@ export class PlanStagnation {
     const start = Math.max(Date.parse(record.roundAt), Date.parse(record.diagnosisDeliveredAt ?? record.roundAt),
       Date.parse(assignment.startedAt ?? record.roundAt))
     if (record.attempts - record.roundAttempts < maxAttemptsWithoutProgress && Date.parse(now) - start < idleSeconds * 1000) return
-    if (record.attempts === 0 && record.stage === 'watching') this.addFailure(ticket, record, {
+    if (record.attempts === 0 && record.stage === 'watching') this.addFailure(record, {
       id: key('no-progress', assignment.id, record.roundAt), kind: 'idle', assignmentId: assignment.id, at: now,
       summary: `No new passing check since ${record.roundAt}`, read: `ticket/${ticket.id}/delivery-check`,
     })
@@ -241,13 +233,22 @@ export class PlanStagnation {
     } else if (record.stage === 'diagnose' && canRetry(ticket)) {
       const updated = this.host.engine.retryTicket(ticket.id, assignment.id)
       record.assignmentId = latestAssignment(updated)!.id; record.stage = 'reassigned'
+      delete record.diagnosisInputId
       delete record.diagnosisDeliveredAt
     } else record.reason = record.stage === 'reassigned' ? 'The replacement Assignment has not made credible progress'
       : 'The diagnostic did not restore progress; the current Assignment is not safely retryable'
     if (record.reason) { record.stage = 'stalled'; this.withdraw(ticket, record) }
     record.roundAttempts = record.attempts; record.roundAt = now
     this.save(ticket, record)
-    if (record.stage === 'stalled') this.host.routeReplan?.(ticket, failure.id)
+  }
+
+  /** Only a still-current stall may wait for authorization or steer a Hub review. */
+  review(ticketId: string, failureId: string): 'current' | 'held' | undefined {
+    const ticket = this.host.store.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
+    if (!ticket?.plan || !assignment || !this.claimed(ticket)) return undefined
+    const record = this.host.store.get(KV.planStagnation.ticket(ticketId))
+    if (record?.assignmentId !== assignment.id || record.stage !== 'stalled' || record.failures.at(-1)?.id !== failureId) return undefined
+    return this.admission(ticket, ticket.plan, record).hold || (assignment.report?.state === 'ready' && !record.attempts) ? 'held' : 'current'
   }
 
   /** Resolve an earlier Plan revision's failure even after another report, progress, replacement, or formal delivery. */

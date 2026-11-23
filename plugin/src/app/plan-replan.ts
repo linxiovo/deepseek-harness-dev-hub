@@ -8,6 +8,7 @@ import { technicalReplan, type PlanTopology } from '../core/plan-topology.ts'
 import { KV } from '../kv.ts'
 import type { Plans } from './plans.ts'
 import type { PlanStagnation } from './plan-stagnation.ts'
+import type { RunLimits } from './run-limits.ts'
 import type { Store } from './store.ts'
 
 const id = z.string().min(1).max(200)
@@ -27,10 +28,11 @@ interface ReplanHost {
   plans: Pick<Plans, 'current' | 'state' | 'requiredDelivery' | 'revise'>
   engine: Pick<Engine, 'supersedePlanTicket'>
   stagnation: Pick<PlanStagnation, 'view'>
+  runLimits: Pick<RunLimits, 'forDispatch'>
 }
 
 /** Validate the actual failure and applicable scope before publishing one new graph version. */
-export function replanTechnical({ store, plans, stagnation, engine }: ReplanHost, input: TechnicalReplan) {
+export function replanTechnical({ store, plans, stagnation, engine, runLimits }: ReplanHost, input: TechnicalReplan) {
   const { planId, nodeId: stalled, revision, failureId, reason, change } = input
   const repair = change.kind === 'repair'
   return store.atomic(() => {
@@ -70,7 +72,13 @@ export function replanTechnical({ store, plans, stagnation, engine }: ReplanHost
       })
     }
     const next = new Map(topology.draft.nodes.map(node => [node.id, node]))
-    const scope = current.plan.nodes.filter(node => !isDeepStrictEqual(node, next.get(node.id))).map(node => node.id)
+    const scope: string[] = []
+    for (const node of current.plan.nodes) {
+      if (isDeepStrictEqual(node, next.get(node.id))) continue
+      const { block } = runLimits.forDispatch(key('plan-ticket', planId, node.id), { planId, nodeId: node.id, role: node.role })
+      if (block) throw new UserError('invalidPlan', { detail: `Cannot replan node "${node.id}": ${block.scope} budget: ${block.state}` })
+      scope.push(node.id)
+    }
     const cause = { kind: 'technical' as const, nodeId: stalled, failureId, reason, scope }
     const result = plans.revise(planId, revision, topology, repair ? { ...cause, repair: true } : cause)
     if (repair) engine.supersedePlanTicket(stalledState.claim.ticketId, reason)

@@ -363,18 +363,18 @@ export class Runtime extends Service implements SourceHost {
           if (!binding || store.get(KV.plans.retired(binding.planId, binding.nodeId)) || attention.blocked(ticket.id)) return false
           const merge = mainlineIntent(store, ticket.id)
           return !merge || merge.status === 'waiting' || (merge.status === 'repair' && merge.repair_requested === true)
-        }, routeReplan: (ticket, failureId) => {
-          effects.enqueue('replanReview', key('plan-replan', ticket.id, failureId), { ticketId: ticket.id, failureId })
+        }, replaceReview: (ticketId, previous, current) => {
+          if (previous) effects.cancel('replanReview', key('plan-replan', ticketId, previous))
+          if (current) effects.enqueue('replanReview', key('plan-replan', ticketId, current), { ticketId, failureId: current })
         } })
       effects.handle('replanReview', async ({ ticketId, failureId }, requestId) => {
         const plan = store.tickets.get(ticketId)?.plan
         if (!plan) return
         const withdrawn = new Error('The Plan recovery review no longer applies')
         const authorize = () => {
-          const recovery = stagnation.view(ticketId)
-          if (recovery?.failureId !== failureId) throw withdrawn
-          if (['quota-paused', 'waiting-for-budget', 'paused', 'held'].includes(recovery.status)) throw new Later()
-          if (recovery.status !== 'stalled' || !recovery.canReplan) throw withdrawn
+          const review = stagnation.review(ticketId, failureId)
+          if (!review) throw withdrawn
+          if (review === 'held') throw new Later()
         }
         try {
           const { planId, nodeId } = plan

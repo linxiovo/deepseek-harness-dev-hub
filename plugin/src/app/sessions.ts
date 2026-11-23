@@ -632,7 +632,7 @@ export class Sessions {
         binding.review = { ticketId, grant }
         const register = this.registerTool(agent, binding)
         for (const tool of host.tools(agent, ticket, 'review')) {
-          if (tool.name === 'orchestrator_review_submit') register(tool.name, tool.description, tool.schema, tool.execute)
+          if (tool.name === 'orchestrator_review_submit' || tool.name === 'orchestrator_read') register(tool.name, tool.description, tool.schema, tool.execute)
         }
       }
       delete binding.observeDelegation

@@ -1,1 +1,1 @@
-Which existing acceptance criterion should change? Give its number from the Plan's acceptance list.
+Which numbered acceptance criterion in this Plan do you mean to change?

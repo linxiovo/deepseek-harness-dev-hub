@@ -219,6 +219,15 @@ export type ReportState = 'progress' | 'waiting' | 'ready' | 'blocked' | 'failed
 /** Independent review axes used to evaluate an Assignment candidate. */
 export type ReviewAxis = 'standards' | 'spec'
 export type ReviewConclusion = 'passed' | 'blocked'
+/** The reviewer judges assertion coverage; the executor resolves both cited files in the committed trees. */
+export interface CheckRetention {
+  failure: string
+  rerun: string
+  originalPath: string
+  currentPath: string
+  rationale: string
+}
+export interface VerifiedCheckRetention extends CheckRetention { originalBlob: string; currentBlob: string }
 /** One immutable, independently submitted review of an exact candidate against the ticket's pinned base. */
 export interface ReviewEvidence {
   id: string
@@ -228,6 +237,8 @@ export interface ReviewEvidence {
   basis: string[]
   /** Original evidence this reviewer independently reaffirmed on a repaired candidate (delivery-check keys). */
   reuses?: string[]
+  /** Append-only confirmations on this lane. A fresh reviewer can supplement, but not replace, its verdict. */
+  retainedChecks?: (VerifiedCheckRetention & { reviewer_session: string; at: string })[]
   base: string
   candidate: string
   conclusion: ReviewConclusion
@@ -250,6 +261,8 @@ export interface Assignment {
   endedAt?: string
   endedReason?: string
   report?: { state: ReportState; summary: string; at: string }
+  /** A Worker proposal is internal until the Hub classifies it as a missing product decision. */
+  planQuestion?: { id: string; question: string }
   /** When Inputs last reached the worker; one at or after `report.at` means the worker has been busy with Inputs since that report. */
   deliveredAt?: string
   /**

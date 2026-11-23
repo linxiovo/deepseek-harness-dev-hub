@@ -7,6 +7,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, ExecutionClaim, ExecutionIdentity, Executor, MainlineRepair, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
+import type { CheckRetention, VerifiedCheckRetention } from '../core/model.ts'
 import type { Machine } from '../deployment.ts'
 import { KV } from '../kv.ts'
 import { runAsWorker, sameDirectory, verifyDirectory } from '../infra/environment.ts'
@@ -892,7 +893,7 @@ export class DshExecutor implements Executor {
 
   async inspectTestEvidence(ticketId: string, sessionId: string, candidate: string, red: readonly string[], signal: AbortSignal) {
     const git = this.host.commands.git.bind(this.host.commands)
-    const { candidate: head, base, generation } = await this.inspectCandidate(ticketId, sessionId, candidate, 'Test', signal,
+    const { checked: worktree, ...revision } = await this.inspectCandidate(ticketId, sessionId, candidate, 'Test', signal,
       async (worktree, base, stopped) => {
         for (const revision of new Set(red)) {
           stopped.throwIfAborted()
@@ -908,11 +909,14 @@ export class DshExecutor implements Executor {
             throw error
           }
         }
-        if (await git(['status', '--porcelain=v1', '--untracked-files=all'], worktree)) {
-          throw new Error('Test evidence requires a clean candidate worktree')
-        }
+        return worktree
       })
-    return { candidate: head, base, generation }
+    const status = (await git(['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all'], worktree)).split('\0')
+    if (!status.includes(`# branch.oid ${candidate}`) || status.some(item => item && !item.startsWith('# ')))
+      throw new Error('Test evidence requires a clean candidate worktree at the inspected HEAD')
+    signal.throwIfAborted()
+    if (this.reviewGeneration(ticketId) !== revision.generation) throw new Error('Test evidence writer generation changed during inspection')
+    return revision
   }
   /** Bind a retro observation to the clean current candidate, and prove a recorded repair changes its predecessor's tree. */
   async inspectDeliveryCandidate(ticketId: string, sessionId: string, candidate: string, prior: string | undefined, signal: AbortSignal) {
@@ -942,20 +946,57 @@ export class DshExecutor implements Executor {
       throw new Error('Delivery evidence requires the active writer for this ticket worktree')
     return revision
   }
-  /** Verify a review candidate is the clean current ticket HEAD and return its pinned base. */
-  async inspectReviewCandidate(ticketId: string, _reviewerSession: string, candidate: string, signal: AbortSignal) {
-    const revision = await this.inspectCandidate(ticketId, workerSessionId(ticketId), candidate, 'Review', signal,
+  /** Pin the two cited files as regular Git blobs. Their contents, assertion meaning and runner reachability are reviewed, not inferred here. */
+  async inspectReviewCandidate(ticketId: string, _reviewerSession: string, candidate: string, signal: AbortSignal,
+    checks: readonly (CheckRetention & { failureRevision: string })[] = []) {
+    const { checked: retainedChecks, ...revision } = await this.inspectCandidate(ticketId, workerSessionId(ticketId), candidate, 'Review', signal,
       async (worktree, _base, stopped) => {
         stopped.throwIfAborted()
         if (await this.host.commands.git(['status', '--porcelain=v1', '--untracked-files=all'], worktree))
           throw new Error('Review requires a clean candidate worktree')
+        const verified: VerifiedCheckRetention[] = []
+        if (!checks.length) return verified
+        const { commands } = this.host
+        const blobs = new Map<string, string>()
+        let options = ['--no-replace-objects', '--literal-pathspecs', '--no-lazy-fetch']
+        const fileAt = async (revision: string, path: string) => {
+          stopped.throwIfAborted()
+          if (!fullCommit.test(revision)) throw new Error('Missing original failed check revision')
+          const key = `${revision}:${path}`, cached = blobs.get(key)
+          if (cached) return cached
+          const args = ['ls-tree', '--full-tree', '-z', `--abbrev=${revision.length}`, revision, '--', path]
+          let output: string
+          try { output = await commands.git([...options, ...args], worktree) }
+          catch (error) {
+            if (!(error instanceof CliError) || !error.message.startsWith('unknown option: --no-lazy-fetch')) throw error
+            // Older Git cannot disable lazy fetch. Never consult a remote to inspect a missing check.
+            try {
+              await commands.git(['config', '--includes', '--name-only', '--get-regexp', '^(extensions[.]partialclone|remote[.].*[.](promisor|partialclonefilter))$'], worktree)
+              throw new Error('Retained check inspection requires local objects on this Git version')
+            } catch (error) { if (!(error instanceof CliError) || error.exitCode !== 1) throw error }
+            options = ['--no-replace-objects', '--literal-pathspecs']
+            output = await commands.git([...options, ...args], worktree)
+          }
+          const entry = /^100(?:644|755) blob ([0-9a-f]+)\t/.exec(output)
+          if (!entry || entry[1]!.length !== revision.length || output.slice(entry[0].length) !== `${path}\0`)
+            throw new Error(`Retained check must cite a committed regular file at ${revision}:${path}`)
+          blobs.set(key, entry[1]!)
+          return entry[1]!
+        }
+        for (const { failureRevision, ...claim } of checks) {
+          const originalBlob = await fileAt(failureRevision, claim.originalPath), currentBlob = await fileAt(candidate, claim.currentPath)
+          verified.push({ ...claim, originalBlob, currentBlob })
+        }
+        return verified
       })
     const worktree = this.host.store.tickets.get(ticketId)?.execution?.directory
     if (!worktree || (await this.host.commands.git(['rev-parse', '--verify', 'HEAD'], worktree)).trim() !== candidate
       || (await this.host.commands.git(['status', '--porcelain=v1', '--untracked-files=all'], worktree)).trim()) {
       throw new Error('Review candidate changed or became dirty before submission')
     }
-    return { candidate: revision.candidate, base: revision.base }
+    signal.throwIfAborted()
+    if (this.reviewGeneration(ticketId) !== revision.generation) throw new Error('Review writer generation changed during inspection')
+    return { ...revision, retainedChecks }
   }
   /** Stop every loaded worker and release only claims this instance can prove fully idle before Store closes. */
   async shutdown(): Promise<void> {

@@ -108,6 +108,8 @@ export const KV = {
       (id, sessionId, messageId) => JSON.stringify([id, sessionId, messageId])) },
   /** Only the product change flow writes previews and consumes direct operator approval events. */
   planRequirements: { preview: family<RequirementPreview>('plan-requirement-preview:'),
+    request: family<string, [sessionId: string, messageId: string]>('plan-requirement-request:',
+      (sessionId, messageId) => JSON.stringify([sessionId, messageId])),
     approval: family<string, [sessionId: string, messageId: string]>('plan-requirement-approval:',
       (sessionId, messageId) => JSON.stringify([sessionId, messageId])) },
   /** Stagnation observations and scheduled recovery belong to the original Ticket. */

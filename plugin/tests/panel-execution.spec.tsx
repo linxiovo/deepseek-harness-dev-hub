@@ -125,7 +125,7 @@ it('shows the exact release hold and downloads its verified Plan package', async
   try {
     await click(zh['planDelivery.download'])
     expect(server.requests.some(request => request.path === 'plans/plan-a/artifact' && request.method === 'GET')).toBe(true)
-    expect(downloadedName).toBe('dsh-superagent-0.1.0.tgz')
+    await act(async () => { await vi.waitFor(() => expect(downloadedName).toBe('dsh-superagent-0.1.0.tgz')) })
   } finally {
     anchor.mockRestore()
     if (originalCreateUrl) Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: originalCreateUrl })

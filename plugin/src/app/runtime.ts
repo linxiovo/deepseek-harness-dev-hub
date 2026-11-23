@@ -14,7 +14,7 @@ import { existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
 import { Engine, key, latestAssignment, UserError, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
-import { settingsPolicy, SettingsSchema } from '../policy.ts'
+import { policyVersion, settingsPolicy, SettingsSchema } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
 import { workerProbe, type Deployment, type Machine } from '../deployment.ts'
@@ -41,15 +41,16 @@ import { ScopedAttention } from './scoped-attention.ts'
 import { PlanDispatcher } from './plan-dispatch.ts'
 import { MainlineQueue } from './mainline-queue.ts'
 import { advanceMainline, precedes, prepareMainline, readMainline, readPlanIntegrationTarget, verifyDeliveryOnTarget } from '../executor/mainline-git.ts'
-import { Prompts } from './prompts.ts'
+import { Prompts, promptByteLimit, PromptConflict } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import { projectNavigationLink, ticketNavigationLink } from '../navigation.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
-import { eventNotice, followupNotice } from './notices.ts'
+import { eventNotice, followupNotice, promptsNotice } from './notices.ts'
 import { dispatchPlanActions, isLatestPlanActions, observePlanActions } from '../sources/actions-evidence.ts'
 import { cleanupPlanArtifactStaging, commitPlanArtifact, discardPlanArtifact, downloadPlanArtifact, openPlanArtifact, planArtifactExists } from './plan-artifacts.ts'
 import { pullEndNotices, recoverPulls } from '../sources/github-pull.ts'
+import { githubKind } from '../sources/github.ts'
 import { HealthBoard } from '../infra/health.ts'
 import { Outbox } from './outbox.ts'
 import { Passes } from './passes.ts'
@@ -62,7 +63,7 @@ import { RunLimits } from './run-limits.ts'
 import { installModelAdmission } from './model-admission.ts'
 import { restoreReviewBindings } from './meter-recovery.ts'
 import { PLANNER_PRESET, ROUTER_PRESET, Sessions, splitterSessionId, WORKER_PRESET } from './sessions.ts'
-import { Settings } from './settings.ts'
+import { bindRequiredChecks, Settings } from './settings.ts'
 import { sourceContextOf, type SourceContextDeps } from './source-context.ts'
 import { approveMainline, authorizeMainline, inspectFormalDelivery, type ResourceHost } from './resources.ts'
 import { mainTools, type MainToolsHost } from './tools/main.ts'
@@ -207,10 +208,11 @@ export class Runtime extends Service implements SourceHost {
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
       const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx,
         meter: { read: (id, signal) => this.readScopedMeter(id, signal) }, plans, handoffs,
+        rulesManifestMaxBytes: () => promptByteLimit(machine.promptMaxChars.get()),
         reviewGeneration: ticketId => runtime.executor?.reviewGeneration(ticketId),
         credentialBlocked: ticketId => attention.blocked(ticketId),
         quotaBlocked: ticketId => runLimits.blocked(ticketId),
-        promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
+        promptVersion: id => this.sessions.promptVersion(id),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
       const sessions = this.sessions = new Sessions({ context: ctx, store, projectMeter, prompts, effects, health: board.claim('models'), masterId,
         lifetime: this.lifetime, boundWorkspace: project?.workspace,
@@ -318,6 +320,14 @@ export class Runtime extends Service implements SourceHost {
         credentialBlocked: ticketId => attention.blocked(ticketId),
         quotaBlocked: ticketId => runLimits.blocked(ticketId),
         outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
+          if (event.type === 'ticket.created') {
+            const { ticketId } = event.data
+            prompts.bindTicket(ticketId)
+            if (store.tickets.get(ticketId)?.plan) {
+              const { requiredChecks } = githubKind.schema.parse(store.settings().sources.github?.config ?? {})
+              bindRequiredChecks(store, ticketId, requiredChecks)
+            }
+          }
           if (event.type === 'assignment.started') {
             const ticket = store.tickets.get(event.data.ticketId)
             plans.assignmentStarted(event.data.ticketId, event.data.assignmentId, ticket?.execution?.session ?? workerSessionId(event.data.ticketId))
@@ -361,9 +371,26 @@ export class Runtime extends Service implements SourceHost {
           if (!plan) return 'plan_claim'
           try {
             authorizeMainline(resources, ticketId, approval)
-            planDelivery.deliver(plan.planId, plan.nodeId, receipt)
-            planIntegration.enqueue(plan.planId)
+            store.atomic(() => {
+              if (approval.rulesRevision !== undefined) {
+                prompts.publish(ticketId, approval.rulesRevision, receipt)
+                const rules = prompts.current().config.admissionRules
+                if (rules !== undefined) {
+                  const previous = store.settings()
+                  const next = { ...previous, policy: { ...previous.policy, rules } }
+                  const from = policyVersion(previous), to = policyVersion(next)
+                  if (from !== to) {
+                    store.saveSettings(next, { source: 'panel', block: 'policy', policyVersion: to, policyChanged: true, notified: [] })
+                    engine.policyChanged(from, to)
+                  }
+                }
+                sessions.notify(...promptsNotice(approval.rulesRevision))
+              }
+              planDelivery.deliver(plan.planId, plan.nodeId, receipt)
+              planIntegration.enqueue(plan.planId)
+            })
           } catch (error) {
+            if (error instanceof PromptConflict) return 'shared_rules_proposal_changed'
             if (error instanceof UserError) {
               if (error.code === 'mainlineRefused') return 'delivery_target_changed'
               if (error.code === 'invalidPlan' || error.code === 'unknownPlan' || error.code === 'unknownPlanNode') return 'plan_claim'
@@ -387,7 +414,13 @@ export class Runtime extends Service implements SourceHost {
       })
       // Reconcile historical dispatch receipts before serving even paused/setup-pending reads. This grants no tools or writer lease.
       this.planDispatcher.restoreBindings()
+      const { requiredChecks } = githubKind.schema.parse(store.settings().sources.github?.config ?? {})
       for (const ticket of store.tickets.list()) {
+        if (ticket.plan && !ticket.ended) bindRequiredChecks(store, ticket.id, requiredChecks)
+        if (!ticket.ended || ticket.execution?.session) {
+          const prior = store.get(KV.sessions.prompts(workerSessionId(ticket.id)))?.at(-1)
+          prompts.bindTicket(ticket.id, prior)
+        }
         if (ticket.execution?.session) sessions.bindWorker(ticket.id, ticket.execution.session)
         for (const [index, assignment] of ticket.assignments.entries()) {
           if (assignment.writer?.session) sessions.bindWorker(ticket.id, assignment.writer.session,
@@ -411,7 +444,7 @@ export class Runtime extends Service implements SourceHost {
           if (kind === FEISHU && this.topicBinding?.claims(trigger)) return this.receiveBoundFeishu(trigger)
           return passes.receive(trigger)
         } }
-      this.toolHost = { context: ctx, engine, store, prompts, sessions, executor, mainline, planDispatcher: this.planDispatcher, settings: this.settings,
+      this.toolHost = { context: ctx, engine, store, sessions, executor, mainline, planDispatcher: this.planDispatcher, settings: this.settings,
         assessor, resources, projectMeter, runLimits, attention, handoffs, plans, planIntegration, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,

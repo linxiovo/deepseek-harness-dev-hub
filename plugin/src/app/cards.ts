@@ -52,9 +52,10 @@ export function inputLine(ticket: Ticket, input: TicketInput, worker = false) {
     : { preview: preview(input.text).slice(0, INPUT_TEXT), chars: input.text.length, ...read }
   return { kind: input.kind, at: input.at, ...names, ...ticket.undelivered.includes(input.id) ? { undelivered: true } : {} }
 }
-export function assignmentLine(ticket: Ticket, item: Ticket['assignments'][number], previewLimit = 100) {
+export function assignmentLine(ticket: Ticket, item: Ticket['assignments'][number], includePreview = true) {
   return { id: item.id, state: item.state, at: item.createdAt, ...(item.endedReason ? { ended_reason: reasonText({ code: item.endedReason }) } : {}),
-    ...(item.report ? { report: { state: item.report.state, at: item.report.at, preview: preview(item.report.summary).slice(0, previewLimit),
+    ...(item.report ? { report: { state: item.report.state, at: item.report.at,
+      ...includePreview ? { preview: preview(item.report.summary).slice(0, 100) } : {},
       chars: item.report.summary.length, read: `ticket/${ticket.id}/report/${item.id}` } } : {}) }
 }
 export function newestPage<T, L>(items: readonly T[], offset: number, size: number, line: (item: T) => L, next: string) {
@@ -65,14 +66,13 @@ export function newestPage<T, L>(items: readonly T[], offset: number, size: numb
 export interface TicketThread { thread: string; context?: true; bound?: true }
 /** Projects a ticket with its linked triggers, threads, and first pages of assignments and inputs, omitting decision IDs for workers. */
 export function ticketDetails(ticket: Ticket, threads: TicketThread[], batch: readonly Trigger[], worker = false) {
-  // Drop the latest report preview because the first assignment shows it. Large pages keep the full execution identity,
-  // but omit repeatable self-links and directory (already present in execution); all report bodies remain readable.
+  // Large pages keep the full execution identity and references to report bodies, without repeated previews and links.
   const compact = !!ticket.execution?.preparation && (ticket.assignments.length > ASSIGNMENTS || ticket.inputs.length > INPUTS)
   const { preview: _preview, read: self, ...card } = ticketCard(ticket)
   return { ...card, ...compact ? {} : { read: self }, trigger_id: ticket.origin.triggerId, ...batch.length ? { batch: batch.map(batchLine) } : {},
     ...worker ? {} : { decision_id: ticket.decisionId }, threads, ...compact ? {} : { directory: ticket.execution?.directory },
     scope: ticket.mandate.scope, requested_by: ticket.mandate.actor.id,
-    assignments: newestPage(ticket.assignments, 0, ASSIGNMENTS, item => assignmentLine(ticket, item, compact ? 16 : 100), `ticket/${ticket.id}/assignments`),
+    assignments: newestPage(ticket.assignments, 0, ASSIGNMENTS, item => assignmentLine(ticket, item, !compact), `ticket/${ticket.id}/assignments`),
     inputs: newestPage(ticket.inputs, 0, INPUTS, input => inputLine(ticket, input, worker), `ticket/${ticket.id}/inputs`),
     ...ticket.assignments.some(assignment => assignment.reviews?.evidence.length) ? { reviews: `ticket/${ticket.id}/reviews` } : {},
     ...compact ? {} : { assignment: `ticket/${ticket.id}/assignment`, result: `ticket/${ticket.id}/result`,

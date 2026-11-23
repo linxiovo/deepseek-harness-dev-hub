@@ -10,7 +10,7 @@ import { InstallationError, type GithubIdentity, type InstallationApi, type Onbo
   from './installation-api.ts'
 import { bundledSkills } from './skill-files.ts'
 import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
-import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInParts, defaultPrompts, savePrompts, type Prompts }
+import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInParts, defaultPrompts, promptByteLimit, type Prompts }
   from './prompts.ts'
 import { PolicyConfigSchema, policyVersion } from '../policy.ts'
 import { SettingsConflict, type Settings } from './settings.ts'
@@ -50,7 +50,7 @@ export interface HttpHost {
   /** Feishu message links resolved since startup, used by search to match AppLink URLs. */
   readonly sourceLinks: Pick<TextCache, 'entries'>
   readonly sources: SourceRegistry
-  readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
+  readonly prompts: Pick<Prompts, 'current' | 'effective' | 'version' | 'history' | 'preview' | 'stage' | 'state' | 'defaultChanged'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
   readonly engine: EngineForPeople
@@ -116,7 +116,8 @@ function failure(error: unknown): [number, Record<string, unknown>] {
   if (error instanceof SetupError) return [400, { error: error.message, setup: error.problem }]
   if (error instanceof RouteError || error instanceof TopicBindingError) return [error.status, { error: error.message }]
   if (error instanceof UserError) return [error.missing ? 404 : 400, { error: error.message, code: error.code, values: error.values }]
-  if (error instanceof SettingsConflict || error instanceof PromptConflict) return [409, { error: error.message }]
+  if (error instanceof PromptConflict) return [409, { error: error.message, code: error.code }]
+  if (error instanceof SettingsConflict) return [409, { error: error.message }]
   return [500, { error: error instanceof Error ? error.message : String(error) }]
 }
 
@@ -152,15 +153,14 @@ function ticketPage(runtime: HttpHost, id: string) {
 }
 export type TicketPageView = ReturnType<typeof ticketPage>
 function promptsView(runtime: HttpHost, revision: number | undefined, offset: number) {
-  const current = runtime.prompts.current()
-  const shown = revision === undefined || revision === current.revision ? current : runtime.prompts.version(revision)
-  // Each built-in part with the key of its text, which an override records as its base, and for the overrides shown whose
-  // built-in text changed since, the text they were edited from when known.
+  const active = runtime.prompts.effective()
+  const shown = revision === undefined ? runtime.prompts.current() : runtime.prompts.version(revision)
   const parts = Object.entries(builtInParts()).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) }))
-  return { masterId: runtime.masterId, current: shown, defaults: defaultPrompts(), sections: TEAM_SECTIONS, skillName: SKILL_NAME.source,
+  return { masterId: runtime.masterId, current: shown, shownState: runtime.prompts.state(shown.revision), effective: active,
+    admissionRules: runtime.store.settings().policy.rules,
+    defaults: defaultPrompts(), sections: TEAM_SECTIONS, skillName: SKILL_NAME.source,
     builtin: Object.keys(bundledSkills).filter(name => SKILL_NAME.test(name)), skillPrefix: SKILL_PREFIX, parts,
-    defaultChanged: runtime.prompts.defaultChanged(shown.config),
-    ...runtime.sessions.status(), ...runtime.prompts.history(offset) }
+    defaultChanged: runtime.prompts.defaultChanged(shown.config), ...runtime.sessions.status(), ...runtime.prompts.history(offset) }
 }
 export type PromptsView = ReturnType<typeof promptsView>
 
@@ -183,6 +183,8 @@ const SourceBlock = z.templateLiteral(['source:', z.string().regex(/^[a-z][a-z0-
 const SettingsBlockSchema = z.union([z.enum(['policy', 'eval', 'executor']), SourceBlock])
 const SaveRequest = z.object({ value: z.unknown(), revision: z.number().int().nonnegative() })
 const nonBlank = z.string().refine(value => value.trim().length > 0 && !/[\u0000\r\n]/.test(value))
+const PromptStageRequest = z.strictObject({ config: z.unknown(), baseRevision: z.number().int().nonnegative(),
+  maintenanceTicketId: nonBlank })
 const VerifyRequest = z.strictObject({ cli: nonBlank })
 const CreateProjectRequest = z.strictObject({ repository: nonBlank, workspace: nonBlank, baseRef: nonBlank,
   policy: PolicyConfigSchema.optional() })
@@ -283,7 +285,7 @@ function routes(runtime: HttpHost): Routes {
   const { store } = runtime
   const verifyBinding = runtime.verifyTopicBinding?.bind(runtime)
   const ticket = (id: string) => { if (!store.tickets.get(id)) throw new RouteError(404, 'Ticket not found'); return id }
-  const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
+  const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(promptByteLimit(runtime.machine.promptMaxChars.get()))
   const meter = async (scope: 'project' | 'plan' | 'ticket', id?: string) => {
     const view = await runtime.projectMeter.read(scope, id)
     if (!view) throw new RouteError(404, `${scope === 'plan' ? 'Plan' : scope === 'ticket' ? 'Ticket' : 'Project'} not found`)
@@ -430,8 +432,11 @@ function routes(runtime: HttpHost): Routes {
     'GET tickets/:id/run-limits': ({ params }) => runLimitStatus(params.id),
     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
     'PUT prompts': async input => {
-      const request = z.object({ config: z.unknown(), baseRevision: z.number().int().nonnegative() }).parse(await promptBody(input))
-      return input.write(() => savePrompts(runtime, request.config, request.baseRevision, 'panel'))
+      const request = PromptStageRequest.parse(await promptBody(input))
+      return input.write(async () => {
+        const staged = await runtime.prompts.stage(request.config, request.baseRevision, request.maintenanceTicketId)
+        return { revision: staged.revision, effect: 'pending-review' as const }
+      })
     },
     'POST prompts/preview': async input => runtime.prompts.preview(await promptBody(input)),
   }

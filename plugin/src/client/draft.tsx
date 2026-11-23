@@ -157,13 +157,15 @@ export function useDraft<V, M = undefined>({ key, saved, revision, save, reload 
       result = await save(draft.value, draft.revision, draft.base)
     } catch (failure) {
       const fields = failure instanceof ApiError ? failure.issues.map(issue => issue.path) : []
-      if (failure instanceof ApiError && failure.status === 409) {
+      if (failure instanceof ApiError && failure.status === 409 && failure.details.code !== 'promptProposalRefused') {
         await reload().then(() => dispatch({ type: 'refused', notice: { kind: 'rebasing' } }), failed)
       } else dispatch({ type: 'refused', notice: fields.length ? { kind: 'invalid', fields } : { kind: 'failed',
         error: errorText(failure) } })
       return
     }
     dispatch({ type: 'saved', revision: result.revision, restarting: !!result.restarting })
+    // A staged proposal can succeed without changing the active revision.
+    if (result.revision === revision && !result.restarting) dispatch({ type: 'revisionArrived', saved, revision })
     if (result.restarting) restart(); else await reload().catch(failed)
   }
   return { state, value: state.sent?.value ?? state.draft?.value ?? saved, meta: state.draft?.meta,

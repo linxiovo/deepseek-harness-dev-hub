@@ -1,10 +1,10 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { advanceMainline, precedes, readMainline, type MainlineTarget } from '../src/executor/mainline-git.ts'
+import { advanceMainline, inspectRulesChange, precedes, readMainline, RULES_MANIFEST, type MainlineTarget } from '../src/executor/mainline-git.ts'
 import { Commands } from '../src/infra/commands.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 import { gitEnv, gitRepository, type GitRepository } from './fixtures/git.ts'
@@ -22,10 +22,10 @@ let transfers: string[]
 let losePushReply: boolean
 
 function commands(repository = slug): Commands {
-  return new Commands(() => testDeployment({ repository }), {
+  return new Commands(() => testDeployment({ repository }), gitEnv({
     GIT_CONFIG_GLOBAL: join(directory, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'never',
-  }, new AbortController().signal)
+  }), new AbortController().signal)
 }
 
 beforeEach(() => {
@@ -169,5 +169,104 @@ describe('mainline Git', () => {
     losePushReply = false
     await expect(advanceMainline(restarted, target, clone.base.sha, candidate)).resolves.toBe('unchanged')
     expect(gitFor(remote, 'rev-parse', main)).toBe(candidate)
+  })
+})
+
+describe('rules Git snapshot', () => {
+  let checkout: string
+  let manifest: string
+  const config = { disabledSkills: ['文档'] }
+  const text = `${JSON.stringify(config)}\n`
+
+  beforeEach(() => {
+    checkout = join(directory, 'rules')
+    clone.worktree(checkout, 'rules-candidate')
+    manifest = join(checkout, RULES_MANIFEST)
+    mkdirSync(join(checkout, '.dsh-superagent'))
+  })
+
+  function commitFiles(...paths: string[]): string {
+    if (paths.length) gitFor(checkout, 'add', '--', ...paths)
+    gitFor(checkout, 'commit', '-qm', 'candidate rules')
+    return gitFor(checkout, 'rev-parse', 'HEAD')
+  }
+
+  it('recovers the exact committed blob even when the worktree, index, HEAD and replacement refs have changed', async () => {
+    const base = clone.base.sha
+    writeFileSync(manifest, text)
+    gitFor(checkout, 'add', '--', RULES_MANIFEST)
+    await expect(inspectRulesChange(commands(), checkout, base, base, 1024)).resolves.toEqual({ kind: 'unchanged' })
+
+    const pinned = commitFiles(RULES_MANIFEST)
+    await expect(inspectRulesChange(commands(), checkout, base, pinned, Buffer.byteLength(text))).resolves.toEqual({ kind: 'changed', config })
+    writeFileSync(manifest, '{"disabledSkills":[]}')
+    const moved = commitFiles(RULES_MANIFEST)
+    gitFor(checkout, 'replace', pinned, moved)
+    writeFileSync(manifest, 'not JSON')
+    gitFor(checkout, 'add', '--', RULES_MANIFEST)
+    await expect(inspectRulesChange(commands(), checkout, base, pinned, 1024)).resolves.toEqual({ kind: 'changed', config })
+  })
+
+  it('distinguishes unrelated changes from mixed changes, even inside the rules directory', async () => {
+    const base = clone.base.sha
+    writeFileSync(join(checkout, 'shared.txt'), 'unrelated change')
+    const unrelated = commitFiles('shared.txt')
+    await expect(inspectRulesChange(commands(), checkout, base, unrelated, 1024)).resolves.toEqual({ kind: 'unchanged' })
+
+    writeFileSync(manifest, 'not JSON')
+    writeFileSync(join(checkout, '.dsh-superagent', 'other source.ts'), 'export {}')
+    const mixed = commitFiles(RULES_MANIFEST, '.dsh-superagent/other source.ts')
+    await expect(inspectRulesChange(commands(), checkout, base, mixed, 1024)).resolves.toEqual({ kind: 'not-isolated' })
+    await expect(inspectRulesChange(commands(), checkout, unrelated, mixed, 1024)).resolves.toEqual({ kind: 'not-isolated' })
+  })
+
+  it('rejects deletion and distinguishes a rules directory from an isolated file change', async () => {
+    writeFileSync(manifest, text)
+    const base = commitFiles(RULES_MANIFEST)
+    gitFor(checkout, 'rm', '--', RULES_MANIFEST)
+    const deleted = commitFiles()
+    await expect(inspectRulesChange(commands(), checkout, base, deleted, 1024)).resolves.toEqual({ kind: 'invalid' })
+
+    mkdirSync(manifest, { recursive: true })
+    writeFileSync(join(manifest, 'nested.json'), text)
+    const directoryInstead = commitFiles(`${RULES_MANIFEST}/nested.json`)
+    await expect(inspectRulesChange(commands(), checkout, base, directoryInstead, 1024)).resolves.toEqual({ kind: 'not-isolated' })
+  })
+
+  it('rejects symlink and gitlink entries without following or checking them out', async () => {
+    const base = clone.base.sha
+    writeFileSync(manifest, text)
+    const blob = gitFor(checkout, 'hash-object', '-w', '--', RULES_MANIFEST)
+    // Stage actual commit modes on Windows as well as POSIX, without requiring filesystem symlink privileges.
+    for (const [mode, oid] of [['120000', blob], ['160000', base]]) {
+      gitFor(checkout, 'update-index', '--add', '--cacheinfo', `${mode},${oid},${RULES_MANIFEST}`)
+      const candidate = commitFiles()
+      await expect(inspectRulesChange(commands(), checkout, base, candidate, 1024)).resolves.toEqual({ kind: 'invalid' })
+    }
+  })
+
+  it('rejects an oversized blob, malformed JSON, and malformed UTF-8', async () => {
+    const base = clone.base.sha
+    writeFileSync(manifest, text)
+    const oversized = commitFiles(RULES_MANIFEST)
+    await expect(inspectRulesChange(commands(), checkout, base, oversized, Buffer.byteLength(text) - 1)).resolves.toEqual({ kind: 'invalid' })
+
+    writeFileSync(manifest, '{"disabledSkills":[}')
+    const malformed = commitFiles(RULES_MANIFEST)
+    await expect(inspectRulesChange(commands(), checkout, base, malformed, 1024)).resolves.toEqual({ kind: 'invalid' })
+
+    writeFileSync(manifest, Buffer.from([0x22, 0xff, 0x22]))
+    const invalidUtf8 = commitFiles(RULES_MANIFEST)
+    await expect(inspectRulesChange(commands(), checkout, base, invalidUtf8, 1024)).resolves.toEqual({ kind: 'invalid' })
+  })
+
+  it('rejects refs, other object types, and missing commits with sanitized diagnostics', async () => {
+    const base = clone.base.sha
+    const tree = gitFor(checkout, 'rev-parse', `${base}^{tree}`)
+    for (const candidate of ['HEAD', base.slice(0, 12), tree]) {
+      await expect(inspectRulesChange(commands(), checkout, base, candidate, 1024)).rejects.toThrow('full commit object IDs')
+    }
+    await expect(inspectRulesChange(commands(), checkout, base, 'f'.repeat(base.length), 1024))
+      .rejects.toThrow(/^Cannot read a rules commit object(?: \(Git exit \d+\))?$/)
   })
 })

@@ -242,10 +242,16 @@ async function drive(host: Host) {
   expect(resumed).toBeDefined()
   expect(host.inputs.some(input => input.sessionId === workerA && input.text === inputMessage(resumed!))).toBe(true)
   const policy = runtime.store.settings().policy
-  // The rule ticket b was accepted under changes, so its worker is told how; the one it was not is disabled, which tells no one.
+  // Import a changed deployment policy to size the existing policy-change notice surface.
   const rules = policy.rules.map(rule => rule.id === 'visual' ? { ...rule, enabled: false }
     : rule.id === 'copy' ? { ...rule, instruction: `${rule.instruction} Keep the wording short.` } : rule)
-  await runtime.settings.save('policy', { ...policy, rules }, runtime.store.blockRevision('policy'), 'panel')
+  const previousSettings = runtime.store.settings()
+  const changedSettings = { ...previousSettings, policy: { ...policy, rules } }
+  runtime.store.saveSettings(changedSettings)
+  runtime.engine.policyChanged('before', 'after', new Map([[b, { rules: [{ id: 'copy', name: 'Copy fixes', change: 'changed',
+    instruction: rules.find(rule => rule.id === 'copy')!.instruction }] }]]))
+  const evaluation = runtime.store.settings().eval
+  await runtime.settings.save('eval', { ...evaluation, timeoutSeconds: evaluation.timeoutSeconds + 1 }, runtime.store.blockRevision('eval'), 'panel')
   // Worker b's turn ends: it is idle, as DSH says when it emits the event.
   host.agents.get(workerB)!.status = 'idle'
   host.ctx.emit('agent/status', { agent: host.agents.get(workerB), status: 'idle' } as never)
@@ -399,6 +405,7 @@ it('collects both roles\' tools, prompts, skills and inputs', () => {
   for (const name of ['orchestrator_ticket_accept', 'orchestrator_ticket_attach', 'orchestrator_ticket_stop', 'orchestrator_trigger_ignore']) {
     expect(toolsOf('orchestrator').has(name)).toBe(false)
   }
+  expect(toolsOf('orchestrator').has('orchestrator_prompts_save')).toBe(false)
   const wheres = new Set(surfaces.map(surface => surface.where))
   for (const where of ['orchestrator prompt runtime/dispatch', 'worker prompt runtime/work', 'skill dsh-superagent-github', 'skill dsh-superagent-feishu', 'skill dsh-superagent-doc-tree',
     'skill dsh-worker-implement', 'skill dsh-worker-tdd', 'skill dsh-worker-test-scope', 'skill dsh-worker-code-review',

@@ -29,7 +29,7 @@ export interface SessionsHost {
   readonly context: Context
   readonly store: Pick<Store, 'tickets' | 'settings' | 'get' | 'set' | 'keys'>
   readonly projectMeter: Pick<ProjectMeter, 'bind' | 'owns'>
-  readonly prompts: Pick<Prompts, 'current' | 'version' | 'compose' | 'skills'>
+  readonly prompts: Pick<Prompts, 'current' | 'version' | 'effective' | 'forTicket' | 'compose' | 'skills'>
   readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'idle' | 'pending'>
   /** The `models` health entry, which reports managed sessions waiting on a model-budget retry. */
   readonly health: HealthEntry
@@ -58,8 +58,8 @@ export interface SessionsHost {
  * What Sessions registered for an agent it decorated: the releases of its prompt section, tools and skill scope, the scope
  * its skills are registered in, and the skills of one prompt revision; for a worker's subagent, only its tool limits.
  */
-interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void };
-  role?: PromptRole; subagent?: true; ready?: Promise<void>; observeDelegation?: (initial?: UserMessage) => void;
+interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; names: Set<string>; dispose: () => void };
+  role?: PromptRole; subagent?: true; ready?: Promise<void>; observeDelegation?: (initial?: UserMessage) => void; ticketId?: string;
   review?: { ticketId: string; grant: z.infer<typeof ReviewAssignmentSchema> } }
 
 /** The agent presets Executor, planner and main Sessions are created with, which the bundle's patch defines. */
@@ -128,6 +128,7 @@ const SPLITTER_INACTIVE = promptFile('splitter-inactive'), SPLITTER_DENIED = pro
 const WORKER_TICKET_ENDED = promptFile('worker-ticket-ended')
 const WORKER_WRITER_REQUIRED = promptFile('worker-writer-required')
 const WORKER_ANCESTRY_PENDING = promptFile('worker-ancestry-pending')
+const WORKER_SKILL_NOT_BOUND = promptFile('worker-skill-not-bound')
 /**
  * The DSH tools an Executor Session works with: files, search, the shell and its jobs, the web, skills, its todo list and
  * subagents. It gets no other DSH tool the profile has, whenever it was registered: none that asks or shows a person
@@ -355,20 +356,19 @@ export class Sessions {
   /** Returns the current prompt revision, the active prompt revision of each loaded Session, and whether the main Session still has a pending `'prompts'` notice. */
   status() {
     const { store, prompts, effects } = this.host
-    const sessions = store.keys(KV.sessions.prompts).flatMap(name => {
-      const sessionId = name.slice(KV.sessions.prompts.prefix.length), revision = store.get(name)?.at(-1)
-      return this.ctx.agents.get(sessionId as SessionId) && revision !== undefined ? [{ sessionId, revision }] : []
+    const sessions = this.ctx.agents.list().flatMap(agent => {
+      const binding = this.bindings.get(agent)
+      const revision = binding?.ticketId ? prompts.forTicket(binding.ticketId).revision : store.get(KV.sessions.prompts(agent.id))?.at(-1)
+      return revision === undefined ? [] : [{ sessionId: agent.id, revision }]
     })
-    return { revision: prompts.current().revision, sessions, notificationPending: effects.pending('notice', 'prompts') }
+    return { revision: prompts.effective().revision, sessions, notificationPending: effects.pending('notice', 'prompts') }
   }
-  /** Returns the prompt version a Session runs under (the one bound on its latest model request, or the current version). */
+  /** Returns the pinned prompt version for ticket Sessions, otherwise the latest version worked under. */
   promptVersion(sessionId: string): PromptVersion {
+    const ticketId = ticketOfSession(sessionId) ?? this.host.store.get(KV.projectMeter.binding(sessionId))?.ticket_id
+    if (ticketId) return this.host.prompts.forTicket(ticketId)
     const revision = this.host.store.get(KV.sessions.prompts(sessionId))?.at(-1)
-    return revision === undefined ? this.host.prompts.current() : this.host.prompts.version(revision)
-  }
-  /** Whether a Session is authorized to read `revision` (its active revision or any revision it previously ran under). */
-  mayRead(sessionId: string, revision: number): boolean {
-    return revision === this.promptVersion(sessionId).revision || (this.host.store.get(KV.sessions.prompts(sessionId)) ?? []).includes(revision)
+    return revision === undefined ? this.host.prompts.effective() : this.host.prompts.version(revision)
   }
   /** Returns a tool registrar for `agent` that renders tool output as JSON text and attaches `output.image` as an image when present. */
   private registerTool(agent: Agent, binding: SessionBinding): RegisterTool {
@@ -439,6 +439,7 @@ export class Sessions {
     const handoffRole = plannerId ? 'planner' : splitterId ? 'splitter' : undefined
     const role: PromptRole = handoffRole ?? (master ? 'orchestrator' : 'worker')
     const binding: SessionBinding = { disposers: [], role }
+    if (ticket) binding.ticketId = ticket.id
     this.bindings.set(agent, binding)
     if (master) {
       // The router preset omits the shell, jobs and every write tool; restrict the inherited surface too, so a profile that
@@ -468,7 +469,7 @@ export class Sessions {
     const skillScope = agent.ctx.inject(['skills'], scope => {
       binding.scope = scope
       binding.skills = undefined
-      this.bindSkills(binding, host.prompts.current())
+      this.bindSkills(binding, this.promptFor(agent, false))
     })
     binding.disposers.push(() => { skillScope.dispose().catch((error: unknown) => { this.ctx.logger.warn('dsh-superagent could not release a skill scope: %s', String(error)) }) })
     binding.ready = Promise.resolve(skillScope).then(() => {
@@ -513,12 +514,17 @@ export class Sessions {
     const store = this.host.store
     const parent = scopeParentOf(agent)
     const allow = [...toolNames, ...DEV_MCP_TOOLS].filter(name => agent.ctx.tools.get(name, parent))
-    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(({ name }) => {
+    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(({ name, arguments: args }) => {
       const current = store.tickets.get(ticketId)
       if (!current || !liveTicket(current)) return WORKER_TICKET_ENDED
       if (name === 'orchestrator_credential_blocked' && agent.id === workerSessionId(ticketId)
         && agent.session.header.parentSession === undefined && this.host.credentialBlocked?.(ticketId)) return undefined
       if (!this.host.workerAuthorized(ticketId, workerSessionId(ticketId))) return WORKER_WRITER_REQUIRED
+      if (name === 'skill') {
+        const skill = (args as { name?: unknown } | null)?.name
+        if (typeof skill === 'string' && (skill.startsWith(SKILL_PREFIX) || skill.startsWith('dsh-worker-'))
+          && !this.bindings.get(agent)?.skills?.names.has(skill)) return WORKER_SKILL_NOT_BOUND
+      }
       return undefined
     })]
   }
@@ -566,6 +572,8 @@ export class Sessions {
     if (this.bindings.get(agent) !== pending || this.host.closing()) return
     if (!lineage) { this.release(agent); return }
     const { ticketId, nativeParents } = lineage
+    pending.ticketId = ticketId
+    pending.role = 'worker'
     pending.disposers.push(...this.workOnly(agent, ticketId))
     if (agent.session.header.origin !== 'subagent') { pending.disposers.shift()!(); return }
     // Native children without a proven dispatch keep their guard, including a native child of an ordinary fork.
@@ -594,18 +602,20 @@ export class Sessions {
       const grant = reviewTask(message)
       const ticket = host.store.tickets.get(ticketId)
       if (!ticket) return
+      if (!admitted) {
+        const version = host.prompts.forTicket(ticketId)
+        const skillScope = agent.ctx.inject(['skills'], scope => {
+          binding.scope = scope
+          binding.skills = undefined
+          this.bindSkills(binding, version)
+        })
+        binding.disposers.push(() => { skillScope.dispose().catch((error: unknown) => {
+          this.ctx.logger.warn('dsh-superagent could not release a child skill scope: %s', String(error))
+        }) })
+      }
       if (grant && !limited) {
         // Restrict as soon as the delegated task is known, not after the first model call/Skill lookup.
         binding.disposers.push(...this.workOnly(agent, ticketId, REVIEW_TOOLS))
-        const skill = bundledSkills['worker/code-review']
-        // Native DSH children belong to AgentLoop, which does not inject the skills service.
-        const skillScope = agent.ctx.inject(['skills'], scope => {
-          scope.skills.register({ name: skill.name, description: skill.description, content: skill.content,
-            source: 'runtime', resourceBase: { kind: 'directory', path: dirname(skill.path) } })
-        })
-        binding.disposers.push(() => { skillScope.dispose().catch((error: unknown) => {
-          this.ctx.logger.warn('dsh-superagent could not release a review skill scope: %s', String(error))
-        }) })
         limited = true
       }
       const writer = latestAssignment(ticket)?.writer
@@ -636,21 +646,26 @@ export class Sessions {
     if (!scope || previous?.revision === version.revision) return
     previous?.dispose()
     const disposers: (() => void)[] = []
+    const names = new Set<string>()
     for (const [name, content] of this.host.prompts.skills(version.config, binding.role)) {
       const bundled = binding.role === 'splitter' ? splitterSkill : isBundledSkill(name) ? bundledSkills[name] : undefined
       const body = version.config.skills[name] ?? ''
       const description = bundled?.description ?? (body.replace(/\s+/g, ' ').slice(0, 120) || 'Custom dsh-superagent operational skill.')
-      disposers.push(scope.skills.register({ name: bundled?.name ?? `${SKILL_PREFIX}${name}`, description, content, source: 'runtime',
+      const registeredName = bundled?.name ?? `${SKILL_PREFIX}${name}`
+      names.add(registeredName)
+      disposers.push(scope.skills.register({ name: registeredName, description, content, source: 'runtime',
         ...(bundled ? { resourceBase: { kind: 'directory' as const, path: dirname(bundled.path) } } : {}) }))
     }
-    binding.skills = { revision: version.revision, dispose: () => { disposers.forEach(dispose => dispose()) } }
+    binding.skills = { revision: version.revision, names, dispose: () => { disposers.forEach(dispose => dispose()) } }
   }
-  /** Return the current prompt version, updating the agent's skills and recording the revision in Store when bound to a model request. */
+  /** Return a ticket's pinned prompt or the effective current prompt, refreshing skills and recording non-ticket history. */
   private promptFor(agent: Agent, bind: boolean): PromptVersion {
-    const version = this.host.prompts.current()
-    if (!bind) return version
     const binding = this.bindings.get(agent)
+    const ticketId = binding?.ticketId ?? ticketOfSession(agent.id)
+    const version = ticketId ? this.host.prompts.forTicket(ticketId) : this.host.prompts.effective()
+    if (!bind) return version
     if (binding) this.bindSkills(binding, version)
+    if (ticketId) return version
     const { store } = this.host
     const revisions = store.get(KV.sessions.prompts(agent.id)) ?? []
     const bound = [...revisions.filter(revision => revision !== version.revision), version.revision]

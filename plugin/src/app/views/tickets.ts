@@ -3,6 +3,7 @@ import { liveTicket, threadKey, ticketStage, type AcceptMode, type AdmissionCell
   type TicketStage } from '../../core/index.ts'
 import { workerSessionId } from '../../executor/dsh.ts'
 import { mainlineIntent } from '../mainline-queue.ts'
+import { KV } from '../../kv.ts'
 import type { Store } from '../store.ts'
 import { channelLink, decisionView, newestFirst, page, snapshot, threadSummary, ticketLine, type Snapshot,
   type ViewHost } from './records.ts'
@@ -73,7 +74,9 @@ export function ticketDetail(host: ViewHost, id: string) {
   // Pass `human = false` for bot-originated mandates so the Source kind still labels the actor as a bot if removed from the policy list.
   const human = ticket.mandate.basis.via !== 'bot'
   const mainline = ticket.plan ? mainlineIntent(store, id) : undefined
+  const rulesRevision = store.get(KV.prompts.ticket(id))
   return { ...ticketLine(view, ticket), mandate: { ...ticket.mandate, actor: view.actor(ticket.mandate.actor, human) },
+    ...rulesRevision === undefined ? {} : { rulesRevision },
     ...mainline ? { mainline } : {},
     basis: basisFacts(ticket.mandate.basis, view.rule), paused: store.settings().paused,
     channels: ticket.channels.map(channel => channelLink(view, channel)),

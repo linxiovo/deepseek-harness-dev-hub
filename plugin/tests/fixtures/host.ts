@@ -223,6 +223,15 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   const steps = new Map<string, () => void>(), claims = new Map<string, () => void>()
   let reviewChildSequence = 0
   const tools = new Map<string, Map<string, RegisteredTool>>()
+  const mountedSkills = new Map<string, Map<string, string>>()
+  const skillRegistry = (sessionId: string) => {
+    const skills = new Map<string, string>()
+    mountedSkills.set(sessionId, skills)
+    return { register: ({ name, content }: { name: string; content: string }) => {
+      skills.set(name, content)
+      return () => { skills.delete(name) }
+    } }
+  }
   const toolLimits = new Map<string, Set<string>>()
   const deliveries = vi.fn<(request: Delivery) => void>()
   let http!: HttpHandler
@@ -235,7 +244,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
       tools.set(sessionId, sessionTools)
       const register = (tool: RegisteredTool) => { sessionTools.set(tool.name, tool); return () => sessionTools.delete(tool.name) }
       agentCtx.reflect.provide('tools', { register, get: () => undefined, restrict: vi.fn(() => () => {}), guard: vi.fn(() => () => {}) })
-      agentCtx.reflect.provide('skills', { register: () => () => {} })
+      agentCtx.reflect.provide('skills', skillRegistry(sessionId))
       agentCtx.reflect.provide('systemPrompt', { section: () => () => {} })
       const inbox = { nextTurn: [] as UserMessage[], nextStep: [] as UserMessage[],
         // A pending message taken out, as DSH's inbox does by its id.
@@ -363,6 +372,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     await runtime.stop()
     agents.clear()
     tools.clear()
+    mountedSkills.clear()
     ctx = new Context()
     for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
     runtime = new Runtime(ctx, testMachine({ stateDir: directory, ...machineOverrides }), vi.fn())
@@ -398,7 +408,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     const parent = agents.get(parentId)
     if (!parent) throw new Error(`Session ${parentId} does not exist`)
     const childHost = new Context(), sessionTools = new Map<string, RegisteredTool>()
-    await childHost.plugin(scope => { scope.provide('skills', { register: () => () => {} } as never) })
+    await childHost.plugin(scope => { scope.provide('skills', skillRegistry(childId) as never) })
     // DSH creates native children in an agent-loop scope without injecting skills into it.
     const agentCtx = childHost.plugin(() => {}).ctx
     tools.set(childId, sessionTools)
@@ -508,7 +518,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
   return { get runtime() { return runtime }, get ctx() { return ctx }, get toolLimits() { return toolLimits }, restart, idlePlanning, idleRelay, directory, localGit, agents, tools, deliveries, relays, jsonRelays, candidates, runTool, sendUserMessage, record, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
-    jobs, subagents, reviewSubagent, useStoredLog, step, claim, modelRequest }
+    jobs, subagents, reviewSubagent, useStoredLog, step, claim, modelRequest, mountedSkills }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>
 interface ManagedProject {

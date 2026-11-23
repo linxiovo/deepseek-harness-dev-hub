@@ -141,6 +141,8 @@ The host records the verified merge and enqueues closure in the same transaction
 
 Before the push the queue records the successful Actions run ID for each required workflow on the verified PR, base and candidate. If GitHub clears a run's PR links after the push, the closing check accepts only that recorded run for that workflow. It still reads the latest attempt and all required jobs; removed, failed or mismatched runs do not pass. An intent without the recorded run identity cannot prove a detached PR run.
 
+Each Plan Ticket uses the first complete, nonempty required check set from its start or later operator configuration. Changes to the configured list apply to new Tickets, not to existing required checks. A shared-rule maintenance Ticket also needs the staged manifest described in `plugin/docs/004-prompts.md`.
+
 The host ends the Ticket (`by: delivery`, `outcome: merged`) and records the Plan receipt atomically. It revokes the Worker grant and stops its work on commit. The Ticket cannot reopen on a later Thread message. Closure is internal; it neither closes a GitHub issue nor sends a per-Ticket external notice.
 
 If the evidence no longer passes, the Ticket stays open and `mainline.delivery_missing` names the blockers on the verified attempt. Restart resumes pending checks. Replaying the same SHA rechecks closure without advancing Git; a fresh checked SHA can enter the queue after a refused closure and follows the normal actual-baseline repair flow. After closure, replay returns the existing intent without closing or claiming again.

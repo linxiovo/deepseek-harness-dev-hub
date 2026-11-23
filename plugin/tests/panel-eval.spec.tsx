@@ -79,6 +79,7 @@ it('opens the rule list for an invalid field inside it only', async () => {
   const openRows = () => all('.dt-disclosure[data-open]').length
   await act(async () => { field(zh.evalTimeout).dispatchEvent(new Event('invalid', { bubbles: false })) })
   expect(openRows()).toBe(0)
+  await click(zh.promptManageRules)
   await click(all('.dt-rule [data-disclosure-row]')[0]!)
   await act(async () => { all('.dt-rule input')[0]!.dispatchEvent(new Event('invalid')) })
   expect(openRows()).toBe(all('.dt-rule').length)
@@ -98,10 +99,11 @@ it('syncs a Source\'s list from where the Source keeps it, but not while a Polic
   expect(server.requests.slice(before).some(request => request.path.startsWith('policy-sync'))).toBe(false)
 })
 
-it('adds, copies, renames, disables and deletes rules in Policy without touching Eval', async () => {
+it('stages changes to admission rules without editing the live Policy', async () => {
   await mount()
   await click(zh['tab.eval'])
   await click(find(zh['tab.settings'], '.dt-status-head button'))
+  await click(zh.promptManageRules)
   await click(zh.addRule)
   await type(field<HTMLInputElement>(zh.ruleName), '文档')
   await type(field<HTMLTextAreaElement>(zh.ruleInstruction), '修复失效链接')
@@ -110,9 +112,14 @@ it('adds, copies, renames, disables and deletes rules in Policy without touching
   await click('启用规则：文案修改')
   const removeButtons = all('button').filter(button => button.textContent === '删除')
   await click(removeButtons.at(-1)!)
+  await type(field<HTMLInputElement>(zh.promptMaintenanceTicket), 'M-22')
   await click(zh.save)
-  expect(server.settings.policy.rules.map(rule => [rule.name, rule.enabled])).toEqual([['文案修改', false], ['文档', true]])
-  expect(server.requests.filter(request => request.method === 'PUT').map(request => request.path)).toEqual(['settings/policy'])
+  const requests = server.requests.filter(request => request.method === 'PUT')
+  expect(requests.map(request => request.path)).toEqual(['prompts'])
+  expect(requests[0]?.body).toMatchObject({ maintenanceTicketId: 'M-22', config: { admissionRules: [
+    { name: '文案修改', enabled: false }, { name: '文档', enabled: true },
+  ] } })
+  expect(server.settings.policy.rules.some(rule => rule.name === '文档')).toBe(false)
 })
 
 it('shows the current Policy version once, explains what makes it up, and opens a Mandate\'s version in the Policy history', async () => {

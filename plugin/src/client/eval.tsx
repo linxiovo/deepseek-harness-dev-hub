@@ -67,6 +67,29 @@ function RuleRow({ rule, expanded, onToggle, onChange, onDuplicate, onRemove }: 
   </li>
 }
 
+export function AdmissionRuleEditor({ rules, onChange }: { rules: readonly Rule[]; onChange: (rules: Rule[]) => void }) {
+  const { t } = usePanel()
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const toggle = (id: string) => setExpanded(previous => {
+    const next = new Set(previous)
+    if (next.has(id)) next.delete(id); else next.add(id)
+    return next
+  })
+  const insert = (rule: Rule, at: number) => {
+    setExpanded(previous => new Set([...previous, rule.id]))
+    onChange([...rules.slice(0, at), rule, ...rules.slice(at)])
+  }
+  return <Section title={t('rules')} hint={t('rulesHint')} action={<Button variant="ghost" size="sm" icon={<Icon name="plus" />}
+    onClick={() => insert({ id: crypto.randomUUID(), name: '', enabled: true, instruction: '' }, rules.length)}>{t('addRule')}</Button>}>
+    {rules.length ? <ul className="dt-rules" onInvalidCapture={() => setExpanded(new Set(rules.map(rule => rule.id)))}>
+      {rules.map((rule, index) => <RuleRow key={rule.id} rule={rule} expanded={expanded.has(rule.id)}
+        onToggle={() => toggle(rule.id)} onChange={next => onChange(rules.map((item, position) => position === index ? next : item))}
+        onDuplicate={() => insert({ ...rule, id: crypto.randomUUID(), name: `${rule.name}${t('copySuffix')}`.slice(0, LIMITS.ruleName) }, index + 1)}
+        onRemove={() => onChange(rules.filter((_, position) => position !== index))} />)}
+    </ul> : <Hint>{t('rulesEmpty')}</Hint>}
+  </Section>
+}
+
 type Part = Record<string, unknown>
 function SourcePart({ source, part, saved, dirty, onChange, reload }: {
   source: SourceView; part: Part; saved: Part; dirty: boolean; onChange: (next: Part) => void; reload: () => Promise<void>
@@ -134,44 +157,23 @@ function AdmissionTable({ rows, labels, table, explicit, onChange }: {
 }
 
 function PolicyBlock() {
-  const { t } = usePanel()
+  const { t, navigate } = usePanel()
   const { settings: { blocks, sources, policyVersion }, reload } = useSettings()
   const draft = useBlockDraft('policy', blocks.policy.value, blocks.policy.revision)
   const policy = draft.value
-  const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const parts = sources.filter(source => source.installed && source.policy)
   const [tab, setTab] = useState<string>()
   const current = parts.find(source => source.id === tab) ?? parts[0]
   const edit = (next: Partial<typeof policy>) => draft.edit({ ...policy, ...next })
-  const toggle = (id: string) => { const next = new Set(expanded); if (next.has(id)) next.delete(id); else next.add(id); setExpanded(next) }
-  const insert = (rule: Rule, at: number) => {
-    setExpanded(new Set([...expanded, rule.id]))
-    edit({ rules: [...policy.rules.slice(0, at), rule, ...policy.rules.slice(at)] })
-  }
-  // Expand all rules when native form validation fails inside a collapsed rule.
-  const reveal = (target: EventTarget) => { if (target instanceof Element
-    && target.closest('.dt-rules')) setExpanded(new Set(policy.rules.map(rule => rule.id))) }
   const part = (id: string) => (policy.sources[id] ?? { allowed: [] }) as Part
-  const add = () => insert({ id: crypto.randomUUID(), name: '', enabled: true, instruction: '' }, policy.rules.length)
-  return <form className="dt-form dt-block" onSubmit={event => { void draft.submit(event) }}
-    onInvalidCapture={event => reveal(event.target)}>
+  return <form className="dt-form dt-block" onSubmit={event => { void draft.submit(event) }}>
     <Fields disabled={draft.busy}>
       <h2 className="dt-block-title">{t('term.policy')}<InfoTip text={t('policyIntro')} /></h2>
       <p className="dt-flow">
         <LabelValue label={t('policyVersion')} value={<span className="dt-mono">{policyVersion.slice(0, 8)}</span>} /><InfoTip
           text={t('policyVersionHint')} />
       </p>
-      <Section title={t('rules')} hint={t('rulesHint')} action={<Button variant="ghost" size="sm" icon={<Icon name="plus" />}
-        onClick={add}>{t('addRule')}</Button>}>
-        {policy.rules.length ? <ul className="dt-rules">{policy.rules.map((rule, index) => <RuleRow key={rule.id} rule={rule}
-          expanded={expanded.has(rule.id)}
-          onToggle={() => toggle(rule.id)} onChange={next => edit({ rules: policy.rules.map((item, position) => position === index ? next
-            : item) })}
-          onDuplicate={() => insert({ ...rule, id: crypto.randomUUID(), name: `${rule.name}${t('copySuffix')}`.slice(0, LIMITS.ruleName) },
-            index + 1)}
-          onRemove={() => edit({ rules: policy.rules.filter((_, position) => position !== index) })} />)}</ul>
-            : <Hint>{t('rulesEmpty')}</Hint>}
-      </Section>
+      <Button variant="outline" onClick={() => navigate({ page: 'settings', query: { group: 'prompts' } })}>{t('promptManageRules')}</Button>
       {current && <Section title={t('policyPerSource')} hint={t('policyPerSourceHint')}>
         {parts.length > 1 && <div className="dt-subtabs" role="tablist" aria-label={t('policyPerSource')}>
           {parts.map(source => <button key={source.id} type="button" role="tab" aria-selected={source === current} className="dt-subtab"

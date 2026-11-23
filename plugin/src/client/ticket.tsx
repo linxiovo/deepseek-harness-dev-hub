@@ -233,6 +233,7 @@ export function TicketPage({ id }: { id: string }) {
     [t('ticketDirectory'), <span className="dt-mono">{execution?.directory ?? data.directory ?? t('empty')}</span>],
   ]
   if (session) identifiers.push([t('workerSession'), <span className="dt-mono">{session}</span>])
+  if (data.rulesRevision !== undefined) identifiers.push([t('ticketRulesRevision'), data.rulesRevision])
   if (execution?.repository) identifiers.push([t('executionRepository'), <span className="dt-mono">{execution.repository}</span>])
   if (execution?.worktree) identifiers.push([t('executionWorktree'), <span className="dt-mono">{execution.worktree}</span>])
   if (execution?.branch) identifiers.push([t('executionBranch'), <span className="dt-mono">{execution.branch}</span>])

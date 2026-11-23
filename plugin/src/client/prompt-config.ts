@@ -8,12 +8,13 @@ export const isSkill = (name: string): name is `skill/${string}` => name.startsW
 /** A built-in part, which the editor names `part/<key>`, apart from the team skills (`skill/<name>`). */
 export const isPart = (name: string): name is `part/${string}` => name.startsWith('part/')
 export const partKey = (name: `part/${string}`): string => name.slice(5)
-export const sections = (config: PromptConfig): string[] => [...Object.keys(config).filter(name => name !== 'skills' && name !== 'overrides'),
-  ...Object.keys(config.skills).map(name => `skill/${name}`), ...Object.keys(config.overrides ?? {}).map(key => `part/${key}`)]
+export const sections = (config: PromptConfig): string[] => [...Object.keys(config).filter(name => name !== 'skills' && name !== 'overrides'
+  && name !== 'disabledSkills' && name !== 'admissionRules'), ...Object.keys(config.skills).map(name => `skill/${name}`), ...Object.keys(config.overrides ?? {}).map(key => `part/${key}`)]
 /** Returns a team section or team skill's text, a built-in part's override, or `undefined` for one the team did not write. */
 export const sectionText = (config: PromptConfig, name: string): string | undefined => isPart(name) ? config.overrides?.[partKey(name)]?.text
   : isSkill(name) ? config.skills[name.slice(6)]
-  : name !== 'skills' && name !== 'overrides' && Object.hasOwn(config, name) ? config[name as TeamSection] : undefined
+  : name !== 'skills' && name !== 'overrides' && name !== 'disabledSkills' && name !== 'admissionRules' && Object.hasOwn(config, name)
+    ? config[name as TeamSection] : undefined
 /**
  * A configuration with its overrides, none as an empty map, as the editor keeps it: a draft and the version it moves onto then
  * merge override by override, as a host stores no overrides as none. With `parts`, only the overrides of those parts stay, as
@@ -35,17 +36,26 @@ export function withOverride(config: PromptConfig, part: BuiltInPart, text: stri
 export function withSection(config: PromptConfig, name: string, text: string): PromptConfig {
   return isSkill(name) ? { ...config, skills: { ...config.skills, [name.slice(6)]: text } } : { ...config, [name]: text }
 }
+export function withSkillEnabled(config: PromptConfig, name: string, enabled: boolean): PromptConfig {
+  const disabledSkills = new Set(config.disabledSkills ?? [])
+  if (enabled) disabledSkills.delete(name)
+  else if (Object.hasOwn(config.skills, name)) disabledSkills.add(name)
+  return { ...config, disabledSkills: [...disabledSkills] }
+}
 export function withoutSkill(config: PromptConfig, name: string): PromptConfig {
   const { [name.slice(6)]: _removed, ...skills } = config.skills
-  return { ...config, skills }
+  return { ...config, skills, disabledSkills: (config.disabledSkills ?? []).filter(skill => skill !== name.slice(6)) }
 }
 /** The sections, skills and overrides of a draft that differ from the saved version; an override re-based counts too. */
 export const changedSections = (config: PromptConfig, saved: PromptConfig): string[] =>
-  [...new Set([...sections(config), ...sections(saved)])].filter(name => isPart(name)
+  [...new Set([...sections(config), ...sections(saved), 'admissionRules'])].filter(name => name === 'admissionRules'
+    ? JSON.stringify(config.admissionRules) !== JSON.stringify(saved.admissionRules) : isPart(name)
     ? JSON.stringify(config.overrides?.[partKey(name)]) !== JSON.stringify(saved.overrides?.[partKey(name)])
-    : sectionText(config, name) !== sectionText(saved, name))
+    : sectionText(config, name) !== sectionText(saved, name)
+      || isSkill(name) && config.disabledSkills?.includes(name.slice(6)) !== saved.disabledSkills?.includes(name.slice(6)))
 export const sectionLabel = (t: T, view: Pick<PromptsView, 'skillPrefix'>, name: string): string =>
-  isPart(name) ? valueLabel(t, 'promptPart', partKey(name)) : isSkill(name) ? `${view.skillPrefix}${name.slice(6)}` : valueLabel(t, 'promptPart', name)
+  name === 'admissionRules' ? t('rules') : isPart(name) ? valueLabel(t, 'promptPart', partKey(name))
+    : isSkill(name) ? `${view.skillPrefix}${name.slice(6)}` : valueLabel(t, 'promptPart', name)
 export const skillNameFree = (name: string, config: PromptConfig, view: Pick<PromptsView, 'skillName' | 'builtin'>): boolean =>
   new RegExp(view.skillName).test(name) && !Object.hasOwn(config.skills, name) && !view.builtin.includes(name)
 /** Formats a team prompt part with its heading (omitted for skills, which have no heading). */

@@ -253,13 +253,13 @@ Its `context`, `read` and `decide` methods serve `orchestrator_eval`, `orchestra
 
 `Settings` (`src/app/settings.ts`) reads and writes revisioned settings blocks. `current` and `view` read them; `save(block, value, revision, origin)` validates a save; `pause(paused, origin)` changes the separate `paused` setting.
 
-Every save declares its origin: `panel`, `tool` or `sync`. Only `panel` can change the execution environment, the authorized run limits (`016-run-limits.md`), or fields listed in `SETUP_FIELDS` (`src/deployment.ts`).
+Settings saves name their origin (`panel`, `tool`, `sync`). Only `panel` may change accept mode, Source authorization (apart from configured synchronization), required CI, execution environment, authorized run limits, or fields listed in `SETUP_FIELDS`. Admission rule text and enablement change only through [rule publication](004-prompts.md#versions).
 
 A Policy-version change calculates `policyEffects`, records which Tickets were notified, and calls `Engine.policyChanged`. `syncable` and `sync(id)` refresh a Source's Policy part. `refreshLabels(id)` refreshes display names.
 
 ### Prompts
 
-`Prompts` (`src/app/prompts.ts`) stores configurations as `Versions`. `current`, `version` and `history` read them; `validate`, `preview` and `save(value, baseRevision, source)` check and save them. `compose` and `skills` build Session text.
+`Prompts` (`src/app/prompts.ts`) stores configurations as `Versions`. Management reads, previews and stages; only the formal delivery transaction publishes. See [Prompt versions](004-prompts.md#versions) for the contract.
 
 `builtInParts` lists override keys, roles, default text and required template placeholders. Each override stores team `text` and a `base`: the `builtInBase` key of its original default. Saves preserve that default under `KV.prompts.builtIn`. `defaultChanged` then reports changed defaults, their old text when available, and removed parts.
 
@@ -271,9 +271,7 @@ Validation inherits an omitted base from the saved override, drops removed parts
 
 `prompt` delivers once per request id. `relay` and `notify` enqueue main-Session messages handled by the `relay` and `notice` effects. `src/app/notices.ts` defines their content; `delivery` checks whether a message arrived.
 
-Each model request binds the Session to the current prompt revision. The revisions it used are stored durably: `promptVersion` identifies the active one and `mayRead` restricts which versions a worker can inspect. Registrations are tracked in one map per agent.
-
-`status` and `promptVersion` serve prompt pages. Saves go through `Prompts.save` and notify the main Session. `modelRetry` exposes model-budget retry state.
+`Sessions` registers prompt text and Skills from the Ticket's persisted snapshot or, for non-Ticket roles, from the effective revision. `status` and `promptVersion` serve prompt reads; `modelRetry` exposes model-budget retry state.
 
 ### Plan handoff navigation
 
@@ -457,7 +455,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents` (descendant cleanup per `010-session-boundaries.md`), `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/executor/worktree.ts` | Read-only inspection of the canonical clone, linked worktrees, branch, base and destination. On repair, Worker reclaim accepts the last queued candidate as a temporary lineage anchor, but evidence still requires the new base. |
 | `src/executor/repository-identity.ts` | `validateRepositoryIdentity` reads the clone's local `remote.origin.url` without modifying it or contacting GitHub; it accepts one direct github.com HTTPS, SSH or Git URL for the configured owner/name, case-insensitively and with an optional `.git` suffix, and refuses missing, ambiguous, unsupported or mismatched origins with `WorktreeRejected` |
-| `src/executor/mainline-git.ts` | Isolated GitHub branch observation, reproducible integration commits, and lease-checked fast-forward writes; never changes the checkout refs |
+| `src/executor/mainline-git.ts` | Isolated GitHub branch observation, committed shared-rule manifest inspection, reproducible integration commits and lease-checked fast-forward writes |
 | `src/executor/doc-tree.ts` | Candidate-bound Doc Tree structure and changed-path evidence; see `011-doc-tree-impact.md` |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. Supports native Windows batch wrappers and process-tree cancellation. `CliError` carries the code reported by the CLI, such as a GitHub HTTP status; when nothing is printed, the error describes how the command ended without exposing its arguments. `validItems` skips and counts malformed list items |
 | `src/infra/environment.ts` | The agent's process environment: platform-specific command shims, the git configuration and credential helper, `runAsWorker` through the DeepSeek Harness subprocess interface, and the checks of the environment and of a Ticket's directory |
@@ -534,7 +532,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/worktree-inspector.spec.ts` | `inspectRepository`, `inspectWorktree` and `validateWorktreeDestination` on temporary Git repositories: a canonical clone and linked worktree accepted, while an ordinary folder, a foreign repository or worktree, a wrong branch or base, and an alias path are refused without changing the tree; destination isolation refuses the primary checkout, registered worktrees, symlink aliases and unrelated Git checkouts without creating paths; reuse requires a previously verified claim |
 | `tests/doc-tree.spec.ts` | Doc Tree structure and committed-candidate evidence in real Git repositories |
 | `tests/repository-identity.spec.ts` | Real Git clones: the fixture's matching origin, GitHub HTTPS/SSH/Git variants, and refusals of wrong owner or repository, missing or duplicate origins, and disguised or unsupported URLs without modifying the clone |
-| `tests/mainline-git.spec.ts` | Real Git mainline fetches, strict ancestry and atomic lease rejection on a temporary bare transport |
+| `tests/mainline-git.spec.ts` | Real Git mainline fetches, strict ancestry, atomic lease rejection and committed shared-rule manifest inspection |
 | `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the worker, read-only router and planner presets it defines |
 | `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown |
 | `tests/passes.spec.ts` | Passes: one at a time, the ones asked for during a pass run as one after it, and the runtime health a failed pass reports |
@@ -548,7 +546,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
 | `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |
 | `tests/plan-integration-crash.spec.ts` | SIGKILL after GitHub accepts workflow dispatch but before the effect records a result; SQLite recovery observes the existing run without another dispatch |
-| `tests/mainline-queue.spec.ts` | Queue admission, versioned candidate CI, same-target serialization, code and Doc Tree conflicts, formal closure, recovery, Plan regression and generic artifact delivery, including a pause during 403 and a rerun during download |
+| `tests/mainline-queue.spec.ts` | Queue admission, versioned candidate CI, same-target serialization, code and Doc Tree conflicts, formal closure, shared-rule publication, restart, Frontier claims, Plan regression and generic artifact delivery, including a pause during 403 and a rerun during download |
 | `tests/plan-artifacts.spec.ts` | Exact workflow attempt/profile binding, safe filenames and media types, package SHA-256, strict archive contents, restart staging cleanup and retained-file tamper rejection |
 | `tests/panel-execution.spec.tsx` | Ticket delivery status in Harness, release-verification hold and project-scoped artifact download |
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
@@ -607,17 +605,18 @@ A generated column is computed from its row's JSON and is empty outside its set,
 | --- | --- |
 | Schema | Current schema version |
 | Settings versions | `settings-revision`, `settings-version:<n>`, `settings-block-revision:<block>`; snapshots include origin, Policy version and affected Tickets |
-| Prompt versions | `prompt-revision`, `prompt-version:<n>` |
+| Prompt versions | `prompt-revision` (latest proposal sequence), `prompt-version:<n>` (history), `prompt-active-revision` (published pointer), `prompt-snapshot:<n>` (resolved content), `ticket-prompt-revision:<ticket id>` (immutable pin), `ticket-prompt-proposal:<ticket id>` (latest proposal) |
 | Main Session | `master-id` |
 | Session prompt history | `session-prompts:<session id>` |
 | Session meter | `session-meter:<session id>`: the durable meter state, whose `cursor` is the exclusive upper bound of the folded own events and the next read's first seq |
 | Mainline intent | `mainline-ticket:<ticket id>` versioned attempts and `mainline-pending:<target>` pending Ticket order; effect rows commit with the relevant queue, repair or verified-merge transition |
+| Plan Ticket CI | `plan-ticket-required-checks:<ticket id>` keeps the required Actions jobs fixed for that Ticket |
 | Source state | Read positions such as `github-cursor:<number>`, PR CI fingerprints and seen Feishu-topic messages; keys begin with the kind or `thread-` plus a Thread key |
 | Display names | `source-labels:<source id>` |
 
 Dismissal is stored on its Decision. Input text is rendered from the Ticket when read, so neither needs a separate key-value record.
 
-Read caches use bounded in-memory `TextCache` instances and are lost on restart. A Session paging through an original Source record or prompt preview must reread offset 0 after a restart. Feishu links resolved after intake are cached the same way; link-based search finds them only after that link has been read during the current process lifetime.
+Read caches use bounded in-memory `TextCache` instances and are lost on restart. A Session paging through an original Source record must reread offset 0 after a restart. Feishu links resolved after intake are cached the same way; link-based search finds them only after that link has been read during the current process lifetime.
 
 Nothing deletes old records yet, so these grow without bound: the `trigger`, `disposition` and `decision` rows; ended Tickets and their Threads; the outbox's receipts; and in `kv`, every saved settings revision and prompt version, the prompt revisions each Session worked under, and the Sources' records per Thread and per Issue or pull request.
 
@@ -627,7 +626,7 @@ Nothing deletes old records yet, so these grow without bound: the `trigger`, `di
 
 ### Main Session tools
 
-The main Session has 16 application tools, grouped here by purpose; `010-session-boundaries.md` owns the allowed and refused tool contract:
+Main Session tools are grouped here by purpose; `plugin/docs/010-session-boundaries.md` owns access rules:
 
 | Purpose | Tools |
 | --- | --- |
@@ -637,13 +636,13 @@ The main Session has 16 application tools, grouped here by purpose; `010-session
 | Re-evaluate | `orchestrator_trigger_requeue` |
 | Assess proactive work | `orchestrator_eval`, `orchestrator_eval_read`, `orchestrator_eval_decide` |
 | Communicate and unsubscribe | `orchestrator_reply`, `orchestrator_thread_unsubscribe` |
-| Configure | `orchestrator_settings_save`, `orchestrator_policy_sync`, `orchestrator_prompts_save` |
+| Configure | `orchestrator_settings_save`, `orchestrator_policy_sync` |
 
 `orchestrator_reply` sends an `answer`, `result` or `attention` message through the Outbox; it cannot send an acceptance acknowledgement. The host queues that acknowledgement, pull-request end notices and Source notices itself, also through the Outbox. A Worker's take-up and report queue no Channel message directly.
 
 `orchestrator_route` accepts 1–20 decisions in order. Each accept, attach, stop or ignore runs as a separate Engine command. It also permits ignoring an inferred candidate directly from its card. `orchestrator_ticket_note` sends a fact as context, not authority.
 
-Settings saves select `policy`, `eval`, `executor`, `pause`, or `source`; the last also names its Source id. A prompt save with `preview: true` composes text without saving.
+Settings saves select `policy`, `eval`, `executor`, `pause`, or `source`; the last also names its Source id.
 
 The main Session also has the read-only Harness inspection tools; it has no shell, background-job, subagent, web or file-writing tool. The runtime's `tools.restrict` enforces the inherited surface at call time, not a prompt rule; `010-session-boundaries.md` owns the exact contract.
 
@@ -704,7 +703,7 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 | `ticket/<id>` | Related ids, source-batch Triggers, Threads, and first pages of Assignments and Inputs |
 | Ticket subresources | `/assignments`, `/inputs`, `/assignment`, `/reviews`, `/review/<review id>`, `/result`, `/report/<assignment id>`, `/transcript`, `/message/<n>`, `/input/<id>` |
 | `settings`, `settings/<block>` | Revisions and summaries, or a complete block ready to save |
-| `prompts`, `prompts/<revision>`, `prompts/current`, `prompts/defaults`, `prompt-preview/<id>` | Prompt configurations and composed text |
+| `prompts`, `prompts/<revision>`, `prompts/current`, `prompts/defaults` | Effective rule versions, history and Ticket-bound prompt configurations |
 | `models`, `models/<provider>` | Available models |
 | `session/<id>` | The `SessionMeterView` of one Session: its `context` snapshot and cumulative `usage`, with provenance, quality, sampled ranges and missing ranges; main Session only |
 | `project/meter`, `plan/<id>/meter`, `ticket/<id>/meter` | Hub-only scoped usage, shared overhead, and per-Session samples; contract in `plugin/docs/014-project-metering.md` |
@@ -712,7 +711,7 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 | `feishu/<trigger id>/…`, `github/…` | Original Source records, described in the Source skills |
 | `actions/<ticket\|plan>/<id>/commit/<40 lowercase hex SHA>` | GitHub Actions evidence for one owned commit, main Session only |
 
-Ticket Threads are marked `context` for context-only follows and `bound` for Source bindings. Assignment pages are newest first and include report previews. Continue lists with `next_offset`. `/input/<id>` accepts an Input's name or id. `settings` includes small blocks in full and summarizes Policy and Source blocks.
+Ticket Threads are marked `context` for context-only follows and `bound` for Source bindings. Assignment pages are newest first and include report previews. Compact Ticket details omit inline report previews but retain the links to full reports. Continue lists with `next_offset`. `/input/<id>` accepts an Input's name or id. `settings` includes small blocks in full and summarizes Policy and Source blocks.
 
 `ticket/<id>/reviews` returns `{ticket_id, assignment_id, base, candidate, generation, clean, stale, aggregate, standards, spec, history, next_offset}`. `aggregate` is `pending`, `blocked` or `passed`; it is pending whenever the observed HEAD/cleanliness or the in-process Worker lease generation does not match the recorded target. `standards` and `spec` contain only current-generation evidence. Each evidence item has `{id, axis, reviewer_session, generation, basis, base, candidate, conclusion, blockers, summary, at}`. `history` lists the latest Assignment's reviews newest first, paged with `offset`/`limit` (up to 50), with `next_offset` and a `read` pointer for each row. `/review/<review id>` opens a retained review from any Assignment of that Ticket and returns the current base and candidate. The record is stale unless it belongs to the active review pair and writer generation; stale records never count toward the aggregate.
 

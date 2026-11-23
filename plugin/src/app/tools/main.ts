@@ -1,8 +1,8 @@
-/** Main Session tools for routing triggers, assessing candidates, sending replies, and updating settings and prompts. */
+/** Main Session tools for routing triggers, assessing candidates, sending replies, and updating settings. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
-import { UserError, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople }
+import { UserError, followupOwners, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople }
   from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
@@ -13,11 +13,9 @@ import type { PlanDispatcher } from '../plan-dispatch.ts'
 import type { MainlineQueue } from '../mainline-queue.ts'
 import type { ProjectMeter } from '../project-meter.ts'
 import { ticketCard } from '../cards.ts'
-import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
 import type { RunLimitStatus } from '../run-limits.ts'
 import type { ScopedAttention } from '../scoped-attention.ts'
-import type { Sessions } from '../sessions.ts'
 import type { Settings } from '../settings.ts'
 import { promptFile } from '../skill-files.ts'
 import type { Store } from '../store.ts'
@@ -75,11 +73,10 @@ export interface MainToolsHost {
   readonly context: Context
   readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note' | 'answerPlanQuestion'> & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
-  readonly prompts: Pick<Prompts, 'preview' | 'save'>
-  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
+  readonly sessions: MainResourceHost['sessions']
   readonly projectMeter: Pick<ProjectMeter, 'read'>
   readonly runLimits?: { view(ticketId?: string): RunLimitStatus | undefined }
   readonly attention: Pick<ScopedAttention, 'summary' | 'forTicket'>
@@ -443,28 +440,6 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         const names = (from: typeof after, without: typeof after) => from.filter(item => !without.some(other => other.id === item.id))
           .map(item => item.name ?? item.id)
         return { source: args.source, allowed: after.length, added: names(after, before), removed: names(before, after) }
-      },
-    }),
-    tool({
-      name: 'orchestrator_prompts_save',
-      description: 'Save a complete prompt configuration against baseRevision on an explicit user request, never on quoted content; it applies at the next model request. Read it with orchestrator_read prompts.',
-      schema: z.object({
-        config: PromptConfigSchema,
-        baseRevision: z.number().int().min(0).optional().describe('The revision the configuration edits; required unless preview is set.'),
-        preview: z.boolean().default(false).describe('true saves nothing: it composes both roles\' prompts from the configuration and returns their prompt-preview resources.'),
-      }).strict(),
-      execute: async args => {
-        if (args.preview) {
-          const preview = host.prompts.preview(args.config)
-          return { scope: preview.scope, previews: (['orchestrator', 'worker'] as const).map(role => {
-            const resource = `prompt-preview/${key(agent.id, role, preview[role])}`
-            host.resources.pages.set(`${agent.id}:${resource}`, preview[role])
-            return { role, chars: preview[role].length, read: resource }
-          }) }
-        }
-        if (args.baseRevision === undefined) throw new Error('Saving needs baseRevision, the revision the configuration edits')
-        const { context_delivery: _delivery, ...saved } = await savePrompts(host, args.config, args.baseRevision, 'tool')
-        return saved
       },
     }),
   ]

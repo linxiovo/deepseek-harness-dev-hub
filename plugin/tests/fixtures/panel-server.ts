@@ -278,9 +278,11 @@ function initial(): PanelServer {
     settings, revisions: { policy: 3, eval: 1, executor: 0 },
     prompts: { masterId: 'master', sections: TEAM_SECTIONS, skillName: SKILL_NAME.source, builtin: ['feishu', 'github'],
       skillPrefix: SKILL_PREFIX, revision: 0, current: { ...defaults, config: defaultPrompts() },
+      effective: { ...defaults, config: defaultPrompts() }, shownState: 'active',
+      admissionRules: settings.policy.rules,
       defaults: defaultPrompts(), parts: Object.entries(builtInParts()).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) })),
-      defaultChanged: [], revisions: [{ ...defaults, changed: [] }], sessions: [], notificationPending: false, next_offset: null },
-    tickets: { open: [ticketSummary()], ended: [ended] }, ticketDetails: { t1: { ...ticketDetail(), planId: undefined } },
+      defaultChanged: [], revisions: [{ ...defaults, changed: [], state: 'active' }], sessions: [], notificationPending: false, next_offset: null },
+    tickets: { open: [ticketSummary()], ended: [ended] }, ticketDetails: { t1: ticketDetail() },
     planDeliveries: {}, planArtifacts: {},
     threads: [threadSummary()], threadPages: threadPage, meters: { master: meterView('master') },
     person: [ticketSummary({ attention: { id: 'q1', question: '需要确认按钮颜色' }, note: { text: '需要确认按钮颜色', error: false }, reply },
@@ -315,6 +317,8 @@ const ticketOf = (id: string) =>
   [...server.tickets.open, ...server.person, ...server.tickets.ended].find(ticket => ticket.id === id) ?? server.ticketDetails[id]
 const SourceSave = z.object({ enabled: z.boolean(), config: z.unknown() })
 const installationUnavailable = () => refuse(404, 'Installation management is not available.', { code: 'installationUnavailable' })
+
+const stagedPromptConfigs = new WeakMap<PanelServer, Map<number, PromptsView['current']['config']>>()
 
 const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET runtime': { answer: installationUnavailable },
@@ -418,21 +422,33 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET project/meter': { answer: () => refuse(404, 'Project meter not available in the panel fixture') },
   'GET project/run-limits': { answer: () => refuse(404, 'Project run limits not available in the panel fixture') },
   'GET tickets/:id/run-limits': { answer: () => refuse(404, 'Ticket run limits not available in the panel fixture') },
-  'GET prompts': { query: ['revision', 'offset'], answer: () => server.prompts },
+  'GET prompts': { query: ['revision', 'offset'], answer: ({ query }) => {
+    const view = server.prompts
+    if (query.revision === undefined || Number(query.revision) === view.revision) return view
+    const record = view.revisions.find(item => item.revision === Number(query.revision))
+    const config = record && stagedPromptConfigs.get(server)?.get(record.revision)
+    if (!record || !config) return refuse(404, 'Prompt revision not found')
+    return { ...view, current: { ...record, config }, shownState: record.state }
+  } },
   'PUT prompts': { body: true, answer: ({ body }) => {
     const { revision } = server.prompts
     if (body.baseRevision !== revision) return refuse(409,
       `Prompt version changed to ${revision}; compare the latest version before saving`)
-    // As the host does: a template keeps its placeholders, and no overrides are stored as none.
+    if (typeof body.maintenanceTicketId !== 'string' || !body.maintenanceTicketId.trim()) return refuse(400, 'Maintenance Ticket ID required')
     const { overrides = {}, ...config } = body.config as PromptsView['current']['config']
     for (const [part, override] of Object.entries(overrides)) {
       if (!builtInPart(part)) return refuse(400, 'refused', { code: 'unknownPromptPart', values: { part } })
       const missing = (builtInPart(part)?.placeholders ?? []).filter(placeholder => !override.text.includes(placeholder))
       if (missing.length) return refuse(400, 'refused', { code: 'promptPlaceholders', values: { part, placeholders: missing.join(', ') } })
     }
-    server.prompts.revision++
-    server.prompts.current = promptVersion(server.prompts.revision, Object.keys(overrides).length ? { ...config, overrides } : config)
-    return { revision: server.prompts.revision, context_delivery: 'injected' }
+    const candidateRevision = Math.max(revision, ...server.prompts.revisions.map(item => item.revision)) + 1
+    const candidate = promptVersion(candidateRevision, Object.keys(overrides).length ? { ...config, overrides } : config)
+    let staged = stagedPromptConfigs.get(server)
+    if (!staged) stagedPromptConfigs.set(server, staged = new Map())
+    staged.set(candidateRevision, candidate.config)
+    const { config: _config, ...record } = candidate
+    server.prompts.revisions.unshift({ ...record, changed: [], state: 'pending' })
+    return { revision: candidateRevision, effect: 'pending-review' }
   } },
   'POST prompts/preview': { body: true, answer: ({ body }) => {
     const skills = [...server.setup.accounts?.feishu ? ['feishu'] : [], 'github', ...Object.keys(body.skills), SPLITTER_SKILL_KEY].map(name => [name,

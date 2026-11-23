@@ -1,12 +1,11 @@
 /** Manages versioned role prompts, behavioral policies, and operational skills independently of access settings. */
+import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 import { UserError, key } from '../core/index.ts'
-import { policyVersion, type Settings, type SettingsOrigin } from '../policy.ts'
+import { PolicyConfigSchema, policyVersion, type Settings } from '../policy.ts'
 import { masterPrompt, workerPrompt, sharedPrompt, guides, mainAdmissionPolicy, handoffPolicy, teamDefaults, sourceSkills, cliNotes } from './context.ts'
 import { environmentLines, type Variable } from './execution-environment.ts'
 import { bundledSkills, isBundledSkill, promptFile, splitterSkill, workerSkills } from './skill-files.ts'
-import { promptsNotice } from './notices.ts'
-import type { Sessions } from './sessions.ts'
 import type { Store } from './store.ts'
 import { Versions } from './versions.ts'
 import { KV } from '../kv.ts'
@@ -37,12 +36,17 @@ const OverrideSchema = z.object({ text: z.string(),
  * saved version holds it and refuses otherwise.
  */
 export const PromptConfigSchema = z.object({ communication: z.string(), scope: z.string(), delivery: z.string(),
-  skills: z.record(SkillNameSchema, z.string()), overrides: z.record(z.string(), OverrideSchema).optional()
+  skills: z.record(SkillNameSchema, z.string()), disabledSkills: z.array(SkillNameSchema).optional(),
+  admissionRules: PolicyConfigSchema.shape.rules.unwrap().optional(),
+  overrides: z.record(z.string(), OverrideSchema).optional()
     .describe('Text in place of a built-in part, by its key in prompts/defaults; a part not named follows its built-in text.') }).strict()
 export type PromptConfig = z.infer<typeof PromptConfigSchema>
 export interface PromptVersion { revision: number; previousRevision: number | null; savedAt: string; source: string; config: PromptConfig;
+  maintenanceTicketId?: string
+  published?: { receiptId: string; candidate: string; at: string }
   /** Original unmigrated config preserved when differences cannot be compared across schema versions. */
   legacy?: { config: unknown } }
+export type PromptVersionState = 'active' | 'previous' | 'pending' | 'stale'
 export const defaultPrompts = (): PromptConfig => ({ ...teamDefaults, skills: {} })
 
 const ENVIRONMENT_HEADING = 'Execution environment (from this installation\'s settings; it takes precedence over any repository or account named elsewhere in these instructions; an empty value means that part is not configured here). The prepare command of a ticket directory reads the same variables:'
@@ -142,18 +146,23 @@ export function composeSkill(config: PromptConfig, name: string): string {
 export interface DefaultChange { part: string; base?: string; previous?: string; removed?: true }
 /**
  * Indicates an optimistic concurrency conflict when saving a prompt configuration against a stale base revision.
- * Thrown by `Prompts.save` and translated into an HTTP 409 response by the management routes.
+ * Thrown by `Prompts.stage` and translated into an HTTP 409 response by the management routes.
  */
-export class PromptConflict extends Error {}
+export class PromptConflict extends Error {
+  constructor(message: string, readonly code: 'promptRevisionChanged' | 'promptProposalRefused' = 'promptRevisionChanged') { super(message) }
+}
+/** JSON byte budget for the management request and its committed manifest. */
+export const promptByteLimit = (maxChars: number): number => 4 * maxChars + 4096
 /**
  * Stores numbered prompt configurations in `Store` via `Versions` and composes role system prompts and skills with the execution environment.
- * `Sessions` reads the composed prompts and skills for orchestrator and worker runs, while management routes and tools validate, preview, and save revisions through it.
+ * Sessions use frozen snapshots; management stages a proposal and the formal delivery transaction publishes it.
  */
 export class Prompts {
   private readonly versions: Versions<PromptVersion>
   constructor(private readonly store: Store, private readonly maxChars: () => number, private readonly environment: () => Variable[] | undefined,
     private readonly feishu: () => boolean) {
     this.versions = new Versions(store, KV.prompts.revision, KV.prompts.version)
+    this.store.atomic(() => this.snapshot(this.current().revision))
   }
   /** A role's prompt; the main Session's Policy section follows the settings as they are now, at each model request. */
   compose(config: PromptConfig, role: Role, variables?: Variable[]): string {
@@ -166,17 +175,71 @@ export class Prompts {
     if (role === 'splitter') return [[splitterSkill.shortName, composeSkill(config, SPLITTER_SKILL_KEY)]]
     const names = [...this.feishu() ? ['feishu'] : [], 'github', ...role === 'worker' ? ['doc-tree', ...Object.keys(workerSkills)] : []]
     return names.map((name): [string, string] => [name, composeSkill(config, name)])
-      .concat(Object.entries(config.skills).filter(([name]) => !isBundledSkill(name)))
+      .concat(Object.entries(config.skills).filter(([name]) => !isBundledSkill(name) && !config.disabledSkills?.includes(name)))
   }
   current(): PromptVersion {
-    const revision = this.versions.revision()
-    return revision ? this.version(revision) : { revision: 0, previousRevision: null, savedAt: '', source: 'defaults', config: defaultPrompts() }
+    return this.version(this.store.get(KV.prompts.active) ?? this.versions.revision())
   }
-  /** Reads a revision by number; revision 0 resolves to built-in defaults before the first save persists it. */
+  /** Editable configuration without defaults resolved during publication. */
   version(revision: number): PromptVersion {
-    const version = this.versions.get(revision) ?? (revision === 0 && this.versions.revision() === 0 ? this.current() : undefined)
+    const version = this.versions.get(revision) ?? (revision === 0 && this.versions.revision() === 0
+      ? { revision: 0, previousRevision: null, savedAt: '', source: 'defaults', config: defaultPrompts() } : undefined)
     if (!version) throw new UserError('unknownPromptRevision', { revision: String(revision) })
     return version
+  }
+  state(revision: number): PromptVersionState {
+    const version = this.version(revision)
+    if (revision === this.current().revision) return 'active'
+    if (version.published || !version.maintenanceTicketId) return 'previous'
+    const ticket = this.store.tickets.get(version.maintenanceTicketId)
+    return ticket && !ticket.ended && version.previousRevision === this.current().revision
+      && this.proposal(ticket.id) === revision ? 'pending' : 'stale'
+  }
+  /** Published configuration, with the packaged defaults resolved at publication. */
+  effective(): PromptVersion {
+    const { revision } = this.current()
+    const snapshot = this.store.get(KV.prompts.snapshot(revision))
+    if (!snapshot) throw new Error(`Effective rule revision ${revision} has no snapshot`)
+    return snapshot
+  }
+  boundRevision(ticketId: string): number | undefined { return this.store.get(KV.prompts.ticket(ticketId)) }
+  forTicket(ticketId: string): PromptVersion {
+    const revision = this.boundRevision(ticketId)
+    const snapshot = revision === undefined ? undefined : this.store.get(KV.prompts.snapshot(revision))
+    if (!snapshot) throw new Error(`Ticket ${ticketId} has no stored rule binding`)
+    return snapshot
+  }
+  /** Persist before launch; retries, recovery and rechecks never replace an existing binding. */
+  bindTicket(ticketId: string, legacyRevision?: number): void {
+    if (this.boundRevision(ticketId) !== undefined) return
+    this.store.atomic(() => {
+      const revision = legacyRevision ?? this.current().revision
+      this.snapshot(revision)
+      this.store.set(KV.prompts.ticket(ticketId), revision)
+    })
+  }
+  private snapshot(revision: number): PromptVersion {
+    const stored = this.store.get(KV.prompts.snapshot(revision))
+    if (stored) return stored
+    const version = this.version(revision)
+    const overrides = Object.fromEntries(PART_KEYS.map(part => [part, { text: builtIn(version.config, part) }]))
+    const snapshot = { ...version, config: { ...version.config, overrides } }
+    if (revision === 0 && !this.versions.get(0)) this.versions.keep(version)
+    this.store.set(KV.prompts.snapshot(revision), snapshot)
+    return snapshot
+  }
+  proposal(ticketId: string): number | undefined { return this.store.get(KV.prompts.proposal(ticketId)) }
+  matches(revision: number, value: unknown): boolean {
+    try { return isDeepStrictEqual(this.version(revision).config, this.validate(value)) } catch { return false }
+  }
+  /** Called inside the same transaction as formal closure, before it marks the Ticket ended. */
+  publish(ticketId: string, revision: number, receipt: { receiptId: string; candidate: string; verifiedAt: string }): void {
+    const version = this.version(revision)
+    if (this.proposal(ticketId) !== revision || version.maintenanceTicketId !== ticketId || this.state(revision) !== 'pending')
+      throw new PromptConflict('The shared rule proposal changed before delivery')
+    this.versions.keep({ ...version, published: { receiptId: receipt.receiptId, candidate: receipt.candidate, at: receipt.verifiedAt } })
+    this.snapshot(revision)
+    this.store.set(KV.prompts.active, revision)
   }
   /**
    * Parse a configuration: an override names a built-in part, holds text and keeps its template's placeholders, and records the
@@ -184,7 +247,9 @@ export class Prompts {
    * the built-in text again, and so does one of a part this version no longer has, which the saved version holds.
    */
   validate(value: unknown): PromptConfig {
-    const { overrides, ...config } = PromptConfigSchema.parse(value)
+    const { overrides, disabledSkills, ...config } = PromptConfigSchema.parse(value)
+    if (disabledSkills?.some(name => !Object.hasOwn(config.skills, name)))
+      throw new UserError('unknownCustomSkill')
     const saved = this.current().config.overrides ?? {}
     const kept = Object.entries(overrides ?? {}).flatMap(([name, override]) => {
       const part = builtInPart(name)
@@ -196,7 +261,9 @@ export class Prompts {
       const base = override.base ?? (Object.hasOwn(saved, name) ? saved[name]!.base : undefined) ?? builtInBase(part.text)
       return override.text === part.text ? [] : [[name, { text: override.text, base }] as const]
     })
-    const result: PromptConfig = { ...config, ...kept.length ? { overrides: Object.fromEntries(kept) } : {} }
+    const disabled = [...new Set(disabledSkills)].sort()
+    const result: PromptConfig = { ...config, ...disabled.length ? { disabledSkills: disabled } : {},
+      ...kept.length ? { overrides: Object.fromEntries(kept) } : {} }
     const limit = this.maxChars()
     if (JSON.stringify(result).length > limit) throw new UserError('promptTooLong', { limit: String(limit) })
     return result
@@ -216,7 +283,9 @@ export class Prompts {
   }
   preview(value: unknown) {
     const config = this.validate(value)
-    const environment = environmentSection(config, this.environment()), policy = policySection(this.store.settings(), config)
+    const environment = environmentSection(config, this.environment()), settings = this.store.settings()
+    const policy = policySection(config.admissionRules === undefined ? settings
+      : { ...settings, policy: { ...settings.policy, rules: config.admissionRules } }, config)
     const skills = Object.fromEntries(this.skills(config))
     skills[SPLITTER_SKILL_KEY] = composeSkill(config, SPLITTER_SKILL_KEY)
     return { orchestrator: composePrompt(config, 'orchestrator', environment, policy), worker: composePrompt(config, 'worker', environment),
@@ -225,32 +294,46 @@ export class Prompts {
         planner: promptParts(config, 'planner'), splitter: promptParts(config, 'splitter') },
       skills, scope: 'Team sections, skills, and overrides of built-in parts, which follow their built-in text until overridden. Workers additionally inherit the host prompt and repository AGENTS.md. Prompt text changes what the agents are told, not what dsh-superagent allows: tool permissions, the gate and account wrappers stay.' }
   }
-  save(value: unknown, baseRevision: number, source: SettingsOrigin): PromptVersion {
+  /** Store only a proposal, never an effective version. */
+  stage(value: unknown, baseRevision: number, maintenanceTicketId: string): PromptVersion {
     const config = this.validate(value)
     return this.store.atomic(() => {
-      const previous = this.current()
+      const previous = this.current(), priorId = this.proposal(maintenanceTicketId)
+      const prior = priorId === undefined ? undefined : this.version(priorId)
+      if (prior?.previousRevision === baseRevision && this.state(prior.revision) === 'pending' && isDeepStrictEqual(prior.config, config)) return prior
       if (previous.revision !== baseRevision) throw new PromptConflict(`Prompt version changed to ${previous.revision}; compare the latest version before saving`)
-      // Persist the built-in defaults as revision 0 before recording the first custom revision.
-      if (previous.revision === 0 && !this.versions.get(0)) this.versions.keep(previous)
-      // The built-in text each override was edited from, kept to show what an upgrade changed in it.
+      const ticket = this.store.tickets.get(maintenanceTicketId)
+      const plan = ticket?.plan && this.store.get(KV.plans.record(ticket.plan.planId))
+      if (!ticket?.plan || ticket.ended || plan?.nodes.length !== 1 || plan.nodes[0]?.id !== ticket.plan.nodeId)
+        throw new PromptConflict('Shared rules require an open, independent Plan maintenance Ticket', 'promptProposalRefused')
+      const attempt = this.store.get(KV.mainline.ticket(maintenanceTicketId))?.at(-1)
+      if (attempt && (attempt.status === 'queued' || attempt.status === 'applying' || attempt.status === 'verified'))
+        throw new PromptConflict('Cannot replace a shared rule proposal while its mainline attempt is pending or verified', 'promptProposalRefused')
+      this.store.set(KV.prompts.active, previous.revision)
       for (const [part, { base }] of Object.entries(config.overrides ?? {})) {
         const text = builtInParts()[part as PartKey].text
         if (base === builtInBase(text) && this.store.get(KV.prompts.builtIn(base)) === undefined) this.store.set(KV.prompts.builtIn(base), text)
       }
-      return this.versions.save(revision => ({ revision, previousRevision: previous.revision, savedAt: new Date().toISOString(), source, config }))
+      const staged = this.versions.save(revision => ({ revision, previousRevision: previous.revision, savedAt: new Date().toISOString(),
+        source: 'panel', config, maintenanceTicketId }))
+      this.store.set(KV.prompts.proposal(maintenanceTicketId), staged.revision)
+      return staged
     })
   }
   history(offset = 0, limit = 20) {
-    const current = this.current()
-    const revisions = Array.from({ length: Math.min(limit, Math.max(0, current.revision + 1 - offset)) }, (_, i) => {
-      const version = current.revision - offset - i === 0 && current.revision === 0 ? current : this.version(current.revision - offset - i)
-      const { config, ...summary } = version
+    const latest = this.versions.revision()
+    const revisions = Array.from({ length: Math.min(limit, Math.max(0, latest + 1 - offset)) }, (_, i) => {
+      const version = this.version(latest - offset - i)
+      const { config, ...record } = version
+      const summary = { ...record, state: this.state(version.revision) }
       const previous = version.previousRevision === null ? undefined : this.versions.get(version.previousRevision)?.config
       // Pre-team-section revisions are not comparable field-by-field.
       const legacy = version.legacy || (version.previousRevision !== null && this.versions.get(version.previousRevision)?.legacy)
       if (legacy) return { ...summary, changed: ['legacy'] }
       const entries = (value: PromptConfig) => ({ communication: value.communication, scope: value.scope, delivery: value.delivery,
+        admissionRules: value.admissionRules === undefined ? undefined : JSON.stringify(value.admissionRules),
         ...Object.fromEntries(Object.entries(value.skills).map(([name, text]) => ['skill/' + name, text])),
+        ...Object.fromEntries((value.disabledSkills ?? []).map(name => ['disabled-skill/' + name, 'true'])),
         // An override changes with its text or with the built-in text it was edited from.
         ...Object.fromEntries(Object.entries(value.overrides ?? {}).map(([part, override]) => [part, JSON.stringify(override)])) })
       const before = previous ? entries(previous) : {}
@@ -258,16 +341,6 @@ export class Prompts {
       const changed = previous ? [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(name => (before as Record<string, string>)[name] !== (after as Record<string, string>)[name]) : []
       return { ...summary, changed }
     })
-    return { revisions, next_offset: offset + revisions.length <= current.revision ? offset + revisions.length : null }
+    return { revisions, next_offset: offset + revisions.length <= latest ? offset + revisions.length : null }
   }
-}
-/** Save a new prompt revision and notify the main Session when the change originated outside its own tool call. */
-export async function savePrompts(host: { store: Pick<Store, 'atomic'>; prompts: Pick<Prompts, 'save'>; sessions: Pick<Sessions, 'notify' | 'delivery'> },
-  config: unknown, baseRevision: number, origin: SettingsOrigin) {
-  const version = host.store.atomic(() => {
-    const saved = host.prompts.save(config, baseRevision, origin)
-    if (origin !== 'tool') host.sessions.notify(...promptsNotice(saved.revision))
-    return saved
-  })
-  return { revision: version.revision, effect: 'next-request' as const, context_delivery: await host.sessions.delivery('prompts') }
 }

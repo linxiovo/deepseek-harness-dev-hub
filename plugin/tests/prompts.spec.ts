@@ -20,26 +20,32 @@ function withStore(body: (store: Store, dir: string) => void): void {
   try { body(store, dir) } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
 }
 
-it('saves team sections and skills as versions that survive a restart, with history and rollback', () => {
+// Existing installations import their last saved configuration before staging new versions.
+function importPromptVersion(store: Store, config: PromptConfig, revision: number): void {
+  if (revision === 1 && !store.get(KV.prompts.version(0)))
+    store.set(KV.prompts.version(0), { revision: 0, previousRevision: null, savedAt: '', source: 'defaults', config: defaultPrompts() })
+  store.set(KV.prompts.version(revision), { revision, previousRevision: revision - 1, savedAt: '', source: 'panel', config })
+  store.set(KV.prompts.revision, revision)
+}
+
+it('keeps a legacy published revision and its Ticket binding across restart', () => {
   const dir = mkdtempSync(join(tmpdir(), 'prompt-config-'))
   let store = new Store(join(dir, 'db'))
   try {
-    let prompts = promptsOf(store)
-    expect(prompts.current().config).toEqual(defaultPrompts())
     const config = { ...defaultPrompts(), scope: 'Finish what was asked.', delivery: '', skills: { release: 'Tag releases on Fridays.' } }
-    prompts.save(config, 0, 'panel')
-    expect(composePrompt(prompts.current().config, 'worker')).toContain('## Ticket scope\nFinish what was asked.')
+    importPromptVersion(store, config, 1)
+    let prompts = promptsOf(store)
+    prompts.bindTicket('existing-ticket', 0)
+    expect(composePrompt(prompts.effective().config, 'worker')).toContain('## Ticket scope\nFinish what was asked.')
     // An empty team section leaves the prompt; the fixed sections stay.
     expect(promptParts(config, 'worker').map(part => part.name)).not.toContain('delivery')
     expect(store.get('settings-revision')).toBeUndefined()
     store.close(); store = new Store(join(dir, 'db')); prompts = promptsOf(store)
     expect(prompts.current()).toMatchObject({ revision: 1, config })
-    prompts.save(prompts.version(0).config, 1, 'tool')
-    expect(prompts.current()).toMatchObject({ revision: 2, previousRevision: 1, config: defaultPrompts() })
-    expect(prompts.history(0, 1)).toMatchObject({ revisions: [{ revision: 2 }], next_offset: 1 })
-    expect(prompts.history(2, 1).next_offset).toBeNull()
-    expect(prompts.history(1, 1).revisions[0]).toMatchObject({ revision: 1, changed: ['scope', 'delivery', 'skill/release'] })
-    expect(() => prompts.save(config, 1, 'panel')).toThrow('version changed')
+    expect(prompts.forTicket('existing-ticket').revision).toBe(0)
+    expect(prompts.history(0, 1)).toMatchObject({ revisions: [{ revision: 1, state: 'active' }], next_offset: 1 })
+    expect(prompts.history(1, 1)).toMatchObject({ revisions: [{ revision: 0, state: 'previous' }], next_offset: null })
+    expect(() => prompts.stage(defaultPrompts(), 1, 'not-a-ticket')).toThrow('independent Plan maintenance Ticket')
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
 })
 
@@ -93,11 +99,11 @@ it.each(['orchestrator', 'worker'] as const)('ends the %s prompt with the fixed 
 it('rejects unknown keys, built-in skill names and oversized configuration before persisting', () => {
   withStore(store => {
     const prompts = promptsOf(store)
-    expect(() => prompts.save({ ...defaultPrompts(), shared: 'x' }, 0, 'panel')).toThrow()
-    expect(() => prompts.save({ communication: '', scope: '' }, 0, 'panel')).toThrow()
-    for (const name of ['github', 'feishu', 'doc-tree']) expect(() => prompts.save({ ...defaultPrompts(), skills: { [name]: 'mine' } }, 0, 'panel')).toThrow('built-in skill')
-    expect(() => prompts.save({ ...defaultPrompts(), skills: { 'Bad Name': 'x' } }, 0, 'panel')).toThrow()
-    expect(() => promptsOf(store, 1000).save(defaultPrompts(), 0, 'panel')).toThrow('exceeds')
+    expect(() => prompts.validate({ ...defaultPrompts(), shared: 'x' })).toThrow()
+    expect(() => prompts.validate({ communication: '', scope: '' })).toThrow()
+    for (const name of ['github', 'feishu', 'doc-tree']) expect(() => prompts.validate({ ...defaultPrompts(), skills: { [name]: 'mine' } })).toThrow('built-in skill')
+    expect(() => prompts.validate({ ...defaultPrompts(), skills: { 'Bad Name': 'x' } })).toThrow()
+    expect(() => promptsOf(store, 1000).validate(defaultPrompts())).toThrow('exceeds')
     expect(prompts.current().revision).toBe(0)
   })
 })
@@ -139,7 +145,7 @@ it('mounts the bundled Doc Tree skill only for workers, even with an older same-
 it.each(['implement', 'tdd', 'test-scope', 'code-review'])('mounts the bundled %s skill for workers alongside a same-name team skill', name => {
   withStore(store => {
     const prompts = promptsOf(store), config = defaultPrompts()
-    const saved = prompts.save({ ...config, skills: { [name]: 'Team workflow.' } }, 0, 'panel').config
+    const saved = prompts.validate({ ...config, skills: { [name]: 'Team workflow.' } })
     expect(prompts.skills(saved, 'worker')).toEqual(expect.arrayContaining([
       [`worker/${name}`, expect.stringMatching(/\S/)], [name, 'Team workflow.'],
     ]))
@@ -158,11 +164,11 @@ it('round-trips a team to-tickets skill without replacing the splitter’s bundl
   withStore(store => {
     const prompts = promptsOf(store)
     const team = 'Document our team ticket workflow.'
-    const saved = prompts.save({ ...defaultPrompts(), skills: { 'to-tickets': team } }, 0, 'panel')
-    const preview = prompts.preview(prompts.version(saved.revision).config)
+    const saved = prompts.validate({ ...defaultPrompts(), skills: { 'to-tickets': team } })
+    const preview = prompts.preview(saved)
     expect(preview.skills['to-tickets']).toBe(team)
     expect(preview.skills['splitter/to-tickets']).toBeTruthy()
-    expect(prompts.skills(saved.config, 'splitter')).toEqual([['to-tickets', preview.skills['splitter/to-tickets']]])
+    expect(prompts.skills(saved, 'splitter')).toEqual([['to-tickets', preview.skills['splitter/to-tickets']]])
   })
 })
 
@@ -222,26 +228,27 @@ describe('overrides of built-in parts', () => {
     withStore(store => {
       const prompts = promptsOf(store)
       // An override edited from today's built-in text has nothing to show.
-      const saved = prompts.save(config({ 'runtime/dispatch': { text: '## dispatch\nRoute well.' } }), 0, 'panel')
-      expect(saved.config.overrides!['runtime/dispatch']!.base).toBe(builtInBase(`## dispatch\n${guides.dispatch}`))
-      expect(prompts.defaultChanged(saved.config)).toEqual([])
+      const saved = prompts.validate(config({ 'runtime/dispatch': { text: '## dispatch\nRoute well.' } }))
+      expect(saved.overrides!['runtime/dispatch']!.base).toBe(builtInBase(`## dispatch\n${guides.dispatch}`))
+      expect(prompts.defaultChanged(saved)).toEqual([])
       // One edited from a built-in text an earlier version shipped, which this installation kept when it was saved.
       const earlier = '## replies\nAn earlier built-in text.'
       store.set(KV.prompts.builtIn(builtInBase(earlier)), earlier)
-      const upgraded = prompts.save(config({ ...saved.config.overrides, 'runtime/replies': { text: 'Our replies.', base: builtInBase(earlier) },
-        'runtime/work': { text: 'Our work.', base: 'unknown' } }), saved.revision, 'panel')
-      expect(prompts.defaultChanged(upgraded.config)).toEqual([{ part: 'runtime/replies', base: builtInBase(earlier), previous: earlier },
+      const upgraded = prompts.validate(config({ ...saved.overrides, 'runtime/replies': { text: 'Our replies.', base: builtInBase(earlier) },
+        'runtime/work': { text: 'Our work.', base: 'unknown' } }))
+      expect(prompts.defaultChanged(upgraded)).toEqual([{ part: 'runtime/replies', base: builtInBase(earlier), previous: earlier },
         { part: 'runtime/work', base: 'unknown' }])
       // Kept as it was: an upgrade never replaces the team's text.
-      expect(prompts.compose(prompts.current().config, 'worker')).toContain('Our replies.')
+      expect(prompts.compose(upgraded, 'worker')).toContain('Our replies.')
     })
   })
   it('reads a configuration saved before overrides existed unchanged', () => {
     withStore(store => {
       const prompts = promptsOf(store)
-      const saved = prompts.save({ ...defaultPrompts(), communication: 'Ours.' }, 0, 'panel')
-      expect(saved.config).toEqual({ ...defaultPrompts(), communication: 'Ours.' })
-      expect(prompts.compose(saved.config, 'orchestrator')).toBe(prompts.compose({ ...defaultPrompts(), communication: 'Ours.', overrides: {} }, 'orchestrator'))
+      const saved = { ...defaultPrompts(), communication: 'Ours.' }
+      importPromptVersion(store, saved, 1)
+      expect(prompts.current().config).toEqual(saved)
+      expect(prompts.compose(prompts.current().config, 'orchestrator')).toBe(prompts.compose({ ...saved, overrides: {} }, 'orchestrator'))
     })
   })
   it('drops an override of a part a later version no longer has, which the saved version holds, and lists it as removed', () => {
@@ -259,12 +266,14 @@ describe('overrides of built-in parts', () => {
   it('keeps the base of the saved override of a part when a save omits it, and shows a re-based override as a change', () => {
     withStore(store => {
       const prompts = promptsOf(store)
-      const first = prompts.save(config({ 'runtime/shared': { text: 'Ours.', base: 'earlier' } }), 0, 'panel')
-      const second = prompts.save(config({ 'runtime/shared': { text: 'Ours, edited.' } }), first.revision, 'tool')
-      expect(second.config.overrides!['runtime/shared']).toEqual({ text: 'Ours, edited.', base: 'earlier' })
-      // Keeping the team's text after an upgrade changes only the base, which the history names.
-      const rebased = prompts.save(config({ 'runtime/shared': { text: 'Ours, edited.', base: builtInBase(sharedPrompt) } }), second.revision, 'panel')
-      expect(prompts.history().revisions.find(version => version.revision === rebased.revision)!.changed).toEqual(['runtime/shared'])
+      const first = prompts.validate(config({ 'runtime/shared': { text: 'Ours.', base: 'earlier' } }))
+      importPromptVersion(store, first, 1)
+      const second = prompts.validate(config({ 'runtime/shared': { text: 'Ours, edited.' } }))
+      expect(second.overrides!['runtime/shared']).toEqual({ text: 'Ours, edited.', base: 'earlier' })
+      importPromptVersion(store, second, 2)
+      const rebased = prompts.validate(config({ 'runtime/shared': { text: 'Ours, edited.', base: builtInBase(sharedPrompt) } }))
+      importPromptVersion(store, rebased, 3)
+      expect(prompts.history().revisions[0]?.changed).toEqual(['runtime/shared'])
     })
   })
   it('refuses a part an object\'s prototype names, and empty text, and fills no placeholder a prototype names', () => {

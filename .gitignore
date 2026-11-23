@@ -18,5 +18,8 @@ coverage/
 # 本地辅助工作树
 /worktrees/
 
+# 本地 CodeGraph 索引，由工具生成，不纳入版本库
+/.codegraph/
+
 # 编码前的本地历史资料，不纳入版本库
 /meta/

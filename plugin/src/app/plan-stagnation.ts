@@ -47,7 +47,7 @@ export interface StagnationView {
 }
 interface Host {
   store: Pick<Store, 'tickets' | 'atomic' | 'get' | 'set'>
-  plans: Pick<Plans, 'state' | 'failedChecks'>
+  plans: Pick<Plans, 'state' | 'testHistory'>
   limits: Pick<RunLimits, 'forDispatch' | 'blocked'>
   engine: Pick<Engine, 'retryTicket' | 'note' | 'withdrawPlanDiagnosis'>
   paused(): boolean
@@ -147,7 +147,7 @@ export class PlanStagnation {
     if (entry?.kind !== 'tests' || entry.revision.candidate !== observation.candidate || entry.result !== observation.result
       || observation.read !== `ticket/${ticketId}/delivery-observation/${index}` || entry.revision.generation !== assignment.writer?.generation) return
     if (entry.result === 'unverified') return
-    const inherited = this.host.plans.failedChecks(plan.planId, plan.nodeId) ?? []
+    const inherited = this.host.plans.testHistory(plan.planId, plan.nodeId)
     const progress = latestTestProgress(ticket.id, ticket.deliveryCheck, entry.revision, inherited)
     if (!progress) return
     const record = this.record(ticket, assignment), { read } = observation

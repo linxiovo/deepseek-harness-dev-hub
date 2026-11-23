@@ -103,7 +103,7 @@ export interface MainToolsHost {
   readonly attention: Pick<ScopedAttention, 'summary' | 'forTicket'>
   readonly planIntegration?: MainResourceHost['planIntegration']
   readonly handoffs: Pick<Handoffs, 'confirm' | 'answer' | 'get' | 'spec'>
-  readonly plans: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'failedChecks' | 'view' | 'node' | 'append' | 'at' | 'revision' | 'current' | 'state' | 'requiredDelivery' | 'revise'>
+  readonly plans: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'testHistory' | 'view' | 'node' | 'append' | 'at' | 'revision' | 'current' | 'state' | 'requiredDelivery' | 'revise'>
   readonly stagnation: MainResourceHost['stagnation']
   readonly requirements: Pick<PlanRequirements, 'preview' | 'apply' | 'get'>
   readonly planDispatcher: Pick<PlanDispatcher, 'dispatch'>

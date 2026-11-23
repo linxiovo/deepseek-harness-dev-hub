@@ -4,7 +4,7 @@
  */
 import type { Handoff, ProjectRef, Spec } from './core/handoff.ts'
 import type { Plan, PlanMessage, PlanNodeState } from './core/plan.ts'
-import type { FailedCheck } from './core/delivery-check.ts'
+import type { TestHistory } from './core/delivery-check.ts'
 import type { PlanIntegrationView } from './core/plan-integration.ts'
 import type { PromptVersion } from './app/prompts.ts'
 import type { MainlineIntent } from './app/mainline-queue.ts'
@@ -97,7 +97,7 @@ export const KV = {
     handover: family<string[], [planId: string, nodeId: string]>('plan-handover:'),
     budgetOrigin: family<string, [planId: string, nodeId: string]>('plan-budget-origin:'),
     repairSource: family<PlanRepairSource, [planId: string, nodeId: string]>('plan-repair-source:'),
-    failedChecks: family<FailedCheck[], [planId: string, nodeId: string]>('plan-failed-checks:'),
+    testHistory: family<TestHistory, [planId: string, nodeId: string]>('plan-test-history:'),
     requiredChecks: family<GithubConfig['requiredChecks']>('plan-ticket-required-checks:'),
     claimRevision: family<number, [planId: string, nodeId: string]>('plan-claim-revision:'),
     node: family<PlanNodeState, [id: string, nodeId: string]>('plan-node:', (id, nodeId) => JSON.stringify([id, nodeId])),

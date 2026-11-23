@@ -92,6 +92,9 @@ it('automatically delegates a published spec, resumes interrupted splitting, and
   await expect(h.runTool(h.runtime.masterId, 'orchestrator_plan_register', { handoffId: id, specId, ...splitDraft })).rejects.toThrow(/not registered/i)
   await expect(h.runTool(sessionId, 'orchestrator_spec_question', { handoffId: id })).rejects.toThrow(/not registered/i)
   expect(await h.runTool(sessionId, 'orchestrator_read', { resource: `spec/${id}` })).toMatchObject({ id: specId, ...spec })
+  expect(h.tools.get(sessionId)?.get('orchestrator_plan_register')).toMatchObject({ parameters: { properties: { nodes: {
+    items: { properties: { interfaceContract: { required: ['path', 'requirements'], additionalProperties: false } } },
+  } } } })
   await h.restart()
   await h.runtime.idle()
   expect(tasks()).toHaveLength(2)
@@ -1223,10 +1226,24 @@ it('previews a product replan before applying an exact, durable direct approval'
   send(request)
   const stale = await preview()
   const staleReview = await reviewRequirement(stale.proposalId)
-  const failed = await h.runTool(catalogClaim.session, 'orchestrator_test_evidence', {
-    candidate: h.localGit!.base.sha, scope: 'focused', reason: 'Catalog request check', red: null,
-    checks: [{ directory: '.', command: 'pnpm test catalog', status: 'failed', observed: 'The catalog check still returns 500.' }],
+  const catalogCommand = 'pnpm test catalog'
+  const statusFailure = 'The catalog check still returns 500.', resultsFailure = 'Search results include products from another tenant.'
+  const check = (status: 'passed' | 'failed', observed: string, command = catalogCommand) => ({ directory: '.', command, status, observed })
+  const record = (session: string, reference: string, checks: ReturnType<typeof check>[]) => h.runTool(session, 'orchestrator_test_evidence', {
+    candidate: h.localGit!.base.sha, scope: 'focused', reason: 'Catalog request check', red: null, reference, checks,
   })
+  const oldGreen = 'run/catalog-before-regression', redRun = 'run/catalog-regression'
+  const mixed = await record(catalogClaim.session, oldGreen, [check('passed', 'Catalog status 200.'),
+    check('failed', 'Catalog seed cannot load.', 'pnpm test catalog-seed')])
+  const failed = await record(catalogClaim.session, redRun, [check('failed', statusFailure), check('failed', resultsFailure)])
+  await record(catalogClaim.session, oldGreen, [check('passed', 'The earlier request succeeded.')])
+  const retained = [
+    { command: 'pnpm test catalog-seed', read: mixed.read, observed: 'Catalog seed cannot load.' },
+    { command: catalogCommand, read: failed.read, observed: statusFailure },
+    { command: catalogCommand, read: failed.read, observed: resultsFailure },
+  ]
+  const outstanding = retained.map(failure => ({ failure, rerun: null }))
+  expect(await read(`ticket/${catalogClaim.ticketId}/failed-checks`)).toMatchObject({ items: outstanding })
   send(approval(stale, staleReview))
   await expect(apply(stale)).rejects.toThrow(/evidence|in-flight state/i)
   const deliveriesBeforePreview = h.deliveries.mock.calls.length
@@ -1253,6 +1270,7 @@ it('previews a product replan before applying an exact, durable direct approval'
   await h.runtime.effects.idle('requirementScopeReview')
   expect(tasks()).toHaveLength(1)
   expect(lostReceipt.mock.results.some(result => result.type === 'throw')).toBe(true)
+  expect(h.runtime.effects.pending('requirementScopeReview', proposalId)).toBe(true)
   expect(JSON.parse(tasks()[0]!.text)).toEqual({ proposalId, planId: id, expectedRevision: 1, currentGoal: fanInSpec.body,
     desiredGoal: fanInSpec.body, changedCriteria: [{ criterion: 1,
       before: { statement: fanInSpec.acceptance[0]!.statement, observable: fanInSpec.acceptance[0]!.observable },
@@ -1267,8 +1285,8 @@ it('previews a product replan before applying an exact, durable direct approval'
   h.controller.resolveAgent.mockImplementation(async id => {
     if (id === reviewer) {
       h.agents.set(id, restoreOriginal ? originalReviewer : impostor)
-      if (restoreOriginal) h.tools.set(id, reviewerTools)
-      else impostorSeen.resolve()
+      h.tools.set(id, reviewerTools)
+      if (!restoreOriginal) impostorSeen.resolve()
     }
     return h.resolveDefault(id)
   })
@@ -1279,7 +1297,7 @@ it('previews a product replan before applying an exact, durable direct approval'
     .rejects.toThrow(/not registered/i)
   restoreOriginal = true
   await vi.waitFor(() => expect(h.tools.get(reviewer)?.has('orchestrator_plan_scope_review')).toBe(true), { timeout: 20_000 })
-  expect(tasks()).toHaveLength(1)
+  await h.runtime.effects.idle('requirementScopeReview')
   h.controller.resolveAgent.mockImplementation(h.resolveDefault)
   expect(await preview()).toMatchObject({ status: 'preview', proposalId, requestMessageId: proposal.requestMessageId,
     scopeReview: { status: 'pending' } })
@@ -1289,6 +1307,8 @@ it('previews a product replan before applying an exact, durable direct approval'
   send(approval(proposal, staleReview))
   await expect(apply(proposal)).rejects.toThrow(/scope review/i)
   const scopeReviewId = await reviewRequirement(proposalId)
+  expect(h.runtime.effects.pending('requirementScopeReview', proposalId)).toBe(false)
+  expect(tasks()).toHaveLength(1)
   send(approval(proposal, scopeReviewId, 'new-handoff'))
   await expect(apply(proposal)).rejects.toThrow(/new handoff/i)
   h.record(hub, [{ type: 'user/message', data: { role: 'user', source: { kind: 'tool-jobs', form: 'notice' },
@@ -1345,8 +1365,12 @@ it('previews a product replan before applying an exact, durable direct approval'
     .toMatchObject({ goal: fanInSpec.body, authorizedScope: brief.authorization.scope, acceptanceScope: brief.acceptanceScope,
       outOfScope: fanInSpec.outOfScope, acceptance: [{ id: '1', text: expect.stringContaining(changed.observable) }],
       interfaceContract: { path: 'docs/catalog-api.md', previousRequirements: 'Document query inputs and return all substring matches.' },
-      inheritedChecks: [expect.objectContaining({ command: 'pnpm test catalog', read: failed.read })] })
+      inheritedChecks: retained })
   expect((await read(`ticket/${replacement.ticketId}/assignment`)).text).not.toContain('return all substring matches')
+  for (const reference of [oldGreen, redRun]) {
+    await record(replacement.session, reference, [check('passed', 'Stale receipt reported as the current catalog check.')])
+    expect(await read(`ticket/${replacement.ticketId}/failed-checks`)).toMatchObject({ items: outstanding })
+  }
   expect((await read(`ticket/${replacement.ticketId}/delivery-check`)).missing).toContain('failed_checks_require_recheck')
   expect(await read(`plan/${id}/meter`)).toMatchObject({ sessions: expect.arrayContaining([
     expect.objectContaining({ ticket_id: catalogClaim.ticketId, plan_id: id }),

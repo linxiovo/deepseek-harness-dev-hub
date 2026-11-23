@@ -30,6 +30,8 @@ export interface DeliveryLedger { events: readonly Entry[] }
 export interface FailedCheck extends Run { id: string; read: string; revision: string; reference: string }
 type Rerun = Pick<FailedCheck, 'id' | 'read' | 'observed' | 'reference'>
 export interface FailedCheckObligation { failure: FailedCheck; rerun: Rerun | null }
+/** Retired test observations and completed external run identities, carried across replacements. */
+export interface TestHistory { failures: FailedCheck[]; externalRuns: string[] }
 const runKey = ({ directory, command }: Run) => JSON.stringify([directory, command])
 
 type Issue = Stamp & (Finding | (Result & { category: 'acceptance' }))
@@ -211,8 +213,9 @@ function passingRuns(report: Tests): boolean {
 type TestProgress = { status: 'failed'; check: FailedCheck } | { status: 'passed' }
 
 function projectTestEvidence(ticketId: string, ledger: DeliveryLedger | undefined, target: DeliveryRevision | undefined,
-  inherited: readonly FailedCheck[]) {
-  const failures = [...inherited], reruns = new Map<string, Rerun>(), seenRuns = new Set<string>(), seenRed = new Set<string>()
+  inherited: TestHistory | undefined) {
+  const failures = inherited?.failures.slice() ?? [], externalRuns = new Set(inherited?.externalRuns)
+  const reruns = new Map<string, Rerun>(), seenRuns = new Set<string>(), seenRed = new Set<string>()
   const lastFailure = new Map<string, string>(), lastPass = new Map<string, string>()
   const events = ledger?.events ?? [], defaultReference = `ticket/${ticketId}/delivery-check`
   let latest: TestProgress | undefined
@@ -242,15 +245,23 @@ function projectTestEvidence(ticketId: string, ledger: DeliveryLedger | undefine
         if (exact) reruns.delete(command)
         continue
       }
+      // Even a green row in a mixed report consumes that run's identity. Its log cannot become a new rerun.
+      if (!local) {
+        const receipt = JSON.stringify([command, reference])
+        if (run.status === 'passed' && externalRuns.has(receipt)) continue
+        externalRuns.add(receipt)
+      }
       if (run.status === 'passed' && !passing) continue
       const onRevision = JSON.stringify([command, revision.base, revision.candidate, revision.generation])
-      // An exact cited run cannot become new evidence when red recurs. A local report has no run receipt;
-      // a new opposite result for the same check is the durable boundary between its identical reports.
-      const identity = local
-        ? JSON.stringify([run.status, onRevision, run.observed, run.status === 'failed' ? lastPass.get(onRevision) : lastFailure.get(command)])
-        : JSON.stringify([run.status, command, reference])
-      if (seenRuns.has(identity) || (!local && run.status === 'passed' && seenRuns.has(JSON.stringify(['failed', command, reference])))) continue
-      seenRuns.add(identity)
+      // Local reports have no run receipt. An opposite result opens a new episode for identical local output.
+      // A single cited run may contain multiple independently failing assertions.
+      if (local || run.status === 'failed') {
+        const identity = local
+          ? JSON.stringify([run.status, onRevision, run.observed, run.status === 'failed' ? lastPass.get(onRevision) : lastFailure.get(command)])
+          : JSON.stringify([command, reference, run.observed])
+        if (seenRuns.has(identity)) continue
+        seenRuns.add(identity)
+      }
       const id = `${read}#checks/${i}`
       if (run.status === 'failed') {
         const failure = fail(command, run, id, revision.candidate)
@@ -262,19 +273,24 @@ function projectTestEvidence(ticketId: string, ledger: DeliveryLedger | undefine
       }
     }
   }
-  return { failures, reruns, latest }
+  return { failures, externalRuns, reruns, latest }
+}
+
+export function captureTestHistory(ticketId: string, ledger: DeliveryLedger, inherited?: TestHistory): TestHistory {
+  const { failures, externalRuns } = projectTestEvidence(ticketId, ledger, undefined, inherited)
+  return { failures, externalRuns: [...externalRuns] }
 }
 
 /** A matching Worker rerun is evidence of progress, not proof that the assertions survived. */
 export function failedCheckObligations(ticketId: string, ledger: DeliveryLedger | undefined, target: DeliveryRevision | undefined,
-  inherited: readonly FailedCheck[] = []): FailedCheckObligation[] {
+  inherited?: TestHistory): FailedCheckObligation[] {
   const { failures, reruns } = projectTestEvidence(ticketId, ledger, target, inherited)
   return failures.map(failure => ({ failure, rerun: reruns.get(runKey(failure)) ?? null }))
 }
 
 /** Only the latest distinct observation can affect recovery. A pass must cover every outstanding failed check. */
 export function latestTestProgress(ticketId: string, ledger: DeliveryLedger | undefined, target: DeliveryRevision,
-  inherited: readonly FailedCheck[]): TestProgress | undefined {
+  inherited?: TestHistory): TestProgress | undefined {
   const { failures, reruns, latest } = projectTestEvidence(ticketId, ledger, target, inherited)
   if (latest?.status === 'passed' && failures.some(failure => !reruns.has(runKey(failure)))) return undefined
   return latest
@@ -374,14 +390,14 @@ export function advanceDelivery(ledger: DeliveryLedger | undefined, revision: De
 
 /** A local evidence view, not CI, a merge receipt, or formal delivery. Missing/dirty worktrees have no active evidence. */
 export function viewDelivery(ledger: DeliveryLedger | undefined, revision: DeliveryRevision | undefined, reviews: readonly ReviewEvidence[],
-  acceptance: readonly Criterion[], ticketId: string, inherited?: readonly FailedCheck[]) {
+  acceptance: readonly Criterion[], ticketId: string, inherited?: TestHistory | null) {
   const events = ledger?.events ?? []
   const { active, followups } = project(events, reviews, ticketId)
   const state = forRevision(active, revision)
   const matching = currentReviews(reviews, revision)
   const missing: string[] = []
-  // Plan callers opt in with their canonical inherited checks, even when that list is empty.
-  const failed_checks = inherited === undefined ? [] : reviewedChecks(failedCheckObligations(ticketId, ledger, revision, inherited), matching)
+  // Undefined is standalone; null is a Plan Ticket without any retired history.
+  const failed_checks = inherited === undefined ? [] : reviewedChecks(failedCheckObligations(ticketId, ledger, revision, inherited ?? undefined), matching)
   if (failed_checks.some(check => check.confirmed_by.length !== 2)) missing.push('failed_checks_require_recheck')
   if (!revision) missing.push('revision')
   if (!dual(matching)) missing.push('dual-review')

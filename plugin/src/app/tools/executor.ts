@@ -103,7 +103,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId
           const current = host.store.tickets.get(ticketId), writer = current && latestAssignment(current)?.writer, base = current?.execution?.base?.sha
           if (!current || !base || writer?.state !== 'active') throw new Error('Missing active review target')
           if (!current.plan) throw new Error('Failed-check retention is limited to Plan Tickets')
-          const inherited = host.resources.plans?.failedChecks(current.plan.planId, current.plan.nodeId)
+          const inherited = host.resources.plans?.testHistory(current.plan.planId, current.plan.nodeId)
           const target = { candidate: args.candidate, base, generation: writer.generation }
           const obligations = new Map(failedCheckObligations(ticketId, current.deliveryCheck, target, inherited).map(o => [o.failure.id, o]))
           return retainedChecks.map(claim => {

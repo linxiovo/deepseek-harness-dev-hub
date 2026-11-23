@@ -11,7 +11,7 @@ import { KV } from '../kv.ts'
 import type { Effects } from './effects.ts'
 import type { Handoffs } from './handoffs.ts'
 import { mainlineIntent } from './mainline-queue.ts'
-import { failedCheckObligations, type FailedCheck } from '../core/delivery-check.ts'
+import { captureTestHistory, type FailedCheck, type TestHistory } from '../core/delivery-check.ts'
 import type { Store } from './store.ts'
 
 const SlugSchema = z.string().max(80).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Expected a lowercase slug')
@@ -23,8 +23,8 @@ const RepoPathSchema = z.string().max(260).refine(
   'Expected a portable repository-relative path using forward slashes',
 )
 
-/** Draft shape shared with the splitter tool. Specification and graph constraints are checked by register. */
-export const PlanDraftSchema = z.strictObject({
+const InterfaceContractSchema = z.strictObject({ path: RepoPathSchema, requirements: TextSchema.max(1000) })
+const draftSchema = <Contract extends z.ZodType<NonNullable<PlanNode['interfaceContract']>>>(contract: Contract) => z.strictObject({
   features: z.array(z.strictObject({ id: SlugSchema, kind: z.enum(PLAN_FEATURE_KINDS) })).min(1).max(100),
   nodes: z.array(z.strictObject({
     id: SlugSchema,
@@ -34,12 +34,16 @@ export const PlanDraftSchema = z.strictObject({
     acceptance: z.array(z.number().int().min(1)).min(1).max(100),
     demonstration: TextSchema.max(1000),
     blockedBy: z.array(SlugSchema).max(100),
-    interfaceContract: z.union([
-      z.strictObject({ path: RepoPathSchema, requirements: TextSchema.max(1000) }),
-      z.strictObject({ path: RepoPathSchema, previousRequirements: TextSchema.max(1000) }),
-    ]).optional(),
+    interfaceContract: contract.optional(),
   })).min(1).max(100),
 }) satisfies z.ZodType<PlanDraft>
+
+/** Published splitter input and initial record accept current requirements only. */
+export const PlanDraftSchema = draftSchema(InterfaceContractSchema)
+const RevisionDraftSchema = draftSchema(z.union([
+  InterfaceContractSchema,
+  z.strictObject({ path: RepoPathSchema, previousRequirements: TextSchema.max(1000) }),
+]))
 const PlanRecordSchema = z.strictObject({ id: TextSchema, handoffId: TextSchema, specId: TextSchema, status: z.literal('registered'),
   features: PlanDraftSchema.shape.features, nodes: PlanDraftSchema.shape.nodes }) satisfies z.ZodType<Plan>
 
@@ -99,7 +103,7 @@ export class Plans {
     if (!handoff || handoff.id !== result.data.handoffId || !spec || spec.id !== result.data.specId || spec.handoffId !== handoff.id) return undefined
     const update = revision === 1 ? undefined : this.store.get(KV.plans.revision(id, revision))
     if (revision !== 1 && (!update || update.revision !== revision)) return undefined
-    const parsed = update ? PlanDraftSchema.safeParse(update.draft) : undefined
+    const parsed = update ? RevisionDraftSchema.safeParse(update.draft) : undefined
     if (parsed && !parsed.success) return undefined
     const plan = parsed ? { ...result.data, ...parsed.data } : result.data
     const goal = update?.goal ?? handoff.goal, acceptance = update?.acceptance ?? spec.acceptance
@@ -120,7 +124,7 @@ export class Plans {
       const refuse = (detail: string): never => { throw new UserError('invalidPlan', { detail }) }
       if (current.revision !== expected) refuse(`Plan revision changed from ${expected} to ${current.revision}; read it again`)
       if (!this.requiredDelivery(id)?.waitingFor.length) refuse('A fully delivered Plan cannot be replanned')
-      const draft = parse(PlanDraftSchema, topology.draft, 'draft')
+      const draft = parse(RevisionDraftSchema, topology.draft, 'draft')
       const { replacements } = topology
       const { plan } = current
       const goal = cause.kind === 'requirements' ? cause.goal : current.goal
@@ -134,7 +138,7 @@ export class Plans {
       const origins = new Map<string, string>()
       const handovers = new Map<string, Set<string>>()
       const repairs = new Map<string, PlanRepairSource>()
-      const inheritedChecks = new Map<string, Map<string, FailedCheck>>()
+      const inheritedTests = new Map<string, { failures: Map<string, FailedCheck>; externalRuns: Set<string> }>()
       const instructions = new Map<string, Map<string, PlanMessage>>()
       for (const [oldId, successorIds] of Object.entries(replacements)) {
         if (!previous.has(oldId) || next.has(oldId) || !successorIds.length) refuse(`Invalid replacement of node ${oldId}`)
@@ -157,11 +161,9 @@ export class Plans {
           }
           source = { nodeId: oldId, ticketId: oldTicket.id, failureId: failure.id, summary: failure.summary.slice(0, 500) }
         }
-        // Failure evidence is bound to observations, not to criteria a product revision can change.
-        const inherited = this.failedChecks(id, oldId)
-        const checks = oldTicket?.deliveryCheck
-          ? failedCheckObligations(oldTicket.id, oldTicket.deliveryCheck, undefined, inherited).map(item => item.failure)
-          : inherited
+        // Preserve original failures and the identity of completed runs, even if criteria change.
+        const inherited = this.testHistory(id, oldId)
+        const history = oldTicket?.deliveryCheck ? captureTestHistory(oldTicket.id, oldTicket.deliveryCheck, inherited) : inherited
         for (const successor of successorIds) {
           if (!next.has(successor) || previous.has(successor) || this.store.get(KV.plans.retired(id, successor)) || this.state(id, successor)) {
             refuse(`Replacement node ${successor} is not new`)
@@ -169,10 +171,11 @@ export class Plans {
           if (origins.has(successor) && origins.get(successor) !== origin) refuse(`Replacement node ${successor} would combine separate budget pools`)
           origins.set(successor, origin)
           if (source) repairs.set(successor, source)
-          if (checks?.length) {
-            const unique = inheritedChecks.get(successor) ?? new Map<string, FailedCheck>()
-            for (const check of checks) unique.set(check.id, check)
-            inheritedChecks.set(successor, unique)
+          if (history && (history.failures.length || history.externalRuns.length)) {
+            const combined = inheritedTests.get(successor) ?? { failures: new Map<string, FailedCheck>(), externalRuns: new Set<string>() }
+            for (const failure of history.failures) combined.failures.set(failure.id, failure)
+            for (const run of history.externalRuns) combined.externalRuns.add(run)
+            inheritedTests.set(successor, combined)
           }
           if (draining.length) {
             const writers = handovers.get(successor) ?? new Set<string>()
@@ -202,7 +205,8 @@ export class Plans {
       for (const [nodeId, origin] of origins) this.store.set(KV.plans.budgetOrigin(id, nodeId), origin)
       for (const [nodeId, writers] of handovers) this.store.set(KV.plans.handover(id, nodeId), [...writers])
       for (const [nodeId, source] of repairs) this.store.set(KV.plans.repairSource(id, nodeId), source)
-      for (const [nodeId, checks] of inheritedChecks) this.store.set(KV.plans.failedChecks(id, nodeId), [...checks.values()])
+      for (const [nodeId, history] of inheritedTests) this.store.set(KV.plans.testHistory(id, nodeId),
+        { failures: [...history.failures.values()], externalRuns: [...history.externalRuns] })
       for (const [nodeId, messages] of instructions) this.store.set(KV.plans.instructions(id, nodeId), [...messages.values()])
       this.store.set(KV.plans.revision(id, revision), { revision, draft, replacements, cause, goal, acceptance, at: new Date().toISOString() })
       this.store.set(KV.plans.head(id), revision)
@@ -226,8 +230,8 @@ export class Plans {
   /** The technical repair's recovery source, also used to pin the original rules and CI. */
   repairSource(id: string, nodeId: string): PlanRepairSource | undefined { return this.store.get(KV.plans.repairSource(id, nodeId)) }
 
-  /** Failed observations inherited from every replaced ancestor, including on an unclaimed node. */
-  failedChecks(id: string, nodeId: string): FailedCheck[] | undefined { return this.store.get(KV.plans.failedChecks(id, nodeId)) }
+  /** Test history inherited from every replaced ancestor, including on an unclaimed node. */
+  testHistory(id: string, nodeId: string): TestHistory | undefined { return this.store.get(KV.plans.testHistory(id, nodeId)) }
 
   list(): Plan[] { return this.store.keys(KV.plans.record).map(name => this.get(name.slice(KV.plans.record.prefix.length))).filter((plan): plan is Plan => !!plan) }
   state(id: string, nodeId: string): PlanNodeState | undefined {
@@ -308,12 +312,7 @@ export class Plans {
     if (!handoffId?.trim() || !specId?.trim()) throw new UserError('invalidPlan', { detail: 'Expected handoffId and specId' })
     const parsed = parse(PlanDraftSchema, draft, 'draft')
     // Explicit undefined in a non-tool caller's optional field is also absent in the persisted JSON.
-    for (const node of parsed.nodes) {
-      if (node.interfaceContract === undefined) delete node.interfaceContract
-      else if ('previousRequirements' in node.interfaceContract) {
-        throw new UserError('invalidPlan', { detail: 'The initial interface contract requires current requirements' })
-      }
-    }
+    for (const node of parsed.nodes) if (node.interfaceContract === undefined) delete node.interfaceContract
     return this.store.atomic(() => {
       const handoff = this.handoffs.get(handoffId)
       if (!handoff || handoff.id !== handoffId || handoff.status !== 'specified' || !handoff.spec) {

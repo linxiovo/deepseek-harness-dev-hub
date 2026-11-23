@@ -110,8 +110,8 @@ export type RequirementScopeTask = {
   stop: (ticketId: string, reason: string) => void
   authorize: () => void
   requestScopeReview: (proposalId: string) => void
-  isHubGeneration?: (sessionId: string) => boolean
-  isCurrentHub?: (sessionId: string) => boolean
+  isHubGeneration: (sessionId: string) => boolean
+  isCurrentHub: (sessionId: string) => boolean
  }
 type ActivePlan = { plan: Plan; revision: number; goal: string; acceptance: Spec['acceptance']; handoff: Handoff; spec: Spec; waitingFor: string[] }
 
@@ -373,7 +373,7 @@ export class PlanRequirements {
   }
 
   private sameHub(first: string, second: string): boolean {
-    return first === second || (this.host.isHubGeneration?.(first) === true && this.host.isHubGeneration?.(second) === true)
+    return first === second || (this.host.isHubGeneration(first) && this.host.isHubGeneration(second))
   }
 
   private currentScopePreview(preview: PendingPreview) {
@@ -389,7 +389,7 @@ export class PlanRequirements {
 
   private requireOwner(handoffId: string, sessionId: string): Handoff {
     const handoff = this.host.handoffs.get(handoffId)
-    if (this.host.isCurrentHub?.(sessionId) === false || !handoff || handoff.status !== 'specified' || !this.sameHub(handoff.confirmedBy.sessionId, sessionId)) {
+    if (!this.host.isCurrentHub(sessionId) || !handoff || handoff.status !== 'specified' || !this.sameHub(handoff.confirmedBy.sessionId, sessionId)) {
       refuse('Only the current Hub Session that confirmed the original Handoff can change its product requirements')
     }
     return handoff

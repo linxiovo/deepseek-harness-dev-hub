@@ -318,7 +318,9 @@ const withdrawnRelay = Symbol('withdrawn relay')
     let old = this.ctx.agents.get(oldId as SessionId)
     if (!old) {
       const result = await this.ctx.sessionController.resolveAgent(oldId as SessionId)
-      if (!('error' in result)) old = result.agent
+      if ('error' in result) {
+        if (result.error.code !== 'session/not-found') throw result.error
+      } else old = result.agent
     }
     const messages = new Map<string, UserMessage>()
     for (const message of saved?.messages ?? []) messages.set(message.id, message)
@@ -329,6 +331,12 @@ const withdrawnRelay = Symbol('withdrawn relay')
     }
     for (const message of messages.values()) {
       if (!await this.agentDelivery.holdsMessage(target, message.id)) target.followup(message)
+    }
+    await this.ctx.sessionPersistence.flush()
+    for (const message of messages.values()) {
+      if (!await this.agentDelivery.holdsMessage(target, message.id)) throw new Error(`Hub inbox transfer was not persisted for ${message.id}`)
+    }
+    for (const message of messages.values()) {
       const source = message.source as { kind?: string; plugin?: unknown }
       if (source.kind === 'dsh-superagent' || (source.kind === 'plugin' && source.plugin === 'dsh-superagent')) {
         const requestId = String(message.id).replace(/^dsh-superagent:/, '')
@@ -336,10 +344,6 @@ const withdrawnRelay = Symbol('withdrawn relay')
         this.host.store.set(KV.runtime.delivery(requestId), { hash: key(text), sessionId: target.id, at: new Date().toISOString() })
       }
       old?.inbox.remove(message.id)
-    }
-    await this.ctx.sessionPersistence.flush()
-    for (const message of messages.values()) {
-      if (!await this.agentDelivery.holdsMessage(target, message.id)) throw new Error(`Hub inbox transfer was not persisted for ${message.id}`)
     }
     this.host.store.delete(transferKey)
   }

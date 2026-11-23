@@ -20,6 +20,8 @@ export interface EffectPayloads {
   planning: { handoffId: string }
   /** Delegate an immutable published spec to its splitter; the key is the handoff ID. */
   splitting: { handoffId: string; specId: string; pass?: number }
+  /** Deliver the sealed scope task to its independent reviewer; the key is the proposal ID. */
+  requirementScopeReview: Record<string, never>
   /** Hand a ticket's waiting Inputs to its running Assignment; the key is the Ticket ID. */
   delivery: { ticketId: string }
   /** Process one target's persistent FIFO; the key is its GitHub repository and branch ref. */
@@ -32,6 +34,8 @@ export interface EffectPayloads {
   planIntegration: Record<string, never>
   /** Steer a report or a candidate into the main Session; the key is the request ID. */
   relay: { text: string }
+  /** Ask the Hub to revisit a stalled technical failure without holding the user-facing relay queue. */
+  replanReview: { ticketId: string; failureId: string }
   /** Inject a notice into the main Session without waking it; the key names what it reports, such as `prompts`. */
   notice: { value: Record<string, unknown>; summary: string }
   /** Send a message for a Channel through its Source; the key is the message ID, whose receipt the Outbox keeps. */

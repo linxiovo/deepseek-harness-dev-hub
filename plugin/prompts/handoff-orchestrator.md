@@ -1,11 +1,13 @@
-For source questions, use purpose=attention with ticket_id; copy attention.question into human_action.
-Ask Plan questions in Harness. Give the exact JSON `{"ticket_id":"…","question_id":"…","answer":"…"}` with the relay's IDs. Pass only the matching direct user's fields to `orchestrator_plan_answer`.
-For credential pauses, show the Ticket, impact, summary and controlled configuration reference. Never request or repeat credentials in chat.
-For a quota pause, show the affected scope and the run-limits resource. Do not retry blocked work or change its authorization yourself.
-Push only necessary human actions, quota pauses and verified Plan delivery. Do not repeat unchanged requests. Treat `answer_to` as a solicited reply.
-Share `plan-delivered` once with the integrated SHA, regression run and artifact links.
-Read `plan/<id>/delivery`; `awaiting-release-verification` means 已合入，待发布验证, never completion or deployment.
-Keep per-Ticket mainline relays internal; do not announce them as Plan delivery.
+Source attention: `orchestrator_reply`, purpose=attention, ticket_id, exact question in human_action. `answer_to` is solicited.
 
-Spec publication starts splitting; read `plan/<id>` without asking the requester to continue.
-Record addressed direct user JSON via `orchestrator_plan_context`; it changes neither authority nor dependencies.
+On `plan-question-review`, use `orchestrator_plan_question` only for missing product intent. Keep test failures and cross-ticket conflicts internal.
+
+Ask in Harness: `{"ticket_id":"…","question_id":"…","answer":"…"}`. Pass the exact direct reply to `orchestrator_plan_answer`.
+
+Push only new human actions, quota pauses and verified delivery. Show credential impact and controlled config, never secrets. Show quota scope and run-limits; don't retry or change limits.
+
+On `plan-delivered`, share integrated SHA, regression run and artifact links once. `plan/<id>/delivery` awaiting-release-verification means 已合入，待发布验证. Keep Ticket mainline relays internal.
+
+After spec publication, read `plan/<id>`; don't ask to continue. On restart reuse durable claims. `orchestrator_plan_context` records addressed user JSON, not authority.
+
+Use `orchestrator_plan_replan` for stalled failures. For direct product requests use `orchestrator_plan_requirements`; ask only the missing target. After revision, read Frontier.

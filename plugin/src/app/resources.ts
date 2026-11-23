@@ -4,6 +4,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { UserError, key, latestReport, reached, reviewStatus, runningAssignment, threadKey, viewDelivery, type Assignment, type Ticket,
   type Trigger } from '../core/index.ts'
+import { failedCheckObligations, type TestHistory } from '../core/delivery-check.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { inspectWorktree } from '../executor/worktree.ts'
 import { docTreeImpactSchema, docTreeScopeSchema } from '../executor/doc-tree.ts'
@@ -26,6 +27,8 @@ import { sameDirectory } from '../infra/environment.ts'
 import { KV } from '../kv.ts'
 import type { Handoffs } from './handoffs.ts'
 import { PlanDeliveryReceiptSchema, type Plans } from './plans.ts'
+import type { PlanStagnation } from './plan-stagnation.ts'
+import type { PlanRequirements } from './plan-requirements.ts'
 import { mainlineAttempts, mainlineIntent, type CheckDeliveryTarget, type DeliveryTargetObservation,
   type MainlineCiBinding, type MainlineIntent, type MergeApproval } from './mainline-queue.ts'
 import type { ProjectMeter } from './project-meter.ts'
@@ -50,13 +53,18 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'handoff/<id>', holds: 'confirmed project, intent and planner question/answer' },
   { name: 'spec/<id>', holds: 'published acceptance and test interfaces, or pending' },
   { name: 'plan/<id>', holds: 'Plan graph, role totals, Frontier and claims with background' },
+  { name: 'plan/<id>/revision/<n>', holds: 'historical Plan graph, acceptance and reason for revision' },
+  { name: 'plan-requirement/<id>', holds: 'impact and approval status of a product-change preview' },
   { name: 'plan/<id>/delivery', holds: 'integrated commit, regression result and artifact' },
   { name: 'plan/<id>/node/<node-id>', holds: 'node claim or waiting reason, delivery and instructions' },
+  { name: 'plan/<id>/node/<node-id>/recovery/<failure-id>', holds: 'one retained technical failure observation' },
   { name: 'plan/<id>/attention', holds: 'Plan status counts and credential actions' },
   { name: 'ticket/<id>', holds: 'ticket, claim, worktree, active writer and work history', executor: true },
+  { name: 'ticket/<id>/plan-scope', holds: 'Ticket-specific goal, constraints, Plan acceptance and inherited check failures', executor: true },
   { name: 'ticket/<id>/mainline', holds: 'mainline attempts, actual Git verification and formal delivery blockers (not a receipt)', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
   { name: 'ticket/<id>/delivery-check', holds: 'candidate queue readiness, separate formal_delivery status for Plan tickets, and paginated acceptance, evidence and required CI', executor: true },
+  { name: 'ticket/<id>/failed-checks', holds: 'Plan retention obligations and matching Worker reruns, without either review verdict; empty for standalone work', executor: true },
   { name: 'ticket/<id>/delivery-observation/<n>', holds: 'one durable delivery observation', executor: true },
   { name: 'retro-followups', holds: 'optional retro backlog, independent of Plan delivery' },
   { name: 'ticket/<id>/reviews', holds: 'reviews', executor: true },
@@ -99,8 +107,7 @@ export interface ResourceHost {
   credentialBlocked?(ticketId: string): boolean
   quotaBlocked?(ticketId: string): boolean
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
-  readonly handoffs?: Pick<Handoffs, 'spec'>
-  readonly plans?: Pick<Plans, 'get'>
+  readonly plans?: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'testHistory'>
   readonly pages: TextCache
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'skills' | 'defaultChanged' | 'boundRevision' | 'proposal' | 'state' | 'matches'>
   rulesManifestMaxBytes(): number
@@ -120,21 +127,21 @@ export interface MainResourceHost extends ResourceHost {
   readonly settings: Pick<Settings, 'view' | 'block'>
   readonly handoffs: Pick<Handoffs, 'get' | 'spec'>
   readonly planIntegration?: { view(id: string): PlanIntegrationView | undefined }
-  readonly plans: Pick<Plans, 'get' | 'view' | 'node'>
+  readonly plans: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'testHistory' | 'view' | 'node' | 'at' | 'revision'>
+  readonly stagnation: Pick<PlanStagnation, 'view' | 'failure'>
+  readonly requirements: Pick<PlanRequirements, 'get'>
 }
 
 /** Resolve only this Slice Ticket's registered acceptance, never criteria supplied with a report. */
 export function deliveryAcceptance(host: ResourceHost, ticket: Ticket): readonly { id: string; text: string }[] {
   const binding = ticket.plan
   if (!binding) return []
-  const plan = host.plans?.get(binding.planId)
-  if (!plan || plan.id !== binding.planId || plan.status !== 'registered') return []
-  const node = plan.nodes.find(node => node.id === binding.nodeId && node.role === binding.role)
-  const spec = host.handoffs?.spec(plan.handoffId)
-  if (!node || !spec || spec.id !== plan.specId || spec.handoffId !== plan.handoffId) return []
+  const definition = host.plans?.definition(binding.planId, binding.nodeId)
+  if (!definition || definition.node.role !== binding.role) return []
+  const { node, acceptance } = definition
   const criteria: { id: string; text: string }[] = []
   for (const index of node.acceptance) {
-    const item = spec.acceptance[index - 1]
+    const item = acceptance[index - 1]
     if (!item?.statement.trim() || !item.observable.trim()) return []
     criteria.push({ id: String(index), text: `${item.statement}\nObservable: ${item.observable}` })
   }
@@ -275,6 +282,7 @@ interface DeliveryState {
   assignment: Assignment | undefined
   generation: number | undefined
   criteria: readonly { id: string; text: string }[]
+  testHistory: TestHistory | undefined
   paused: boolean
   credentialBlocked: boolean
   quotaBlocked: boolean
@@ -289,6 +297,7 @@ function deliveryState(host: ResourceHost, id: string): DeliveryState {
   if (!ticket) throw new UserError('unknownTicket')
   const assignment = ticket.assignments.at(-1)
   const criteria = deliveryAcceptance(host, ticket)
+  const testHistory = ticket.plan && host.plans?.testHistory(ticket.plan.planId, ticket.plan.nodeId)
   const generation = host.reviewGeneration?.(id)
   const credentialBlocked = host.credentialBlocked?.(id) === true
   const quotaBlocked = host.quotaBlocked?.(id) === true
@@ -300,8 +309,8 @@ function deliveryState(host: ResourceHost, id: string): DeliveryState {
   const proposalState = proposal === undefined ? undefined : host.prompts.state(proposal)
   const stamp = createHash('sha256').update(JSON.stringify([host.store.get(KV.settings.revision), settings.paused, credentialBlocked, quotaBlocked,
     settings.executor, settings.sources.github, ticket.plan, ticket.ended, ticket.execution, ticket.assignments, ticket.deliveryCheck, generation, criteria, pull,
-    required, proposal, proposalState])).digest('hex')
-  return { ticket, assignment, generation, criteria, paused: settings.paused, credentialBlocked, quotaBlocked, required, pull, proposal, stamp }
+    required, proposal, proposalState, testHistory])).digest('hex')
+  return { ticket, assignment, generation, criteria, testHistory, paused: settings.paused, credentialBlocked, quotaBlocked, required, pull, proposal, stamp }
 }
 
 interface DeliveryCheckout {
@@ -349,6 +358,20 @@ const ciBinding = z.union([
 
 const scopedDocuments = z.object({ scope: docTreeScopeSchema, impact: docTreeImpactSchema })
 
+function deliveryTarget({ ticket, assignment, generation }: DeliveryState, checkout: DeliveryCheckout | undefined,
+  replay?: MainlineIntent, formal?: true) {
+  const writer = assignment?.writer, active = ticket.execution?.active_writer
+  const ownsLease = generation !== undefined && generation === writer?.generation && generation === ticket.execution?.ownership?.generation
+    && (!formal || (writer.state === 'active' && active?.assignment === assignment?.id && active?.session === writer.session))
+  // Only an already queued, exact pair can resume after the same writer was confirmed idle.
+  const idleReplay = replay && assignment?.id === replay.assignment && checkout?.base === replay.base && checkout.candidate === replay.candidate
+    && writer?.state === 'idle' && !active && writer.generation === replay.generation && ticket.execution?.ownership?.generation === replay.generation
+  const approvedGeneration = ownsLease ? generation : idleReplay ? replay.generation : undefined
+  const target = checkout?.clean && approvedGeneration !== undefined
+    ? { base: checkout.base, candidate: checkout.candidate, generation: approvedGeneration } : undefined
+  return { approvedGeneration, target }
+}
+
 async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSignal,
   scope?: { replay: MainlineIntent | undefined; formal?: never } | { replay: MainlineIntent; formal: true; verify: CheckDeliveryTarget }) {
   const replay = scope?.replay, formal = scope?.formal
@@ -360,21 +383,10 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
   let changed = state.stamp !== latest.stamp
 
   const local = () => {
-    const { ticket, assignment, generation, criteria, paused } = state
-    const writer = assignment?.writer, active = ticket.execution?.active_writer
-    const ownsLease = generation !== undefined && generation === writer?.generation &&
-      generation === ticket.execution?.ownership?.generation &&
-      (!formal || (writer.state === 'active' && active?.assignment === assignment?.id && active?.session === writer.session))
-    // For an existing queued intent only, the exact originally approved pair can resume after the same writer was
-    // confirmed idle. A held or replaced lease cannot stand in for a live generation.
-    const idleReplay = replay && assignment?.id === replay.assignment && checkout?.base === replay.base &&
-      checkout.candidate === replay.candidate && assignment.writer?.state === 'idle' && !ticket.execution?.active_writer &&
-      assignment.writer.generation === replay.generation && ticket.execution?.ownership?.generation === replay.generation
-    const approvedGeneration = ownsLease ? generation : idleReplay ? replay.generation : undefined
-    const target = checkout?.clean && approvedGeneration !== undefined ?
-      { base: checkout.base, candidate: checkout.candidate, generation: approvedGeneration } : undefined
+    const { ticket, assignment, criteria, paused } = state, writer = assignment?.writer
+    const { target, approvedGeneration } = deliveryTarget(state, checkout, replay, formal)
     const reviews = ticket.assignments.flatMap(item => item.reviews?.evidence ?? [])
-    const view = viewDelivery(ticket.deliveryCheck, target, reviews, criteria, id)
+    const view = viewDelivery(ticket.deliveryCheck, target, reviews, criteria, id, ticket.plan ? (state.testHistory ?? null) : undefined)
     const missing = new Set(view.missing)
     if (!view.ready && missing.size === 0) missing.add('delivery_evidence')
     if (!criteria.length) missing.add('registered_acceptance')
@@ -658,11 +670,34 @@ const ROUTES: readonly Route[] = [
     if (!handoff || !read.rest || read.rest.includes('/')) throw new Error('Unknown handoff')
     return host.handoffs.spec(read.rest) ?? { handoffId: read.rest, status: 'pending' }
   }],
+  ['plan-requirement/', read => {
+    const preview = main(read).requirements.get(read.rest)
+    if (!preview) throw new Error('Unknown requirement change preview')
+    return preview
+  }],
   ['plan/', read => {
-    const { plans, handoffs, attention } = main(read)
+    const { plans, handoffs, attention, stagnation } = main(read)
     const [id, section, nodeId, ...extra] = read.rest.split('/')
     if (id && section === 'meter' && nodeId === undefined) return projectMeter(read, 'plan', id)
     if (id && section === 'attention' && nodeId === undefined) return attention.summary(id)
+    if (id && section === 'revision' && nodeId && !extra.length && /^[1-9][0-9]*$/.test(nodeId)) {
+      const version = plans.at(id, Number(nodeId))
+      if (!version) throw new Error('Unknown Plan revision')
+      const update = plans.revision(id, version.revision)
+      const { nodes, ...plan } = version.plan
+      const page = list(read, (offset, count) => nodes.slice(offset, offset + count))
+      return { ...plan, revision: version.revision, goal: version.goal, acceptance: version.acceptance, nodes: page.items,
+        ...(update ? { at: update.at, cause: update.cause, replacements: update.replacements,
+          ...(update.cause.kind === 'technical' ? { failure_read: `plan/${id}/node/${update.cause.nodeId}/recovery/${update.cause.failureId}` } : {}) } : {}),
+        next_offset: page.next_offset }
+    }
+    if (id && section === 'node' && nodeId && extra[0] === 'recovery' && extra.length <= 2) {
+      const claim = plans.node(id, nodeId)?.claim
+      if (!claim) throw new UserError('unknownPlanNode', { id, node: nodeId })
+      const result = extra.length === 1 ? stagnation.view(claim.ticketId) : stagnation.failure(claim.ticketId, extra[1]!)
+      if (!result) throw new Error('Unknown Plan recovery observation')
+      return result
+    }
     if (!id || extra.length || (section !== undefined && section !== 'delivery' && (section !== 'node' || !nodeId))
       || (section === 'delivery' && nodeId !== undefined)) throw new Error('Unknown plan resource')
     if (nodeId) {
@@ -671,7 +706,9 @@ const ROUTES: readonly Route[] = [
       const { instructions, ...detail } = node
       const page = list(read, (offset, count) => instructions.slice(offset, offset + count))
       const action = detail.claim && attention.forTicket(detail.claim.ticketId)
-      return { ...detail, ...(action ? { attention: action } : {}), instructions: page.items, next_offset: page.next_offset }
+      const recovery = detail.claim && stagnation.view(detail.claim.ticketId)
+      return { ...detail, ...(action ? { attention: action } : {}), ...(recovery ? { recovery } : {}),
+        instructions: page.items, next_offset: page.next_offset }
     }
     const handoff = handoffs.get(id)
     if (!handoff) throw new UserError('unknownPlan', { id })
@@ -685,11 +722,14 @@ const ROUTES: readonly Route[] = [
       const { nodes, context, ...header } = graph
       const nodePage = list(read, (offset, count) => nodes.slice(offset, offset + count).map(node => {
         const action = node.claim && attention.forTicket(node.claim.ticketId)
-        return action ? { ...node, attention: action } : node
+        const recovery = node.claim && stagnation.view(node.claim.ticketId)
+        return { ...node, ...(action ? { attention: action } : {}),
+          ...(recovery ? { recovery: { status: recovery.status, failureId: recovery.failureId,
+            read: `plan/${id}/node/${node.id}` } } : {}) }
       }))
       const contextPage = list(read, (offset, count) => context.slice(offset, offset + count))
       return { ...header, delivery: `plan/${id}/delivery`, nodes: nodePage.items, context: contextPage.items,
-        next_offset: nodePage.next_offset ?? contextPage.next_offset }
+        revision_read: `plan/${id}/revision/${header.revision}`, next_offset: nodePage.next_offset ?? contextPage.next_offset }
     }
     if (!handoff.spec) return { id, handoffId: id, status: 'awaiting-spec' }
     return { id, handoffId: id, specId: handoff.spec.id,
@@ -828,6 +868,25 @@ const ROUTES: readonly Route[] = [
         ...mainline ? { mainline } : {},
         ...ticket.plan || ticket.deliveryCheck ? { delivery_check: { read: `ticket/${id}/delivery-check` } } : {} }
     }
+    if (section === 'plan-scope' && part === undefined && ticket.plan) {
+      const { planId, nodeId } = ticket.plan
+      const definition = host.plans?.definition(planId, nodeId)
+      if (!definition) throw new UserError('unknownPlanNode', { id: planId, node: nodeId })
+      const { node, goal, constraints, authorization, retired, testInterfaces, acceptanceScope, outOfScope } = definition
+      const repair = host.plans?.repairSource(planId, nodeId)
+      const inheritedChecks = host.plans?.testHistory(planId, nodeId)?.failures
+      return { planId, nodeId, goal, constraints, authorizedScope: authorization.scope, role: node.role,
+        demonstration: node.demonstration, interfaceContract: node.interfaceContract, acceptance: deliveryAcceptance(host, ticket), testInterfaces,
+        acceptanceScope, outOfScope, ...(inheritedChecks?.length ? { inheritedChecks } : {}),
+        ...(repair ? { repair } : {}), ...(retired ? { superseded: retired } : {}), evidence: `ticket/${id}/delivery-check` }
+    }
+    if (section === 'failed-checks' && part === undefined) {
+      if (!ticket.plan) return { scope: 'standalone' as const, revision: null, items: [], next_offset: null }
+      const before = deliveryState(host, id), checkout = await deliveryCheckout(host.commands.withSignal(signal), before, signal)
+      const current = deliveryState(host, id), { target } = deliveryTarget(current, before.stamp === current.stamp ? checkout : undefined)
+      const checks = failedCheckObligations(id, current.ticket.deliveryCheck, target, current.testHistory)
+      return { scope: 'plan' as const, revision: target ?? null, ...list(read, (offset, count) => checks.slice(offset, offset + count)) }
+    }
     if (section === 'delivery-check') {
       if (part !== undefined) throw new Error('Unknown context resource')
       return deliveryPage(read, id)
@@ -849,7 +908,7 @@ const ROUTES: readonly Route[] = [
       const item = section === 'review' && part ? requireTicketReview(ticket, part) : undefined
       let currentHead: string | undefined
       let clean = false
-      if (ticket.execution?.directory) {
+      if (!ticket.ended && ticket.execution?.directory) {
         currentHead = (await host.commands.git(['rev-parse', '--verify', 'HEAD'], ticket.execution.directory)).trim()
         clean = !(await host.commands.git(['status', '--porcelain=v1', '--untracked-files=all'], ticket.execution.directory)).trim()
       }

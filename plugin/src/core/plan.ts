@@ -53,7 +53,10 @@ export interface PlanNode {
   acceptance: number[]
   demonstration: string
   blockedBy: string[]
-  interfaceContract?: { path: string; requirements: string }
+  interfaceContract?: { path: string } & (
+    { requirements: string; previousRequirements?: never } |
+    { previousRequirements: string; requirements?: never }
+  )
 }
 
 export interface PlanDraft { features: PlanFeature[]; nodes: PlanNode[] }

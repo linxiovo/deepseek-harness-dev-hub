@@ -2,13 +2,16 @@ import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 import { UserError } from '../core/errors.ts'
 import { key } from '../core/ids.ts'
+import type { Spec } from '../core/handoff.ts'
 import { latestAssignment } from '../core/model.ts'
 import { PLAN_FEATURE_KINDS, PLAN_ROLES, validatePlanDraft, type Plan, type PlanDeliveryReceipt, type PlanDraft, type PlanMessage, type PlanNode,
   type PlanNodeClaim, type PlanNodeState, type PlanTarget } from '../core/plan.ts'
+import type { PlanTopology } from '../core/plan-topology.ts'
 import { KV } from '../kv.ts'
 import type { Effects } from './effects.ts'
 import type { Handoffs } from './handoffs.ts'
 import { mainlineIntent } from './mainline-queue.ts'
+import { captureTestHistory, type FailedCheck, type TestHistory } from '../core/delivery-check.ts'
 import type { Store } from './store.ts'
 
 const SlugSchema = z.string().max(80).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Expected a lowercase slug')
@@ -20,8 +23,8 @@ const RepoPathSchema = z.string().max(260).refine(
   'Expected a portable repository-relative path using forward slashes',
 )
 
-/** Draft shape shared with the splitter tool. Specification and graph constraints are checked by register. */
-export const PlanDraftSchema = z.strictObject({
+const InterfaceContractSchema = z.strictObject({ path: RepoPathSchema, requirements: TextSchema.max(1000) })
+const draftSchema = <Contract extends z.ZodType<NonNullable<PlanNode['interfaceContract']>>>(contract: Contract) => z.strictObject({
   features: z.array(z.strictObject({ id: SlugSchema, kind: z.enum(PLAN_FEATURE_KINDS) })).min(1).max(100),
   nodes: z.array(z.strictObject({
     id: SlugSchema,
@@ -31,9 +34,16 @@ export const PlanDraftSchema = z.strictObject({
     acceptance: z.array(z.number().int().min(1)).min(1).max(100),
     demonstration: TextSchema.max(1000),
     blockedBy: z.array(SlugSchema).max(100),
-    interfaceContract: z.strictObject({ path: RepoPathSchema, requirements: TextSchema.max(1000) }).optional(),
+    interfaceContract: contract.optional(),
   })).min(1).max(100),
 }) satisfies z.ZodType<PlanDraft>
+
+/** Published splitter input and initial record accept current requirements only. */
+export const PlanDraftSchema = draftSchema(InterfaceContractSchema)
+const RevisionDraftSchema = draftSchema(z.union([
+  InterfaceContractSchema,
+  z.strictObject({ path: RepoPathSchema, previousRequirements: TextSchema.max(1000) }),
+]))
 const PlanRecordSchema = z.strictObject({ id: TextSchema, handoffId: TextSchema, specId: TextSchema, status: z.literal('registered'),
   features: PlanDraftSchema.shape.features, nodes: PlanDraftSchema.shape.nodes }) satisfies z.ZodType<Plan>
 
@@ -62,30 +72,167 @@ function parse<T extends z.ZodType>(schema: T, input: unknown, label: string): z
   return result.data
 }
 
+type PlanVersion = { plan: Plan; revision: number; goal: string; acceptance: Spec['acceptance'] }
+type ReplanCause = { kind: 'technical'; nodeId: string; failureId: string; reason: string; scope: string[]; repair?: true }
+  | { kind: 'requirements'; proposalId: string; approval: PlanMessage; goal: string; acceptance: Spec['acceptance'] }
+export type PlanRevision = Omit<PlanVersion, 'plan'> & PlanTopology & { at: string; cause: ReplanCause }
+export interface PlanRepairSource { nodeId: string; ticketId: string; failureId: string; summary: string }
+
 type PlanNodeView = PlanNode & {
-  status: PlanNodeState['status'] | 'blocked' | 'waiting-for-slot'
-  waiting_for?: 'predecessors'
+  status: PlanNodeState['status'] | 'blocked' | 'waiting-for-slot' | 'superseded'
+  waiting_for?: 'predecessors' | 'superseded-writers'
   waiting_on?: string[]
   claim?: PlanNodeState['claim']
   delivery?: PlanNodeState['delivery']
+  superseded?: { revision: number; replacements: string[] }
 }
 
-/** Durable Plan DAG registration, node claims, delivery gates and targeted context. */
+/** Owns immutable Plan versions, node claims, formal delivery gates and targeted context. */
 export class Plans {
   constructor(private readonly store: Pick<Store, 'atomic' | 'get' | 'set' | 'keys' | 'tickets'>, private readonly handoffs: Pick<Handoffs, 'get'>,
     private readonly effects: Pick<Effects, 'cancel'>) {}
 
-  get(id: string): Plan | undefined {
+  get(id: string): Plan | undefined { return this.current(id)?.plan }
+
+  current(id: string): PlanVersion | undefined { return this.at(id, this.store.get(KV.plans.head(id)) ?? 1) }
+
+  at(id: string, revision: number): PlanVersion | undefined {
     const result = PlanRecordSchema.safeParse(this.store.get(KV.plans.record(id)))
-    if (!result.success) return undefined
-    const handoff = this.handoffs.get(result.data.handoffId)
-    if (!handoff || handoff.id !== result.data.handoffId || handoff.spec?.id !== result.data.specId || handoff.spec.handoffId !== result.data.handoffId) return undefined
-    const delivery = handoff.spec.acceptance.map(item => item.delivery)
-    if (delivery.some(item => !item || !PLAN_FEATURE_KINDS.includes(item))) return undefined
-    try { validatePlanDraft(result.data, delivery as (typeof PLAN_FEATURE_KINDS[number])[]) }
+    if (!result.success || result.data.id !== id) return undefined
+    const handoff = this.handoffs.get(result.data.handoffId), spec = handoff?.spec
+    if (!handoff || handoff.id !== result.data.handoffId || !spec || spec.id !== result.data.specId || spec.handoffId !== handoff.id) return undefined
+    const update = revision === 1 ? undefined : this.store.get(KV.plans.revision(id, revision))
+    if (revision !== 1 && (!update || update.revision !== revision)) return undefined
+    const parsed = update ? RevisionDraftSchema.safeParse(update.draft) : undefined
+    if (parsed && !parsed.success) return undefined
+    const plan = parsed ? { ...result.data, ...parsed.data } : result.data
+    const goal = update?.goal ?? handoff.goal, acceptance = update?.acceptance ?? spec.acceptance
+    const delivery = acceptance.map(item => item.delivery)
+    if (delivery.length !== spec.acceptance.length || delivery.some((item, i) => !item || item !== spec.acceptance[i]?.delivery)) return undefined
+    try { validatePlanDraft(plan, delivery as (typeof PLAN_FEATURE_KINDS[number])[]) }
     catch { return undefined }
-    return result.data
+    return { plan, revision, goal, acceptance }
   }
+
+  revision(id: string, revision: number) { return this.store.get(KV.plans.revision(id, revision)) }
+
+  /** Atomically publish the validated successor without rewriting the registered graph or a retired claim. */
+  revise(id: string, expected: number, topology: PlanTopology, cause: ReplanCause): { planId: string; revision: number } {
+    return this.store.atomic(() => {
+      const current = this.current(id)
+      if (!current) throw new UserError('unknownPlan', { id })
+      const refuse = (detail: string): never => { throw new UserError('invalidPlan', { detail }) }
+      if (current.revision !== expected) refuse(`Plan revision changed from ${expected} to ${current.revision}; read it again`)
+      if (!this.requiredDelivery(id)?.waitingFor.length) refuse('A fully delivered Plan cannot be replanned')
+      const draft = parse(RevisionDraftSchema, topology.draft, 'draft')
+      const { replacements } = topology
+      const { plan } = current
+      const goal = cause.kind === 'requirements' ? cause.goal : current.goal
+      const acceptance = cause.kind === 'requirements' ? cause.acceptance : current.acceptance
+      if (acceptance.length !== current.acceptance.length || acceptance.some((item, i) => item.delivery !== current.acceptance[i]?.delivery)) {
+        refuse('A revision cannot change which roles verify a registered acceptance criterion')
+      }
+      validatePlanDraft(draft, acceptance.map(item => item.delivery!))
+      const previous = new Map(plan.nodes.map(node => [node.id, node]))
+      const next = new Map(draft.nodes.map(node => [node.id, node]))
+      const origins = new Map<string, string>()
+      const handovers = new Map<string, Set<string>>()
+      const repairs = new Map<string, PlanRepairSource>()
+      const inheritedTests = new Map<string, { failures: Map<string, FailedCheck>; externalRuns: Set<string> }>()
+      const instructions = new Map<string, Map<string, PlanMessage>>()
+      for (const [oldId, successorIds] of Object.entries(replacements)) {
+        if (!previous.has(oldId) || next.has(oldId) || !successorIds.length) refuse(`Invalid replacement of node ${oldId}`)
+        const origin = this.store.get(KV.plans.budgetOrigin(id, oldId)) ?? oldId
+        const messages = cause.kind === 'technical' ? this.store.get(KV.plans.instructions(id, oldId)) ?? [] : []
+        const claim = this.state(id, oldId)?.claim
+        const oldTicket = claim && this.store.tickets.get(claim.ticketId)
+        if (claim && !oldTicket) refuse(`Cannot verify the claimed Ticket of node ${oldId}`)
+        if (oldTicket?.assignments.some(item => item.writer && item.writer.state !== 'idle' && (!item.startedAt || !item.writer.session))) {
+          refuse(`Plan node ${oldId} has an unconfirmed Worker launch; wait for preparation to finish before replacing it`)
+        }
+        const draining = this.waitingForWriters(id, oldId)
+        if (claim) draining.push(oldId)
+        let source = cause.kind === 'technical' ? this.repairSource(id, oldId) : undefined
+        if (cause.kind === 'technical' && cause.repair && cause.nodeId === oldId) {
+          const failure = claim && this.store.get(KV.planStagnation.ticket(claim.ticketId))?.failures.find(item => item.id === cause.failureId)
+          if (!oldTicket || oldTicket.ended || !failure || successorIds.length !== 1 || Object.keys(replacements).length !== 1 ||
+              !isDeepStrictEqual({ ...previous.get(oldId), id: successorIds[0] }, next.get(successorIds[0]!))) {
+            throw new UserError('invalidPlan', { detail: 'A repair must preserve one active node and its recorded failure' })
+          }
+          source = { nodeId: oldId, ticketId: oldTicket.id, failureId: failure.id, summary: failure.summary.slice(0, 500) }
+        }
+        // Preserve original failures and the identity of completed runs, even if criteria change.
+        const inherited = this.testHistory(id, oldId)
+        const history = oldTicket?.deliveryCheck ? captureTestHistory(oldTicket.id, oldTicket.deliveryCheck, inherited) : inherited
+        for (const successor of successorIds) {
+          if (!next.has(successor) || previous.has(successor) || this.store.get(KV.plans.retired(id, successor)) || this.state(id, successor)) {
+            refuse(`Replacement node ${successor} is not new`)
+          }
+          if (origins.has(successor) && origins.get(successor) !== origin) refuse(`Replacement node ${successor} would combine separate budget pools`)
+          origins.set(successor, origin)
+          if (source) repairs.set(successor, source)
+          if (history && (history.failures.length || history.externalRuns.length)) {
+            const combined = inheritedTests.get(successor) ?? { failures: new Map<string, FailedCheck>(), externalRuns: new Set<string>() }
+            for (const failure of history.failures) combined.failures.set(failure.id, failure)
+            for (const run of history.externalRuns) combined.externalRuns.add(run)
+            inheritedTests.set(successor, combined)
+          }
+          if (draining.length) {
+            const writers = handovers.get(successor) ?? new Set<string>()
+            for (const node of draining) writers.add(node)
+            handovers.set(successor, writers)
+          }
+          if (messages.length) {
+            const unique = instructions.get(successor) ?? new Map<string, PlanMessage>()
+            for (const message of messages) unique.set(key(message.sessionId, message.messageId), message)
+            instructions.set(successor, unique)
+          }
+        }
+      }
+      for (const [nodeId, node] of previous) {
+        if (!next.has(nodeId) && !Object.hasOwn(replacements, nodeId)) refuse(`Missing replacement for ${nodeId}`)
+        if (cause.kind === 'technical' && this.state(id, nodeId) && !isDeepStrictEqual(node, next.get(nodeId)) &&
+            !(cause.repair && cause.nodeId === nodeId && Object.hasOwn(replacements, nodeId))) {
+          refuse(`Technical replan cannot change claimed node ${nodeId}`)
+        }
+      }
+      for (const nodeId of next.keys()) if (!previous.has(nodeId) && !origins.has(nodeId)) refuse(`Replacement has no prior scope: ${nodeId}`)
+      if (cause.kind === 'technical' && isDeepStrictEqual(draft, { features: plan.features, nodes: plan.nodes })) refuse('Technical replan has no changes')
+      const revision = expected + 1
+      for (const [oldId, successors] of Object.entries(replacements)) {
+        this.store.set(KV.plans.retired(id, oldId), { revision: expected, replacements: successors })
+      }
+      for (const [nodeId, origin] of origins) this.store.set(KV.plans.budgetOrigin(id, nodeId), origin)
+      for (const [nodeId, writers] of handovers) this.store.set(KV.plans.handover(id, nodeId), [...writers])
+      for (const [nodeId, source] of repairs) this.store.set(KV.plans.repairSource(id, nodeId), source)
+      for (const [nodeId, history] of inheritedTests) this.store.set(KV.plans.testHistory(id, nodeId),
+        { failures: [...history.failures.values()], externalRuns: [...history.externalRuns] })
+      for (const [nodeId, messages] of instructions) this.store.set(KV.plans.instructions(id, nodeId), [...messages.values()])
+      this.store.set(KV.plans.revision(id, revision), { revision, draft, replacements, cause, goal, acceptance, at: new Date().toISOString() })
+      this.store.set(KV.plans.head(id), revision)
+      return { planId: id, revision }
+    })
+  }
+
+  /** Resolve old work against the contract under which it ran, not the goal that superseded it. */
+  definition(id: string, nodeId: string) {
+    const retired = this.store.get(KV.plans.retired(id, nodeId))
+    const claimed = this.store.get(KV.plans.node(id, nodeId))
+    const pinned = claimed ? this.store.get(KV.plans.claimRevision(id, nodeId)) ?? 1 : retired?.revision
+    const version = pinned === undefined ? this.current(id) : this.at(id, pinned)
+    const node = version?.plan.nodes.find(item => item.id === nodeId)
+    const handoff = version && this.handoffs.get(version.plan.handoffId)
+    return node && version && handoff?.spec ? { node, goal: version.goal, acceptance: version.acceptance, retired,
+      constraints: handoff.constraints, authorization: handoff.authorization, acceptanceScope: handoff.acceptanceScope,
+      testInterfaces: handoff.spec.testInterfaces, outOfScope: handoff.spec.outOfScope } : undefined
+  }
+
+  /** The technical repair's recovery source, also used to pin the original rules and CI. */
+  repairSource(id: string, nodeId: string): PlanRepairSource | undefined { return this.store.get(KV.plans.repairSource(id, nodeId)) }
+
+  /** Test history inherited from every replaced ancestor, including on an unclaimed node. */
+  testHistory(id: string, nodeId: string): TestHistory | undefined { return this.store.get(KV.plans.testHistory(id, nodeId)) }
+
   list(): Plan[] { return this.store.keys(KV.plans.record).map(name => this.get(name.slice(KV.plans.record.prefix.length))).filter((plan): plan is Plan => !!plan) }
   state(id: string, nodeId: string): PlanNodeState | undefined {
     const raw = this.store.get(KV.plans.node(id, nodeId))
@@ -113,6 +260,14 @@ export class Plans {
     const node = plan.nodes.find(item => item.id === nodeId)
     if (!node) throw new UserError('unknownPlanNode', { id, node: nodeId })
     return { plan, node }
+  }
+
+  waitingForWriters(id: string, nodeId: string): string[] {
+    const previous = this.store.get(KV.plans.handover(id, nodeId)) ?? []
+    return previous.filter(oldId => {
+      const state = this.state(id, oldId), ticket = state && this.store.tickets.get(state.claim.ticketId)
+      return !ticket?.ended || !!ticket.execution?.active_writer || ticket.assignments.some(assignment => assignment.writer && assignment.writer.state !== 'idle')
+    })
   }
 
   /** A predecessor unlocks only through a persisted formal delivery receipt, never through a Worker report. */
@@ -149,7 +304,7 @@ export class Plans {
   frontier(id: string): string[] {
     const plan = this.get(id)
     if (!plan) return []
-    return plan.nodes.filter(node => !this.state(id, node.id) && this.waitingOn(id, node).length === 0).map(node => node.id)
+    return plan.nodes.filter(node => !this.state(id, node.id) && this.waitingOn(id, node).length === 0 && !this.waitingForWriters(id, node.id).length).map(node => node.id)
   }
 
   /** Register against the exact published specification. Only an identical replay may reuse an existing Plan. */
@@ -174,7 +329,7 @@ export class Plans {
       })
       validatePlanDraft(parsed, delivery)
       const plan: Plan = { id: handoffId, handoffId, specId, status: 'registered', ...parsed }
-      const prior = this.get(handoffId)
+      const prior = this.at(handoffId, 1)?.plan
       if (prior && !isDeepStrictEqual(prior, plan)) {
         throw new UserError('invalidPlan', { detail: `Plan ${handoffId} is already registered and cannot be replaced` })
       }
@@ -192,11 +347,14 @@ export class Plans {
       if (prior) return prior
       const waiting = this.waitingOn(id, node)
       if (waiting.length) throw new UserError('invalidPlan', { detail: `Node ${nodeId} waits for formal delivery of ${waiting.join(', ')}` })
+      if (this.waitingForWriters(id, nodeId).length) throw new UserError('invalidPlan', { detail: `Node ${nodeId} waits for superseded writers to drain` })
       if (claim.planId !== id || claim.nodeId !== nodeId || claim.role !== node.role) {
         throw new UserError('invalidPlan', { detail: `Node ${nodeId} claim does not match its registered role` })
       }
       prepare()
       const state: PlanNodeState = { planId: id, nodeId, status: 'claimed', claim }
+      const revision = this.store.get(KV.plans.head(id))
+      if (revision !== undefined) this.store.set(KV.plans.claimRevision(id, nodeId), revision)
       this.store.set(KV.plans.node(id, nodeId), state)
       return state
     })
@@ -208,7 +366,8 @@ export class Plans {
       const ticket = this.store.tickets.get(ticketId), plan = ticket?.plan
       if (!plan) return
       const state = this.state(plan.planId, plan.nodeId)
-      if (!state || state.claim.ticketId !== ticketId || state.claim.assignmentId !== assignmentId) return
+      if (!state || state.claim.ticketId !== ticketId || ticket.assignments[0]?.id !== state.claim.assignmentId ||
+          latestAssignment(ticket)?.id !== assignmentId || this.store.get(KV.plans.retired(plan.planId, plan.nodeId))) return
       if (state.status === 'delivered' || state.status === 'failed' || state.status === 'stopped') return
       state.status = 'running'; state.claim.pendingAction = null; state.claim.startedAt ??= new Date().toISOString(); state.claim.session = session
       this.store.set(KV.plans.node(plan.planId, plan.nodeId), state)
@@ -269,27 +428,33 @@ export class Plans {
     const state = this.state(id, node.id)
     if (state) return { ...node, status: state.status, claim: state.claim, ...(state.delivery ? { delivery: state.delivery } : {}) }
     const waiting = this.waitingOn(id, node)
-    return { ...node, status: waiting.length ? 'blocked' : 'waiting-for-slot', ...(waiting.length ? { waiting_for: 'predecessors', waiting_on: waiting } : {}) }
+    if (waiting.length) return { ...node, status: 'blocked', waiting_for: 'predecessors', waiting_on: waiting }
+    const writers = this.waitingForWriters(id, node.id)
+    return writers.length ? { ...node, status: 'blocked', waiting_for: 'superseded-writers', waiting_on: writers }
+      : { ...node, status: 'waiting-for-slot' }
   }
 
   /** Public graph shows node claims and formal delivery state, while ticket instructions stay behind node reads. */
   view(id: string) {
-    const plan = this.get(id)
-    if (!plan) return undefined
+    const current = this.current(id)
+    if (!current) return undefined
+    const { plan, revision, goal } = current
     const stats = { backend: { total: 0, delivered: 0 }, frontend: { total: 0, delivered: 0 } }
     const nodes = plan.nodes.map(node => {
       stats[node.role].total++
       if (this.state(id, node.id)?.status === 'delivered') stats[node.role].delivered++
       return this.nodeView(id, node)
     })
-    return { ...plan, nodes, frontier: this.frontier(id), stats, context: this.store.get(KV.plans.background(id)) ?? [] }
+    return { ...plan, revision, goal, nodes, frontier: this.frontier(id), stats, context: this.store.get(KV.plans.background(id)) ?? [] }
   }
 
   /** A node sees only its targeted instructions and its own durable dispatch state. */
   node(id: string, nodeId: string) {
-    const node = this.get(id)?.nodes.find(node => node.id === nodeId)
-    if (!node) return undefined
-    return { ...this.nodeView(id, node), instructions: this.store.get(KV.plans.instructions(id, nodeId)) ?? [] }
+    const definition = this.definition(id, nodeId)
+    if (!definition) return undefined
+    const { node, retired } = definition
+    const detail: PlanNodeView = retired ? { ...node, ...this.state(id, nodeId), status: 'superseded', superseded: retired } : this.nodeView(id, node)
+    return { ...detail, instructions: this.store.get(KV.plans.instructions(id, nodeId)) ?? [] }
   }
 
   /** The trusted caller selects a target from an authorized message. A source message cannot be retargeted on replay. */

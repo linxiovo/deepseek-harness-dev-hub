@@ -1,6 +1,6 @@
 /** Frontier selection and durable Plan-node dispatch into the existing Ticket Executor. */
 import { UserError } from '../core/errors.ts'
-import { latestAssignment } from '../core/model.ts'
+import { latestAssignment, waitsForPerson } from '../core/model.ts'
 import { key } from '../core/ids.ts'
 import { PLAN_ROLES, type PlanNodeClaim, type PlanNodeState, type PlanRole } from '../core/plan.ts'
 import type { Engine } from '../core/engine.ts'
@@ -25,7 +25,7 @@ export type PlanDispatchResult = {
 
 interface PlanDispatcherHost {
   readonly store: Pick<Store, 'tickets'>
-  readonly plans: Pick<Plans, 'get' | 'state' | 'waitingOn' | 'claim' | 'list' | 'rearm'>
+  readonly plans: Pick<Plans, 'get' | 'state' | 'waitingOn' | 'waitingForWriters' | 'claim' | 'list' | 'rearm'>
   readonly engine: Pick<Engine, 'createPlanTicket'>
   readonly executor: Pick<DshExecutor, 'reserveLaunch' | 'releaseLaunch' | 'start'>
   readonly attention: Pick<ScopedAttention, 'forTicket' | 'blocked'>
@@ -59,6 +59,9 @@ export class PlanDispatcher {
     const waitingOn = this.host.plans.waitingOn(planId, node)
     if (waitingOn.length) return { ...request, status: 'blocked', reused: false, waitingOn,
       reason: `Waiting for formal delivery of ${waitingOn.join(', ')}` }
+    const draining = this.host.plans.waitingForWriters(planId, nodeId)
+    if (draining.length) return { ...request, status: 'blocked', reused: false, waitingOn: draining,
+      reason: `Waiting for superseded writers to drain: ${draining.join(', ')}` }
 
     if (block) return { ...request, status: block.state === 'reserved' ? 'waiting-for-budget' : 'quota-paused',
       reused: false, reason: `${block.scope} budget: ${block.state}` }
@@ -115,7 +118,7 @@ export class PlanDispatcher {
         if (this.host.limits.blocked(state.claim.ticketId)) continue
         const ticket = this.host.store.tickets.get(state.claim.ticketId)
         const assignment = ticket && latestAssignment(ticket)
-        if (!ticket || !assignment || assignment.state !== 'pending') continue
+        if (!ticket || ticket.ended || !assignment || assignment.state !== 'pending' || waitsForPerson(ticket)) continue
         const action = ticket.execution?.active_writer || assignment.writer?.state === 'active' ? 'resume' : 'launch'
         this.host.plans.rearm(plan.id, node.id, action)
         this.host.executor.start(ticket, assignment)

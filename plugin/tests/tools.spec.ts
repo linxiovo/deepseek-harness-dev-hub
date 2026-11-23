@@ -221,34 +221,44 @@ it('reacquires changed evidence after the final retro and only queues with curre
   const inspect = (page = {}) => read(path, page)
   expect(await read(`ticket/${ticketId}`)).toMatchObject({ delivery_check: { read: path } })
   const submit = (candidate: string, event: object) => h.runTool(session, 'orchestrator_retro_evidence', { candidate, ...event })
-  const review = async (candidate: string, reuses: string[] = []) => {
+  const review = async (candidate: string, reuses: string[] = [], retain = false) => {
     await Promise.all((['standards', 'spec'] as const).map(async axis => {
       const reviewer = await h.reviewSubagent(session, axis)
+      const retainedChecks = retain && await h.runTool(reviewer, 'orchestrator_read', { resource: `ticket/${ticketId}/failed-checks` }) as false | {
+        items: { failure: { id: string }; rerun: { id: string } }[]
+      }
       return h.runTool(reviewer, 'orchestrator_review_submit', { candidate, axis, summary: `${axis} passed after inspecting the diff.`,
-        basis: [axis === 'standards' ? 'Repository guidance' : `spec/${id}`], conclusion: 'passed', blockers: [], reuses })
+        basis: [axis === 'standards' ? 'Repository guidance' : `spec/${id}`], conclusion: 'passed', blockers: [], reuses,
+        ...(retainedChecks ? { retainedChecks: retainedChecks.items.map(({ failure, rerun }) => ({
+          failure: failure.id, rerun: rerun.id, originalPath: trailingCheckFile, currentPath: trailingCheckFile,
+          rationale: 'The committed trailing-space assertion is unchanged and now passes on the repaired formatter.',
+        })) } : {}) })
     }))
   }
-  const tests = async (candidate: string, check: string, status: 'passed' | 'failed' | 'not_run' = 'passed') => {
-    const code = `import assert from 'node:assert/strict'; import { label } from './label.mjs'; ${check}`
+  const checkArgs = (check: string) => ['--input-type=module', '-e', `import assert from 'node:assert/strict'; import { label } from './label.mjs'; ${check}`]
+  const trailingCheckFile = 'trailing-label-check.mjs'
+  writeFileSync(join(directory, trailingCheckFile), `${checkArgs("assert.equal(label(' alert '), 'alert')")[2]}\n`)
+  git('add', trailingCheckFile)
+  const tests = async (candidate: string, argv: string[], status: 'passed' | 'failed' | 'not_run' = 'passed') => {
     if (status !== 'not_run') {
-      const run = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: directory, encoding: 'utf8' })
+      const run = spawnSync(process.execPath, argv, { cwd: directory, encoding: 'utf8' })
       expect(run.status, run.stderr).toBe(status === 'passed' ? 0 : 1)
       if (status === 'failed') expect(run.stderr).toMatch(/AssertionError/)
     }
     return h.runTool(session, 'orchestrator_test_evidence', { candidate, scope: 'focused', reason: 'Only label() changed.', red: null,
-      checks: [{ directory: '.', command: `node --input-type=module -e ${JSON.stringify(code)}`, status,
+      checks: [{ directory: '.', command: `node ${argv.map(arg => /\s/.test(arg) ? JSON.stringify(arg) : arg).join(' ')}`, status,
         observed: status === 'not_run' ? 'Not executed.' : status === 'passed' ? 'exit 0' : 'exit 1' }] })
   }
   const acceptance = (criteria: string[], ref: unknown) => ({ kind: 'acceptance', results: criteria.map(id => ({ id, status: 'passed', evidence: [ref] })) })
   const before = commit('export const label = value => value.trimStart()\n')
   await review(before)
-  const original = await tests(before, "assert.equal(label(' alert'), 'alert'); assert.equal(label(''), '')")
-  const failed = await tests(before, "assert.equal(label(' alert '), 'alert')", 'failed')
-  const unrun = await tests(before, "assert.equal(label(''), '')", 'not_run')
+  const original = await tests(before, checkArgs("assert.equal(label(' alert'), 'alert'); assert.equal(label(''), '')"))
+  const failed = await tests(before, [trailingCheckFile], 'failed')
+  const unrun = await tests(before, checkArgs("assert.equal(label(''), '')"), 'not_run')
   const brokenDocs = await h.runTool(session, 'orchestrator_doc_impact', { candidate: before,
     root: 'missing-navigation.md', routes: [], leaves: [], impact: { kind: 'unchanged', reason: 'No changes to navigation.' } })
   expect(brokenDocs).toMatchObject({ structure: 'issues', read: expect.any(String) })
-  const latest = await tests(before, "assert.equal(label(' alert'), 'alert'); assert.equal(label(''), '')")
+  const latest = await tests(before, checkArgs("assert.equal(label(' alert'), 'alert'); assert.equal(label(''), '')"))
   await submit(before, { kind: 'first-retro', findings: [{ id: 'improve-direction', category: 'optional',
     summary: 'Consider a localized future mode.', evidence: [original.read] }] })
   expect(await read('retro-followups')).toMatchObject({ items: [{ ticket_id: ticketId, id: expect.any(String), summary: 'Consider a localized future mode.' }] })
@@ -269,7 +279,10 @@ it('reacquires changed evidence after the final retro and only queues with curre
   await submit(candidate, repair)
   await review(candidate, ['docs', 'acceptance:2', 'tests']) // An affected check cannot be carried even with approval.
   expect(await inspect()).toMatchObject({ ready: false, candidate, missing: expect.arrayContaining(['tests']) })
-  const fixed = await tests(candidate, "assert.equal(label(' alert '), 'alert'); assert.equal(label(''), '')")
+  const fixed = await tests(candidate, checkArgs("assert.equal(label(' alert '), 'alert'); assert.equal(label(''), '')"))
+  expect(await inspect()).toMatchObject({ missing: expect.arrayContaining(['failed_checks_require_recheck']) })
+  await tests(candidate, [trailingCheckFile])
+  await review(candidate, [], true)
   const foreign = await h.acceptedTicket(feishu('retro-foreign-observation', '@bot Verify a separate label ticket.'))
   const foreignDir = foreign.ticket.execution!.directory
   h.localGit!.git('-C', foreignDir, 'merge', '--ff-only', candidate)
@@ -291,7 +304,7 @@ it('reacquires changed evidence after the final retro and only queues with curre
     await expect(submit(candidate, acceptance(['1'], current))).resolves.toMatchObject({ recorded: 'acceptance', candidate })
   }
   await submit(candidate, { kind: 'final-retro', findings: [] })
-  await tests(candidate, "assert.equal(label(' alert '), 'alert'); assert.equal(label(''), '')")
+  await tests(candidate, checkArgs("assert.equal(label(' alert '), 'alert'); assert.equal(label(''), '')"))
   git('reset', '--keep', before)
   await expect(submit(before, { kind: 'first-retro', findings: [] })).rejects.toThrow(/repair lineage/i)
   git('reset', '--keep', candidate)
@@ -358,7 +371,7 @@ it('reacquires changed evidence after the final retro and only queues with curre
   const ledger = persisted.deliveryCheck!
   const fixedIndex = Number(String(fixed.read).split('/').at(-1))
   for (const events of [
-    ledger.events.filter((_, index) => index !== fixedIndex),
+    ledger.events.map((event, index) => index === fixedIndex && event.kind === 'tests' ? { ...event, result: 'unverified' as const } : event),
     ledger.events.map(event => event.kind === 'acceptance' && event.revision.candidate === candidate
       ? { ...event, results: event.results.map(result => ({ ...result, evidence: [String(original.read)] })) } : event),
   ]) {
@@ -398,14 +411,14 @@ it('reacquires changed evidence after the final retro and only queues with curre
   releaseCi.resolve()
   expect(await delivery).toMatchObject({ ready: false, candidate: changed, missing: expect.arrayContaining(['delivery_target_changed']) })
   await review(changed)
-  const regression = await tests(changed, "assert.equal(label(' ALERT '), 'ALERT')", 'failed')
+  const regression = await tests(changed, checkArgs("assert.equal(label(' ALERT '), 'ALERT')"), 'failed')
   await submit(changed, { kind: 'first-retro', findings: [] })
   await expect(submit(changed, { kind: 'acceptance', results: [{ id: '1', status: 'failed', evidence: [regression.read] }] }))
     .resolves.toMatchObject({ recorded: 'acceptance', candidate: changed })
   await h.restart(); await h.runtime.idle()
   expect(await inspect()).toMatchObject({ ready: false, status: 'return_for_recheck', missing: expect.arrayContaining(['repair:1']) })
   expect(await read(`plan/${id}/node/labels`)).not.toHaveProperty('delivery')
-}, 90_000)
+}, 180_000) // Full delivery cycle with fresh Git checks at each evidence boundary on Windows CI.
 
 it('checks documentation impact in the active worker candidate and never approves its semantics', async () => {
   const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot Add a backend API contract'))
@@ -507,6 +520,14 @@ test('trims a displayed label', () => assert.equal(label('  alert  '), 'alert'))
   await expect(evidence({ ...args, red: [{ ...args.red[0], revision: tag }] })).rejects.toThrow(/commit hash/i)
   const result = await evidence()
   expect(result).toMatchObject({ ...args, base: h.localGit!.base.sha, result: 'reported_passed', source: 'worker' })
+  for (const axis of ['standards', 'spec'] as const) {
+    const reviewer = await h.reviewSubagent(sessionId, axis)
+    expect(await h.runTool(reviewer, 'orchestrator_read', { resource: `ticket/${ticket.id}/failed-checks` }))
+      .toMatchObject({ scope: 'standalone', items: [] })
+    expect(await h.runTool(reviewer, 'orchestrator_review_submit', { candidate, axis,
+      basis: ['label.test.mjs'], summary: 'Checked the public red and green case.', conclusion: 'passed', blockers: [] }))
+      .toMatchObject({ aggregate: axis === 'spec' ? 'passed' : 'pending' })
+  }
   const summary = JSON.stringify(result)
   await h.runTool(sessionId, 'orchestrator_report', { state: 'progress', summary })
   write('label.mjs', 'export const label = value => value.trimStart().trimEnd()\n')

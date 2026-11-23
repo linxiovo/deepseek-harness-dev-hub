@@ -2038,7 +2038,8 @@ it('recovers only detached reviewer receipts with verified direct business paren
     'unbound-lineage', 'unreadable-review', 'missing-review', 'direct-review', 'recreated-review']
   const base = ticket.execution!.base!.sha
   reviewers.forEach((id, index) => runtime.engine.recordReview(ticket.id, id, {
-    axis: 'standards', base, candidate: (index + 1).toString(16).repeat(40), basis: ['Ticket specification'],
+    axis: 'standards', base, generation: ticket.assignments.at(-1)!.writer!.generation,
+    candidate: (index + 1).toString(16).repeat(40), basis: ['Ticket specification'],
     conclusion: 'passed', blockers: [], summary: 'Checked.',
   }))
   projectMeter.bind({ session_id: 'bound-parent', ticket_id: ticket.id, parent_session_id: sessionId, role: 'implementation' })
@@ -2071,7 +2072,7 @@ it('recovers only detached reviewer receipts with verified direct business paren
   }
 
   const priorWorker = binding(sessionId)
-  const rotated = new ProjectMeter({ store, meter: runtime.meter, masterId: 'rotated-recovery-hub' })
+  const rotated = new ProjectMeter({ store, meter: runtime.meter, plans: runtime.plans, masterId: 'rotated-recovery-hub' })
   const keys = store.keys(KV.projectMeter.binding).sort()
   stat.mockClear()
   await restoreReviewBindings(ctx, store, rotated, signal)

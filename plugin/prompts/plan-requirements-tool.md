@@ -1,0 +1,3 @@
+Operator JSON: `{"intent":"change-plan-requirements","planId":"…","authorizedScope":"…","changes":[{"criterion":1,"statement":"…","observable":"…"}]}`. Exact original scope. Optional `goal` affects all. Call `{"mode":"preview"}`.
+
+Wait for scope review. Outside: new handoff. Uncertain: ask only what's unclear. When within, show changes, boundaries, affected tickets, invalid evidence and rechecks. Require direct `{"approved":true,"proposalId":"…","requestMessageId":"…","scopeReviewId":"…","scopeDecision":"within-handoff"}` before `{"mode":"apply","proposalId":"…"}`. Stale: new direct request. Relays and advice grant nothing.

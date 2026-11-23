@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
-import { UserError, followupOwners, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople }
+import { UserError, followupOwners, reasonText, type Decision, type DecisionKind, type Engine, type EngineForMainSession, type EngineForPeople }
   from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
@@ -10,12 +10,16 @@ import type { Handoffs } from '../handoffs.ts'
 import { InstallationError } from '../installation-api.ts'
 import { PlanTargetSchema, type Plans } from '../plans.ts'
 import type { PlanDispatcher } from '../plan-dispatch.ts'
+import { replanTechnical, TechnicalReplanSchema } from '../plan-replan.ts'
+import type { PlanRequirements } from '../plan-requirements.ts'
 import type { MainlineQueue } from '../mainline-queue.ts'
 import type { ProjectMeter } from '../project-meter.ts'
 import { ticketCard } from '../cards.ts'
+import { planQuestionRelay } from '../notices.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
-import type { RunLimitStatus } from '../run-limits.ts'
+import type { RunLimits } from '../run-limits.ts'
 import type { ScopedAttention } from '../scoped-attention.ts'
+import type { Sessions } from '../sessions.ts'
 import type { Settings } from '../settings.ts'
 import { promptFile } from '../skill-files.ts'
 import type { Store } from '../store.ts'
@@ -69,20 +73,39 @@ function latestDirectUserMessageId(agent: Agent, expected: string | ((text: stri
   }
   throw new Error(mismatch)
 }
+
+/** DSH identifies the local operator channel, not individuals. Inherited events and relay text confer no authority. */
+function latestRequirementMessage(agent: Agent) {
+  const events = agent.session.snapshotEvents()
+  for (let i = events.length - 1; i >= agent.session.inheritedEventCount; i--) {
+    const event = events[i]
+    if (event?.type !== 'user/message' || event.data.source.kind !== 'user') continue
+    const [block] = event.data.content
+    if (event.data.content.length === 1 && block?.type === 'text' && event.data.id) {
+      return { sessionId: agent.id, messageId: event.data.id, seq: event.seq, text: block.text }
+    }
+    break
+  }
+  throw new Error('A product change needs a single text message from the direct Harness operator')
+}
+
 export interface MainToolsHost {
   readonly context: Context
-  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note' | 'answerPlanQuestion'> & EngineForPeople
-  readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
+  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note' | 'approvePlanQuestion' | 'answerPlanQuestion'> &
+    EngineForPeople & Pick<Engine, 'supersedePlanTicket'>
+  readonly store: Pick<Store, 'get' | 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
-  readonly sessions: MainResourceHost['sessions']
+  readonly sessions: MainResourceHost['sessions'] & Pick<Sessions, 'relay'>
   readonly projectMeter: Pick<ProjectMeter, 'read'>
-  readonly runLimits?: { view(ticketId?: string): RunLimitStatus | undefined }
+  readonly runLimits: Pick<RunLimits, 'forDispatch' | 'view'>
   readonly attention: Pick<ScopedAttention, 'summary' | 'forTicket'>
   readonly planIntegration?: MainResourceHost['planIntegration']
   readonly handoffs: Pick<Handoffs, 'confirm' | 'answer' | 'get' | 'spec'>
-  readonly plans: Pick<Plans, 'get' | 'view' | 'node' | 'append'>
+  readonly plans: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'testHistory' | 'view' | 'node' | 'append' | 'at' | 'revision' | 'current' | 'state' | 'requiredDelivery' | 'revise'>
+  readonly stagnation: MainResourceHost['stagnation']
+  readonly requirements: Pick<PlanRequirements, 'preview' | 'apply' | 'get'>
   readonly planDispatcher: Pick<PlanDispatcher, 'dispatch'>
   readonly mainline: Pick<MainlineQueue, 'enqueue'>
   assertNewWork?(): void
@@ -218,7 +241,7 @@ function routeTool(host: MainToolsHost): Tool {
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings,
     handoffs: host.handoffs, plans: host.plans, projectMeter: host.projectMeter, runLimits: host.runLimits, attention: host.attention,
-    planIntegration: host.planIntegration }
+    planIntegration: host.planIntegration, stagnation: host.stagnation, requirements: host.requirements }
   return [
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
@@ -266,6 +289,26 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       },
     }),
     tool({
+      name: 'orchestrator_plan_question',
+      description: promptFile('plan-question-tool'),
+      schema: PlanAnswerSchema.omit({ answer: true }).extend({ criterion: z.number().int().positive() }),
+      execute: async ({ ticket_id, question_id, criterion }) => {
+        if (agent.id !== host.resources.masterId) throw new Error('Only the Hub may approve Plan product questions')
+        host.assertNewWork?.()
+        return host.store.atomic(() => {
+          const binding = host.store.tickets.get(ticket_id)?.plan
+          const scope = binding && host.plans.definition(binding.planId, binding.nodeId)
+          if (!scope || scope.retired || scope.node.role !== binding?.role || !scope.node.acceptance.includes(criterion)) {
+            throw new UserError('invalidPlan', { detail: 'A product question must identify a criterion of the active Plan Ticket' })
+          }
+          const { ticket, reused } = host.engine.approvePlanQuestion(ticket_id, question_id)
+          const relay = !reused && planQuestionRelay(ticket)
+          if (relay) host.sessions.relay(relay.id, relay.text)
+          return { ticket_id, question_id, criterion, reused }
+        })
+      },
+    }),
+    tool({
       name: 'orchestrator_plan_answer',
       description: 'Record the latest direct Hub user’s JSON answer to a current Plan Ticket question.',
       schema: PlanAnswerSchema,
@@ -309,6 +352,36 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       },
     }),
     tool({
+      name: 'orchestrator_plan_replan',
+      description: promptFile('plan-replan-tool'),
+      schema: TechnicalReplanSchema,
+      execute: async args => {
+        if (agent.id !== host.resources.masterId) throw new Error('Only the Hub may replan technical work')
+        host.assertNewWork?.()
+        return replanTechnical(host, args)
+      },
+    }),
+    tool({
+      name: 'orchestrator_plan_requirements',
+      description: promptFile('plan-requirements-tool'),
+      schema: z.discriminatedUnion('mode', [
+        z.strictObject({ mode: z.literal('preview') }),
+        z.strictObject({ mode: z.literal('apply'), proposalId: z.uuid() }),
+      ]),
+      execute: async args => {
+        if (agent.id !== host.resources.masterId) throw new Error('Only the Hub may handle Plan requirement changes')
+        if (args.mode === 'preview') return host.requirements.preview(latestRequirementMessage(agent))
+        const replay = host.requirements.get(args.proposalId)?.status === 'applied'
+        if (!replay) {
+          host.assertNewWork?.()
+          await host.verifyProjectBinding?.()
+        }
+        const result = host.requirements.apply(args.proposalId, latestRequirementMessage(agent))
+        if (!replay) host.requestPass()
+        return result
+      },
+    }),
+    tool({
       name: 'orchestrator_queue_merge',
       description: promptFile('queue-merge-tool'),
       schema: z.object({ ticket_id: z.string().trim().min(1), candidate: z.string().regex(/^[0-9a-f]{40}$/) }).strict(),
@@ -325,6 +398,9 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       schema: z.object({ ticket_id: z.string() }).strict(),
       execute: async args => {
         host.assertNewWork?.()
+        if (host.store.tickets.get(args.ticket_id)?.plan) {
+          throw new UserError('invalidPlan', { detail: 'Plan recovery follows the effective stagnation policy; manual retry requires an operator' })
+        }
         return routed(host, { reason: 'Started a new assignment', ticketId: host.engine.retryTicket(args.ticket_id).id })
       },
     }),

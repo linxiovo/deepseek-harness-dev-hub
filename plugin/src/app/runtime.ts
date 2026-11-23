@@ -24,22 +24,25 @@ import { promptFile } from './skill-files.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
 import { DshExecutor, sourceTrigger, workerSessionId } from '../executor/dsh.ts'
+import { validateRepositoryIdentity } from '../executor/repository-identity.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
 import { evalsHealth } from './views/overview.ts'
 import { TextCache } from './cache.ts'
-import { Effects } from './effects.ts'
+import { Effects, Later, Park } from './effects.ts'
 import { Handoffs } from './handoffs.ts'
 import { TopicBinding } from './topic-binding.ts'
 import { Installation, projectDatabase, projectHubId } from './installation.ts'
 import { InstallationError } from './installation-api.ts'
 import { Planning } from './planning.ts'
 import { Plans, planDeliveryWriter } from './plans.ts'
+import { PlanRequirements } from './plan-requirements.ts'
+import { PlanStagnation } from './plan-stagnation.ts'
 import { PlanIntegration } from './plan-integration.ts'
 import { ScopedAttention } from './scoped-attention.ts'
 import { PlanDispatcher } from './plan-dispatch.ts'
-import { MainlineQueue } from './mainline-queue.ts'
+import { MainlineQueue, mainlineIntent } from './mainline-queue.ts'
 import { advanceMainline, precedes, prepareMainline, readMainline, readPlanIntegrationTarget, verifyDeliveryOnTarget } from '../executor/mainline-git.ts'
 import { Prompts, promptByteLimit, PromptConflict } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
@@ -70,6 +73,7 @@ import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { plannerTools, type PlannerToolsHost } from './tools/planner.ts'
 import { splitterTools, type SplitterToolsHost } from './tools/splitter.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
+import { scopeProposalId } from './tools/requirement-scope.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
@@ -92,6 +96,7 @@ export class Runtime extends Service implements SourceHost {
   readonly planDispatcher: PlanDispatcher
   readonly attention: ScopedAttention
   readonly planning: Planning
+  private readonly stagnation: PlanStagnation
   readonly sources: SourceRegistry
   readonly commands: Commands
   readonly meter: SessionMeter
@@ -162,7 +167,6 @@ export class Runtime extends Service implements SourceHost {
       const deployed = () => setup.configured()
         ? environmentOf({ deployment: setup.deployment, sources: this.sources, settings: store.settings() }) : undefined
       const feishu = () => setup.configured() && !!setup.deployment.feishu
-      const prompts = this.prompts = new Prompts(store, () => machine.promptMaxChars.get(), deployed, feishu)
       const masterId = this.masterId = store.get(KV.runtime.masterId) ?? projectHubId(installation.stateDir)
       store.set(KV.runtime.masterId, masterId)
       const commands = this.commands = new Commands(() => setup.deployment, setup.commandEnvironment, this.lifetime)
@@ -172,6 +176,7 @@ export class Runtime extends Service implements SourceHost {
       const handoffs = this.handoffs = new Handoffs(store, effects, project, () => installation.assertNewWork(),
         handoff => this.topicBinding?.changed(handoff))
       const plans = this.plans = new Plans(store, handoffs, effects)
+      const prompts = this.prompts = new Prompts(store, () => machine.promptMaxChars.get(), deployed, feishu, plans)
       const credentialChecks = new Map(projectMachine.credentialChecks?.filter(check => check.projectId === project?.id)
         .map(check => [check.id, check]))
       const attention = this.attention = new ScopedAttention({ store, plans, projectId: project?.id,
@@ -194,7 +199,7 @@ export class Runtime extends Service implements SourceHost {
         drained: ticketId => this.executor.drainedForCredential(ticketId),
         resume: (ticketId, blockerId) => this.executor.resumeAfterCredential(ticketId, blockerId),
       })
-      const projectMeter = this.projectMeter = new ProjectMeter({ store, meter, masterId, canSample: binding => this.canSample(binding) })
+      const projectMeter = this.projectMeter = new ProjectMeter({ store, meter, plans, masterId, canSample: binding => this.canSample(binding) })
       const runLimits = this.runLimits = new RunLimits({ store, relay: message => this.sessions.relay(message.id, message.text),
         changed: () => { if (!this.closing()) this.executor.reconcileQuotaPauses() } })
       const sources = this.sources = new SourceRegistry(() => store.settings(), board, kind => {
@@ -207,18 +212,43 @@ export class Runtime extends Service implements SourceHost {
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
       const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx,
-        meter: { read: (id, signal) => this.readScopedMeter(id, signal) }, plans, handoffs,
+        meter: { read: (id, signal) => this.readScopedMeter(id, signal) }, plans,
         rulesManifestMaxBytes: () => promptByteLimit(machine.promptMaxChars.get()),
         reviewGeneration: ticketId => runtime.executor?.reviewGeneration(ticketId),
         credentialBlocked: ticketId => attention.blocked(ticketId),
         quotaBlocked: ticketId => runLimits.blocked(ticketId),
         promptVersion: id => this.sessions.promptVersion(id),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
-      const sessions = this.sessions = new Sessions({ context: ctx, store, projectMeter, prompts, effects, health: board.claim('models'), masterId,
+      const sessions: Sessions = this.sessions = new Sessions({ context: ctx, store, projectMeter, prompts, effects, health: board.claim('models'), masterId,
         lifetime: this.lifetime, boundWorkspace: project?.workspace,
         relayAvailable: requestId => this.planIntegration.relayAvailable(requestId),
         closing: () => this.closing(), environment, ownsPlanner: id => handoffs.get(id) !== undefined,
         plannerActive: id => this.configured() && handoffs.isPlanning(id),
+        scopeTask: id => {
+          if (this.paused()) throw new Later('Requirement scope review is paused')
+          const task = requirements.scopeTask(id)
+          if (!task) return undefined
+          installation.assertNewWork()
+          const checkout = project?.workspace ?? store.settings().executor.repository
+          const handoff = handoffs.get(task.planId)
+          if (!checkout || !handoff || !sameDirectory(checkout, task.workspace) || !isAbsolute(task.workspace)
+            || handoff.project.repository.toLowerCase() !== this.deployment.repository.toLowerCase()) {
+            throw new Error('Requirement scope task does not belong to the active project checkout')
+          }
+          return task
+        },
+        verifyScopeWorkspace: async task => {
+          const handoff = handoffs.get(task.planId)
+          if (!handoff) throw new Error('Requirement scope handoff no longer exists')
+          if (project) await installation.validateWorkspace(handoff.project)
+          else await validateRepositoryIdentity(commands, task.workspace, handoff.project.repository)
+        },
+        recordScopeReview: (id, reviewer, verdict) => store.atomic(() => {
+          const preview = requirements.recordScopeReview(id, reviewer, verdict)
+          effects.cancel('requirementScopeReview', id)
+          sessions.relay(key('requirement-scope-result', id), JSON.stringify({ kind: 'plan-requirement-scope-review',
+            read: `plan-requirement/${id}`, classification: preview.scopeReview.status }))
+        }),
         splitterWorkspace: id => {
           if (!this.configured()) return undefined
           const handoff = handoffs.get(id)
@@ -270,14 +300,15 @@ export class Runtime extends Service implements SourceHost {
           }
           const overrides = after.executor.runLimits?.ticketOverrides
           if (overrides !== before.executor.runLimits?.ticketOverrides) for (const { planId, nodeId } of overrides ?? []) {
-            const plan = plans.get(planId)
-            if (plan?.status !== 'registered') throw new UserError('unknownPlan', { id: planId })
-            if (!plan.nodes.some(node => node.id === nodeId)) throw new UserError('unknownPlanNode', { id: planId, node: nodeId })
+            if (!plans.get(planId)) throw new UserError('unknownPlan', { id: planId })
+            if (!plans.at(planId, 1)?.plan.nodes.some(node => node.id === nodeId)) throw new UserError('unknownPlanNode', { id: planId, node: nodeId })
           }
         } })
       this.executor = new DshExecutor({ context: ctx, commands, get engine() { return runtime.engine }, store, effects,
         health: board.claim('worker'), machine: projectMachine, lifetime: this.lifetime, sessions, closing: () => this.closing(),
         credentialBlocked: ticketId => attention.blocked(ticketId),
+        diagnosisAllowed: (ticket, inputId) => runtime.stagnation.allowed(ticket, inputId),
+        reassignmentAllowed: ticket => runtime.stagnation.allowed(ticket),
         quota: runLimits,
         paused: () => this.paused(), environment, sourceLink: link,
         repliedTo: trigger => repliedTo({ store, sources }, trigger) })
@@ -322,10 +353,13 @@ export class Runtime extends Service implements SourceHost {
         outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
           if (event.type === 'ticket.created') {
             const { ticketId } = event.data
-            prompts.bindTicket(ticketId)
-            if (store.tickets.get(ticketId)?.plan) {
-              const { requiredChecks } = githubKind.schema.parse(store.settings().sources.github?.config ?? {})
-              bindRequiredChecks(store, ticketId, requiredChecks)
+            const binding = store.tickets.get(ticketId)?.plan
+            const repair = binding && plans.repairSource(binding.planId, binding.nodeId)
+            prompts.bindTicket(ticketId, repair ? prompts.forTicket(repair.ticketId).revision : undefined)
+            if (binding) {
+              const inherited = repair && store.get(KV.plans.requiredChecks(repair.ticketId))
+              const required = inherited ?? githubKind.schema.parse(store.settings().sources.github?.config ?? {}).requiredChecks
+              bindRequiredChecks(store, ticketId, required)
             }
           }
           if (event.type === 'assignment.started') {
@@ -350,6 +384,44 @@ export class Runtime extends Service implements SourceHost {
         } })
       this.planDispatcher = new PlanDispatcher({ store, plans, engine, executor, attention, limits: runLimits,
         bindWorker: (ticket, id) => sessions.bindWorker(ticket, id) })
+      const stagnation = this.stagnation = new PlanStagnation({ store, plans, limits: runLimits, engine,
+        paused: () => this.paused(), eligible: ticket => {
+          const binding = ticket.plan
+          if (!binding || store.get(KV.plans.retired(binding.planId, binding.nodeId)) || attention.blocked(ticket.id)) return false
+          const merge = mainlineIntent(store, ticket.id)
+          return !merge || merge.status === 'waiting' || (merge.status === 'repair' && merge.repair_requested === true)
+        }, replaceReview: (ticketId, previous, current) => {
+          if (previous) effects.cancel('replanReview', key('plan-replan', ticketId, previous))
+          if (current) effects.enqueue('replanReview', key('plan-replan', ticketId, current), { ticketId, failureId: current })
+        } })
+      effects.handle('replanReview', async ({ ticketId, failureId }, requestId) => {
+        const plan = store.tickets.get(ticketId)?.plan
+        if (!plan) return
+        const withdrawn = new Error('The Plan recovery review no longer applies')
+        const authorize = () => {
+          const review = stagnation.review(ticketId, failureId)
+          if (!review) throw withdrawn
+          if (review === 'held') throw new Later()
+        }
+        try {
+          const { planId, nodeId } = plan
+          await sessions.prompt(masterId, requestId, JSON.stringify({ kind: 'plan-replan-review', plan: `plan/${planId}`,
+            failure: `plan/${planId}/node/${nodeId}/recovery/${failureId}`, instructions: promptFile('plan-replan-relay') }), 'steer', authorize)
+        } catch (error) { if (error !== withdrawn) throw error }
+      }, { limit: () => this.configured() && !this.closing() ? 1 : 0 })
+      const requirements = new PlanRequirements({ store, plans, handoffs, limits: runLimits,
+        stop: (ticketId, reason) => { engine.stopTicket(ticketId, reason) }, authorize: () => installation.assertNewWork(),
+        requestScopeReview: id => effects.enqueue('requirementScopeReview', id, {}) })
+      const scopeDispatchOpen = () => {
+        if (this.paused()) return false
+        const state = runLimits.view()?.budget.state
+        return state === 'unlimited' || state === 'available'
+      }
+      effects.handle('requirementScopeReview', async (_, id) => {
+        if (!requirements.scopeTask(id)) return
+        await sessions.deliverScope(id, () => { if (!scopeDispatchOpen()) throw new Later('Requirement scope review dispatch is held') })
+        if (requirements.scopeTask(id)) return Park
+      }, { limit: () => scopeDispatchOpen() ? 1 : 0 })
       const planDelivery = planDeliveryWriter(plans, id => engine.closePlanTicket(id))
       const mainline = new MainlineQueue({ store, effects, lifetime: this.lifetime,
         available: () => this.configured() && !this.closing(), paused: () => this.paused(),
@@ -423,13 +495,14 @@ export class Runtime extends Service implements SourceHost {
         }
         if (ticket.execution?.session) sessions.bindWorker(ticket.id, ticket.execution.session)
         for (const [index, assignment] of ticket.assignments.entries()) {
+          const replacement = ticket.assignments[index - 1]?.endedReason
           if (assignment.writer?.session) sessions.bindWorker(ticket.id, assignment.writer.session,
-            assignment.startedAt !== undefined && ticket.assignments[index - 1]?.endedReason === 'retried')
+            assignment.startedAt !== undefined && (replacement === 'retried' || replacement === 'reassigned'))
         }
       }
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
-      const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
+      const evaluateDue = () => { engine.evaluateDue(); stagnation.scan(); evals.set(evalsHealth(store)) }
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
         health: this.runtimeHealth, lifetime: this.lifetime, configured: () => this.configured(), closing: () => this.closing() })
       const sourceInactive = () => this.closing() || !installation.github
@@ -445,7 +518,7 @@ export class Runtime extends Service implements SourceHost {
           return passes.receive(trigger)
         } }
       this.toolHost = { context: ctx, engine, store, sessions, executor, mainline, planDispatcher: this.planDispatcher, settings: this.settings,
-        assessor, resources, projectMeter, runLimits, attention, handoffs, plans, planIntegration, lifetime: this.lifetime,
+        assessor, resources, projectMeter, runLimits, attention, handoffs, plans, planIntegration, stagnation, requirements, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
@@ -556,10 +629,13 @@ export class Runtime extends Service implements SourceHost {
     this.runLimits.recover()
     this.executor.recoverCredentialPauses()
     this.disposeAdmission = installModelAdmission(this.ctx, {
-      owns: id => this.projectMeter.owns(id) || this.sessions.hasManagedAncestry(id),
+      owns: id => scopeProposalId(id) !== undefined || this.projectMeter.owns(id) || this.sessions.hasManagedAncestry(id),
       acquire: (id, maximum, signal) => {
         const binding = this.store.get(KV.projectMeter.binding(id))
         if (this.closing() || !binding) return { admitted: false, reason: 'Run limit Session is not authorized in this mount' }
+        if (scopeProposalId(id) !== undefined && !this.sessions.scopeModelAllowed(id)) {
+          return { admitted: false, reason: 'Requirement scope reviewer has no authorized native task in this mount' }
+        }
         const { ticket_id: ticket } = binding
         if (ticket && !this.executor.writerAuthorized(ticket, workerSessionId(ticket))) {
           return { admitted: false, reason: 'Run limit Session has no active Ticket writer' }
@@ -601,6 +677,7 @@ export class Runtime extends Service implements SourceHost {
     if (this.closing()) return
     this.planDispatcher.resume()
     this.planning.resume()
+    this.effects.wakeParked('requirementScopeReview')
     this.executor.resume()
     this.passes.start()
     this.effects.start()
@@ -669,10 +746,11 @@ export class Runtime extends Service implements SourceHost {
   private async canSample(binding: MeterSessionBinding): Promise<MeterLogAccess> {
     const { session_id: id, ticket_id: ticketId, parent_session_id: parentId, roles } = binding
     const hub = roles.includes('hub'), planning = roles.includes('planner') || roles.includes('splitter')
+    const scopeId = scopeProposalId(id)
     const parent = parentId ? this.store.get(KV.projectMeter.binding(parentId)) : undefined
     const worker = !!ticketId && parent?.roles.includes('hub') && roles.includes('implementation')
     const nativeChild = !!ticketId && !worker && (roles.includes('implementation') || roles.includes('review'))
-    if (!hub && !planning && !worker && !nativeChild) return 'read' // Explicit host registrations (retro and inspection).
+    if (!hub && !planning && !worker && !nativeChild && scopeId === undefined) return 'read' // Explicit host registrations (retro and inspection).
     const ticket = ticketId ? this.store.tickets.get(ticketId) : undefined, execution = ticket?.execution
     if (worker && (!ticket || execution?.ownership?.ticket !== ticketId || !execution.ownership.verified || !execution.worktree)) return 'unverified'
     const issued = worker && (execution?.session === id || ticket?.assignments.some(item => item.writer?.session === id))
@@ -691,6 +769,14 @@ export class Runtime extends Service implements SourceHost {
     if (header.id !== id) return 'unverified'
     if (nativeChild) return header.origin === 'subagent' && header.parentSession === parentId ? { header } : 'unverified'
     if (header.origin !== undefined || header.parentSession !== undefined || header.isSeeded) return 'unverified'
+    if (scopeId !== undefined) {
+      const pin = this.store.get(KV.planRequirements.reviewer(scopeId))
+      const preview = this.store.get(KV.planRequirements.preview(scopeId))
+      const workspace = preview && this.handoffs.get(preview.handoffId)?.project.workspace
+      return roles.includes('review') && parentId === this.masterId && preview?.planId === binding.plan_id && pin?.sessionId === id
+        && pin.createdAt === header.createdAt && header.agentPreset === PLANNER_PRESET && workspace && header.cwd && isAbsolute(header.cwd)
+        && sameDirectory(workspace, header.cwd) ? { header } : 'unverified'
+    }
     const project = this.installation.project
     const handoff = planning ? this.handoffs.get(id.slice(id.indexOf('-') + 1)) : undefined
     const cwd = worker ? execution?.worktree : planning ? handoff && (project?.workspace ?? handoff.project.workspace)
@@ -712,11 +798,12 @@ export class Runtime extends Service implements SourceHost {
         return splitter && this.sessions.isSplitterSession(splitter) ? [`planner-${id}`, splitter.id] : [`planner-${id}`]
       })
       const live = (ids: string[]) => ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
-      const agents = live([this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id)), ...handoffSessions()])
+      const reviewSessions = () => this.ctx.agents.list().filter(agent => scopeProposalId(agent.id) !== undefined && this.projectMeter.owns(agent.id)).map(agent => agent.id)
+      const agents = live([this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id)), ...handoffSessions(), ...reviewSessions()])
       for (const agent of agents) agent.cancel({ kind: 'user' }, { keepInbox: true })
       await Promise.allSettled([http, passes, this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
       // An effect may have been creating a planner or splitter when shutdown took the first snapshot.
-      const lateHandoffs = live(handoffSessions()).filter(agent => !agents.includes(agent))
+      const lateHandoffs = live([...handoffSessions(), ...reviewSessions()]).filter(agent => !agents.includes(agent))
       for (const agent of lateHandoffs) agent.cancel({ kind: 'user' }, { keepInbox: true })
       await Promise.allSettled(lateHandoffs.map(agent => agent.whenIdle()))
       // The workers' jobs and subagents stop too: their ends would start worker turns without the tool limits released below.

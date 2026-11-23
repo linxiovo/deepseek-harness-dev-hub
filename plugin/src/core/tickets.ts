@@ -10,8 +10,8 @@ import type { Replies } from './replies.ts'
 import { canRetry } from './stage.ts'
 
 const sameChannel = (a: ChannelRef, b: ChannelRef): boolean => JSON.stringify(a) === JSON.stringify(b)
-/** Whether an Input is a message no person wrote, such as CI's, a bot's, or the main Session's note. */
-export const automatic = (input: TicketInput | undefined): boolean => input?.kind === 'note' || (input?.kind === 'trigger' && !input.human)
+/** Ordinary automated Inputs are held after a failed report. A fenced same-Assignment diagnosis is not a human follow-up. */
+export const automatic = (input: TicketInput | undefined): boolean => input?.kind === 'note' && !input.diagnosisFor || (input?.kind === 'trigger' && !input.human)
 /**
  * Whether a ticket's worker read a Trigger Input before `until`, its latest report or turn end: its Session took the message
  * into a step before then. One delivered before reads were recorded counts as read once it reached the worker by then.
@@ -280,7 +280,7 @@ export class Tickets extends EnginePart {
     this.leftToWorkers(trigger)
     const current = this.require(ticketId)
     if (current.ended?.by === 'human') throw new UserError('ticketStopped')
-    if (current.ended?.by === 'delivery') throw new UserError('ticketEnded')
+    if (current.ended?.by === 'delivery' || current.ended?.by === 'replan') throw new UserError('ticketEnded')
     if (!liveTicket(current) && !this.policy().revalidate(current.mandate)) throw new UserError('mandateRevoked')
     return trigger
   }
@@ -351,11 +351,17 @@ export class Tickets extends EnginePart {
    * The old writer keeps its lease until Executor confirms idle; reservation fences the new attempt until then.
    * @throws UserError when the ticket is unknown or not retryable.
    */
-  retry(ticketId: string): Ticket {
+  retry(ticketId: string, reassignFrom?: string): Ticket {
     const ticket = this.require(ticketId)
     const latest = latestAssignment(ticket)
     if (!canRetry(ticket) || !latest) throw new UserError('notRetryable')
-    this.endAssignment(ticket, latest, 'retried')
+    if (reassignFrom !== undefined && (!ticket.plan || ticket.attention || latest.id !== reassignFrom || latest.state !== 'running')) {
+      throw new UserError('notRetryable')
+    }
+    this.endAssignment(ticket, latest, reassignFrom === undefined ? 'retried' : 'reassigned')
+    // Do not deliver the replaced Assignment's outstanding diagnostic into its successor's Session.
+    const diagnostics = ticket.inputs.filter(input => input.kind === 'note' && input.diagnosisFor === latest.id)
+    if (diagnostics.length) ticket.undelivered = ticket.undelivered.filter(id => !diagnostics.some(input => input.id === id))
     this.requeueUntaken(ticket, latest)
     const assignment = this.newAssignment(ticket)
     ticket.updatedAt = this.now()
@@ -610,12 +616,27 @@ export class Tickets extends EnginePart {
    * Give an open ticket's Executor a fact as a note Input, such as what another ticket found; it grants nothing (see `TicketInput`).
    * @throws UserError when the ticket is unknown or has ended.
    */
-  note(ticketId: string, text: string): Ticket {
+  note(ticketId: string, text: string, diagnosisFor?: string): Ticket {
     const ticket = this.require(ticketId)
     if (!liveTicket(ticket)) throw new UserError('ticketEnded')
     const at = this.now()
-    this.addInput(ticket, { id: key('input', ticketId, 'note', at, text), kind: 'note', text, at })
+    if (diagnosisFor !== undefined && (!ticket.plan || ticket.attention || runningAssignment(ticket)?.id !== diagnosisFor)) {
+      throw new UserError('assignmentEnded')
+    }
+    const id = diagnosisFor === undefined ? key('input', ticketId, 'note', at, text) : key('input', ticketId, 'diagnosis', diagnosisFor, text)
+    this.addInput(ticket, { id, kind: 'note', text, at, ...(diagnosisFor !== undefined && { diagnosisFor }) })
     return this.require(ticketId)
+  }
+  /** Keep the Input history and its delivery ID even if a send just crossed the withdrawal boundary. */
+  withdrawPlanDiagnosis(ticketId: string, assignmentId: string, inputId: string): void {
+    const ticket = this.repo.tickets.get(ticketId)
+    if (!ticket?.plan || !liveTicket(ticket)) return
+    const assignment = latestAssignment(ticket)
+    if (assignment?.id !== assignmentId || assignment.state !== 'running') return
+    const index = ticket.undelivered.indexOf(inputId)
+    if (index < 0 || !ticket.inputs.some(input => input.id === inputId && input.kind === 'note' && input.diagnosisFor === assignmentId)) return
+    ticket.undelivered.splice(index, 1)
+    this.repo.tickets.save(ticket)
   }
   /**
    * Subscribe an open ticket to a Thread its Executor found related, for context: see `Thread.context`.

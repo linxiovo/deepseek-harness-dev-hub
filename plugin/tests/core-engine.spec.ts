@@ -1546,7 +1546,7 @@ describe('assignment review evidence', () => {
 
   it('passes only with one independent standards and specification review of the same candidate and base', () => {
     const { h, ticketId } = readyForReviews()
-    const common = { basis: ['plugin/docs/007-architecture.md'], candidate, conclusion: 'passed' as const, blockers: [], summary: 'Checked.' }
+    const common = { basis: ['plugin/docs/007-architecture.md'], candidate, generation: 1, conclusion: 'passed' as const, blockers: [], summary: 'Checked.' }
     expect(h.engine.recordReview(ticketId, 'child-standards', { ...common, axis: 'standards', base }).status).toBe('pending')
     expect(h.engine.recordReview(ticketId, 'child-spec', { ...common, axis: 'spec', base }).status).toBe('passed')
     expect(h.repo.tickets.get(ticketId)!.assignments[0]!.reviews?.evidence).toHaveLength(2)
@@ -1557,7 +1557,7 @@ describe('assignment review evidence', () => {
 
   it('does not pass on missing, blocked, duplicate, or mismatched review evidence', () => {
     const { h, ticketId } = readyForReviews()
-    const common = { basis: ['ticket/1'], candidate, base, conclusion: 'passed' as const, blockers: [], summary: 'Checked.' }
+    const common = { basis: ['ticket/1'], candidate, base, generation: 1, conclusion: 'passed' as const, blockers: [], summary: 'Checked.' }
     expect(h.engine.recordReview(ticketId, 'child', { ...common, axis: 'standards' }).status).toBe('pending')
     expect(() => h.engine.recordReview(ticketId, 'child', { ...common, axis: 'spec' })).toThrow(/different reviewer Sessions/)
     expect(() => h.engine.recordReview(ticketId, 'child-again', { ...common, axis: 'standards' })).toThrow(/already submitted/)
@@ -1570,8 +1570,10 @@ describe('assignment review evidence', () => {
     changed.execution!.base = { ref: 'main', sha: '3'.repeat(40) }
     changed.assignments[0]!.writer!.generation = 2
     h.repo.tickets.save(changed)
-    expect(h.engine.recordReview(ticketId, 'child-new-base-standards', { ...common, base: '3'.repeat(40), axis: 'standards' }).status).toBe('pending')
-    expect(h.engine.recordReview(ticketId, 'child-new-base-spec', { ...common, base: '3'.repeat(40), axis: 'spec' }).status).toBe('passed')
+    const advanced = { ...common, base: '3'.repeat(40), generation: 2 }
+    expect(() => h.engine.recordReview(ticketId, 'child-stale', { ...advanced, generation: 1, axis: 'standards' })).toThrow(new UserError('assignmentEnded'))
+    expect(h.engine.recordReview(ticketId, 'child-new-base-standards', { ...advanced, axis: 'standards' }).status).toBe('pending')
+    expect(h.engine.recordReview(ticketId, 'child-new-base-spec', { ...advanced, axis: 'spec' }).status).toBe('passed')
   })
 })
 

@@ -26,6 +26,14 @@ type Stamp = { revision: DeliveryRevision; at: string }
 type Entry = DeliveryEvent & Stamp & { reviewsBeforeRepair?: readonly string[] }
 export interface DeliveryLedger { events: readonly Entry[] }
 
+/** Immutable addresses distinguish failed assertions even when they share a suite, command or candidate. */
+export interface FailedCheck extends Run { id: string; read: string; revision: string; reference: string }
+type Rerun = Pick<FailedCheck, 'id' | 'read' | 'observed' | 'reference'>
+export interface FailedCheckObligation { failure: FailedCheck; rerun: Rerun | null }
+/** Retired test observations and completed external run identities, carried across replacements. */
+export interface TestHistory { failures: FailedCheck[]; externalRuns: string[] }
+const runKey = ({ directory, command }: Run) => JSON.stringify([directory, command])
+
 type Issue = Stamp & (Finding | (Result & { category: 'acceptance' }))
 type Observation = Stamp & Result & { text: string }
 interface Cycle {
@@ -202,6 +210,115 @@ function passingRuns(report: Tests): boolean {
       && checks.some(c => c.directory === r.directory && c.command === r.command)))
 }
 
+type TestProgress = { status: 'failed'; check: FailedCheck } | { status: 'passed' }
+
+function projectTestEvidence(ticketId: string, ledger: DeliveryLedger | undefined, target: DeliveryRevision | undefined,
+  inherited: TestHistory | undefined) {
+  const failures = inherited?.failures.slice() ?? [], externalRuns = new Set(inherited?.externalRuns)
+  const reruns = new Map<string, Rerun>(), seenRuns = new Set<string>(), seenRed = new Set<string>()
+  const lastFailure = new Map<string, string>(), lastPass = new Map<string, string>()
+  const events = ledger?.events ?? [], defaultReference = `ticket/${ticketId}/delivery-check`
+  let latest: TestProgress | undefined
+  for (const [index, entry] of events.entries()) {
+    if (entry.kind !== 'tests') continue
+    const { revision, reference } = entry, read = `ticket/${ticketId}/delivery-observation/${index}`
+    const exact = matches(revision, target), current = exact && index === events.length - 1
+    const local = reference === defaultReference
+    const fail = (command: string, run: Run, id: string, candidate: string): FailedCheck => {
+      const failure = { directory: run.directory, command: run.command, observed: run.observed, id, read, revision: candidate, reference }
+      failures.push(failure)
+      lastFailure.set(command, id)
+      reruns.delete(command)
+      return failure
+    }
+    // The ancestral red in a TDD report is distinct from a failed check on that report's candidate.
+    for (const [i, run] of entry.evidence.red?.entries() ?? []) {
+      const command = runKey(run), key = JSON.stringify([run.revision, command, run.observed])
+      if (seenRed.has(key)) continue
+      seenRed.add(key)
+      fail(command, run, `${read}#red/${i}`, run.revision)
+    }
+    const passing = entry.result === 'reported_passed' && passingRuns(entry)
+    for (const [i, run] of entry.evidence.checks.entries()) {
+      const command = runKey(run)
+      if (run.status !== 'passed' && run.status !== 'failed') {
+        if (exact) reruns.delete(command)
+        continue
+      }
+      // Even a green row in a mixed report consumes that run's identity. Its log cannot become a new rerun.
+      if (!local) {
+        const receipt = JSON.stringify([command, reference])
+        if (run.status === 'passed' && externalRuns.has(receipt)) continue
+        externalRuns.add(receipt)
+      }
+      if (run.status === 'passed' && !passing) continue
+      const onRevision = JSON.stringify([command, revision.base, revision.candidate, revision.generation])
+      // Local reports have no run receipt. An opposite result opens a new episode for identical local output.
+      // A single cited run may contain multiple independently failing assertions.
+      if (local || run.status === 'failed') {
+        const identity = local
+          ? JSON.stringify([run.status, onRevision, run.observed, run.status === 'failed' ? lastPass.get(onRevision) : lastFailure.get(command)])
+          : JSON.stringify([command, reference, run.observed])
+        if (seenRuns.has(identity)) continue
+        seenRuns.add(identity)
+      }
+      const id = `${read}#checks/${i}`
+      if (run.status === 'failed') {
+        const failure = fail(command, run, id, revision.candidate)
+        if (current) latest ??= { status: 'failed', check: failure }
+      } else {
+        lastPass.set(onRevision, id)
+        if (exact) reruns.set(command, { id, read, observed: run.observed, reference })
+        if (current) latest ??= { status: 'passed' }
+      }
+    }
+  }
+  return { failures, externalRuns, reruns, latest }
+}
+
+export function captureTestHistory(ticketId: string, ledger: DeliveryLedger, inherited?: TestHistory): TestHistory {
+  const { failures, externalRuns } = projectTestEvidence(ticketId, ledger, undefined, inherited)
+  return { failures, externalRuns: [...externalRuns] }
+}
+
+/** A matching Worker rerun is evidence of progress, not proof that the assertions survived. */
+export function failedCheckObligations(ticketId: string, ledger: DeliveryLedger | undefined, target: DeliveryRevision | undefined,
+  inherited?: TestHistory): FailedCheckObligation[] {
+  const { failures, reruns } = projectTestEvidence(ticketId, ledger, target, inherited)
+  return failures.map(failure => ({ failure, rerun: reruns.get(runKey(failure)) ?? null }))
+}
+
+/** Only the latest distinct observation can affect recovery. A pass must cover every outstanding failed check. */
+export function latestTestProgress(ticketId: string, ledger: DeliveryLedger | undefined, target: DeliveryRevision,
+  inherited?: TestHistory): TestProgress | undefined {
+  const { failures, reruns, latest } = projectTestEvidence(ticketId, ledger, target, inherited)
+  if (latest?.status === 'passed' && failures.some(failure => !reruns.has(runKey(failure)))) return undefined
+  return latest
+}
+
+function reviewedChecks(obligations: readonly FailedCheckObligation[], reviews: readonly ReviewEvidence[]) {
+  if (!obligations.length) return []
+  const axes = ['standards', 'spec'] as const
+  const lanes = axes.map(axis => reviews.filter(r => r.axis === axis))
+  const signers = lanes.map(lane => new Set(lane.flatMap(r => [r.reviewer_session, ...(r.retainedChecks ?? []).map(c => c.reviewer_session)])))
+  const blob = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/
+  const confirmations = lanes.map((lane, i) => {
+    const review = lane[0], valid = new Set<string>()
+    if (lane.length === 1 && review?.conclusion === 'passed' && !review.blockers.length) {
+      for (const c of review.retainedChecks ?? []) {
+        if (nonblank(c.reviewer_session) && !signers[1 - i]!.has(c.reviewer_session) && nonblank(c.at) && nonblank(c.rationale)
+          && nonblank(c.originalPath) && nonblank(c.currentPath) && blob.test(c.originalBlob) && blob.test(c.currentBlob))
+          valid.add(JSON.stringify([c.failure, c.rerun]))
+      }
+    }
+    return valid
+  })
+  return obligations.map(({ failure, rerun }) => {
+    const pair = JSON.stringify([failure.id, rerun?.id])
+    return { failure, rerun, confirmed_by: axes.filter((_, i) => !!rerun && confirmations[i]!.has(pair)) }
+  })
+}
+
 function observationPassed(event: DeliveryEvent): boolean {
   return event.kind === 'tests' ? event.result === 'reported_passed' && passingRuns(event)
     : event.kind === 'docs' && (event.structure === 'checked' || event.structure === 'not-applicable')
@@ -273,12 +390,15 @@ export function advanceDelivery(ledger: DeliveryLedger | undefined, revision: De
 
 /** A local evidence view, not CI, a merge receipt, or formal delivery. Missing/dirty worktrees have no active evidence. */
 export function viewDelivery(ledger: DeliveryLedger | undefined, revision: DeliveryRevision | undefined, reviews: readonly ReviewEvidence[],
-  acceptance: readonly Criterion[], ticketId: string) {
+  acceptance: readonly Criterion[], ticketId: string, inherited?: TestHistory | null) {
   const events = ledger?.events ?? []
   const { active, followups } = project(events, reviews, ticketId)
   const state = forRevision(active, revision)
   const matching = currentReviews(reviews, revision)
   const missing: string[] = []
+  // Undefined is standalone; null is a Plan Ticket without any retired history.
+  const failed_checks = inherited === undefined ? [] : reviewedChecks(failedCheckObligations(ticketId, ledger, revision, inherited ?? undefined), matching)
+  if (failed_checks.some(check => check.confirmed_by.length !== 2)) missing.push('failed_checks_require_recheck')
   if (!revision) missing.push('revision')
   if (!dual(matching)) missing.push('dual-review')
   if (!state.first) missing.push('first-retro')
@@ -294,6 +414,6 @@ export function viewDelivery(ledger: DeliveryLedger | undefined, revision: Deliv
   if (needsRepair(active, revision)) for (const issue of active.repaired) missing.push(`repair:${issue.id}`)
   if (!state.tests || !observationPassed(state.tests)) missing.push('tests')
   if (!state.docs || !observationPassed(state.docs)) missing.push('docs')
-  return { revision: revision ?? null, events, reviews: matching, blockers: active.blockers, repaired: active.repaired,
+  return { revision: revision ?? null, events, reviews: matching, failed_checks, blockers: active.blockers, repaired: active.repaired,
     followups, acceptance: items, tests: state.tests ?? null, docs: state.docs ?? null, missing, ready: missing.length === 0 }
 }

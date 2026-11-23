@@ -1,6 +1,7 @@
 /** Effective run authorization and budget projections for the mounted project. */
 import { randomUUID } from 'node:crypto'
 import { liveTicket, type Ticket } from '../core/model.ts'
+import { key as stableKey } from '../core/ids.ts'
 import { KV } from '../kv.ts'
 import { effectiveRunLimits, type EffectiveRunLimits } from '../policy.ts'
 import type { ModelAdmission } from './model-admission.ts'
@@ -13,6 +14,8 @@ export interface PendingUsage {
   ticketId: string | null
   maximumTokens: number | null
   startedAt: string
+  /** Ticket budget key, when work shares a retired Plan node's authorization. */
+  poolId?: string
 }
 
 export interface BudgetLedger {
@@ -88,7 +91,7 @@ export class RunLimits {
     store.atomic(() => {
       const configuration = effectiveRunLimits(store.settings().executor)
       this.updateHold(null, configuration.effective.projectTokens)
-      for (const ticket of store.tickets.open()) this.updateHold(ticket.id, this.ticketLimit(configuration, ticket.plan))
+      for (const ticket of store.tickets.open()) this.updateHold(ticket.id, this.ticketLimit(configuration, ticket.plan), this.pool(ticket.id, ticket.plan))
       store.afterCommit(() => { this.wakeWaiters(); this.host.changed() })
     })
   }
@@ -104,12 +107,12 @@ export class RunLimits {
       const { projectTokens } = config.effective
       const owner = ticketId === null ? undefined : store.tickets.get(ticketId)
       if (ticketId !== null && (!owner || !liveTicket(owner))) return { admitted: false, reason: 'Run limit Ticket is not live' }
+      const poolId = owner ? this.pool(owner.id, owner.plan) : undefined
       const ticketTokens = owner ? this.ticketLimit(config, owner.plan) : null
       const pending = projectTokens === null && ticketTokens === null ? [] : this.pending()
       let waiting = false
       for (const budget of [projectTokens === null ? undefined : this.budget(projectTokens, store.get(KV.runLimits.project), pending),
-        ticketTokens === null || ticketId === null ? undefined :
-          this.ticketBudget(ticketId, ticketTokens, pending)]) {
+        ticketTokens === null || poolId === undefined ? undefined : this.ticketBudget(poolId, ticketTokens, pending)]) {
         if (!budget || budget.limitTokens === null) continue
         if (budget.state === 'exhausted' || budget.state === 'usage-missing') {
           return { admitted: false, reason: `Run limit paused: ${budget.state}` }
@@ -124,7 +127,8 @@ export class RunLimits {
       if (waiting) return { admitted: false, reason: 'Run limit balance is reserved by existing requests',
         wait: (this.balanceChanged ??= Promise.withResolvers<void>()).promise }
       const key = KV.runLimits.pending(randomUUID())
-      const request: PendingUsage = { sessionId, ticketId, maximumTokens, startedAt: new Date().toISOString() }
+      const request: PendingUsage = { sessionId, ticketId, maximumTokens, startedAt: new Date().toISOString(),
+        ...poolId && poolId !== ticketId ? { poolId } : {} }
       store.set(key, request)
       return { admitted: true, settle: totalTokens => {
         if (this.closed) return // A late old-mount completion cannot commit into a reopened Store.
@@ -135,7 +139,8 @@ export class RunLimits {
           const config = effectiveRunLimits(store.settings().executor)
           const projectHeld = this.updateHold(null, config.effective.projectTokens)
           const ticket = ticketId === null ? undefined : store.tickets.get(ticketId)
-          const ticketHeld = ticket && liveTicket(ticket) && this.updateHold(ticket.id, this.ticketLimit(config, ticket.plan))
+          const affected = ticket && (liveTicket(ticket) ? ticket : store.tickets.open().find(other => this.pool(other.id, other.plan) === poolId))
+          const ticketHeld = affected && this.updateHold(affected.id, this.ticketLimit(config, affected.plan), poolId)
           store.afterCommit(() => {
             this.wakeWaiters()
             if (projectHeld || ticketHeld) this.host.changed()
@@ -155,7 +160,7 @@ export class RunLimits {
     if (projectTokens === null && ticketTokens === null) return { limits }
     const pending = this.pending()
     const project = this.budget(projectTokens, store.get(KV.runLimits.project), pending)
-    const ticket = this.ticketBudget(ticketId, ticketTokens, pending)
+    const ticket = this.ticketBudget(this.pool(ticketId, plan), ticketTokens, pending)
     if (project.state === 'exhausted' || project.state === 'usage-missing') return { limits, block: { scope: 'project', state: project.state } }
     if (ticket.state === 'exhausted' || ticket.state === 'usage-missing') return { limits, block: { scope: 'ticket', state: ticket.state } }
     if (project.state === 'reserved') return { limits, block: { scope: 'project', state: 'reserved' } }
@@ -168,7 +173,7 @@ export class RunLimits {
     const config = effectiveRunLimits(store.settings().executor)
     if (quotaHold(config.effective.projectTokens, store.get(KV.runLimits.project) ?? EMPTY)) return true
     const ticket = store.tickets.get(ticketId)
-    return !!ticket && !!quotaHold(this.ticketLimit(config, ticket.plan), store.get(KV.runLimits.ticket(ticketId)) ?? EMPTY)
+    return !!ticket && !!quotaHold(this.ticketLimit(config, ticket.plan), store.get(KV.runLimits.ticket(this.pool(ticketId, ticket.plan))) ?? EMPTY)
   }
 
   /** An already approved call settles before this Ticket's pause drains its writer. */
@@ -182,7 +187,7 @@ export class RunLimits {
     const inFlight = this.pending()
     const projectBudget = this.budget(configuration.effective.projectTokens, store.get(KV.runLimits.project), inFlight)
     return ticket ? { scope: 'ticket', ticketId: ticket.id, configuration, projectBudget,
-      budget: this.ticketBudget(ticket.id, this.ticketLimit(configuration, ticket.plan), inFlight) }
+      budget: this.ticketBudget(this.pool(ticket.id, ticket.plan), this.ticketLimit(configuration, ticket.plan), inFlight) }
       : { scope: 'project', ticketId: null, configuration, budget: projectBudget }
   }
 
@@ -192,8 +197,8 @@ export class RunLimits {
     waiting?.resolve()
   }
 
-  private ticketBudget(ticketId: string, limit: number | null, inFlight: PendingUsage[]): BudgetView {
-    return this.budget(limit, this.host.store.get(KV.runLimits.ticket(ticketId)), inFlight.filter(item => item.ticketId === ticketId))
+  private ticketBudget(poolId: string, limit: number | null, inFlight: PendingUsage[]): BudgetView {
+    return this.budget(limit, this.host.store.get(KV.runLimits.ticket(poolId)), inFlight.filter(item => (item.poolId ?? item.ticketId) === poolId))
   }
 
   private pending(): PendingUsage[] {
@@ -205,7 +210,7 @@ export class RunLimits {
     const { store } = this.host
     const { sessionId, ticketId } = request
     const at = new Date().toISOString()
-    for (const key of ticketId === null ? [KV.runLimits.project] : [KV.runLimits.project, KV.runLimits.ticket(ticketId)]) {
+    for (const key of ticketId === null ? [KV.runLimits.project] : [KV.runLimits.project, KV.runLimits.ticket(request.poolId ?? ticketId)]) {
       const ledger = store.get(key) ?? EMPTY
       if (total !== null && Number.isSafeInteger(total) && total >= 0) {
         const sum = (ledger.accountedTokens ?? 0) + total
@@ -222,11 +227,11 @@ export class RunLimits {
   }
 
   /** The active marker and its single normal Hub relay commit together. A new episode requires the hold to clear first. */
-  private updateHold(ticketId: string | null, limit: number | null): boolean {
+  private updateHold(ticketId: string | null, limit: number | null, poolId = ticketId): boolean {
     const { store } = this.host
-    const key = ticketId === null ? KV.runLimits.projectHold : KV.runLimits.ticketHold(ticketId)
+    const key = poolId === null ? KV.runLimits.projectHold : KV.runLimits.ticketHold(poolId)
     const prior = store.get(key)
-    const issue = quotaHold(limit, store.get(ticketId === null ? KV.runLimits.project : KV.runLimits.ticket(ticketId)) ?? EMPTY)
+    const issue = quotaHold(limit, store.get(poolId === null ? KV.runLimits.project : KV.runLimits.ticket(poolId)) ?? EMPTY)
     if (!issue) {
       if (prior) store.delete(key)
       return false
@@ -234,9 +239,12 @@ export class RunLimits {
     if (!prior) {
       store.set(key, true)
       const ticket = ticketId === null ? undefined : store.tickets.get(ticketId)
+      const affectedTickets = ticket?.plan && poolId !== null ? store.tickets.open().filter(other => other.id !== ticketId &&
+        this.pool(other.id, other.plan) === poolId).map(other => other.id) : []
       const relay = projectPushRelay({ id: `quota-paused:${randomUUID()}`, kind: 'quota-paused', payload: {
         scope: ticketId === null ? 'project' : 'ticket', reason: issue, ticketId,
         ...(ticket && { title: ticket.title, planId: ticket.plan?.planId, nodeId: ticket.plan?.nodeId }),
+        ...(affectedTickets.length ? { affectedTickets } : {}),
         resource: ticketId === null ? 'project/run-limits' : `ticket/${ticketId}/run-limits`,
       } })
       if (relay) this.host.relay(relay)
@@ -244,8 +252,19 @@ export class RunLimits {
     return true
   }
 
+  private origin(plan: NonNullable<Ticket['plan']>): string {
+    return this.host.store.get(KV.plans.budgetOrigin(plan.planId, plan.nodeId)) ?? plan.nodeId
+  }
+
+  private pool(ticketId: string, plan: Ticket['plan']): string {
+    if (!plan) return ticketId
+    const origin = this.origin(plan)
+    return origin === plan.nodeId ? ticketId : stableKey('plan-ticket', plan.planId, origin)
+  }
+
   private ticketLimit({ effective }: EffectiveRunLimits, plan: Ticket['plan']): number | null {
-    const override = plan && effective.ticketOverrides.find(entry => entry.planId === plan.planId && entry.nodeId === plan.nodeId)
+    const origin = plan && this.origin(plan)
+    const override = plan && effective.ticketOverrides.find(entry => entry.planId === plan.planId && entry.nodeId === origin)
     return override ? override.tokens : effective.ticketTokens
   }
 

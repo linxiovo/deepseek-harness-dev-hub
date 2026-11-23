@@ -3,7 +3,7 @@ import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { advanceDelivery, type DeliveryEvent, type DeliveryRevision } from './delivery-check.ts'
 import { latestAssignment, liveTicket, reviewStatus, runningAssignment } from './model.ts'
-import type { ReviewAxis, ReviewConclusion, ReviewEvidence, ReportState, Ticket } from './model.ts'
+import type { ReviewAxis, ReviewConclusion, ReviewEvidence, ReportState, Ticket, VerifiedCheckRetention } from './model.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
 import { automatic, type Tickets } from './tickets.ts'
@@ -18,6 +18,19 @@ export interface WorkerReport {
   askedBy?: string
   /** The person's question this report answers, which the worker thereby takes up; authorizes the main Session to send an answer reply. */
   answers?: string
+}
+
+export interface ReviewSubmission {
+  axis: ReviewAxis
+  base: string
+  candidate: string
+  generation: number
+  basis: string[]
+  conclusion: ReviewConclusion
+  blockers: string[]
+  summary: string
+  reuses?: string[]
+  retainedChecks?: VerifiedCheckRetention[]
 }
 
 /**
@@ -89,7 +102,9 @@ export class Assignments extends EnginePart {
     const report = running.report
     const busy = !!running.deliveredAt && !!report && running.deliveredAt >= report.at
     const settled = !!report && ['waiting', 'ready', 'blocked', 'failed'].includes(report.state) && !busy
-    if (!settled) this.tickets.recover(ticket, running, recoveryNote)
+    const diagnosis = ticket.plan && ticket.inputs.some(input => input.kind === 'note' && input.diagnosisFor === assignmentId &&
+      ticket.undelivered.includes(input.id))
+    if (!settled && !diagnosis) this.tickets.recover(ticket, running, recoveryNote)
     else if (ticket.undelivered.length) this.options.executor.deliver(ticket, running)
   }
   /**
@@ -115,8 +130,15 @@ export class Assignments extends EnginePart {
     const at = this.now()
     const previous = ticket.attention
     const ask = (question: string) => ({ id: key('attention', ticketId, question, at), question, ...(report.askedBy ? { triggerId: report.askedBy } : {}) })
-    const asked = report.question && report.question !== previous?.question ? ask(report.question) : previous
-    const attention = report.question === null || report.state === 'ready' ? undefined : asked
+    const clears = report.question === null || report.state === 'ready' || report.state === 'dropped'
+    if (ticket.plan) {
+      if (clears) delete assignment.planQuestion
+      else if (report.question && report.question !== previous?.question && report.question !== assignment.planQuestion?.question) {
+        const { id, question } = ask(report.question)
+        assignment.planQuestion = { id, question }
+      }
+    }
+    const attention = clears ? undefined : !ticket.plan && report.question && report.question !== previous?.question ? ask(report.question) : previous
     if (attention) ticket.attention = attention
     else delete ticket.attention
     // A replaced or cleared attention question withdraws any pending unsent reply for the previous question from the outbox.
@@ -136,9 +158,25 @@ export class Assignments extends EnginePart {
     if (outcome) this.tickets.end(ticketId, 'executor', outcome, at)
     return this.require(ticketId)
   }
+
+  /** Promote only the live Assignment's outstanding question; the Hub has checked the affected product criterion. */
+  approvePlanQuestion(ticketId: string, questionId: string): { ticket: Ticket; reused: boolean } {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    const assignment = runningAssignment(ticket)
+    if (!ticket.plan || !assignment || assignment.id !== latestAssignment(ticket)?.id) throw new UserError('assignmentEnded')
+    if (ticket.attention?.id === questionId) return { ticket, reused: true }
+    const proposal = assignment.planQuestion
+    if (!proposal || proposal.id !== questionId || ticket.attention) throw new UserError('notAttention')
+    ticket.attention = proposal
+    delete assignment.planQuestion
+    ticket.updatedAt = this.now()
+    this.repo.tickets.save(ticket)
+    return { ticket, reused: false }
+  }
+
   /** Records one independently authorized review against the running ticket's pinned base. */
-  review(ticketId: string, reviewerSession: string, input: { axis: ReviewAxis; basis: string[]; base: string; candidate: string;
-    conclusion: ReviewConclusion; blockers: string[]; summary: string; reuses?: string[] }): { evidence: ReviewEvidence; status: 'pending' | 'blocked' | 'passed' } {
+  review(ticketId: string, reviewerSession: string, input: ReviewSubmission): { evidence: ReviewEvidence; status: 'pending' | 'blocked' | 'passed' } {
     const ticket = this.require(ticketId)
     if (!liveTicket(ticket)) throw new UserError('ticketEnded')
     const assignment = runningAssignment(ticket)
@@ -150,19 +188,33 @@ export class Assignments extends EnginePart {
     const base = ticket.execution.base?.sha
     const generation = writer.generation
     if (!base || input.base !== base) throw new Error('Review base does not match the ticket pinned base')
+    if (generation !== input.generation) throw new UserError('assignmentEnded')
     if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(input.candidate)) throw new Error('Review candidate must be a full lowercase commit hash')
     const reviews = assignment.reviews ??= { evidence: [] }
-    if (reviews.evidence.some(item => item.base === base && item.generation === generation
-      && item.axis === input.axis && item.candidate === input.candidate))
-      throw new Error('This review axis has already submitted this candidate')
-    if (reviews.evidence.some(item => item.base === base && item.generation === generation && item.candidate === input.candidate
-      && item.reviewer_session === reviewerSession && item.axis !== input.axis))
+    const samePair = (item: ReviewEvidence) => item.base === base && item.generation === generation && item.candidate === input.candidate
+    const prior = reviews.evidence.find(item => samePair(item) && item.axis === input.axis)
+    const passed = input.conclusion === 'passed' && !input.blockers.length
+    const retained = input.retainedChecks?.filter(check => !prior?.retainedChecks?.some(item => item.failure === check.failure && item.rerun === check.rerun))
+    if (input.retainedChecks?.length && (!passed || !ticket.plan)) throw new Error('Failed-check retention requires a passing Plan review')
+    if (prior && (prior.conclusion !== 'passed' || !passed || !retained?.length)) throw new Error('This review axis has already submitted this candidate')
+    if (reviews.evidence.some(item => samePair(item) && item.axis !== input.axis &&
+      (item.reviewer_session === reviewerSession || item.retainedChecks?.some(check => check.reviewer_session === reviewerSession))))
       throw new Error('Independent review axes require different reviewer Sessions')
     reviews.target = { base, candidate: input.candidate, generation }
+    const at = this.now()
+    const signed = retained?.map(check => ({ ...check, reviewer_session: reviewerSession, at }))
+    if (prior && signed?.length) {
+      const signatures = prior.retainedChecks ??= []
+      signatures.push(...signed)
+      ticket.updatedAt = at
+      this.repo.tickets.save(ticket)
+      return { evidence: prior, status: reviewStatus(assignment) }
+    }
     const evidence: ReviewEvidence = { id: key('review', assignment.id, input.axis, input.candidate, String(generation)), axis: input.axis,
       reviewer_session: reviewerSession, generation, basis: [...input.basis], base, candidate: input.candidate,
-      conclusion: input.blockers.length ? 'blocked' : input.conclusion, blockers: [...input.blockers], summary: input.summary, at: this.now() }
+      conclusion: input.blockers.length ? 'blocked' : input.conclusion, blockers: [...input.blockers], summary: input.summary, at }
     if (input.reuses?.length) evidence.reuses = [...new Set(input.reuses)]
+    if (signed?.length) evidence.retainedChecks = signed
     reviews.evidence.push(evidence)
     ticket.updatedAt = evidence.at
     this.repo.tickets.save(ticket)

@@ -193,6 +193,7 @@ Failures retry with exponential backoff. Throwing `Later` defers work without co
 | `delivery` | DshExecutor | Hands a Ticket's waiting Inputs to its running Assignment, in order | 4, none while paused | 2 s doubling to 60 s; one that waits for a worker slot tries again after 2 s |
 | `mainlineDelivery` | MainlineQueue | Rechecks one verified intent for [formal Plan closure](003-execution.md#formal-plan-closure) | 8, only when configured | Resumes pending work on restart; evidence gaps stay on the Ticket until rechecked |
 | `planIntegration` | PlanIntegration | Verifies the actual target, full regression jobs and the attempt-matched package after all formal Plan receipts exist | 4, only when configured and unpaused | Persists the exact revision/configuration before dispatch; resumes by observing that context |
+| `requirementScopeReview` | Runtime | Dispatches the sealed requirement scope comparison to its read-only reviewer | 1, when configured and unpaused | Reconciles the same Session and dispatch on restart |
 | `relay` | Sessions | Steers a worker's report or question, or a person's follow-up, into the main Session's turn | 1, in queue order | 2 s doubling to 60 s |
 | `notice` | Sessions | Injects a notice into the main Session without waking it | 1, in queue order | 2 s doubling to 60 s |
 | `reply` | Outbox | Sends a message for a Channel through its Source, after the earlier messages of its Ticket to its conversation that have not failed three times; withdrawing the message cancels it | 1, none while paused | 5 s doubling to 300 s; one whose Source is off, or behind an earlier message, tries again after 5 s |
@@ -391,6 +392,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/ids.ts` | `key`: ids derived from their inputs, equal for equal inputs |
 | `src/core/handoff.ts` | The handoff records: `ProjectRef`, `HandoffInput`, `HandoffQuestion`, `SpecInput`, `Spec` and `Handoff`, with the fields and statuses 009 Handoff describes |
 | `src/core/plan.ts` | Plan DAG records and domain validation: role separation, acceptance coverage and explicit dependencies |
+| `src/core/plan-topology.ts` | Technical graph transformations for unclaimed nodes; retain acceptance, dependency and interface commitments |
 | `src/core/plan-integration.ts` | Plan full-regression configuration, Actions run evidence, artifact reference and validated retained-file metadata |
 | `src/core/memory.ts` | `MemoryRepositories`: the Store's repositories in memory, in the Store's order and with its nested rollback, for domain tests |
 | `src/core/index.ts` | The core's exports, including `TakeUp` and the Plan integration evidence contract |
@@ -409,8 +411,11 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/handoffs.ts` | `Handoffs`: the durable project and handoff records, their single question, answer and immutable specification |
 | `src/app/topic-binding.ts` | Binds one observed Feishu destination to the selected project and accepts correlated answers from explicitly authorized senders; see `009-handoff.md` |
 | `src/app/planning.ts` | `Planning`: durable `planning` and `splitting` effects for the specification planner and the Plan DAG splitter |
-| `src/app/plans.ts` | `Plans`: validates and atomically registers authorized Plan DAGs; keeps plan background separate from node instructions |
+| `src/app/plans.ts` | `Plans`: validates and publishes immutable Plan revisions, retains old node definitions and claims, and gates Frontier and delivery |
 | `src/app/plan-dispatch.ts` | `PlanDispatcher`: validates Frontier predecessors, reserves a launch slot, atomically claims a node into a stable Ticket/Assignment, and rearms the same claim on restart |
+| `src/app/plan-replan.ts` | Binds a technical replan to the current failure, effective authorization and graph revision |
+| `src/app/plan-stagnation.ts` | `PlanStagnation`: durable technical failure and recovery state, diagnosis and reassignment policy, and failed-check gating |
+| `src/app/plan-requirements.ts` | `PlanRequirements`: computes impact, records an independent scope verdict, consumes exact direct approval and applies one revision |
 | `src/app/mainline-queue.ts` | Durable per-target FIFO, Ticket attempts, Worker repair, actual Git verification and formal closure coordination |
 | `src/app/plan-integration.ts` | Durable Plan verification after formal Ticket receipts, exact Actions run/attempt checks, checksummed artifact acceptance, exactly-once relay and release hold |
 | `src/app/plan-artifacts.ts` | Downloads one exact Actions artifact into private staging, validates its identity manifest, safe filename, media type and file SHA-256, retains it by Plan/context/run/attempt, and serves only a checksum-matching file |
@@ -441,6 +446,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/main.ts` | The main Session's tools |
 | `src/app/tools/planner.ts` | `plannerTools`: a planner Session's own handoff read, product-intent question and specification publication |
 | `src/app/tools/splitter.ts` | The splitter's scoped handoff and spec read and Plan DAG registration |
+| `src/app/tools/requirement-scope.ts` | The proposal's independent read-only Session records its scoped verdict |
 | `src/app/tools/executor.ts` | An Executor Session's tools |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
@@ -708,6 +714,7 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 | `session/<id>` | The `SessionMeterView` of one Session: its `context` snapshot and cumulative `usage`, with provenance, quality, sampled ranges and missing ranges; main Session only |
 | `project/meter`, `plan/<id>/meter`, `ticket/<id>/meter` | Hub-only scoped usage, shared overhead, and per-Session samples; contract in `plugin/docs/014-project-metering.md` |
 | `project/attention`, `plan/<id>/attention` | Hub-only Plan execution and awaiting-human summary, including credential actions; contract in `plugin/docs/015-scoped-attention.md` |
+| `plan/<id>/revision/<n>`, `plan-requirement/<id>`, `ticket/<id>/plan-scope` | Revision history, product-change previews and ticket-specific verification scope; contract in `plugin/docs/018-plan-replanning.md` |
 | `feishu/<trigger id>/…`, `github/…` | Original Source records, described in the Source skills |
 | `actions/<ticket\|plan>/<id>/commit/<40 lowercase hex SHA>` | GitHub Actions evidence for one owned commit, main Session only |
 

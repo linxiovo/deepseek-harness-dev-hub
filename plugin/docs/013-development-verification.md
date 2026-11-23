@@ -27,6 +27,8 @@ When changing the test runner, verify cross-checkout exclusion, nonzero exits, a
 
 In recovery tests that use real Git worktrees, wait for the controlled teardown to start and for the Runtime to become idle after release; assert delivery without a separate short polling deadline.
 
+After restart, a replayed Hub notice does not imply the Worker has reclaimed its writer. Before testing a replan that requires a confirmed writer, wait for the pending Worker delivery and check verified preparation and active writer identity on the Ticket.
+
 ## Worker implementation and test evidence
 
 For an authorized implementation Ticket, the Worker loads `dsh-worker-implement` before editing. Read `ticket/<id>` with `orchestrator_read` to confirm the verified worktree and pinned base. Keep edits and checks in that worktree.
@@ -122,7 +124,15 @@ The output keeps skill names and call/result sequence references, fixture assert
 
 ## Delivery-check
 
-The delivery-check gate applies to Tickets linked to an immutable registered Plan and its specification. A missing Plan or specification for a Plan Ticket leaves the gate incomplete. Tickets without a Plan keep their own acceptance criteria, candidate verification, required CI and ordinary report/PR handoff; they do not receive canonical Plan IDs or a `ready_to_queue` result.
+The delivery-check gate applies to Tickets linked to a registered Plan and the acceptance contract of their active or superseded node. A missing Plan contract leaves the gate incomplete. Tickets without a Plan keep their own acceptance criteria, candidate verification, required CI and ordinary report/PR handoff; they do not receive canonical Plan IDs or a `ready_to_queue` result.
+
+### Failed-check continuity
+
+`ticket/<id>/failed-checks` lists the recorded failures, including declared red runs, and their most recent matching Worker reruns on the active candidate and writer generation. An authenticated independent review child can read this paginated resource for its own Ticket, without seeing the other lane's decisions. `ticket/<id>/delivery-check` adds each confirmed axis in `local.failed_checks`.
+
+For each failure, both reviewers inspect the original assertion, its counterpart in the new commit, and the actual rerun of the same command. Submit `retainedChecks: [{failure, rerun, originalPath, currentPath, rationale}]` with `orchestrator_review_submit`. Use the exact IDs from the resource and repository-relative committed file paths. The host resolves both paths to Git blobs; the review rationale must establish that the assertion still runs and the criterion has not been weakened. Blob identity and a matching command do not prove assertion equivalence or execution. Unknown proof blocks rather than granting readiness. A previously passing lane may append a confirmation for a new pair, but cannot replace a blocked review or use the other lane's signer.
+
+Queue, replay and formal closure require both current confirmations; a new failure or different rerun needs new confirmations. Replacements inherit failed observations and the identities of completed external checks. Separate failures from the same run remain separate obligations; changing one criterion does not waive checks on unchanged commitments. For the same directory and command, repeating an external run reference is not a fresh rerun, even if the earlier result came in a mixed report or on a replaced Ticket. An identical unlinked result after a distinct failure has a new local observation ID, but still needs independent proof of execution. Standalone Tickets have no Plan retained-check obligations.
 
 ### Retro and acceptance
 

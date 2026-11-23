@@ -126,20 +126,30 @@ export function resultRelay(ticket: Ticket, state: string, text: string, replyTo
     ...summary, read: `ticket/${ticket.id}/result` }
   return { id: `report:${id}`, text: JSON.stringify(report) }
 }
-/**
- * Relays explicit questions for a person and answers to a person's question. Other Plan reports stay on the Ticket;
- * legacy non-Plan reports still relay results, blockers and ends.
- */
+/** Only a Hub-approved product question becomes user attention. Worker suggestions are routed internally. */
+export function planQuestionRelay(ticket: Ticket): Relay | undefined {
+  if (!ticket.plan || !ticket.attention) return undefined
+  return projectPushRelay({ id: `attention:${ticket.id}:${ticket.attention.id}`, kind: 'human-action', payload: {
+    ticket: { ...brief(ticket), attention: ticket.attention }, read: `ticket/${ticket.id}/result`,
+  } })
+}
+
+/** Relays suggestions, solicited answers and legacy reports; Plan Worker reports never create user attention. */
 export function reportRelay(ticket: Ticket, report: Pick<WorkerReport, 'state' | 'summary' | 'question' | 'answers'>): Relay | undefined {
+  if (ticket.plan) {
+    if (report.answers) return resultRelay(ticket, report.state, report.summary, report.answers)
+    const proposal = ticket.assignments.at(-1)?.planQuestion
+    if (!report.question || proposal?.question !== report.question || ticket.ended) return undefined
+    return { id: `plan-question-review:${ticket.id}:${proposal.id}`, text: JSON.stringify({ kind: 'plan-question-review',
+      ticket_id: ticket.id, question_id: proposal.id, question: proposal.question, read: `ticket/${ticket.id}/plan-scope`,
+    }) }
+  }
   const asked = report.question ? ticket.attention : undefined
   if (asked) {
     const id = `attention:${ticket.id}:${asked.id}`
     const payload = { ticket: brief(ticket), state: report.state, read: `ticket/${ticket.id}/result` }
-    if (ticket.plan) return projectPushRelay({ id, kind: 'human-action', payload: {
-      ...payload, ticket: { ...payload.ticket, attention: { ...payload.ticket.attention, id: asked.id } },
-    } })
     return { id, text: JSON.stringify({ kind: 'worker_attention', ...payload }) }
   }
-  if (!report.answers && (ticket.plan || report.state === 'progress')) return undefined
+  if (!report.answers && report.state === 'progress') return undefined
   return resultRelay(ticket, report.state, report.summary, report.answers)
 }

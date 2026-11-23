@@ -36,3 +36,4 @@
 | 015 计划注意力 | 计划与项目待处理摘要、测试账号验证、单票暂停及原工作树恢复 | [docs/015-scoped-attention.md](docs/015-scoped-attention.md) |
 | 016 运行限额 | 生效预设、在途准入、独立工单额度及管理与 Hub 查询接口契约 | [docs/016-run-limits.md](docs/016-run-limits.md) |
 | 017 计划集成交付 | 正式票据关闭后的主干验证、Actions 全量回归、产物契约和 Harness 查询接口 | [docs/017-plan-integration.md](docs/017-plan-integration.md) |
+| 018 计划重排 | 停滞时保留承诺的技术恢复、产品变更预览与授权、替代节点和验收重验接口 | [docs/018-plan-replanning.md](docs/018-plan-replanning.md) |

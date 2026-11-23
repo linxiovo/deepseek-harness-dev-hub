@@ -219,6 +219,15 @@ export type ReportState = 'progress' | 'waiting' | 'ready' | 'blocked' | 'failed
 /** Independent review axes used to evaluate an Assignment candidate. */
 export type ReviewAxis = 'standards' | 'spec'
 export type ReviewConclusion = 'passed' | 'blocked'
+/** The reviewer judges assertion coverage; the executor resolves both cited files in the committed trees. */
+export interface CheckRetention {
+  failure: string
+  rerun: string
+  originalPath: string
+  currentPath: string
+  rationale: string
+}
+export interface VerifiedCheckRetention extends CheckRetention { originalBlob: string; currentBlob: string }
 /** One immutable, independently submitted review of an exact candidate against the ticket's pinned base. */
 export interface ReviewEvidence {
   id: string
@@ -228,6 +237,8 @@ export interface ReviewEvidence {
   basis: string[]
   /** Original evidence this reviewer independently reaffirmed on a repaired candidate (delivery-check keys). */
   reuses?: string[]
+  /** Append-only confirmations on this lane. A fresh reviewer can supplement, but not replace, its verdict. */
+  retainedChecks?: (VerifiedCheckRetention & { reviewer_session: string; at: string })[]
   base: string
   candidate: string
   conclusion: ReviewConclusion
@@ -250,6 +261,8 @@ export interface Assignment {
   endedAt?: string
   endedReason?: string
   report?: { state: ReportState; summary: string; at: string }
+  /** A Worker proposal is internal until the Hub classifies it as a missing product decision. */
+  planQuestion?: { id: string; question: string }
   /** When Inputs last reached the worker; one at or after `report.at` means the worker has been busy with Inputs since that report. */
   deliveredAt?: string
   /**
@@ -290,8 +303,8 @@ export type TicketInput =
   | { id: string; kind: 'text'; text: string; at: string }
   /** An inspected repair survives a crash before delivery; the original candidate remains the writer's lineage anchor. */
   | (MainlineRepair & { kind: 'mainline-repair'; at: string; generation: number; deliveredTo?: string; readAt: string | null })
-  /** A fact the main Session gave the ticket from other work: context, which asks for nothing and grants nothing. */
-  | { id: string; kind: 'note'; text: string; at: string }
+  /** Unprivileged context, or a host-scheduled diagnosis bound to a Plan Assignment. Neither grants new authority. */
+  | { id: string; kind: 'note'; text: string; at: string; diagnosisFor?: string }
 
 /**
  * How a Policy change bears on a ticket: the rules it was accepted under that changed, with their instruction now, or no
@@ -305,7 +318,7 @@ export interface PolicyEffect {
   requester?: ActorRef
 }
 
-export type TicketEndBy = 'executor' | 'human' | 'delivery'
+export type TicketEndBy = 'executor' | 'human' | 'delivery' | 'replan'
 /** How a ticket ended: with its result, with its pull request merged or closed unmerged, with nothing to do, or stopped by a person. */
 export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
 /** A question for a person; `triggerId` is the human message that raised it, whose conversation it goes back to. */

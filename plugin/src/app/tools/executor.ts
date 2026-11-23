@@ -1,12 +1,14 @@
 /** Executor Session tools for reading ticket context, taking requests up internally, managing threads, handing back out-of-scope triggers, and reporting status. */
 import { z } from 'zod'
-import { liveTicket, UserError, type EngineForExecutor, type Ticket } from '../../core/index.ts'
+import { latestAssignment, liveTicket, UserError, type EngineForExecutor, type Ticket } from '../../core/index.ts'
+import { failedCheckObligations } from '../../core/delivery-check.ts'
 import { credentialIdPattern } from '../../deployment.ts'
 import { claimPull, readPull } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
 import type { DshExecutor } from '../../executor/dsh.ts'
 import { docTreeImpactSchema, docTreeScopeSchema } from '../../executor/doc-tree.ts'
 import { deliveryAcceptance, readResource, type ResourceHost } from '../resources.ts'
+import type { PlanStagnation } from '../plan-stagnation.ts'
 import type { ScopedAttention } from '../scoped-attention.ts'
 import type { Store } from '../store.ts'
 import { reportRelay, threadFollowedNotice } from '../notices.ts'
@@ -20,6 +22,7 @@ export interface ExecutorToolsHost {
   readonly sessions: Pick<Sessions, 'relay' | 'notify' | 'authorizeReviewSession'>
   readonly resources: ResourceHost
   readonly attention: Pick<ScopedAttention, 'block'>
+  readonly stagnation: Pick<PlanStagnation, 'observeTests' | 'observeReport'>
   readonly executor: Pick<DshExecutor, 'inspectDocImpact' | 'inspectTestEvidence' | 'inspectReviewCandidate' | 'inspectDeliveryCandidate'>
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
@@ -51,6 +54,8 @@ const testEvidenceSchema = z.strictObject({
   red: z.array(z.strictObject({ ...runEvidence, revision: commitHash })).max(50).nullable(),
   reference: evidenceReference.optional(),
 })
+const checkPath = z.string().min(1).max(512).refine(path => !/[\\:\x00-\x1f\x7f]/.test(path)
+  && path.split('/').every(part => part !== '' && part !== '.' && part !== '..'), 'Expected a repository-relative file path')
 const reviewSubmitSchema = z.strictObject({
   candidate: commitHash,
   axis: z.enum(['standards', 'spec']),
@@ -59,6 +64,8 @@ const reviewSubmitSchema = z.strictObject({
   summary: z.string().trim().min(1).max(4000),
   blockers: z.array(z.string().trim().min(1).max(1000)).max(50),
   reuses: evidenceKeys.optional(),
+  retainedChecks: z.array(z.strictObject({ failure: evidenceReference, rerun: evidenceReference, originalPath: checkPath,
+    currentPath: checkPath, rationale: evidenceReference })).min(1).max(50).optional(),
 })
 const retroSchema = z.strictObject({
   candidate: commitHash,
@@ -76,17 +83,42 @@ const requestsCredential = /^\s*(?:please\s+)?(?:provide|paste|send|share|give|r
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId: string, reviewOnly = false): Tool[] {
   const ticketId = ticket.id
   const tools: Tool[] = [
-    readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
+    reviewOnly ? tool({ name: 'orchestrator_read', description: 'Read this ticket\'s original failed observations and current reported reruns, without other reviewers\' conclusions.',
+      schema: z.strictObject({ resource: z.literal(`ticket/${ticketId}/failed-checks`), offset: z.number().int().nonnegative().default(0),
+        limit: z.number().int().min(1).max(50).optional() }),
+      execute: ({ resource, offset, limit }, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal),
+    }) : readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
     tool({
       name: 'orchestrator_review_submit',
-      description: 'Submit your independent standards or specification review of the exact clean current ticket candidate. Cite concrete repository documents or ticket/spec evidence in basis; report blockers explicitly.',
+      description: 'Submit your independent review of the exact clean candidate. For retained checks, cite each original failure and current rerun, the committed check files, and why the failing assertion still executes and covers the behavior.',
       schema: reviewSubmitSchema,
-      execute: async (args, signal) => {
-        if (!await host.sessions.authorizeReviewSession?.(ticketId, sessionId, args.axis, args.candidate))
+      execute: async ({ retainedChecks, ...args }, signal) => {
+        if (!await host.sessions.authorizeReviewSession(ticketId, sessionId, args.axis, args.candidate))
           throw new Error('Review submission requires an active code-review descendant assigned to this axis')
-        const revision = await host.executor.inspectReviewCandidate(ticketId, sessionId, args.candidate, signal)
-        const recorded = host.engine.recordReview(ticketId, sessionId, { ...args, base: revision.base })
+        if (retainedChecks && (args.conclusion !== 'passed' || args.blockers.length || new Set(retainedChecks.map(c => c.failure)).size !== retainedChecks.length))
+          throw new Error('Retained checks require a passing review and one confirmation per failed observation')
+        const claims = () => {
+          if (!retainedChecks) return []
+          const current = host.store.tickets.get(ticketId), writer = current && latestAssignment(current)?.writer, base = current?.execution?.base?.sha
+          if (!current || !base || writer?.state !== 'active') throw new Error('Missing active review target')
+          if (!current.plan) throw new Error('Failed-check retention is limited to Plan Tickets')
+          const inherited = host.resources.plans?.testHistory(current.plan.planId, current.plan.nodeId)
+          const target = { candidate: args.candidate, base, generation: writer.generation }
+          const obligations = new Map(failedCheckObligations(ticketId, current.deliveryCheck, target, inherited).map(o => [o.failure.id, o]))
+          return retainedChecks.map(claim => {
+            const match = obligations.get(claim.failure)
+            if (!match || !match.rerun || match.rerun.id !== claim.rerun || !commitHash.safeParse(match.failure.revision).success)
+              throw new Error('Cite a recorded failed check and its current matching rerun from this ticket\'s failed-checks page')
+            return { ...claim, failureRevision: match.failure.revision }
+          })
+        }
+        const revision = await host.executor.inspectReviewCandidate(ticketId, sessionId, args.candidate, signal, claims())
+        if (!await host.sessions.authorizeReviewSession(ticketId, sessionId, args.axis, args.candidate)) throw new Error('Review grant changed')
+        // Resolve again after Git I/O; a newly reported failure or rerun invalidates the inspected pair.
+        claims()
+        const recorded = host.engine.recordReview(ticketId, sessionId, { ...args, base: revision.base, generation: revision.generation,
+          retainedChecks: revision.retainedChecks })
         return { evidence: recorded.evidence, aggregate: recorded.status }
       },
     }),
@@ -151,9 +183,13 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId
         const allPassed = checks.length > 0 && checks.every(check => check.status === 'passed')
         const redCovered = red === null || red.length > 0 && red.every(run => checks.some(check => check.directory === run.directory && check.command === run.command))
         const result = checks.some(check => check.status === 'failed') ? 'failed' : allPassed && redCovered ? 'reported_passed' : 'unverified'
-        const index = host.engine.recordDeliveryEvidence(ticketId, sessionId, revision, { kind: 'tests', result, evidence: { scope, reason, checks, red },
-          reference: reference ?? `ticket/${ticketId}/delivery-check` })
-        return { ...args, base: revision.base, result, source: 'worker', read: `ticket/${ticketId}/delivery-observation/${index}` }
+        return host.store.atomic(() => {
+          const index = host.engine.recordDeliveryEvidence(ticketId, sessionId, revision, { kind: 'tests', result, evidence: { scope, reason, checks, red },
+            reference: reference ?? `ticket/${ticketId}/delivery-check` })
+          const read = `ticket/${ticketId}/delivery-observation/${index}`
+          if (ticket.plan) host.stagnation.observeTests(ticketId, { candidate, result, checks, read, reference })
+          return { ...args, base: revision.base, result, source: 'worker', read }
+        })
       },
     }),
     tool({
@@ -206,7 +242,9 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId
       schema: z.object({
         state: z.enum(['progress', 'ready', 'blocked', 'failed', 'dropped']),
         summary: z.string().min(1),
-        human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
+        human_action: z.string().trim().min(1).max(1000).nullish().describe(ticket.plan
+          ? 'An internal proposal for a missing product decision; only the Hub can send it. Null clears the question.'
+          : 'One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
         question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
         pr_number: z.number().int().positive().nullish(),
         reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
@@ -220,16 +258,26 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId
         const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
         // Claim the PR, record the report, and queue any eligible relay in the same transaction.
         return host.store.atomic(() => {
+          if (pull && current.plan) {
+            const owner = host.store.tickets.get(ticketId), writer = owner && latestAssignment(owner), before = latestAssignment(current)
+            if (!owner || !liveTicket(owner) || !writer || writer.id !== before?.id || writer.writer?.generation !== before.writer?.generation
+              || writer.writer?.state !== 'active' || owner.execution?.active_writer?.session !== sessionId) {
+              throw new UserError('assignmentEnded')
+            }
+          }
           const refused = pull && claimPull(host.github, ticketId, pull)
           if (refused) throw new Error(refused)
           const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
           const updated = host.engine.report(ticketId, report)
+          if (updated.plan) host.stagnation.observeReport(updated)
           const relay = reportRelay(updated, report)
           if (relay) host.sessions.relay(relay.id, relay.text)
           const notification = relay ? 'orchestrator' : 'internal_only'
-          return { reported: true, notification, ...(updated.attention ? { attention: updated.attention } : {}) }
+          const proposal = args.human_action && latestAssignment(updated)?.planQuestion
+          return { reported: true, notification, ...(updated.attention ? { attention: updated.attention } : {}),
+            ...(proposal ? { question_proposal: proposal } : {}) }
         })
       },
     }),
@@ -241,5 +289,5 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId
     // The host validates the live writer and permits a repeat of an already recorded action.
     execute: async ({ credential_id, occurrence }) => host.attention.block(ticketId, credential_id, sessionId, occurrence),
   }))
-  return reviewOnly ? tools.filter(item => item.name === 'orchestrator_review_submit') : tools.filter(item => item.name !== 'orchestrator_review_submit')
+  return reviewOnly ? tools.filter(item => item.name === 'orchestrator_review_submit' || item.name === 'orchestrator_read') : tools.filter(item => item.name !== 'orchestrator_review_submit')
 }

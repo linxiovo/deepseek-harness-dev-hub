@@ -55,7 +55,7 @@ type AffectedNode = Pick<PlanNode, 'featureId' | 'role' | 'interfaceContract'> &
   blockedBy: string[]
   replacementBlockedBy: string[]
   instructions: 'historical-only'
-  revalidate: { criteria: number[]; demonstration: string; freshEvidence: true }
+  revalidate: { criteria: number[]; demonstration: string; interfaceContract?: PlanNode['interfaceContract']; freshEvidence: true }
   tickets: AffectedTicket[]
 }
 
@@ -97,7 +97,6 @@ export type RequirementScopeTask = {
     expectedRevision: number
     currentGoal: string
     desiredGoal: string
-    currentCriteria: (CriterionText & { criterion: number })[]
     changedCriteria: { criterion: number; before: CriterionText; after: CriterionText }[]
     originalHandoff: Pick<Handoff, 'goal' | 'authorization' | 'constraints' | 'acceptanceScope'> & Pick<Spec, 'outOfScope'>
   }
@@ -202,16 +201,15 @@ export class PlanRequirements {
   scopeTask(proposalId: string): RequirementScopeTask | undefined {
     const preview = this.get(proposalId)
     if (preview?.status !== 'preview' || preview.scopeReview.status !== 'pending') return undefined
-    const active = this.currentScopePreview(preview)
-    if (!active) return undefined
+    const handoff = this.currentScopePreview(preview)
+    if (!handoff) return undefined
     const { planId, expectedRevision, previousGoal, goal, invalidated, retained } = preview
     const { authorization, constraints, outOfScope, acceptanceScope } = retained
-    return { planId, workspace: active.handoff.project.workspace, input: {
+    return { planId, workspace: handoff.project.workspace, input: {
       proposalId, planId, expectedRevision, currentGoal: previousGoal, desiredGoal: goal,
-      currentCriteria: active.acceptance.map((item, i) => ({ criterion: i + 1, ...criterionText(item) })),
       changedCriteria: invalidated.filter(({ before, after }) => before.statement !== after.statement || before.observable !== after.observable)
         .map(({ criterion, before, after }) => ({ criterion, before: criterionText(before), after: criterionText(after) })),
-      originalHandoff: { goal: active.handoff.goal, authorization, constraints, outOfScope, acceptanceScope },
+      originalHandoff: { goal: handoff.goal, authorization, constraints, outOfScope, acceptanceScope },
     } }
   }
 
@@ -277,7 +275,7 @@ export class PlanRequirements {
       if (!invalidated.length) refuse('The proposed requirements make no change to the current Plan')
       this.host.authorize()
       const proposalId = randomUUID(), now = Date.now()
-      const { affected, evidenceFingerprint } = this.impact(active, invalidated, nextGoal, proposalId)
+      const { affected, evidenceFingerprint } = this.impact(active, invalidated, proposalId)
       const preview: PendingPreview = {
         status: 'preview', proposalId, ownerSession, planId, handoffId: active.handoff.id,
         requestMessageId: message.messageId, requestSequence: message.seq, requestDigest,
@@ -330,7 +328,7 @@ export class PlanRequirements {
       if (active.revision !== preview.expectedRevision || active.handoff.id !== preview.handoffId) {
         refuse('Plan revision changed after the preview; send a new explicit product change request')
       }
-      const observed = this.impact(active, preview.invalidated, preview.goal, proposalId)
+      const observed = this.impact(active, preview.invalidated, proposalId)
       if (observed.evidenceFingerprint !== preview.evidenceFingerprint || !isDeepStrictEqual(observed.affected, preview.affected)) {
         refuse('Plan evidence or in-flight state changed after the preview; send a new explicit product change request')
       }
@@ -349,7 +347,8 @@ export class PlanRequirements {
       const nodes = active.plan.nodes.map(node => {
         const replacement = byNode.get(node.id)
         return replacement ? { ...node, id: replacement.replacementId, blockedBy: replacement.replacementBlockedBy,
-          demonstration: replacement.revalidate.demonstration } : node
+          demonstration: replacement.revalidate.demonstration,
+          ...(replacement.revalidate.interfaceContract && { interfaceContract: replacement.revalidate.interfaceContract }) } : node
       })
       const acceptance = [...active.acceptance]
       for (const { criterion, after } of preview.invalidated) acceptance[criterion - 1] = after
@@ -379,7 +378,7 @@ export class PlanRequirements {
     const handoff = handoffs.get(preview.handoffId)
     if (handoff?.status !== 'specified' || handoff.confirmedBy.sessionId !== preview.ownerSession || !handoff.spec ||
         !plans.requiredDelivery(preview.planId)?.waitingFor.length) return undefined
-    return { acceptance: active.acceptance, handoff }
+    return handoff
   }
 
   private requireOwner(handoffId: string, sessionId: string): Handoff {
@@ -400,7 +399,7 @@ export class PlanRequirements {
     return { ...active, handoff, spec: handoff.spec, waitingFor: required.waitingFor }
   }
 
-  private impact(active: ActivePlan, changes: CriterionChange[], goal: string, proposalId: string) {
+  private impact(active: ActivePlan, changes: CriterionChange[], proposalId: string) {
     const { plans, store } = this.host, { plan, revision } = active
     const targets = new Set(changes.map(change => change.criterion))
     const { direct, affected } = impactedNodes(plan, targets)
@@ -451,11 +450,14 @@ export class PlanRequirements {
       }
       for (const predecessor of node.blockedBy) if (!affected.has(predecessor)) prerequisites.add(predecessor)
       const revised = direct.has(node.id)
+      const contract = node.interfaceContract
+      const previousRequirements = contract?.requirements ?? contract?.previousRequirements
       result.push({ nodeId: node.id, replacementId, impact: revised ? 'direct' : 'transitive',
         featureId: node.featureId, role: node.role, ...(node.interfaceContract ? { interfaceContract: node.interfaceContract } : {}),
         status: observations.get(node.id)?.state?.status ?? 'unclaimed', blockedBy: node.blockedBy,
         replacementBlockedBy: node.blockedBy.map(id => nextIds.get(id) ?? id), instructions: 'historical-only',
-        revalidate: { criteria: node.acceptance, demonstration: revised || goal !== active.goal ? demonstration : node.demonstration,
+        revalidate: { criteria: node.acceptance, demonstration: revised || contract ? demonstration : node.demonstration,
+          ...(contract && previousRequirements !== undefined && { interfaceContract: { path: contract.path, previousRequirements } }),
           freshEvidence: true }, tickets })
     }
     const waiting = new Set(active.waitingFor)

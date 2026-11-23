@@ -34,7 +34,10 @@ export const PlanDraftSchema = z.strictObject({
     acceptance: z.array(z.number().int().min(1)).min(1).max(100),
     demonstration: TextSchema.max(1000),
     blockedBy: z.array(SlugSchema).max(100),
-    interfaceContract: z.strictObject({ path: RepoPathSchema, requirements: TextSchema.max(1000) }).optional(),
+    interfaceContract: z.union([
+      z.strictObject({ path: RepoPathSchema, requirements: TextSchema.max(1000) }),
+      z.strictObject({ path: RepoPathSchema, previousRequirements: TextSchema.max(1000) }),
+    ]).optional(),
   })).min(1).max(100),
 }) satisfies z.ZodType<PlanDraft>
 const PlanRecordSchema = z.strictObject({ id: TextSchema, handoffId: TextSchema, specId: TextSchema, status: z.literal('registered'),
@@ -305,7 +308,12 @@ export class Plans {
     if (!handoffId?.trim() || !specId?.trim()) throw new UserError('invalidPlan', { detail: 'Expected handoffId and specId' })
     const parsed = parse(PlanDraftSchema, draft, 'draft')
     // Explicit undefined in a non-tool caller's optional field is also absent in the persisted JSON.
-    for (const node of parsed.nodes) if (node.interfaceContract === undefined) delete node.interfaceContract
+    for (const node of parsed.nodes) {
+      if (node.interfaceContract === undefined) delete node.interfaceContract
+      else if ('previousRequirements' in node.interfaceContract) {
+        throw new UserError('invalidPlan', { detail: 'The initial interface contract requires current requirements' })
+      }
+    }
     return this.store.atomic(() => {
       const handoff = this.handoffs.get(handoffId)
       if (!handoff || handoff.id !== handoffId || handoff.status !== 'specified' || !handoff.spec) {

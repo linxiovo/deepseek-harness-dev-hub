@@ -28,6 +28,8 @@ Call `orchestrator_plan_requirements` in the confirming project's Hub Session, o
 3. After `within-handoff`, show the exact impact and ask the operator for a separate direct `{"approved":true,"proposalId":"…","requestMessageId":"…","scopeReviewId":"…","scopeDecision":"within-handoff"}`. The Hub calls `{mode: "apply", proposalId}` against that exact latest direct event. Relays, technical advice and plain assent cannot create approval or a review result.
 4. A stale or expired preview needs a new request, review and approval. In-flight mainline writes must reconcile, and all affected nodes need available run authorization. Approval publishes the revision, stops affected open Tickets and records the receipt atomically. Replay returns the same receipt. Successors wait for retired writers and formal predecessor delivery; they require fresh acceptance, review, tests and CI, and inherit known failed checks. Already observed Git writes and completed Tickets remain historical. Role classification, constraints, exclusions, test interfaces and authorization are not rewritten. A fully delivered Plan needs a new handoff.
 
+A replaced backend node retains its interface document path. Its earlier descriptive requirements remain visible as `interfaceContract.previousRequirements`; the replacement uses approved acceptance for changed behavior and preserves compatible interface details. The old Ticket still shows its own original contract.
+
 ## Reads and verification
 
 | `orchestrator_read` resource | Audience and result |

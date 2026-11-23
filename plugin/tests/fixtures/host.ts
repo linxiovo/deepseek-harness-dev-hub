@@ -173,7 +173,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   }
   /** A prepare command (`sh -c`) waits for this while it is set. */
   const hooks: { prepare?: Promise<void>; openingLog?: (sessionId: string) => Promise<void> | undefined;
-    credentialCheck?: () => boolean | Promise<boolean> } = {}
+    credentialCheck?: () => boolean | Promise<boolean>; flushSessionLog?: () => void } = {}
   const subprocess = { spawn: vi.fn((spec: { argv: readonly string[]; cwd?: string; env?: Record<string, string> }) => {
     const argv = [...spec.argv]
     while (argv[0] === 'env' || /^[A-Z_]+=/.test(argv[0] ?? '')) argv.shift()
@@ -319,7 +319,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     inspect: vi.fn(async () => ({ events: [] })),
   }
   // A real backend knows only created Sessions and keeps the fork cut beside the log; the meter must see the same answers.
-  const persistence = { flush: vi.fn(async () => {}), stat: vi.fn(async (sessionId: string) => {
+  const persistence = { flush: vi.fn(async () => { hooks.flushSessionLog?.() }), stat: vi.fn(async (sessionId: string) => {
     const header = sessionHeaders.get(sessionId)
     return header ? { header, revision: 'fixture' } : undefined
   }), open: vi.fn(async (sessionId: string) => {

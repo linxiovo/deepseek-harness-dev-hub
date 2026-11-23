@@ -248,8 +248,8 @@ function projectTestEvidence(ticketId: string, ledger: DeliveryLedger | undefine
       // a new opposite result for the same check is the durable boundary between its identical reports.
       const identity = local
         ? JSON.stringify([run.status, onRevision, run.observed, run.status === 'failed' ? lastPass.get(onRevision) : lastFailure.get(command)])
-        : JSON.stringify([run.status, command, run.observed, reference])
-      if (seenRuns.has(identity)) continue
+        : JSON.stringify([run.status, command, reference])
+      if (seenRuns.has(identity) || (!local && run.status === 'passed' && seenRuns.has(JSON.stringify(['failed', command, reference])))) continue
       seenRuns.add(identity)
       const id = `${read}#checks/${i}`
       if (run.status === 'failed') {

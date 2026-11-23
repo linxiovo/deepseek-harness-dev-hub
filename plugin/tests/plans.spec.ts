@@ -60,7 +60,7 @@ const fanInDraft = {
   nodes: [
     { id: 'catalog', featureId: 'catalog', title: 'Catalog search', role: 'backend', acceptance: [1],
       demonstration: 'Run a catalog search against seeded data.', blockedBy: [],
-      interfaceContract: { path: 'docs/catalog-api.md', requirements: 'Document query inputs and search results.' } },
+      interfaceContract: { path: 'docs/catalog-api.md', requirements: 'Document query inputs and return all substring matches.' } },
     { id: 'accounts', featureId: 'accounts', title: 'Account lookup', role: 'backend', acceptance: [2],
       demonstration: 'Look up a test account and observe the profile.', blockedBy: [],
       interfaceContract: { path: 'docs/accounts-api.md', requirements: 'Document profile fields and lookup errors.' } },
@@ -1160,6 +1160,8 @@ it('requires both pinned reviewers to verify a failed check survived a green rer
   const passed = run()
   expect(passed.status).toBe(0)
   expect(passed.stdout).toContain('catalog returns 200')
+  const oldReceipt = 'run/catalog-before-later-failure'
+  await record(fixed, 'passed', 'catalog returns 200: passed', oldReceipt)
   await record(fixed, 'passed', 'catalog returns 200: passed')
   const originalStandards = await review('standards', fixed, true)
   await originalStandards()
@@ -1168,6 +1170,10 @@ it('requires both pinned reviewers to verify a failed check survived a green rer
   expect((await delivery()).missing).not.toContain(missing)
   await record(fixed, 'failed', 'catalog status returned 502 on a later run')
   expect((await delivery()).missing).toContain(missing)
+  await record(fixed, 'passed', 'The earlier catalog run succeeded with 200', oldReceipt)
+  expect(await read(resource)).toMatchObject({ items: expect.arrayContaining([
+    expect.objectContaining({ failure: expect.objectContaining({ observed: 'catalog status returned 502 on a later run' }), rerun: null }),
+  ]) })
   expect(run().status).toBe(0)
   await record(fixed, 'passed', 'catalog returns 200: passed')
   await expect(originalStandards()).rejects.toThrow(/current matching rerun/)
@@ -1223,11 +1229,13 @@ it('previews a product replan before applying an exact, durable direct approval'
   })
   send(approval(stale, staleReview))
   await expect(apply(stale)).rejects.toThrow(/evidence|in-flight state/i)
-  const create = h.controller.create.getMockImplementation()!
-  h.controller.create.mockImplementation(async input => {
-    if (input.sessionId.startsWith('requirement-scope-')) throw new Error('Interrupted before reviewer creation')
-    return create(input)
+  const deliveriesBeforePreview = h.deliveries.mock.calls.length
+  const lostReceipt = vi.fn(() => {
+    if (!h.deliveries.mock.calls.slice(deliveriesBeforePreview).some(([delivery]) => delivery.sessionId.startsWith('requirement-scope-'))) return
+    delete h.hooks.flushSessionLog
+    throw new Error('Interrupted after the native task was recorded, before the effect receipt')
   })
+  h.hooks.flushSessionLog = lostReceipt
   send(request)
   const proposal = await preview()
   expect(proposal).toMatchObject({ status: 'preview', invalidated: [{ criterion: 1,
@@ -1240,10 +1248,39 @@ it('previews a product replan before applying an exact, durable direct approval'
   const { proposalId } = proposal
   expect(await read(`plan/${id}`)).toMatchObject({ revision: 1, goal: fanInSpec.body })
   await expect(apply(proposal)).rejects.toThrow()
+  const reviewer = `requirement-scope-${proposalId}`
+  const tasks = () => h.deliveries.mock.calls.filter(([call]) => call.sessionId === reviewer).map(([call]) => call)
+  await h.runtime.effects.idle('requirementScopeReview')
+  expect(tasks()).toHaveLength(1)
+  expect(lostReceipt.mock.results.some(result => result.type === 'throw')).toBe(true)
+  expect(JSON.parse(tasks()[0]!.text)).toEqual({ proposalId, planId: id, expectedRevision: 1, currentGoal: fanInSpec.body,
+    desiredGoal: fanInSpec.body, changedCriteria: [{ criterion: 1,
+      before: { statement: fanInSpec.acceptance[0]!.statement, observable: fanInSpec.acceptance[0]!.observable },
+      after: { statement: changed.statement, observable: changed.observable } }],
+    originalHandoff: { goal: fanInSpec.body, authorization: brief.authorization, constraints: brief.constraints,
+      acceptanceScope: brief.acceptanceScope, outOfScope: fanInSpec.outOfScope } })
+  const originalReviewer = h.agents.get(reviewer)!, reviewerTools = h.tools.get(reviewer)!
+  const nativeSession = originalReviewer.session as { id: string; header: { createdAt: number } }
+  const impostor = { ...originalReviewer, session: { ...nativeSession, header: { ...nativeSession.header, createdAt: nativeSession.header.createdAt + 1 } } }
+  let restoreOriginal = false
+  const impostorSeen = Promise.withResolvers<void>()
+  h.controller.resolveAgent.mockImplementation(async id => {
+    if (id === reviewer) {
+      h.agents.set(id, restoreOriginal ? originalReviewer : impostor)
+      if (restoreOriginal) h.tools.set(id, reviewerTools)
+      else impostorSeen.resolve()
+    }
+    return h.resolveDefault(id)
+  })
   await h.restart()
-  h.controller.create.mockImplementation(create)
-  await vi.waitFor(() => expect(h.deliveries.mock.calls.filter(([call]) => call.sessionId === `requirement-scope-${proposalId}`))
-    .toHaveLength(1), { timeout: 20_000 })
+  await impostorSeen.promise
+  await h.runtime.effects.idle('requirementScopeReview')
+  await expect(h.runTool(reviewer, 'orchestrator_plan_scope_review', { status: 'within-handoff', reason: 'Same ID, different instance.' }))
+    .rejects.toThrow(/not registered/i)
+  restoreOriginal = true
+  await vi.waitFor(() => expect(h.tools.get(reviewer)?.has('orchestrator_plan_scope_review')).toBe(true), { timeout: 20_000 })
+  expect(tasks()).toHaveLength(1)
+  h.controller.resolveAgent.mockImplementation(h.resolveDefault)
   expect(await preview()).toMatchObject({ status: 'preview', proposalId, requestMessageId: proposal.requestMessageId,
     scopeReview: { status: 'pending' } })
   expect(await read(`plan-requirement/${proposalId}`)).toMatchObject({ status: 'preview', affected: proposal.affected })
@@ -1307,7 +1344,10 @@ it('previews a product replan before applying an exact, durable direct approval'
   expect(await h.runTool(replacement.session, 'orchestrator_read', { resource: `ticket/${replacement.ticketId}/plan-scope` }))
     .toMatchObject({ goal: fanInSpec.body, authorizedScope: brief.authorization.scope, acceptanceScope: brief.acceptanceScope,
       outOfScope: fanInSpec.outOfScope, acceptance: [{ id: '1', text: expect.stringContaining(changed.observable) }],
+      interfaceContract: { path: 'docs/catalog-api.md', previousRequirements: 'Document query inputs and return all substring matches.' },
       inheritedChecks: [expect.objectContaining({ command: 'pnpm test catalog', read: failed.read })] })
+  expect((await read(`ticket/${replacement.ticketId}/assignment`)).text).not.toContain('return all substring matches')
+  expect((await read(`ticket/${replacement.ticketId}/delivery-check`)).missing).toContain('failed_checks_require_recheck')
   expect(await read(`plan/${id}/meter`)).toMatchObject({ sessions: expect.arrayContaining([
     expect.objectContaining({ ticket_id: catalogClaim.ticketId, plan_id: id }),
     expect.objectContaining({ ticket_id: replacement.ticketId, plan_id: id }),

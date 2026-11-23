@@ -119,7 +119,8 @@ export function technicalReplan(plan: PlanDraft, change: TechnicalChange, contex
         }
         if (node.interfaceContract) {
           if (interfaceContract && (interfaceContract.path !== node.interfaceContract.path ||
-            interfaceContract.requirements !== node.interfaceContract.requirements)) invalid('Cannot merge conflicting interface contracts')
+            interfaceContract.requirements !== node.interfaceContract.requirements ||
+            interfaceContract.previousRequirements !== node.interfaceContract.previousRequirements)) invalid('Cannot merge conflicting interface contracts')
           interfaceContract = node.interfaceContract
         }
         for (const id of node.blockedBy) {

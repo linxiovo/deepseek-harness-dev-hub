@@ -118,7 +118,8 @@ export class Engine {
         actor: { source: 'plan', id: 'hub' }, scope: `Plan ${planId} node ${node.id}` }
       const note = `Plan node ${node.id}; execution role ${node.role}. Plan scope: ticket/${id}/plan-scope. `
         + `Demonstrate: ${node.demonstration}`
-        + (node.interfaceContract ? ` Interface contract: ${node.interfaceContract.path}; ${node.interfaceContract.requirements}` : '')
+        + (node.interfaceContract ? ` Interface contract: ${node.interfaceContract.path}.` : '')
+        + (node.interfaceContract?.requirements ? ` ${node.interfaceContract.requirements}` : '')
       this.tickets.create(id, key('plan-decision', planId, node.id), mandate, { triggerIds: [key('plan-trigger', planId, node.id)] },
         { kind: 'accept', title: node.title, scope: mandate.scope, reason: 'Plan dispatch', name: 'plan-node', note }, isoTime(at), plan)
       return this.repo.tickets.get(id)!

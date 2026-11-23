@@ -2,6 +2,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { createReadStream } from 'node:fs'
+import { pipeline } from 'node:stream/promises'
 import { z } from 'zod'
 import { PROJECT_SCOPE_HEADER, THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
 import { InstallationError, type GithubIdentity, type InstallationApi, type OnboardingView, type ProjectView, type RuntimeView }
@@ -25,6 +27,8 @@ import type { ScopedAttention } from './scoped-attention.ts'
 import type { SessionMeter } from './session-meter.ts'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
+import type { PlanIntegrationView } from '../core/plan-integration.ts'
+import { PlanArtifactFileSchema, type PlanArtifactFile } from './plan-artifacts.ts'
 import { actorIdPattern, TopicBindingError, type TopicBinding } from './topic-binding.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
 import type { Variable } from './execution-environment.ts'
@@ -55,6 +59,8 @@ export interface HttpHost {
   readonly meter: Pick<SessionMeter, 'read'>
   readonly projectMeter: Pick<ProjectMeter, 'read'>
   readonly runLimits?: { view(ticketId?: string): RunLimitStatus | undefined }
+  readonly planIntegration?: { view(id: string): PlanIntegrationView | undefined }
+  readonly planArtifact?: (id: string) => Promise<PlanArtifactFile | undefined>
   readonly attention: Pick<ScopedAttention, 'summary' | 'entry' | 'verify'>
   readonly health: Record<string, Health>
   readonly machine: Machine
@@ -141,7 +147,8 @@ export type StateView = ReturnType<typeof stateView>
 function ticketPage(runtime: HttpHost, id: string) {
   const detail = ticketDetail(views(runtime), id), ticket = runtime.store.tickets.get(id)
   if (!detail || !ticket) throw new RouteError(404, 'Ticket not found')
-  return { ...detail, environment: runtime.configured() ? runtime.ticketEnvironment(ticket) : [] }
+  return { ...detail, ...(ticket.plan ? { planId: ticket.plan.planId } : {}),
+    environment: runtime.configured() ? runtime.ticketEnvironment(ticket) : [] }
 }
 export type TicketPageView = ReturnType<typeof ticketPage>
 function promptsView(runtime: HttpHost, revision: number | undefined, offset: number) {
@@ -161,7 +168,8 @@ interface Input<K extends keyof Api> {
   params: RouteParams<K>; query: Record<string, string>; body: (maxBytes?: number) => Promise<unknown>
   write<T>(operation: () => T | Promise<T>, verify?: () => Promise<void>): T | Promise<T>
 }
-type Routes = { [K in keyof Api]: (input: Input<K>) => ApiResponse<K> | Promise<ApiResponse<K>> }
+type RouteOutput<K extends keyof Api> = K extends 'GET plans/:id/artifact' ? PlanArtifactFile : ApiResponse<K>
+type Routes = { [K in keyof Api]: (input: Input<K>) => RouteOutput<K> | Promise<RouteOutput<K>> }
 const offset = z.coerce.number().int().nonnegative().catch(0)
 const limit = (fallback: number, max: number) => z.coerce.number().int().positive().catch(fallback).transform(value => Math.min(max, value))
 const TicketsQuery = z.object({ state: z.enum(TICKET_FILTERS).catch('open'), offset, limit: limit(20, 1000) })
@@ -250,6 +258,10 @@ const topicBindingRoutes: Partial<Record<keyof Api, true>> = {
 
 const projectMeterRoutes: Partial<Record<keyof Api, true>> = {
   'GET project/meter': true, 'GET plans/:id/meter': true, 'GET tickets/:id/meter': true,
+}
+
+const requiredProjectRoutes: Partial<Record<keyof Api, true>> = {
+  'GET plans/:id/delivery': true, 'GET plans/:id/artifact': true,
 }
 
 const runLimitRoutes: Partial<Record<keyof Api, true>> = {
@@ -401,6 +413,17 @@ function routes(runtime: HttpHost): Routes {
       return view
     },
     'GET project/meter': () => meter('project'),
+    'GET plans/:id/delivery': ({ params }) => {
+      const view = runtime.planIntegration?.view(params.id)
+      if (!view) throw new UserError('unknownPlan', { id: params.id })
+      return view
+    },
+    'GET plans/:id/artifact': async ({ params }) => {
+      if (!runtime.planIntegration?.view(params.id)) throw new UserError('unknownPlan', { id: params.id })
+      const artifact = await runtime.planArtifact?.(params.id)
+      if (!artifact) throw new UserError('planArtifactUnavailable', { id: params.id })
+      return artifact
+    },
     'GET plans/:id/meter': ({ params }) => meter('plan', params.id),
     'GET tickets/:id/meter': ({ params }) => meter('ticket', params.id),
     'GET project/run-limits': () => runLimitStatus(),
@@ -477,6 +500,8 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
       if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
       let installationRoute = false
       let attentionRoute = false
+      let mounted: string | null = null
+      let artifactLease = false
       try {
         const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
         if (!route) throw new RouteError(404, 'Unknown operation')
@@ -485,11 +510,11 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         if (!installationRoute) await runtime.ready
         const scope = req.headers[PROJECT_SCOPE_HEADER]
         const runLimitRoute = runLimitRoutes[route.key] === true
-        const mountedRoute = attentionRoute || runLimitRoute || route.key === 'GET settings' || projectMeterRoutes[route.key]
-        const requirement = attentionRoute || runLimitRoute ? 'required' : 'optional'
-        const mounted = mountedRoute ? readableMount(scope, requirement) : undefined
-        if (route.key === 'GET topic-binding') readableMount(scope, 'required')
-        else if (!mountedRoute && !installationRoute && scope !== undefined && (route.key.startsWith('GET ') || route.key === 'POST prompts/preview')) {
+        const requiredProject = attentionRoute || runLimitRoute || topicBindingRoutes[route.key] === true || requiredProjectRoutes[route.key] === true
+        const mountedRoute = requiredProject || route.key === 'GET settings' || projectMeterRoutes[route.key]
+        const requirement = requiredProject ? 'required' : 'optional'
+        if (mountedRoute) mounted = readableMount(scope, requirement)
+        else if (!installationRoute && scope !== undefined && (route.key.startsWith('GET ') || route.key === 'POST prompts/preview')) {
           assertProjectScope(runtime.installation?.projects().activeProjectId ?? null, scope, 'optional')
         }
         const query = Object.fromEntries(url.searchParams)
@@ -497,9 +522,17 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
           ? [...url.searchParams.keys()].some(key => key !== 'planId') || url.searchParams.getAll('planId').length > 1
           : url.searchParams.size !== 0)) throw new RouteError(400, 'Invalid attention query')
         if (runLimitRoute && url.searchParams.size !== 0) throw new RouteError(400, 'Invalid run limits query')
+        if (route.key === 'GET plans/:id/delivery' && url.searchParams.size !== 0) {
+          throw new RouteError(400, 'Invalid plan delivery query')
+        }
         if (route.key === 'POST attention/credentials/:id/verify'
           && req.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') {
           throw new RouteError(400, 'Expected Content-Type: application/json')
+        }
+        if (route.key === 'GET plans/:id/artifact') {
+          if (writing) throw new InstallationError(409, 'projectConflict')
+          writing = 'project'
+          artifactLease = true
         }
         let result: unknown
         try {
@@ -512,10 +545,21 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
           // Do not deliver a sample or credential receipt from a retiring or replaced mount.
           if (mountedRoute && readableMount(scope, requirement) !== mounted) throw new InstallationError(409, 'staleProject')
         }
-        json(res, 200, result)
+        if (route.key === 'GET plans/:id/artifact') {
+          const transfer = PlanArtifactFileSchema.safeParse(result)
+          if (!transfer.success) throw new Error('Plan artifact transfer metadata is invalid')
+          const artifact = transfer.data
+          res.writeHead(200, { 'content-type': artifact.contentType, 'cache-control': 'no-store',
+            'x-content-type-options': 'nosniff', 'content-length': artifact.size,
+            'content-disposition': `attachment; filename="${artifact.fileName}"`, 'x-artifact-sha256': artifact.sha256 })
+          await pipeline(createReadStream(artifact.path), res)
+        } else json(res, 200, result)
       } catch (error) {
+        if (res.headersSent) { res.destroy(error instanceof Error ? error : undefined); return }
         const respond = attentionRoute ? attentionFailure : installationRoute ? installationFailure : failure
         json(res, ...respond(error))
+      } finally {
+        if (artifactLease) writing = undefined
       }
     } })]
   return async () => {

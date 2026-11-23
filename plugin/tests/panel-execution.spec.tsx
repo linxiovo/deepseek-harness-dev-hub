@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 // The Execution status, a Ticket, and the Execution settings.
 import { act } from 'react'
-import { expect, it } from 'vitest'
+import { expect, it, vi } from 'vitest'
+import type { PlanIntegrationView } from '../src/core/plan-integration.ts'
+import { projectNavigation, ticketNavigationLink } from '../src/navigation.ts'
 import { en, zh } from '../src/client/locales.ts'
 import { usePanel, mount, remount, all, find, tab, click, type, text, field, at } from './fixtures/panel.tsx'
 import { MEMBER, server, ticketSummary, threadSummary } from './fixtures/panel-server.ts'
@@ -42,7 +44,6 @@ it('lists Tickets under Execution by who they wait on, with the Executor state a
 
 it('stops an open Ticket from its page after confirmation', async () => {
   await mount()
-  await click('修复回归')
   await click(zh.stop)
   expect(server.requests.some(request => request.path.endsWith('/stop'))).toBe(false)
   expect(document.querySelector('[role="dialog"]')?.textContent).toContain('停止“修复回归”')
@@ -74,6 +75,66 @@ it('shows a Ticket with its stage, its Mandate details with the Trigger and Deci
   await click(document.querySelector<HTMLElement>('.dt-trigger-link')!)
   expect(tab(zh['tab.trigger']).getAttribute('aria-selected')).toBe('true')
 })
+
+it('opens a delivered Ticket from a project-scoped Harness link', async () => {
+  const projectId = 'a'.repeat(32), ticketId = 'b'.repeat(32)
+  server.projectId = projectId
+  server.ticketDetails[ticketId] = { ...server.ticketDetails.t1!, id: ticketId, planId: 'plan-a' }
+  const view: PlanIntegrationView = { planId: 'plan-a', status: 'delivered',
+    version: { repository: 'acme/widgets', ref: 'refs/heads/main', sha: 'a'.repeat(40), context: 'b'.repeat(64), workflowId: '44',
+      configuration: 'plugin-check-v1', environment: 'hosted-v1' },
+    run: { id: 12, attempt: 1, url: 'https://github.com/acme/widgets/actions/runs/12', checks: [] },
+    artifact: { id: 19, name: 'plugin-bundle', url: 'https://github.com/acme/widgets/actions/runs/12/artifacts/19',
+      fileName: 'dsh-superagent-0.1.0.tgz', contentType: 'application/gzip', size: 128, sha256: 'c'.repeat(64) },
+    verifiedAt: '2026-11-23T00:00:00Z' }
+  server.planDeliveries['plan-a'] = view
+  const deliveryUrl = ticketNavigationLink('http://127.0.0.1:3082', projectId, ticketId)
+  window.history.replaceState({}, '', new URL(deliveryUrl).pathname + new URL(deliveryUrl).search)
+  try {
+    await mount()
+    expect(document.querySelector('.dt-page-title h2')?.textContent).toBe('修复回归')
+    const target = projectNavigation(window.location.search)
+    expect(target).toMatchObject({ projectId, ticketId, view: 'project' })
+    expect(text()).toContain(zh['planDelivery.status.delivered'])
+    expect(text()).toContain('dsh-superagent-0.1.0.tgz')
+  } finally { window.history.replaceState({}, '', '/') }
+})
+it('shows the exact release hold and downloads its verified Plan package', async () => {
+  server.projectId = 'a'.repeat(32)
+  server.ticketDetails.t1 = { ...server.ticketDetails.t1!, planId: 'plan-a' }
+  const view: PlanIntegrationView = { planId: 'plan-a', status: 'awaiting-release-verification',
+    version: { repository: 'acme/widgets', ref: 'refs/heads/main', sha: 'a'.repeat(40), context: 'b'.repeat(64), workflowId: '44',
+      configuration: 'plugin-check-v1', environment: 'hosted-v1' },
+    run: { id: 12, attempt: 2, url: 'https://github.com/acme/widgets/actions/runs/12',
+      checks: [{ name: 'integration-identity', status: 'completed', conclusion: 'success', url: 'https://github.com/acme/widgets/job/1' }] },
+    artifact: { id: 19, name: 'plugin-bundle', url: 'https://github.com/acme/widgets/actions/runs/12/artifacts/19',
+      fileName: 'dsh-superagent-0.1.0.tgz', contentType: 'application/gzip', size: 128, sha256: 'c'.repeat(64) }, verifiedAt: '2026-11-23T00:00:00Z' }
+  server.planDeliveries['plan-a'] = view
+  server.planArtifacts['plan-a'] = new Uint8Array([1, 2, 3]).buffer
+  at({ page: 'execution', id: 't1' })
+  await mount()
+  expect(text()).toContain(zh['planDelivery.status.awaiting-release-verification'])
+  expect(text()).toContain('dsh-superagent-0.1.0.tgz')
+  const originalCreateUrl = URL.createObjectURL, originalRevokeUrl = URL.revokeObjectURL
+  Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: () => 'blob:verified-package' })
+  Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: () => {} })
+  let downloadedName = ''
+  const anchor = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+    downloadedName = this.download
+  })
+  try {
+    await click(zh['planDelivery.download'])
+    expect(server.requests.some(request => request.path === 'plans/plan-a/artifact' && request.method === 'GET')).toBe(true)
+    await act(async () => { await vi.waitFor(() => expect(downloadedName).toBe('dsh-superagent-0.1.0.tgz')) })
+  } finally {
+    anchor.mockRestore()
+    if (originalCreateUrl) Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: originalCreateUrl })
+    else Reflect.deleteProperty(URL, 'createObjectURL')
+    if (originalRevokeUrl) Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: originalRevokeUrl })
+    else Reflect.deleteProperty(URL, 'revokeObjectURL')
+  }
+})
+
 
 it('displays verified worktree identity and actual writer, then names a rejected preparation without inventing Git facts', async () => {
   const t1 = server.ticketDetails.t1!

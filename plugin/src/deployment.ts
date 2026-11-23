@@ -6,6 +6,7 @@ import type { Volatile } from '@deepseek-ai/cordis'
 import s from '@deepseek-ai/schemastery'
 import { z } from 'zod'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
+import type { PlanVerificationConfig } from './core/plan-integration.ts'
 import { runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra/environment.ts'
 import { SetupError } from './setup.ts'
 
@@ -20,6 +21,16 @@ const CredentialCheckConfig: s<Partial<CredentialCheck>, CredentialCheck> = s.ob
   args: s.array(s.string()).default([]),
   providerUrl: s.string().description('Optional HTTPS configuration page, without embedded credentials, query or fragment.'),
 })
+type PlanVerificationConfigInput = Omit<PlanVerificationConfig, 'jobs'> & { jobs: string[] }
+const PlanVerificationConfigSchema: s<PlanVerificationConfigInput> = s.object({
+  projectId: s.string().pattern(/^[a-f0-9]{32}$/).required(),
+  workflowId: s.string().pattern(/^[1-9][0-9]*$/).required(),
+  identityJob: s.string().pattern(/^[^\p{Cc}\p{Cf}]{1,128}$/u).required(),
+  jobs: s.array(s.string().pattern(/^[^\p{Cc}\p{Cf}]{1,128}$/u)).min(1).max(16).required(),
+  artifactName: s.string().pattern(/^[a-zA-Z0-9_.-]{1,80}$/).required(),
+  configuration: s.string().pattern(/^[a-zA-Z0-9_.-]{1,120}$/).required(),
+  environment: s.string().pattern(/^[a-zA-Z0-9_.-]{1,120}$/).required(),
+})
 /** Plugin configuration of the dsh-superagent entry. Volatile fields apply without a restart because dsh-superagent reads them on each use; changing `stateDir` remounts the plugin. */
 export const Config = s.object({
   stateDir: absolute('Directory for the database, locks, worker shims, the agent\'s git configuration and, by default, the ticket directories.').required(),
@@ -31,6 +42,7 @@ export const Config = s.object({
   admissionContextTimeoutMs: s.number().min(LIMITS.admissionContextTimeoutMs.min).max(LIMITS.admissionContextTimeoutMs.max).step(1)
     .default(15000).description('Time limit of one context read during an assessment, in milliseconds.').volatile(),
   credentialChecks: s.array(CredentialCheckConfig).default([]).description('Project test-account checks. Credentials must not appear in arguments.'),
+  planVerification: s.array(PlanVerificationConfigSchema).default([]).description('Trusted non-production full regression workflows by project.'),
 })
 export type DeploymentConfig = ReturnType<typeof Config>
 export type RuntimeMode = 'desktop' | 'headless'
@@ -41,6 +53,7 @@ export interface Machine {
   stateDir: string
   runtimeMode?: RuntimeMode
   credentialChecks?: readonly CredentialCheck[]
+  planVerification?: readonly PlanVerificationConfig[]
   promptMaxChars: Volatile<number>
   admissionContextMaxPages: Volatile<number>
   admissionContextTimeoutMs: Volatile<number>
@@ -55,7 +68,7 @@ const MOVED: Record<string, string> = {
 export function machineOf(config: DeploymentConfig): Machine {
   const unknown = Object.keys(config).filter(key => !(key in (Config.dict ?? {})))
   if (unknown.length) throw new Error(`dsh-superagent configuration has keys it does not use: ${unknown.map(key => MOVED[key] ? `${key} (now ${MOVED[key]})` : key).join(', ')}; docs/006-deployment.md lists the keys`)
-  const { stateDir, runtimeMode, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, credentialChecks } = config
+  const { stateDir, runtimeMode, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, credentialChecks, planVerification } = config
   if (new Set(credentialChecks.map(check => `${check.projectId}:${check.id}`)).size !== credentialChecks.length) {
     throw new Error('Duplicate credential check for the same project and credential ID')
   }
@@ -65,8 +78,14 @@ export function machineOf(config: DeploymentConfig): Machine {
       throw new Error('Credential provider URL must be HTTPS without credentials, a query or a fragment')
     }
   }
+  if (new Set(planVerification.map(check => check.projectId)).size !== planVerification.length)
+    throw new Error('Duplicate Plan verification for the same project')
+  for (const { workflowId } of planVerification) if (!Number.isSafeInteger(Number(workflowId)))
+    throw new Error('Plan verification workflow ID must be a safe positive integer')
+  for (const { identityJob, jobs } of planVerification) if (!jobs.includes(identityJob) || new Set(jobs).size !== jobs.length || jobs.some(job => !job.trim()))
+    throw new Error('Plan verification requires a listed identity job and unique, non-blank full regression job names')
   return { stateDir, runtimeMode: runtimeMode ?? 'desktop', promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs,
-    ...(credentialChecks.length ? { credentialChecks } : {}) }
+    ...(credentialChecks.length ? { credentialChecks } : {}), ...(planVerification.length ? { planVerification } : {}) }
 }
 
 const RepositoryName = z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, 'owner/name')

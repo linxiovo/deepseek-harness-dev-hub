@@ -4,6 +4,7 @@
  */
 import type { Handoff, ProjectRef, Spec } from './core/handoff.ts'
 import type { Plan, PlanMessage, PlanNodeState } from './core/plan.ts'
+import type { PlanIntegrationView } from './core/plan-integration.ts'
 import type { PromptVersion } from './app/prompts.ts'
 import type { MainlineIntent } from './app/mainline-queue.ts'
 import type { SettingsVersion } from './app/store.ts'
@@ -83,6 +84,8 @@ export const KV = {
   /** Plans: immutable DAGs plus mutable node execution claims and append-only context. */
   plans: { record: family<Plan, [id: string]>('plan:'),
     node: family<PlanNodeState, [id: string, nodeId: string]>('plan-node:', (id, nodeId) => JSON.stringify([id, nodeId])),
+    integration: family<PlanIntegrationView>('plan-integration:'),
+    integrationDispatch: family<true>('plan-integration-dispatch:'),
     background: family<PlanMessage[], [id: string]>('plan-background:'),
     instructions: family<PlanMessage[], [id: string, nodeId: string]>('plan-instructions:',
       (id, nodeId) => JSON.stringify([id, nodeId])),

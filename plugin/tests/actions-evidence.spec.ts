@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { Commands } from '../src/infra/commands.ts'
-import { actionsEvidence } from '../src/sources/actions-evidence.ts'
+import { actionsEvidence, dispatchPlanActions, observePlanActions } from '../src/sources/actions-evidence.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 
 const SHA = 'a'.repeat(40)
@@ -307,4 +307,86 @@ it('rejects abbreviated or query-contaminated commit IDs before calling GitHub',
   await expect(actionsEvidence(commands, { kind: 'ticket', id: 'T-14' }, `${SHA}&page=2`, BUILD)).rejects.toThrow('complete lowercase commit SHA')
   await expect(actionsEvidence(commands, { kind: 'ticket', id: 'T-14' }, SHA.slice(0, 7), BUILD)).rejects.toThrow('complete lowercase commit SHA')
   expect(gh).not.toHaveBeenCalled()
+})
+
+const PLAN = {
+  repository: 'acme/widgets', ref: 'refs/heads/release/next', sha: SHA, context: 'b'.repeat(64),
+  verification: { projectId: 'project-1', workflowId: '44', identityJob: 'full regression', jobs: ['full regression', 'package'], artifactName: 'release',
+    configuration: 'production-like', environment: 'staging' },
+} as const
+
+it('dispatches only the dedicated verification workflow with exact branch and inputs', async () => {
+  const run = vi.spyOn(commands, 'run').mockResolvedValueOnce('{"workflow_run_id":21}')
+  await dispatchPlanActions(commands, PLAN)
+  expect(run.mock.calls[0]?.[1]).toEqual(['api', 'repos/acme/widgets/actions/workflows/44/dispatches', '--method', 'POST',
+    '-H', 'X-GitHub-Api-Version: 2026-03-10', '-f', 'ref=release/next', '-f', `inputs[dsh_commit]=${SHA}`,
+    '-f', `inputs[dsh_context]=${PLAN.context}`, '-f', 'inputs[dsh_configuration]=production-like', '-f', 'inputs[dsh_environment]=staging'])
+})
+
+it('observes only the latest matching contextual run and its same-attempt artifact', async () => {
+  const gh = vi.spyOn(commands, 'gh').mockResolvedValueOnce({ total_count: 2, workflow_runs: [
+    { id: 20, workflow_id: 44, run_number: 20, run_attempt: 1, head_sha: SHA, head_branch: 'release/next',
+      event: 'workflow_dispatch', display_title: `dsh-plan-verification:${PLAN.context}`, status: 'completed', conclusion: 'success' },
+    { id: 21, workflow_id: 44, run_number: 21, run_attempt: 2, head_sha: SHA, head_branch: 'release/next',
+      event: 'workflow_dispatch', display_title: `dsh-plan-verification:${PLAN.context}`, status: 'completed', conclusion: 'success' },
+  ] }).mockResolvedValueOnce({ total_count: 2, jobs: [
+    { id: 31, run_id: 21, run_attempt: 2, head_sha: SHA, name: 'full regression', status: 'completed', conclusion: 'success' },
+    { id: 32, run_id: 21, run_attempt: 2, head_sha: SHA, name: 'package', status: 'completed', conclusion: 'success' },
+  ] }).mockResolvedValueOnce({ total_count: 2, artifacts: [
+    { id: 41, name: `release-${SHA}-1`, expired: false, size_in_bytes: 100, workflow_run: { id: 20, head_sha: SHA } },
+    { id: 42, name: `release-${SHA}-2`, expired: false, size_in_bytes: 100, workflow_run: { id: 21, head_sha: SHA } },
+  ] }).mockResolvedValueOnce({ total_count: 2, workflow_runs: [
+    { id: 20, workflow_id: 44, run_number: 20, run_attempt: 1, head_sha: SHA, head_branch: 'release/next',
+      event: 'workflow_dispatch', display_title: `dsh-plan-verification:${PLAN.context}`, status: 'completed', conclusion: 'success' },
+    { id: 21, workflow_id: 44, run_number: 21, run_attempt: 2, head_sha: SHA, head_branch: 'release/next',
+      event: 'workflow_dispatch', display_title: `dsh-plan-verification:${PLAN.context}`, status: 'completed', conclusion: 'success' },
+  ] })
+
+  expect(await observePlanActions(commands, PLAN)).toEqual({ status: 'passed', run: { id: 21, attempt: 2,
+    url: 'https://github.com/acme/widgets/actions/runs/21', checks: [
+      { name: 'full regression', status: 'completed', conclusion: 'success', url: 'https://github.com/acme/widgets/actions/runs/21/job/31' },
+      { name: 'package', status: 'completed', conclusion: 'success', url: 'https://github.com/acme/widgets/actions/runs/21/job/32' },
+    ] }, artifact: { id: 42, name: `release-${SHA}-2`, url: 'https://github.com/acme/widgets/actions/runs/21/artifacts/42' } })
+  expect(gh.mock.calls[0]?.[0]).toEqual(['api', `repos/acme/widgets/actions/workflows/44/runs?head_sha=${SHA}&branch=release%2Fnext&event=workflow_dispatch&per_page=100&page=1`])
+})
+
+it('does not accept an older successful attempt when a rerun starts during artifact inspection', async () => {
+  const run = (id: number, attempt: number, status: string, conclusion: string | null) => ({ id, workflow_id: 44,
+    run_number: 21, run_attempt: attempt, head_sha: SHA, head_branch: 'release/next', event: 'workflow_dispatch',
+    display_title: `dsh-plan-verification:${PLAN.context}`, status, conclusion })
+  vi.spyOn(commands, 'gh').mockResolvedValueOnce({ total_count: 1, workflow_runs: [run(21, 1, 'completed', 'success')] })
+    .mockResolvedValueOnce({ total_count: 2, jobs: [
+      { id: 31, run_id: 21, run_attempt: 1, head_sha: SHA, name: 'full regression', status: 'completed', conclusion: 'success' },
+      { id: 32, run_id: 21, run_attempt: 1, head_sha: SHA, name: 'package', status: 'completed', conclusion: 'success' },
+    ] }).mockResolvedValueOnce({ total_count: 1, artifacts: [
+      { id: 41, name: `release-${SHA}-1`, expired: false, size_in_bytes: 100, workflow_run: { id: 21, head_sha: SHA } },
+    ] }).mockResolvedValueOnce({ total_count: 1, workflow_runs: [run(21, 2, 'in_progress', null)] })
+  expect(await observePlanActions(commands, PLAN)).toEqual({ status: 'pending', run: { id: 21, attempt: 2,
+    url: 'https://github.com/acme/widgets/actions/runs/21', checks: [] } })
+})
+
+it('does not accept an older green run when the latest exact-context run has skipped regression work', async () => {
+  vi.spyOn(commands, 'gh').mockResolvedValueOnce({ total_count: 2, workflow_runs: [
+    { id: 20, workflow_id: 44, run_number: 20, run_attempt: 1, head_sha: SHA, head_branch: 'release/next',
+      event: 'workflow_dispatch', display_title: `dsh-plan-verification:${PLAN.context}`, status: 'completed', conclusion: 'success' },
+    { id: 21, workflow_id: 44, run_number: 21, run_attempt: 1, head_sha: SHA, head_branch: 'release/next',
+      event: 'workflow_dispatch', display_title: `dsh-plan-verification:${PLAN.context}`, status: 'completed', conclusion: 'success' },
+  ] }).mockResolvedValueOnce({ total_count: 2, jobs: [
+    { id: 31, run_id: 21, run_attempt: 1, head_sha: SHA, name: 'full regression', status: 'completed', conclusion: 'success' },
+    { id: 32, run_id: 21, run_attempt: 1, head_sha: SHA, name: 'package', status: 'completed', conclusion: 'skipped' },
+  ] })
+  expect(await observePlanActions(commands, PLAN)).toMatchObject({ status: 'failed', reason: 'full_regression_missing', run: { id: 21 } })
+})
+
+it('rejects an artifact from an older attempt of the selected run', async () => {
+  vi.spyOn(commands, 'gh').mockResolvedValueOnce({ total_count: 1, workflow_runs: [
+    { id: 21, workflow_id: 44, run_number: 21, run_attempt: 2, head_sha: SHA, head_branch: 'release/next',
+      event: 'workflow_dispatch', display_title: `dsh-plan-verification:${PLAN.context}`, status: 'completed', conclusion: 'success' },
+  ] }).mockResolvedValueOnce({ total_count: 2, jobs: [
+    { id: 31, run_id: 21, run_attempt: 2, head_sha: SHA, name: 'full regression', status: 'completed', conclusion: 'success' },
+    { id: 32, run_id: 21, run_attempt: 2, head_sha: SHA, name: 'package', status: 'completed', conclusion: 'success' },
+  ] }).mockResolvedValueOnce({ total_count: 1, artifacts: [
+    { id: 41, name: `release-${SHA}-1`, expired: false, size_in_bytes: 100, workflow_run: { id: 21, head_sha: SHA } },
+  ] })
+  expect(await observePlanActions(commands, PLAN)).toMatchObject({ status: 'failed', reason: 'artifact_unavailable', run: { id: 21, attempt: 2 } })
 })

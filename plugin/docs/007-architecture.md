@@ -32,6 +32,8 @@ flowchart TB
 
 Startup registers management routes, initializes the installation binding and runs Setup. After setup resolves, it installs Session and Executor hooks, ensures the main Session exists, syncs Policy, resumes handoffs and interrupted Assignments, and starts passes and effects. `Runtime.ready` marks completion of startup; the installation API can answer before that promise resolves.
 
+`PlanIntegration` owns the durable Plan-level verification effect and its final delivery status and relay. The interface and recovery contract are in `017-plan-integration.md`.
+
 Source plugins inject Runtime as the `orchestrator` service through the narrow `SourceHost` interface.
 Ticket review evidence is submitted only by a Worker descendant through `orchestrator_review_submit`; `Sessions` binds the real descendant Session ID, `DshExecutor` verifies the clean current worktree HEAD against the pinned base, and the Engine atomically records evidence on the current Assignment and writer generation. `ticket/<id>/reviews` returns current-generation evidence and pending when the live Worker lease, worktree HEAD or cleanliness no longer matches; `ticket/<id>/review/<review-id>` reads one persisted review.
 
@@ -190,6 +192,7 @@ Failures retry with exponential backoff. Throwing `Later` defers work without co
 | `splitting` | Planning | Gives a published spec to its splitter; the durable intent is retired with Plan registration | 1 | 2 s doubling to 60 s for delivery failures; resumes unfinished work on restart |
 | `delivery` | DshExecutor | Hands a Ticket's waiting Inputs to its running Assignment, in order | 4, none while paused | 2 s doubling to 60 s; one that waits for a worker slot tries again after 2 s |
 | `mainlineDelivery` | MainlineQueue | Rechecks one verified intent for [formal Plan closure](003-execution.md#formal-plan-closure) | 8, only when configured | Resumes pending work on restart; evidence gaps stay on the Ticket until rechecked |
+| `planIntegration` | PlanIntegration | Verifies the actual target, full regression jobs and the attempt-matched package after all formal Plan receipts exist | 4, only when configured and unpaused | Persists the exact revision/configuration before dispatch; resumes by observing that context |
 | `relay` | Sessions | Steers a worker's report or question, or a person's follow-up, into the main Session's turn | 1, in queue order | 2 s doubling to 60 s |
 | `notice` | Sessions | Injects a notice into the main Session without waking it | 1, in queue order | 2 s doubling to 60 s |
 | `reply` | Outbox | Sends a message for a Channel through its Source, after the earlier messages of its Ticket to its conversation that have not failed three times; withdrawing the message cancels it | 1, none while paused | 5 s doubling to 300 s; one whose Source is off, or behind an earlier message, tries again after 5 s |
@@ -214,11 +217,11 @@ That context supplies deployment and commands, setup readiness (`ready`, `config
 
 ### Actions evidence
 
-`src/sources/actions-evidence.ts` is the shared read-only provider for GitHub Actions results, not a second CI poller. `actionsEvidence(commands, work, sha, required, pr?)` queries `actions/runs?head_sha=<sha>` in the configured repository, then reads the selected runs' latest-attempt jobs and run-level artifacts. It pages all three collections and never reads CI logs. The candidate SHA must be complete and lowercase. Tickets with an own PR or an originating PR use that PR's current head, not GitHub's synthetic merge commit. A run must match `head_sha` and include the same PR number, head SHA and base SHA in `pull_requests`. This rules out unrelated pushes and runs for another PR or base, even on the same head commit.
+`src/sources/actions-evidence.ts` supplies shared GitHub Actions evidence and the dedicated Plan workflow dispatch; it is not a background CI poller. `actionsEvidence(commands, work, sha, required, pr?)` queries `actions/runs?head_sha=<sha>` in the configured repository and reads the selected runs' latest-attempt jobs and run-level artifacts. Plan integration dispatches only the configured numeric workflow for an exact commit and profile, then reads its exact-context run, Jobs and artifact metadata. Both paths page their collections and never read CI logs. The candidate SHA must be complete and lowercase. Tickets with an own PR or an originating PR use that PR's current head, not GitHub's synthetic merge commit. A run must match `head_sha` and include the same PR number, head SHA and base SHA in `pull_requests`. This rules out unrelated pushes and runs for another PR or base, even on the same head commit.
 
-The result identifies the provider, repository, work item (`ticket` or `plan` and its id), candidate `sha` and required names. Each check reports its name, `workflowId`, status, conclusion, `passed`, run metadata when present (`id`, `attempt`, `sha`, optional `mergeSha`, `url`), the job id and URL when available, and artifact download references (`id`, `name`, `url`, `expired`). `run.sha` is the REST `head_sha`; `mergeSha` is contextual PR metadata, not the query key or proof of the checkout. Artifacts are listed for the run, not verified against its latest attempt. See [CI build and commit evidence](006-deployment.md#ci-build-and-commit-evidence) for the manifest that identifies the actual build.
+The result identifies the provider, repository, work item (`ticket` or `plan` and its id), candidate `sha` and required names. Each check reports its name, `workflowId`, status, conclusion, `passed`, run metadata when present (`id`, `attempt`, `sha`, optional `mergeSha`, `url`), the job id and URL when available, and artifact references. Ticket check artifacts are references only and are not verified against a rerun. Plan delivery separately downloads the file from the exact Actions run and validates its manifest and SHA-256 before recording it. `run.sha` is the REST `head_sha`; `mergeSha` is contextual PR metadata, not the query key or proof of the checkout. See [CI build and commit evidence](006-deployment.md#ci-build-and-commit-evidence) for Ticket CI manifests.
 
-A check passes only when the configured workflow's latest matching run and the job both completed with `success`, and the job matches the exact name, run id, attempt and candidate SHA. For each configured workflow, select the highest GitHub `run_number`, then the highest `run_attempt` within that run. A late update to an older run or a same-name job in another workflow cannot replace the selected result. With no job, evidence keeps the applicable run's status (or `pending` if it has none); `not_run` denotes no matching run or a successful run that omitted the job. Missing, pending, failed, cancelled, skipped or timed-out evidence does not pass. API failures propagate instead of reporting success.
+A ticket check passes only when the configured workflow's latest matching run and job both completed with `success`, and the job matches the exact name, run id, attempt and candidate SHA. Plan verification requires every configured identity and full-regression job to pass and rechecks the exact run and attempt after downloading the artifact file. For each configured workflow, select the highest GitHub `run_number`, then the highest `run_attempt` within that run. A late update to an older run or a same-name job in another workflow cannot replace the selected result. With no job, evidence keeps the applicable run's status (or `pending` if it has none); `not_run` denotes no matching run or a successful run that omitted the job. Missing, pending, failed, cancelled, skipped or timed-out evidence does not pass. API failures propagate instead of reporting success.
 
 `satisfied` requires every configured job to pass. The GitHub Source's [`requiredChecks`](006-deployment.md#development-checks) supplies each exact job name and workflow ID. The provider returns `required_checks_unconfigured` for an empty list and `required_workflow_unconfigured` for any name-only row, without querying Actions in either case. It does not infer checks from branch protection or PR state and does not replace `pullChecks`, the Source's existing polling for Trigger events.
 
@@ -334,7 +337,8 @@ Validation: `tests/session-meter.spec.ts` covers the read seam (absent vs corrup
   | A Ticket's worktree ownership and write access (`execution.ownership`, `execution.active_writer`) | `Tickets`; the Executor inspects Git and confirms the previous writer idle. `pinMainlineRepair` changes the base only with the idle fenced writer and the durable repair Input in the same transaction. |
   | Confirmed handoffs and immutable specifications | `Handoffs` |
   | Plan DAGs, root background, and addressed node instructions | `Plans` |
-  | Mainline FIFOs and integration observations | `MainlineQueue` |
+  | Mainline merge FIFOs and actual Git observations | `MainlineQueue` |
+  | Plan integration views, workflow dispatch intents and final delivery relays | `PlanIntegration` |
   | Project Session attribution and business parentage | `ProjectMeter`, through `bind` at a trusted delegation seam |
   | A Source's read positions, and the meta it keeps on its Threads (`label`, `url`, `facts` and its own keys) | That Source, through `SourceContext` |
   | Settings and their history | Settings |
@@ -372,7 +376,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/admission.ts` | The admission table's values, each cell's options and defaults, shared with the panel |
 | `src/limits.ts` | The limits of the values a person sets, which the settings schemas check and the panel's fields offer |
 | `src/kv.ts` | `KV`: every family of `kv` records with its key, its value's type and its owner, and the `Key` and `Family` types the Store and `SourceContext.state` take |
-| `src/navigation.ts` | Opens a DeepSeek Harness Session from the panel once the host's catalog lists it |
+| `src/navigation.ts` | Opens a DeepSeek Harness Session after catalog verification and routes project/ticket deep links into the mounted panel |
 | `src/core/model.ts` | The domain types, among them the typed Ticket and `MandateBasis`, with `threadKey`, `ticketOutcome`, `reached`, `followupOwners`, `settled`, `waitsForPerson`, `liveTicket`, `runningAssignment`, `latestAssignment` and `latestReport` |
 | `src/core/ports.ts` | The ports: `Repositories`, `Policy`, `SourceScope`, `Assessor`, `Executor`, `Outbox`, and the domain events |
 | `src/core/engine.ts` | The Engine, the core's entry point, and the role interfaces `EngineForSources`, `EngineForMainSession`, `EngineForPeople`, `EngineForSettings` and `EngineForExecutor` |
@@ -389,8 +393,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/ids.ts` | `key`: ids derived from their inputs, equal for equal inputs |
 | `src/core/handoff.ts` | The handoff records: `ProjectRef`, `HandoffInput`, `HandoffQuestion`, `SpecInput`, `Spec` and `Handoff`, with the fields and statuses 009 Handoff describes |
 | `src/core/plan.ts` | Plan DAG records and domain validation: role separation, acceptance coverage and explicit dependencies |
+| `src/core/plan-integration.ts` | Plan full-regression configuration, Actions run evidence, artifact reference and validated retained-file metadata |
 | `src/core/memory.ts` | `MemoryRepositories`: the Store's repositories in memory, in the Store's order and with its nested rollback, for domain tests |
-| `src/core/index.ts` | The core's exports, including `TakeUp` |
+| `src/core/index.ts` | The core's exports, including `TakeUp` and the Plan integration evidence contract |
 | `src/app/runtime.ts` | The Runtime, the composition root, with its start and stop |
 | `src/app/installation-api.ts` | Installation route contract, public views and typed refusals |
 | `src/app/installation.ts` | GitHub onboarding, project registration and selection, and runtime lifecycle view |
@@ -409,6 +414,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/plans.ts` | `Plans`: validates and atomically registers authorized Plan DAGs; keeps plan background separate from node instructions |
 | `src/app/plan-dispatch.ts` | `PlanDispatcher`: validates Frontier predecessors, reserves a launch slot, atomically claims a node into a stable Ticket/Assignment, and rearms the same claim on restart |
 | `src/app/mainline-queue.ts` | Durable per-target FIFO, Ticket attempts, Worker repair, actual Git verification and formal closure coordination |
+| `src/app/plan-integration.ts` | Durable Plan verification after formal Ticket receipts, exact Actions run/attempt checks, checksummed artifact acceptance, exactly-once relay and release hold |
+| `src/app/plan-artifacts.ts` | Downloads one exact Actions artifact into private staging, validates its identity manifest, safe filename, media type and file SHA-256, retains it by Plan/context/run/attempt, and serves only a checksum-matching file |
 | `src/app/scoped-attention.ts` | `ScopedAttention`: durable Plan Ticket credential blockers, deduplicated Hub relays, shared management and Hub projections, and verified continuation; contract in `plugin/docs/015-scoped-attention.md` |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
@@ -468,7 +475,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/github-pull.ts` | The pull request rules: which pull requests a Ticket follows (`claimPull`, `observePull`), the closes it reports to the Engine, and `pullEndNotices`, the chat notice of a Ticket that ended merged or closed |
 | `src/sources/github-channel.ts` | The GitHub Channel: comments and review thread replies, `sent` or `gone` |
 | `src/sources/github-read.ts` | CI snapshots, repository reads, the `github/` resources, and `githubThreadContext`: an Issue's or pull request's conversation by page |
-| `src/sources/actions-evidence.ts` | The shared GitHub Actions evidence provider: `EvidenceWork`, `ActionsEvidence` and `actionsEvidence`, which read one complete candidate commit's workflow runs (with optional PR provenance filtering), latest-attempt jobs and artifacts, and never logs |
+| `src/sources/actions-evidence.ts` | Shared GitHub Actions provider: existing Ticket candidate CI, plus exact-context Plan dispatch and same-attempt full-regression job and artifact verification |
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers: live `reply_to` and history/topic `parent_id` identify the direct parent, not the topic root (`root_id`) |
 | `src/sources/feishu-loops.ts` | The Feishu event consumer, including Windows batch-wrapper launch and process-tree cancellation, history recovery, chat names and polling of subscribed topics. Event-processing errors stay visible for that consumer run even if readiness arrives later |
@@ -540,7 +547,10 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
 | `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |
-| `tests/mainline-queue.spec.ts` | Queue admission, versioned CI, same-target serialization, code and Doc Tree conflicts, formal closure, restart recovery and exactly-once Frontier claims |
+| `tests/plan-integration-crash.spec.ts` | SIGKILL after GitHub accepts workflow dispatch but before the effect records a result; SQLite recovery observes the existing run without another dispatch |
+| `tests/mainline-queue.spec.ts` | Queue admission, versioned candidate CI, same-target serialization, code and Doc Tree conflicts, formal closure, recovery, Plan regression and generic artifact delivery, including a pause during 403 and a rerun during download |
+| `tests/plan-artifacts.spec.ts` | Exact workflow attempt/profile binding, safe filenames and media types, package SHA-256, strict archive contents, restart staging cleanup and retained-file tamper rejection |
+| `tests/panel-execution.spec.tsx` | Ticket delivery status in Harness, release-verification hold and project-scoped artifact download |
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
 | `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, review evidence and child-only review submission, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
@@ -548,7 +558,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/plans.spec.ts` | Automatic spec continuation, graph and role queries, invalid graph refusal, root/node message isolation, usage, credential and quota pauses, concurrent model admission and claim replay through public Session tools, DSH streams and HTTP |
 | `tests/credential-smoke.spec.ts` | Credential smoke CLI against loopback HTTP: request scope, explicit verification and safe results; not a live account check |
 | `tests/runtime-concurrency.spec.ts` | Overlapping Triggers, deliveries and launches; Worker inbox recovery after restart, checked after the runtime drains launch and delivery effects against real Git worktrees |
-| `tests/http.spec.ts` | Management request bounds; ticket worktree and writer projections; meter status, ID decoding, same-origin protection and project switch races |
+| `tests/http.spec.ts` | Management request bounds; ticket worktree and writer projections; meter status, ID decoding, project-scoped binary artifact streaming, same-origin protection and project switch races |
 | `tests/projects.spec.ts` | Durable project registration, selection, re-open and workspace collision checks |
 | `tests/project-work.spec.ts` | Bound handoff and Hub work gates, legacy receipt replay and project-scoped Worker IDs |
 | `tests/github-onboarding.spec.ts` | Managed setup only uses the verified account and bound repository |
@@ -563,7 +573,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/index.spec.ts` | The plugin configuration and setup, the agent's process environment, the plugin entry |
 | `tests/service-script.spec.ts` | `scripts/dsh-superagent` against fake `ps`, `tmux` and `dsh` |
 | `tests/verify-linux.spec.ts` | `scripts/verify-linux.mjs` against temporary git repositories and external Linux/WSL boundaries: fixed-commit export, native tool preflight, failure exit with preserved logs and paths with spaces |
-| `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
+| `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, verified Session navigation, validated project/Ticket deep links and route memory, the local controls, and the panel's imports, which have no cycle |
 | `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
 | `tests/panel-settings.spec.tsx`, `panel-prompts.spec.tsx`, `panel-deployment.spec.tsx`, `panel-panel.spec.tsx` | The settings groups, drafts and history, the prompts, the Deployment page, and the panel's search, glossary and route memory |
 | `tests/draft.spec.ts`, `tests/prompt-config.spec.ts`, `tests/markdown.spec.ts`, `tests/marks.spec.ts` | Draft states, merges and the save bar's line; the prompt configuration by section and the line diff; the Markdown subset and its links; the mark of every state the views classify |

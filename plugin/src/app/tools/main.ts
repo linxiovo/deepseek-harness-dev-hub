@@ -83,6 +83,7 @@ export interface MainToolsHost {
   readonly projectMeter: Pick<ProjectMeter, 'read'>
   readonly runLimits?: { view(ticketId?: string): RunLimitStatus | undefined }
   readonly attention: Pick<ScopedAttention, 'summary' | 'forTicket'>
+  readonly planIntegration?: MainResourceHost['planIntegration']
   readonly handoffs: Pick<Handoffs, 'confirm' | 'answer' | 'get' | 'spec'>
   readonly plans: Pick<Plans, 'get' | 'view' | 'node' | 'append'>
   readonly planDispatcher: Pick<PlanDispatcher, 'dispatch'>
@@ -219,7 +220,8 @@ function routeTool(host: MainToolsHost): Tool {
 /** Builds the main Session's tools; `agent` scopes prompt preview resources to that Session. */
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings,
-    handoffs: host.handoffs, plans: host.plans, projectMeter: host.projectMeter, runLimits: host.runLimits, attention: host.attention }
+    handoffs: host.handoffs, plans: host.plans, projectMeter: host.projectMeter, runLimits: host.runLimits, attention: host.attention,
+    planIntegration: host.planIntegration }
   return [
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),

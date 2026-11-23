@@ -1,15 +1,17 @@
+import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { z } from 'zod'
-import { Commands } from '../src/infra/commands.ts'
+import { CliError, Commands } from '../src/infra/commands.ts'
 import { githubKind } from '../src/sources/github.ts'
 import { observePull } from '../src/sources/github-pull.ts'
 import { feishu, startManagedProject, startRuntime, type Host } from './fixtures/host.ts'
 import { KV } from '../src/kv.ts'
 import type { MainlineRepair } from '../src/core/model.ts'
 import type { MainlineIntent } from '../src/app/mainline-queue.ts'
+import { openPlanArtifact } from '../src/app/plan-artifacts.ts'
 
 let h: Host
 beforeEach(async () => { h = await startRuntime() })
@@ -31,6 +33,16 @@ it('mounts the Mainline queue tool on the Hub but not on a Worker', async () => 
   // Ineligible work must reach the Hub handler and be refused there, not fail as a missing tool.
   await expect(queue(ticket.id, args.candidate)).rejects.toThrow(/registered Plan Ticket/i)
 })
+
+it('keeps Plan completion waiting for formally delivered Tickets', async () => {
+  const { id, workers: { trim } } = await registerPlan({ start: ['trim'] })
+  const resource = `plan/${id}/delivery`
+  await h.runTool(trim.session, 'orchestrator_report', { state: 'ready', summary: 'Local checks are green.' })
+  await h.runtime.idle()
+  expect(await read(resource)).toMatchObject({ planId: id, status: 'awaiting-tickets',
+    waitingFor: ['trim', 'lowercase', 'combined-check'] })
+  expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toEqual([])
+}, 90_000)
 
 const claimIdentity = z.object({ ticketId: z.string(), assignmentId: z.string(), session: z.string() })
 type Worker = z.infer<typeof claimIdentity> & { directory: string }
@@ -113,6 +125,29 @@ async function registerPlan<Node extends LabelNode>({ start, checkDependsOn = la
     return [node, { ...claim, directory: String(directory) }] as const
   }))
   return { id, workers: Object.fromEntries(workers) as Record<Node, Worker>, dispatch }
+}
+
+async function registerSingleIntegrationPlan(release: 'authorized' | 'not-authorized' = 'not-authorized') {
+  const acceptance = [{ statement: 'Trim display labels', observable: 'A padded label has no surrounding spaces', delivery: 'backend' }]
+  const brief = { project: { repository: slug, workspace: h.localGit!.repository }, goal: 'Trim display labels.', constraints: [],
+    acceptanceScope: [acceptance[0]!.statement], authorization: { scope: 'Trim display labels', release } }
+  const confirmation = JSON.stringify({ confirmed: true, brief })
+  h.sendUserMessage(h.runtime.masterId, confirmation)
+  const { id } = await hub('orchestrator_handoff_confirm', { ...brief, confirmation }) as { id: string }
+  await h.idlePlanning()
+  const { spec } = await h.runTool(`planner-${id}`, 'orchestrator_spec_publish', { handoffId: id, body: brief.goal, acceptance,
+    testInterfaces: [{ seam: 'label()', kind: 'existing', note: 'Call the public formatter.' }], outOfScope: [] }) as { spec: { id: string } }
+  await h.runtime.idle()
+  await h.runTool(`splitter-${id}`, 'orchestrator_plan_register', { handoffId: id, specId: spec.id,
+    features: [{ id: 'integration', kind: 'backend' }],
+    nodes: [{ id: 'integration', featureId: 'integration', title: 'integration', role: 'backend', acceptance: [1],
+      demonstration: 'Run the public formatter.', blockedBy: [] }] })
+  const result = await hub('orchestrator_plan_dispatch', { planId: id, nodeId: 'integration' })
+  const claim = claimIdentity.parse(result.claim)
+  await h.runtime.idle()
+  const ticket = await read(`ticket/${claim.ticketId}`)
+  expect(ticket.directory).toEqual(expect.any(String))
+  return { id, worker: { ...claim, directory: String(ticket.directory) } as Worker }
 }
 
 async function delivered(plan: string, nodeId: string, worker: Worker, intent: Record<string, unknown>, base: string, candidate: string, integration: string, actual = integration) {
@@ -279,6 +314,205 @@ function actionsHost(beforeRuns?: (sha: string) => Promise<void>) {
     setPull: (value: Pull) => { pull = value; return pullResponse(value) } }
 }
 
+it.each([
+  { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const },
+  { release: 'authorized' as const, dispatchFailure: 'lost-response' as const },
+  { release: 'not-authorized' as const, dispatchFailure: 'forbidden' as const, pauseOnRefusal: true },
+  { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, rerunDuringDownload: true },
+  { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, advanceTargetDuringFinalRunLookup: true },
+  { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, rerunDuringFinalTargetRead: true },
+  { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, loseArtifactBeforeRelay: true },
+ ] as const)('verifies the integrated package: %j',
+  async ({ release, dispatchFailure, pauseOnRefusal, rerunDuringDownload, advanceTargetDuringFinalRunLookup, rerunDuringFinalTargetRead, loseArtifactBeforeRelay }) => {
+  await h.stop()
+  const verification = { workflowId: '44', identityJob: 'integration-identity',
+    jobs: ['integration-identity', 'windows', 'check', 'integration-bundle'], artifactName: 'plugin-bundle',
+    configuration: 'plugin-check-v1', environment: 'github-hosted-node22-pnpm11-v1' }
+  const mounted = await startManagedProject({ withFeishu: false, machine: project => ({ planVerification: [{ projectId: project.id, ...verification }] }) })
+  h = mounted.host
+  const { repository, git, base, remote, tip, runGit } = mainlineRepository()
+  const ci = actionsHost()
+  await configureCI()
+  const actionRuns = new Map<string, { id: number; sha: string; branch: string; context: string }>()
+  let latestAttempt = 1
+  let artifactDownloadStarted = false, targetAdvanced = false
+  let finalRunObserved = false, downloadUnavailable = false
+  const advanceTarget = () => {
+    git('-C', repository, 'fetch', '--no-tags', remote, targetRef)
+    git('-C', repository, 'checkout', '--detach', 'FETCH_HEAD')
+    write(repository, 'after-validation.txt', 'The target advanced during the final Actions read.\n')
+    commit(repository, 'Advance the target during final Actions read')
+    git('-C', repository, 'push', remote, `HEAD:${targetRef}`)
+    targetAdvanced = true
+  }
+  const github = vi.spyOn(Commands.prototype, 'gh')
+  const githubFallback = github.getMockImplementation()!
+  github.mockImplementation(async function (this: Commands, args) {
+    const [method, endpoint] = args
+    if (method !== 'api' || !endpoint) return githubFallback.call(this, args)
+    const path = new URL(`/${endpoint}`, 'https://github.com')
+    if (path.pathname === `/repos/${slug}/actions/workflows/44/runs`) {
+      const runs = [...actionRuns.values()].filter(run => run.sha === path.searchParams.get('head_sha') &&
+        run.branch === path.searchParams.get('branch'))
+      if (advanceTargetDuringFinalRunLookup && artifactDownloadStarted && !targetAdvanced) advanceTarget()
+      if (artifactDownloadStarted) finalRunObserved = true
+      return { total_count: runs.length, workflow_runs: runs.map(run => ({ id: run.id, workflow_id: 44, run_number: run.id,
+        run_attempt: latestAttempt, head_sha: run.sha, head_branch: run.branch, event: 'workflow_dispatch',
+        display_title: `dsh-plan-verification:${run.context}`, status: 'completed', conclusion: 'success' })) }
+    }
+    const jobs = path.pathname.match(new RegExp(`/actions/runs/(\\d+)/attempts/(\\d+)/jobs$`))
+    if (jobs) {
+      const run = [...actionRuns.values()].find(value => value.id === Number(jobs[1]))
+      if (run) return { total_count: verification.jobs.length, jobs: verification.jobs.map((name, index) => ({ id: run.id * 10 + index,
+        run_id: run.id, run_attempt: Number(jobs[2]), head_sha: run.sha, name, status: 'completed', conclusion: 'success' })) }
+    }
+    const artifacts = path.pathname.match(new RegExp(`/actions/runs/(\\d+)/artifacts$`))
+    if (artifacts) {
+      const run = [...actionRuns.values()].find(value => value.id === Number(artifacts[1]))
+      if (run) return { total_count: 1, artifacts: [{ id: run.id * 100, name: `${verification.artifactName}-${run.sha}-${latestAttempt}`,
+        expired: false, size_in_bytes: 1200, workflow_run: { id: run.id, head_sha: run.sha } }] }
+    }
+    return githubFallback.call(this, args)
+  })
+  let loseDispatchReceipt = dispatchFailure === 'lost-response', rejectDispatch = dispatchFailure === 'forbidden'
+  let dispatches = 0
+  const command = vi.spyOn(Commands.prototype, 'run')
+  const commandFallback = command.getMockImplementation()!
+  command.mockImplementation(async function (this: Commands, program, args, cwd, input) {
+    if (args[0] === 'run' && args[1] === 'download') {
+      if (downloadUnavailable) throw new CliError('The fixture artifact is no longer downloadable', 404)
+      const runId = Number(args[2]), attempt = latestAttempt, artifactName = args[args.indexOf('--name') + 1]!
+      const destination = args[args.indexOf('--dir') + 1]!, run = [...actionRuns.values()].find(value => value.id === runId)!
+      const packageName = 'dsh-superagent-0.1.0.tgz', bytes = Buffer.from(`${run.sha}-${attempt}`)
+      mkdirSync(destination, { recursive: true })
+      writeFileSync(join(destination, packageName), bytes)
+      writeFileSync(join(destination, 'dsh-artifact.json'), JSON.stringify({ repository: slug, ref: targetRef, sha: run.sha,
+        context: run.context, configuration: verification.configuration, environment: verification.environment,
+        runId, attempt, fileName: packageName, contentType: 'application/gzip', sha256: createHash('sha256').update(bytes).digest('hex') }))
+      if (rerunDuringDownload && attempt === 1) latestAttempt = 2
+      artifactDownloadStarted = true
+      expect(artifactName).toBe(`${verification.artifactName}-${run.sha}-${attempt}`)
+      return ''
+    }
+    if (args[0] === 'api' && args[1] === `repos/${slug}/actions/workflows/44/dispatches`) {
+      const field = (name: string) => args.find(value => value.startsWith(`inputs[${name}]=`))?.split('=')[1]
+      const sha = field('dsh_commit')!, context = field('dsh_context')!, branch = args[args.indexOf('-f') + 1]!.slice('ref='.length)
+      const runId = 900 + ++dispatches
+      if (rejectDispatch) {
+        rejectDispatch = false
+        if (pauseOnRefusal) await h.runtime.settings.pause(true, 'panel')
+        throw new CliError('GitHub denied workflow dispatch', 403)
+      }
+      actionRuns.set(context, { id: runId, sha, branch, context })
+      if (loseDispatchReceipt) { loseDispatchReceipt = false; throw new Error('Dispatch response was lost') }
+      return JSON.stringify({ workflow_run_id: runId })
+    }
+    return commandFallback.call(this, program, args, cwd, input)
+  })
+  const localGit = vi.spyOn(Commands.prototype, 'git')
+  localGit.mockImplementation(async function (this: Commands, args, cwd) {
+    if (rerunDuringFinalTargetRead && finalRunObserved && latestAttempt === 1 && args.includes(canonicalUrl) && args.includes('fetch')) latestAttempt = 2
+    return runGit(this, args, cwd)
+  })
+
+  const { id, worker } = await registerSingleIntegrationPlan(release)
+  formatLabel(worker.directory, 'value.trim()', 'Trim surrounding whitespace')
+  const candidate = commit(worker.directory, 'Trim display labels')
+  const branch = git('-C', worker.directory, 'branch', '--show-current')
+  await recordEvidence(worker, id, base, candidate, '1', 'ALERT')
+  ci.publish(candidate, undefined, branch)
+  await h.runTool(worker.session, 'orchestrator_report', { state: 'ready', summary: 'The checked candidate is ready.' })
+  const candidateEvidence = await delivery(worker.ticketId)
+  expect(candidateEvidence).toMatchObject({ base, candidate, ready: true, ci_status: 'passed' })
+  await expect(h.runTool(worker.session, 'orchestrator_read', { resource: `plan/${id}/delivery` }))
+    .rejects.toThrow('This resource belongs to the main Session')
+
+  const intent = await queue(worker.ticketId, candidate)
+  await h.runtime.idle()
+  const integration = tip()
+  const closedTicket = await read(`ticket/${worker.ticketId}`), mainlinePage = await read(`ticket/${worker.ticketId}/mainline`)
+  expect({ ticketState: closedTicket.state, mainline: mainlinePage.items, tip: integration, intent },
+    JSON.stringify({ ticketState: closedTicket.state, mainline: mainlinePage.items, tip: integration, intent }))
+    .toMatchObject({ ticketState: 'merged', mainline: [expect.objectContaining({ status: 'verified' })] })
+  expect(intent).toMatchObject({ candidate, base, status: 'queued' })
+  const beforeRecovery = await read(`plan/${id}/delivery`)
+  expect(beforeRecovery).toMatchObject({ status: 'blocked',
+    reason: dispatchFailure === 'forbidden' ? 'actions_unavailable' : 'dispatch_unconfirmed', version: { sha: integration } })
+  expect(dispatches).toBe(1)
+  if (dispatchFailure === 'forbidden') {
+    const refusedContext = z.object({ version: z.object({ context: z.string() }) }).parse(beforeRecovery).version.context
+    expect(h.runtime.store.get(KV.plans.integrationDispatch(refusedContext))).toBeUndefined()
+    await h.runtime.settings.pause(false, 'panel')
+  }
+  if (loseArtifactBeforeRelay) h.controller.resolveAgent.mockImplementation(async sessionId => {
+    const view = h.runtime.store.get(KV.plans.integration(id))
+    if (sessionId === h.runtime.masterId && !downloadUnavailable && view?.status === 'delivered') {
+      const file = await openPlanArtifact(h.runtime.machine.stateDir, id, view)
+      if (!file) throw new Error('The fixture had no retained artifact before relay')
+      downloadUnavailable = true
+      rmSync(file.path)
+    }
+    return h.resolveDefault(sessionId)
+  })
+
+  await h.restart()
+  await h.runtime.idle()
+  const initial = await read(`plan/${id}/delivery`)
+  const initialView = z.object({ version: z.object({ context: z.string() }) }).parse(initial)
+  expect(h.runtime.store.get(KV.plans.integrationDispatch(initialView.version.context))).toBe(true)
+  if (advanceTargetDuringFinalRunLookup) {
+    expect(await read(`plan/${id}/delivery`)).toMatchObject({ status: 'blocked', reason: 'target_changed', version: { sha: integration } })
+    expect(dispatches).toBe(1)
+    expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toEqual([])
+    return
+  }
+  if (loseArtifactBeforeRelay) {
+    expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toEqual([])
+    expect(initial).toMatchObject({ status: 'blocked', reason: 'artifact_unavailable' })
+    expect(downloadUnavailable).toBe(true)
+    h.controller.resolveAgent.mockImplementation(h.resolveDefault)
+    downloadUnavailable = false
+    await h.restart()
+    await h.runtime.idle()
+  }
+  const attempts = rerunDuringDownload || rerunDuringFinalTargetRead ? 2 : 1
+  const resource = await read(`plan/${id}/delivery`), packageBytes = Buffer.from(`${integration}-${attempts}`)
+  expect(resource).toMatchObject({ planId: id, status: release === 'authorized' ? 'awaiting-release-verification' : 'delivered',
+    version: { repository: slug, ref: targetRef, sha: integration, context: expect.stringMatching(/^[a-f0-9]{64}$/),
+      configuration: verification.configuration, environment: verification.environment },
+    run: { id: expect.any(Number), attempt: attempts },
+    artifact: { id: expect.any(Number), name: `plugin-bundle-${integration}-${attempts}`, url: expect.stringContaining('/actions/runs/'),
+      fileName: 'dsh-superagent-0.1.0.tgz', contentType: 'application/gzip', size: packageBytes.length,
+      sha256: createHash('sha256').update(packageBytes).digest('hex') },
+    verifiedAt: expect.any(String) })
+  expect(dispatches).toBe(dispatchFailure === 'forbidden' ? 2 : 1)
+  const relays = h.jsonRelays(h.runtime.masterId, 'plan-delivered')
+  if (release === 'authorized') expect(relays).toEqual([])
+  else expect(relays).toEqual([expect.objectContaining({ planId: id, version: expect.objectContaining({ sha: integration }),
+    verification: expect.stringContaining('/actions/runs/'), artifact: expect.objectContaining({ url: expect.stringContaining('/artifacts/') }),
+    harness: expect.stringContaining(`superagentTicket=${worker.ticketId}`), read: `plan/${id}/delivery` })])
+  expect(await h.api('GET', `plans/${id}/delivery`, undefined, mounted.project.id)).toMatchObject({ status: 200, body: resource })
+  if (loseArtifactBeforeRelay) {
+    const view = h.runtime.store.get(KV.plans.integration(id))!
+    const file = await openPlanArtifact(h.runtime.machine.stateDir, id, view)
+    if (!file) throw new Error('The fixture had no repaired artifact')
+    h.step(h.runtime.masterId)
+    const runSlot = dirname(file.path)
+    rmSync(runSlot, { recursive: true })
+    writeFileSync(runSlot, 'not a directory')
+    await h.restart()
+    await h.runtime.idle()
+    expect(await read(`plan/${id}/delivery`)).toMatchObject({ status: 'delivered', version: { sha: integration } })
+    expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toHaveLength(1)
+    return
+  }
+
+  await h.restart()
+  await h.runtime.idle()
+  expect(await read(`plan/${id}/delivery`)).toEqual(resource)
+  expect(dispatches).toBe(dispatchFailure === 'forbidden' ? 2 : 1)
+  expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toHaveLength(release === 'authorized' ? 0 : 1)
+}, 180_000)
 async function interruptedByRestart(lifetime: AbortSignal): Promise<never> {
   if (!lifetime.aborted) {
     const stopped = Promise.withResolvers<void>()

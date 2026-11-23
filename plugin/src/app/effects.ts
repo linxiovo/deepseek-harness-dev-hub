@@ -20,6 +20,8 @@ export interface EffectPayloads {
   planning: { handoffId: string }
   /** Delegate an immutable published spec to its splitter; the key is the handoff ID. */
   splitting: { handoffId: string; specId: string; pass?: number }
+  /** Deliver the sealed scope task to its independent reviewer; the key is the proposal ID. */
+  requirementScopeReview: Record<string, never>
   /** Hand a ticket's waiting Inputs to its running Assignment; the key is the Ticket ID. */
   delivery: { ticketId: string }
   /** Process one target's persistent FIFO; the key is its GitHub repository and branch ref. */

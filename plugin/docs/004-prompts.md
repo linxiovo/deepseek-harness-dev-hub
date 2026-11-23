@@ -39,6 +39,8 @@ The mainline queue uses `prompts/queue-merge-tool.md` for its Hub tool, `prompts
 
 `prompts/plan-stagnation.md` supplies the Worker diagnosis; `prompts/plan-replan-relay.md` wakes the Hub for internal coordination. `prompts/plan-replan-tool.md`, `prompts/plan-requirements-tool.md` and `prompts/plan-question-tool.md` describe Hub tools. The product change flow uses `prompts/plan-requirements-target.md` for an ambiguous target and `prompts/plan-requirements-revalidate.md` for replacement verification. These packaged templates are not editable prompt parts.
 
+The independent scope reviewer receives `prompts/plan-requirement-scope-review.md` with its sealed request. `prompts/plan-requirement-scope-tool.md` describes its only tool.
+
 The generated sections are editable templates. They must retain these placeholders:
 
 - `runtime/environment`: `{variables}`, filled with execution environment lines.

@@ -208,41 +208,76 @@ function passingRuns(report: Tests): boolean {
       && checks.some(c => c.directory === r.directory && c.command === r.command)))
 }
 
+type TestProgress = { status: 'failed'; check: FailedCheck } | { status: 'passed' }
+
+function projectTestEvidence(ticketId: string, ledger: DeliveryLedger | undefined, target: DeliveryRevision | undefined,
+  inherited: readonly FailedCheck[]) {
+  const failures = [...inherited], reruns = new Map<string, Rerun>(), seenRuns = new Set<string>(), seenRed = new Set<string>()
+  const lastFailure = new Map<string, string>(), lastPass = new Map<string, string>()
+  const events = ledger?.events ?? [], defaultReference = `ticket/${ticketId}/delivery-check`
+  let latest: TestProgress | undefined
+  for (const [index, entry] of events.entries()) {
+    if (entry.kind !== 'tests') continue
+    const { revision, reference } = entry, read = `ticket/${ticketId}/delivery-observation/${index}`
+    const exact = matches(revision, target), current = exact && index === events.length - 1
+    const local = reference === defaultReference
+    const fail = (command: string, run: Run, id: string, candidate: string): FailedCheck => {
+      const failure = { directory: run.directory, command: run.command, observed: run.observed, id, read, revision: candidate, reference }
+      failures.push(failure)
+      lastFailure.set(command, id)
+      reruns.delete(command)
+      return failure
+    }
+    // The ancestral red in a TDD report is distinct from a failed check on that report's candidate.
+    for (const [i, run] of entry.evidence.red?.entries() ?? []) {
+      const command = runKey(run), key = JSON.stringify([run.revision, command, run.observed])
+      if (seenRed.has(key)) continue
+      seenRed.add(key)
+      fail(command, run, `${read}#red/${i}`, run.revision)
+    }
+    const passing = entry.result === 'reported_passed' && passingRuns(entry)
+    for (const [i, run] of entry.evidence.checks.entries()) {
+      const command = runKey(run)
+      if (run.status !== 'passed' && run.status !== 'failed') {
+        if (exact) reruns.delete(command)
+        continue
+      }
+      if (run.status === 'passed' && !passing) continue
+      const onRevision = JSON.stringify([command, revision.base, revision.candidate, revision.generation])
+      // An exact cited run cannot become new evidence when red recurs. A local report has no run receipt;
+      // a new opposite result for the same check is the durable boundary between its identical reports.
+      const identity = local
+        ? JSON.stringify([run.status, onRevision, run.observed, run.status === 'failed' ? lastPass.get(onRevision) : lastFailure.get(command)])
+        : JSON.stringify([run.status, command, run.observed, reference])
+      if (seenRuns.has(identity)) continue
+      seenRuns.add(identity)
+      const id = `${read}#checks/${i}`
+      if (run.status === 'failed') {
+        const failure = fail(command, run, id, revision.candidate)
+        if (current) latest ??= { status: 'failed', check: failure }
+      } else {
+        lastPass.set(onRevision, id)
+        if (exact) reruns.set(command, { id, read, observed: run.observed, reference })
+        if (current) latest ??= { status: 'passed' }
+      }
+    }
+  }
+  return { failures, reruns, latest }
+}
+
 /** A matching Worker rerun is evidence of progress, not proof that the assertions survived. */
 export function failedCheckObligations(ticketId: string, ledger: DeliveryLedger | undefined, target: DeliveryRevision | undefined,
   inherited: readonly FailedCheck[] = []): FailedCheckObligation[] {
-  const failures = [...inherited], reruns = new Map<string, Rerun>(), seenPasses = new Set<string>(), seenRed = new Set<string>()
-  for (const [index, entry] of ledger?.events.entries() ?? []) {
-    if (entry.kind !== 'tests') continue
-    const read = `ticket/${ticketId}/delivery-observation/${index}`, { reference } = entry
-    const fail = (run: Run, id: string, revision: string) => {
-      failures.push({ directory: run.directory, command: run.command, observed: run.observed, id, read, revision, reference })
-      reruns.delete(runKey(run))
-    }
-    // A TDD report can carry its ancestral red and its current green together. Repeating that same ancestral
-    // observation is not a new failure on HEAD. An actual failed check below always invalidates an earlier pass.
-    for (const [i, run] of entry.evidence.red?.entries() ?? []) {
-      const key = JSON.stringify([run.revision, runKey(run), run.observed])
-      if (seenRed.has(key)) continue
-      seenRed.add(key)
-      fail(run, `${read}#red/${i}`, run.revision)
-    }
-    const exact = matches(entry.revision, target)
-    const passing = exact && entry.result === 'reported_passed' && passingRuns(entry)
-    for (const [i, run] of entry.evidence.checks.entries()) {
-      const id = `${read}#checks/${i}`
-      if (run.status === 'failed') { fail(run, id, entry.revision.candidate); continue }
-      if (!exact) continue
-      const command = runKey(run)
-      if (run.status !== 'passed') { reruns.delete(command); continue }
-      if (!passing) continue
-      const key = JSON.stringify([command, run.observed, reference])
-      if (seenPasses.has(key)) continue
-      seenPasses.add(key)
-      reruns.set(command, { id, read, observed: run.observed, reference })
-    }
-  }
+  const { failures, reruns } = projectTestEvidence(ticketId, ledger, target, inherited)
   return failures.map(failure => ({ failure, rerun: reruns.get(runKey(failure)) ?? null }))
+}
+
+/** Only the latest distinct observation can affect recovery. A pass must cover every outstanding failed check. */
+export function latestTestProgress(ticketId: string, ledger: DeliveryLedger | undefined, target: DeliveryRevision,
+  inherited: readonly FailedCheck[]): TestProgress | undefined {
+  const { failures, reruns, latest } = projectTestEvidence(ticketId, ledger, target, inherited)
+  if (latest?.status === 'passed' && failures.some(failure => !reruns.has(runKey(failure)))) return undefined
+  return latest
 }
 
 function reviewedChecks(obligations: readonly FailedCheckObligation[], reviews: readonly ReviewEvidence[]) {
@@ -339,13 +374,14 @@ export function advanceDelivery(ledger: DeliveryLedger | undefined, revision: De
 
 /** A local evidence view, not CI, a merge receipt, or formal delivery. Missing/dirty worktrees have no active evidence. */
 export function viewDelivery(ledger: DeliveryLedger | undefined, revision: DeliveryRevision | undefined, reviews: readonly ReviewEvidence[],
-  acceptance: readonly Criterion[], ticketId: string, inherited: readonly FailedCheck[] = []) {
+  acceptance: readonly Criterion[], ticketId: string, inherited?: readonly FailedCheck[]) {
   const events = ledger?.events ?? []
   const { active, followups } = project(events, reviews, ticketId)
   const state = forRevision(active, revision)
   const matching = currentReviews(reviews, revision)
   const missing: string[] = []
-  const failed_checks = reviewedChecks(failedCheckObligations(ticketId, ledger, revision, inherited), matching)
+  // Plan callers opt in with their canonical inherited checks, even when that list is empty.
+  const failed_checks = inherited === undefined ? [] : reviewedChecks(failedCheckObligations(ticketId, ledger, revision, inherited), matching)
   if (failed_checks.some(check => check.confirmed_by.length !== 2)) missing.push('failed_checks_require_recheck')
   if (!revision) missing.push('revision')
   if (!dual(matching)) missing.push('dual-review')

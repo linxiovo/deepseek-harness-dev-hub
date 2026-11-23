@@ -24,12 +24,13 @@ import { promptFile } from './skill-files.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
 import { DshExecutor, sourceTrigger, workerSessionId } from '../executor/dsh.ts'
+import { validateRepositoryIdentity } from '../executor/repository-identity.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
 import { evalsHealth } from './views/overview.ts'
 import { TextCache } from './cache.ts'
-import { Effects, Later } from './effects.ts'
+import { Effects, Later, Park } from './effects.ts'
 import { Handoffs } from './handoffs.ts'
 import { TopicBinding } from './topic-binding.ts'
 import { Installation, projectDatabase, projectHubId } from './installation.ts'
@@ -72,6 +73,7 @@ import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { plannerTools, type PlannerToolsHost } from './tools/planner.ts'
 import { splitterTools, type SplitterToolsHost } from './tools/splitter.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
+import { scopeProposalId } from './tools/requirement-scope.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
@@ -217,11 +219,36 @@ export class Runtime extends Service implements SourceHost {
         quotaBlocked: ticketId => runLimits.blocked(ticketId),
         promptVersion: id => this.sessions.promptVersion(id),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
-      const sessions = this.sessions = new Sessions({ context: ctx, store, projectMeter, prompts, effects, health: board.claim('models'), masterId,
+      const sessions: Sessions = this.sessions = new Sessions({ context: ctx, store, projectMeter, prompts, effects, health: board.claim('models'), masterId,
         lifetime: this.lifetime, boundWorkspace: project?.workspace,
         relayAvailable: requestId => this.planIntegration.relayAvailable(requestId),
         closing: () => this.closing(), environment, ownsPlanner: id => handoffs.get(id) !== undefined,
         plannerActive: id => this.configured() && handoffs.isPlanning(id),
+        scopeTask: id => {
+          if (this.paused()) throw new Later('Requirement scope review is paused')
+          const task = requirements.scopeTask(id)
+          if (!task) return undefined
+          installation.assertNewWork()
+          const checkout = project?.workspace ?? store.settings().executor.repository
+          const handoff = handoffs.get(task.planId)
+          if (!checkout || !handoff || !sameDirectory(checkout, task.workspace) || !isAbsolute(task.workspace)
+            || handoff.project.repository.toLowerCase() !== this.deployment.repository.toLowerCase()) {
+            throw new Error('Requirement scope task does not belong to the active project checkout')
+          }
+          return task
+        },
+        verifyScopeWorkspace: async task => {
+          const handoff = handoffs.get(task.planId)
+          if (!handoff) throw new Error('Requirement scope handoff no longer exists')
+          if (project) await installation.validateWorkspace(handoff.project)
+          else await validateRepositoryIdentity(commands, task.workspace, handoff.project.repository)
+        },
+        recordScopeReview: (id, reviewer, verdict) => store.atomic(() => {
+          const preview = requirements.recordScopeReview(id, reviewer, verdict)
+          effects.cancel('requirementScopeReview', id)
+          sessions.relay(key('requirement-scope-result', id), JSON.stringify({ kind: 'plan-requirement-scope-review',
+            read: `plan-requirement/${id}`, classification: preview.scopeReview.status }))
+        }),
         splitterWorkspace: id => {
           if (!this.configured()) return undefined
           const handoff = handoffs.get(id)
@@ -383,7 +410,18 @@ export class Runtime extends Service implements SourceHost {
         } catch (error) { if (error !== withdrawn) throw error }
       }, { limit: () => this.configured() && !this.closing() ? 1 : 0 })
       const requirements = new PlanRequirements({ store, plans, handoffs, limits: runLimits,
-        stop: (ticketId, reason) => { engine.stopTicket(ticketId, reason) }, authorize: () => installation.assertNewWork() })
+        stop: (ticketId, reason) => { engine.stopTicket(ticketId, reason) }, authorize: () => installation.assertNewWork(),
+        requestScopeReview: id => effects.enqueue('requirementScopeReview', id, {}) })
+      const scopeDispatchOpen = () => {
+        if (this.paused()) return false
+        const state = runLimits.view()?.budget.state
+        return state === 'unlimited' || state === 'available'
+      }
+      effects.handle('requirementScopeReview', async (_, id) => {
+        if (!requirements.scopeTask(id)) return
+        await sessions.deliverScope(id, () => { if (!scopeDispatchOpen()) throw new Later('Requirement scope review dispatch is held') })
+        if (requirements.scopeTask(id)) return Park
+      }, { limit: () => scopeDispatchOpen() ? 1 : 0 })
       const planDelivery = planDeliveryWriter(plans, id => engine.closePlanTicket(id))
       const mainline = new MainlineQueue({ store, effects, lifetime: this.lifetime,
         available: () => this.configured() && !this.closing(), paused: () => this.paused(),
@@ -591,10 +629,13 @@ export class Runtime extends Service implements SourceHost {
     this.runLimits.recover()
     this.executor.recoverCredentialPauses()
     this.disposeAdmission = installModelAdmission(this.ctx, {
-      owns: id => this.projectMeter.owns(id) || this.sessions.hasManagedAncestry(id),
+      owns: id => scopeProposalId(id) !== undefined || this.projectMeter.owns(id) || this.sessions.hasManagedAncestry(id),
       acquire: (id, maximum, signal) => {
         const binding = this.store.get(KV.projectMeter.binding(id))
         if (this.closing() || !binding) return { admitted: false, reason: 'Run limit Session is not authorized in this mount' }
+        if (scopeProposalId(id) !== undefined && !this.sessions.scopeModelAllowed(id)) {
+          return { admitted: false, reason: 'Requirement scope reviewer has no authorized native task in this mount' }
+        }
         const { ticket_id: ticket } = binding
         if (ticket && !this.executor.writerAuthorized(ticket, workerSessionId(ticket))) {
           return { admitted: false, reason: 'Run limit Session has no active Ticket writer' }
@@ -636,6 +677,7 @@ export class Runtime extends Service implements SourceHost {
     if (this.closing()) return
     this.planDispatcher.resume()
     this.planning.resume()
+    this.effects.wakeParked('requirementScopeReview')
     this.executor.resume()
     this.passes.start()
     this.effects.start()
@@ -704,10 +746,11 @@ export class Runtime extends Service implements SourceHost {
   private async canSample(binding: MeterSessionBinding): Promise<MeterLogAccess> {
     const { session_id: id, ticket_id: ticketId, parent_session_id: parentId, roles } = binding
     const hub = roles.includes('hub'), planning = roles.includes('planner') || roles.includes('splitter')
+    const scopeId = scopeProposalId(id)
     const parent = parentId ? this.store.get(KV.projectMeter.binding(parentId)) : undefined
     const worker = !!ticketId && parent?.roles.includes('hub') && roles.includes('implementation')
     const nativeChild = !!ticketId && !worker && (roles.includes('implementation') || roles.includes('review'))
-    if (!hub && !planning && !worker && !nativeChild) return 'read' // Explicit host registrations (retro and inspection).
+    if (!hub && !planning && !worker && !nativeChild && scopeId === undefined) return 'read' // Explicit host registrations (retro and inspection).
     const ticket = ticketId ? this.store.tickets.get(ticketId) : undefined, execution = ticket?.execution
     if (worker && (!ticket || execution?.ownership?.ticket !== ticketId || !execution.ownership.verified || !execution.worktree)) return 'unverified'
     const issued = worker && (execution?.session === id || ticket?.assignments.some(item => item.writer?.session === id))
@@ -726,6 +769,14 @@ export class Runtime extends Service implements SourceHost {
     if (header.id !== id) return 'unverified'
     if (nativeChild) return header.origin === 'subagent' && header.parentSession === parentId ? { header } : 'unverified'
     if (header.origin !== undefined || header.parentSession !== undefined || header.isSeeded) return 'unverified'
+    if (scopeId !== undefined) {
+      const pin = this.store.get(KV.planRequirements.reviewer(scopeId))
+      const preview = this.store.get(KV.planRequirements.preview(scopeId))
+      const workspace = preview && this.handoffs.get(preview.handoffId)?.project.workspace
+      return roles.includes('review') && parentId === this.masterId && preview?.planId === binding.plan_id && pin?.sessionId === id
+        && pin.createdAt === header.createdAt && header.agentPreset === PLANNER_PRESET && workspace && header.cwd && isAbsolute(header.cwd)
+        && sameDirectory(workspace, header.cwd) ? { header } : 'unverified'
+    }
     const project = this.installation.project
     const handoff = planning ? this.handoffs.get(id.slice(id.indexOf('-') + 1)) : undefined
     const cwd = worker ? execution?.worktree : planning ? handoff && (project?.workspace ?? handoff.project.workspace)
@@ -747,11 +798,12 @@ export class Runtime extends Service implements SourceHost {
         return splitter && this.sessions.isSplitterSession(splitter) ? [`planner-${id}`, splitter.id] : [`planner-${id}`]
       })
       const live = (ids: string[]) => ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
-      const agents = live([this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id)), ...handoffSessions()])
+      const reviewSessions = () => this.ctx.agents.list().filter(agent => scopeProposalId(agent.id) !== undefined && this.projectMeter.owns(agent.id)).map(agent => agent.id)
+      const agents = live([this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id)), ...handoffSessions(), ...reviewSessions()])
       for (const agent of agents) agent.cancel({ kind: 'user' }, { keepInbox: true })
       await Promise.allSettled([http, passes, this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
       // An effect may have been creating a planner or splitter when shutdown took the first snapshot.
-      const lateHandoffs = live(handoffSessions()).filter(agent => !agents.includes(agent))
+      const lateHandoffs = live([...handoffSessions(), ...reviewSessions()]).filter(agent => !agents.includes(agent))
       for (const agent of lateHandoffs) agent.cancel({ kind: 'user' }, { keepInbox: true })
       await Promise.allSettled(lateHandoffs.map(agent => agent.whenIdle()))
       // The workers' jobs and subagents stop too: their ends would start worker turns without the tool limits released below.

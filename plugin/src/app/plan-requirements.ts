@@ -23,7 +23,12 @@ const RequirementRequestSchema = z.strictObject({
   changes: z.array(z.strictObject({ criterion: z.number().int().positive(), statement: Text, observable: Text })).max(100),
 })
 const RequirementApprovalSchema = z.strictObject({ approved: z.literal(true), proposalId: z.uuid(),
-  requestMessageId: Text, scopeDecision: z.enum(['within-handoff', 'new-handoff']) })
+  requestMessageId: Text, scopeDecision: z.enum(['within-handoff', 'new-handoff']), scopeReviewId: z.uuid() })
+export const RequirementScopeVerdictSchema = z.strictObject({
+  status: z.enum(['within-handoff', 'outside-handoff', 'uncertain']), reason: Text,
+})
+export type ScopeVerdict = z.infer<typeof RequirementScopeVerdictSchema>
+type ScopeReview = { status: 'pending' } | ScopeVerdict & { reviewId: string; reviewerSessionId: string; at: string }
 type OperatorMessage = PlanMessage & { seq: number }
 
 const PROPOSAL_TTL = 30 * 60_000
@@ -74,12 +79,29 @@ export type RequirementPreview = {
     handoff: string; spec: string
   }
   evidenceFingerprint: string
+  scopeReview: ScopeReview
 } & ({ status: 'preview' } | {
   status: 'applied'; revision: number; appliedAt: string; approvedBy: Pick<PlanMessage, 'sessionId' | 'messageId'>
 })
 type PendingPreview = Extract<RequirementPreview, { status: 'preview' }>
 type AppliedPreview = Extract<RequirementPreview, { status: 'applied' }>
 type NeedsTarget = { status: 'needs-target'; planId: string; question: string; criteria: { criterion: number; statement: string }[] }
+
+type CriterionText = Pick<Spec['acceptance'][number], 'statement' | 'observable'>
+export type RequirementScopeTask = {
+  planId: string
+  workspace: string
+  input: {
+    proposalId: string
+    planId: string
+    expectedRevision: number
+    currentGoal: string
+    desiredGoal: string
+    currentCriteria: (CriterionText & { criterion: number })[]
+    changedCriteria: { criterion: number; before: CriterionText; after: CriterionText }[]
+    originalHandoff: Pick<Handoff, 'goal' | 'authorization' | 'constraints' | 'acceptanceScope'> & Pick<Spec, 'outOfScope'>
+  }
+}
 
 type Host = {
   store: Pick<Store, 'atomic' | 'get' | 'set' | 'tickets'>
@@ -88,8 +110,11 @@ type Host = {
   limits: Pick<RunLimits, 'forDispatch'>
   stop: (ticketId: string, reason: string) => void
   authorize: () => void
+  requestScopeReview: (proposalId: string) => void
 }
 type ActivePlan = { plan: Plan; revision: number; goal: string; acceptance: Spec['acceptance']; handoff: Handoff; spec: Spec; waitingFor: string[] }
+
+function criterionText({ statement, observable }: Spec['acceptance'][number]): CriterionText { return { statement, observable } }
 
 function refuse(detail: string): never { throw new UserError('invalidPlan', { detail }) }
 
@@ -169,7 +194,50 @@ function impactedNodes(plan: Plan, targets: ReadonlySet<number>) {
 export class PlanRequirements {
   constructor(private readonly host: Host) {}
 
-  get(proposalId: string): RequirementPreview | undefined { return this.host.store.get(KV.planRequirements.preview(proposalId)) }
+  get(proposalId: string): RequirementPreview | undefined {
+    const preview = this.host.store.get(KV.planRequirements.preview(proposalId))
+    return preview?.scopeReview ? preview : undefined
+  }
+
+  scopeTask(proposalId: string): RequirementScopeTask | undefined {
+    const preview = this.get(proposalId)
+    if (preview?.status !== 'preview' || preview.scopeReview.status !== 'pending') return undefined
+    const active = this.currentScopePreview(preview)
+    if (!active) return undefined
+    const { planId, expectedRevision, previousGoal, goal, invalidated, retained } = preview
+    const { authorization, constraints, outOfScope, acceptanceScope } = retained
+    return { planId, workspace: active.handoff.project.workspace, input: {
+      proposalId, planId, expectedRevision, currentGoal: previousGoal, desiredGoal: goal,
+      currentCriteria: active.acceptance.map((item, i) => ({ criterion: i + 1, ...criterionText(item) })),
+      changedCriteria: invalidated.filter(({ before, after }) => before.statement !== after.statement || before.observable !== after.observable)
+        .map(({ criterion, before, after }) => ({ criterion, before: criterionText(before), after: criterionText(after) })),
+      originalHandoff: { goal: active.handoff.goal, authorization, constraints, outOfScope, acceptanceScope },
+    } }
+  }
+
+  /** Runtime authenticates the reviewer Session; only the exact current preview can receive its verdict. */
+  recordScopeReview(proposalId: string, reviewerSessionId: string, verdict: ScopeVerdict): RequirementPreview {
+    const { store } = this.host
+    return store.atomic(() => {
+      const preview = this.get(proposalId)
+      if (preview?.status !== 'preview' || !this.currentScopePreview(preview)) refuse('Scope review no longer applies to a current requirement preview')
+      if (!reviewerSessionId || reviewerSessionId === preview.ownerSession) refuse('The product owner cannot attest to the scope of this preview')
+      this.host.authorize()
+      const parsed = RequirementScopeVerdictSchema.safeParse(verdict)
+      if (!parsed.success) refuse('Invalid requirement scope verdict')
+      const review = preview.scopeReview
+      if (review.status !== 'pending') {
+        if (review.reviewerSessionId !== reviewerSessionId || review.status !== parsed.data.status || review.reason !== parsed.data.reason) {
+          refuse('The scope verdict already recorded for this preview is immutable')
+        }
+        return preview
+      }
+      const reviewed: PendingPreview = { ...preview, scopeReview: { ...parsed.data,
+        reviewId: randomUUID(), reviewerSessionId, at: new Date().toISOString() } }
+      store.set(KV.planRequirements.preview(proposalId), reviewed)
+      return reviewed
+    })
+  }
 
   preview(message: OperatorMessage): RequirementPreview | NeedsTarget {
     const { planId, authorizedScope, goal, changes } = operatorPayload(RequirementRequestSchema, message,
@@ -215,19 +283,21 @@ export class PlanRequirements {
         requestMessageId: message.messageId, requestSequence: message.seq, requestDigest,
         expectedRevision: active.revision, createdAt: new Date(now).toISOString(), expiresAt: new Date(now + PROPOSAL_TTL).toISOString(),
         previousGoal, goal: nextGoal, invalidated, affected, evidenceFingerprint,
+        scopeReview: { status: 'pending' },
         retained: { handoff: `handoff/${active.handoff.id}`, spec: `spec/${active.handoff.id}`,
           authorization: active.handoff.authorization, constraints: active.handoff.constraints, acceptanceScope: active.handoff.acceptanceScope,
           testInterfaces: active.spec.testInterfaces, outOfScope: active.spec.outOfScope },
       }
       store.set(KV.planRequirements.preview(proposalId), preview)
       store.set(requestKey, proposalId)
+      this.host.requestScopeReview(proposalId)
       return preview
     })
   }
 
   apply(proposalId: string, message: OperatorMessage): AppliedPreview {
     const approval = operatorPayload(RequirementApprovalSchema, message,
-      'The latest direct Harness operator approval must identify the preview, source request and scope decision')
+      'The latest direct Harness operator approval must identify the preview, source request, and scope review and decision')
     if (approval.proposalId !== proposalId) refuse('Approval identifies a different requirement preview')
     if (approval.scopeDecision !== 'within-handoff') refuse('A change outside the authorized scope requires a new handoff')
     const { store, plans } = this.host
@@ -239,6 +309,13 @@ export class PlanRequirements {
       if (approval.requestMessageId !== preview.requestMessageId || message.messageId === preview.requestMessageId ||
           message.seq <= preview.requestSequence || store.get(KV.planRequirements.request(message.sessionId, approval.requestMessageId)) !== proposalId) {
         refuse('Approval must be a separate, later direct message bound to this preview and its original product request')
+      }
+      const review = preview.scopeReview
+      if (review.status === 'pending') refuse('Independent scope review is pending; read the requirement preview before approving')
+      if (review.status === 'outside-handoff') refuse('Independent scope review found this change outside the original Handoff; read the requirement preview and start a new Handoff')
+      if (review.status === 'uncertain') refuse('Independent scope review could not determine if this change is within the Handoff; read the requirement preview and clarify the request')
+      if (approval.scopeReviewId !== review.reviewId) {
+        refuse('Approval must be a later direct message bound to the exact independent scope review')
       }
       const approvalKey = KV.planRequirements.approval(message.sessionId, message.messageId)
       const priorApproval = store.get(approvalKey)
@@ -292,6 +369,17 @@ export class PlanRequirements {
       store.set(approvalKey, proposalId)
       return applied
     })
+  }
+
+  private currentScopePreview(preview: PendingPreview) {
+    if (!(Date.now() < Date.parse(preview.expiresAt))) return undefined
+    const { plans, handoffs } = this.host
+    const active = plans.current(preview.planId)
+    if (!active || active.revision !== preview.expectedRevision || active.plan.handoffId !== preview.handoffId) return undefined
+    const handoff = handoffs.get(preview.handoffId)
+    if (handoff?.status !== 'specified' || handoff.confirmedBy.sessionId !== preview.ownerSession || !handoff.spec ||
+        !plans.requiredDelivery(preview.planId)?.waitingFor.length) return undefined
+    return { acceptance: active.acceptance, handoff }
   }
 
   private requireOwner(handoffId: string, sessionId: string): Handoff {

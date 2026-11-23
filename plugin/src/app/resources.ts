@@ -4,7 +4,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { UserError, key, latestReport, reached, reviewStatus, runningAssignment, threadKey, viewDelivery, type Assignment, type Ticket,
   type Trigger } from '../core/index.ts'
-import { failedCheckObligations } from '../core/delivery-check.ts'
+import { failedCheckObligations, type FailedCheck } from '../core/delivery-check.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { inspectWorktree } from '../executor/worktree.ts'
 import { docTreeImpactSchema, docTreeScopeSchema } from '../executor/doc-tree.ts'
@@ -26,7 +26,7 @@ import { CliError, type Commands } from '../infra/commands.ts'
 import { sameDirectory } from '../infra/environment.ts'
 import { KV } from '../kv.ts'
 import type { Handoffs } from './handoffs.ts'
-import { PlanDeliveryReceiptSchema, type PlanRepairSource, type Plans } from './plans.ts'
+import { PlanDeliveryReceiptSchema, type Plans } from './plans.ts'
 import type { PlanStagnation } from './plan-stagnation.ts'
 import type { PlanRequirements } from './plan-requirements.ts'
 import { mainlineAttempts, mainlineIntent, type CheckDeliveryTarget, type DeliveryTargetObservation,
@@ -60,11 +60,11 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'plan/<id>/node/<node-id>/recovery/<failure-id>', holds: 'one retained technical failure observation' },
   { name: 'plan/<id>/attention', holds: 'Plan status counts and credential actions' },
   { name: 'ticket/<id>', holds: 'ticket, claim, worktree, active writer and work history', executor: true },
-  { name: 'ticket/<id>/plan-scope', holds: 'Ticket-specific goal, constraints and Plan acceptance', executor: true },
+  { name: 'ticket/<id>/plan-scope', holds: 'Ticket-specific goal, constraints, Plan acceptance and inherited check failures', executor: true },
   { name: 'ticket/<id>/mainline', holds: 'mainline attempts, actual Git verification and formal delivery blockers (not a receipt)', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
   { name: 'ticket/<id>/delivery-check', holds: 'candidate queue readiness, separate formal_delivery status for Plan tickets, and paginated acceptance, evidence and required CI', executor: true },
-  { name: 'ticket/<id>/failed-checks', holds: 'original failed checks and matching Worker reruns, without either review verdict', executor: true },
+  { name: 'ticket/<id>/failed-checks', holds: 'Plan retention obligations and matching Worker reruns, without either review verdict; empty for standalone work', executor: true },
   { name: 'ticket/<id>/delivery-observation/<n>', holds: 'one durable delivery observation', executor: true },
   { name: 'retro-followups', holds: 'optional retro backlog, independent of Plan delivery' },
   { name: 'ticket/<id>/reviews', holds: 'reviews', executor: true },
@@ -107,7 +107,7 @@ export interface ResourceHost {
   credentialBlocked?(ticketId: string): boolean
   quotaBlocked?(ticketId: string): boolean
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
-  readonly plans?: Pick<Plans, 'get' | 'definition' | 'repairSource'>
+  readonly plans?: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'failedChecks'>
   readonly pages: TextCache
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'skills' | 'defaultChanged' | 'boundRevision' | 'proposal' | 'state' | 'matches'>
   rulesManifestMaxBytes(): number
@@ -127,7 +127,7 @@ export interface MainResourceHost extends ResourceHost {
   readonly settings: Pick<Settings, 'view' | 'block'>
   readonly handoffs: Pick<Handoffs, 'get' | 'spec'>
   readonly planIntegration?: { view(id: string): PlanIntegrationView | undefined }
-  readonly plans: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'view' | 'node' | 'at' | 'revision'>
+  readonly plans: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'failedChecks' | 'view' | 'node' | 'at' | 'revision'>
   readonly stagnation: Pick<PlanStagnation, 'view' | 'failure'>
   readonly requirements: Pick<PlanRequirements, 'get'>
 }
@@ -282,7 +282,7 @@ interface DeliveryState {
   assignment: Assignment | undefined
   generation: number | undefined
   criteria: readonly { id: string; text: string }[]
-  repair: PlanRepairSource | undefined
+  inheritedChecks: readonly FailedCheck[] | undefined
   paused: boolean
   credentialBlocked: boolean
   quotaBlocked: boolean
@@ -297,7 +297,7 @@ function deliveryState(host: ResourceHost, id: string): DeliveryState {
   if (!ticket) throw new UserError('unknownTicket')
   const assignment = ticket.assignments.at(-1)
   const criteria = deliveryAcceptance(host, ticket)
-  const repair = ticket.plan && host.plans?.repairSource(ticket.plan.planId, ticket.plan.nodeId)
+  const inheritedChecks = ticket.plan && host.plans?.failedChecks(ticket.plan.planId, ticket.plan.nodeId)
   const generation = host.reviewGeneration?.(id)
   const credentialBlocked = host.credentialBlocked?.(id) === true
   const quotaBlocked = host.quotaBlocked?.(id) === true
@@ -309,8 +309,8 @@ function deliveryState(host: ResourceHost, id: string): DeliveryState {
   const proposalState = proposal === undefined ? undefined : host.prompts.state(proposal)
   const stamp = createHash('sha256').update(JSON.stringify([host.store.get(KV.settings.revision), settings.paused, credentialBlocked, quotaBlocked,
     settings.executor, settings.sources.github, ticket.plan, ticket.ended, ticket.execution, ticket.assignments, ticket.deliveryCheck, generation, criteria, pull,
-    required, proposal, proposalState, repair])).digest('hex')
-  return { ticket, assignment, generation, criteria, repair, paused: settings.paused, credentialBlocked, quotaBlocked, required, pull, proposal, stamp }
+    required, proposal, proposalState, inheritedChecks])).digest('hex')
+  return { ticket, assignment, generation, criteria, inheritedChecks, paused: settings.paused, credentialBlocked, quotaBlocked, required, pull, proposal, stamp }
 }
 
 interface DeliveryCheckout {
@@ -386,7 +386,7 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
     const { ticket, assignment, criteria, paused } = state, writer = assignment?.writer
     const { target, approvedGeneration } = deliveryTarget(state, checkout, replay, formal)
     const reviews = ticket.assignments.flatMap(item => item.reviews?.evidence ?? [])
-    const view = viewDelivery(ticket.deliveryCheck, target, reviews, criteria, id, state.repair?.checks)
+    const view = viewDelivery(ticket.deliveryCheck, target, reviews, criteria, id, ticket.plan ? (state.inheritedChecks ?? []) : undefined)
     const missing = new Set(view.missing)
     if (!view.ready && missing.size === 0) missing.add('delivery_evidence')
     if (!criteria.length) missing.add('registered_acceptance')
@@ -874,16 +874,18 @@ const ROUTES: readonly Route[] = [
       if (!definition) throw new UserError('unknownPlanNode', { id: planId, node: nodeId })
       const { node, goal, constraints, authorization, retired, testInterfaces, acceptanceScope, outOfScope } = definition
       const repair = host.plans?.repairSource(planId, nodeId)
+      const inheritedChecks = host.plans?.failedChecks(planId, nodeId)
       return { planId, nodeId, goal, constraints, authorizedScope: authorization.scope, role: node.role,
         demonstration: node.demonstration, interfaceContract: node.interfaceContract, acceptance: deliveryAcceptance(host, ticket), testInterfaces,
-        acceptanceScope, outOfScope,
+        acceptanceScope, outOfScope, ...(inheritedChecks ? { inheritedChecks } : {}),
         ...(repair ? { repair } : {}), ...(retired ? { superseded: retired } : {}), evidence: `ticket/${id}/delivery-check` }
     }
     if (section === 'failed-checks' && part === undefined) {
+      if (!ticket.plan) return { scope: 'standalone' as const, revision: null, items: [], next_offset: null }
       const before = deliveryState(host, id), checkout = await deliveryCheckout(host.commands.withSignal(signal), before, signal)
       const current = deliveryState(host, id), { target } = deliveryTarget(current, before.stamp === current.stamp ? checkout : undefined)
-      const checks = failedCheckObligations(id, current.ticket.deliveryCheck, target, current.repair?.checks)
-      return { revision: target ?? null, ...list(read, (offset, count) => checks.slice(offset, offset + count)) }
+      const checks = failedCheckObligations(id, current.ticket.deliveryCheck, target, current.inheritedChecks)
+      return { scope: 'plan' as const, revision: target ?? null, ...list(read, (offset, count) => checks.slice(offset, offset + count)) }
     }
     if (section === 'delivery-check') {
       if (part !== undefined) throw new Error('Unknown context resource')

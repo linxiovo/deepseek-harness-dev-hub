@@ -1,0 +1,1 @@
+Record your single independent judgment on the host-issued product change. Use within-handoff only if the entire exact change fits the original Handoff. Give the specific supporting or conflicting boundary, or the smallest clarifying question for uncertain. This tool does not approve or apply a change.

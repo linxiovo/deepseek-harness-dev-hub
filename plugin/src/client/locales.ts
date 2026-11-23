@@ -50,6 +50,7 @@ const TEXT = {
   'health.mainlineDelivery': ['正式交付核验', 'Formal delivery verification'],
   'health.planIntegration': ['计划集成验证', 'Plan integration verification'],
   'health.replanReview': ['停滞重排协调', 'Stalled Plan coordination'],
+  'health.requirementScopeReview': ['需求变更范围审查', 'Requirement scope review'],
   'health.relay': ['转达给主 Session 的消息', 'Relays to the main Session'],
   'health.notice': ['给主 Session 的通知', 'Notices to the main Session'],
   'health.reply': ['发往渠道的消息', 'Messages to Channels'],

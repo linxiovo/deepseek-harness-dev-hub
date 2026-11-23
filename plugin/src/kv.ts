@@ -4,6 +4,7 @@
  */
 import type { Handoff, ProjectRef, Spec } from './core/handoff.ts'
 import type { Plan, PlanMessage, PlanNodeState } from './core/plan.ts'
+import type { FailedCheck } from './core/delivery-check.ts'
 import type { PlanIntegrationView } from './core/plan-integration.ts'
 import type { PromptVersion } from './app/prompts.ts'
 import type { MainlineIntent } from './app/mainline-queue.ts'
@@ -96,6 +97,7 @@ export const KV = {
     handover: family<string[], [planId: string, nodeId: string]>('plan-handover:'),
     budgetOrigin: family<string, [planId: string, nodeId: string]>('plan-budget-origin:'),
     repairSource: family<PlanRepairSource, [planId: string, nodeId: string]>('plan-repair-source:'),
+    failedChecks: family<FailedCheck[], [planId: string, nodeId: string]>('plan-failed-checks:'),
     requiredChecks: family<GithubConfig['requiredChecks']>('plan-ticket-required-checks:'),
     claimRevision: family<number, [planId: string, nodeId: string]>('plan-claim-revision:'),
     node: family<PlanNodeState, [id: string, nodeId: string]>('plan-node:', (id, nodeId) => JSON.stringify([id, nodeId])),
@@ -108,6 +110,7 @@ export const KV = {
       (id, sessionId, messageId) => JSON.stringify([id, sessionId, messageId])) },
   /** Only the product change flow writes previews and consumes direct operator approval events. */
   planRequirements: { preview: family<RequirementPreview>('plan-requirement-preview:'),
+    reviewer: family<{ sessionId: string; createdAt: number }>('plan-requirement-reviewer:'),
     request: family<string, [sessionId: string, messageId: string]>('plan-requirement-request:',
       (sessionId, messageId) => JSON.stringify([sessionId, messageId])),
     approval: family<string, [sessionId: string, messageId: string]>('plan-requirement-approval:',

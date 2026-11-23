@@ -1,5 +1,5 @@
 /** Bounded technical recovery of an already authorized Plan Ticket; never a grant or a delivery receipt. */
-import { failedCheckObligations } from '../core/delivery-check.ts'
+import { latestTestProgress } from '../core/delivery-check.ts'
 import type { Engine } from '../core/engine.ts'
 import { key } from '../core/ids.ts'
 import { latestAssignment, type Assignment, type Ticket } from '../core/model.ts'
@@ -28,8 +28,7 @@ export interface StagnationRecord {
   /** Only a Worker tool can attest to a technical report. A host/configuration failure or answered product question cannot. */
   technicalReportId?: string
   diagnosisDeliveredAt?: string
-  /** Replaying an old pass cannot reset the idle clock or erase a subsequent failure report. */
-  passes: string[]
+  /** Failed or idle reports cannot make an already applied passing observation count again. */
   progressId?: string
   /** The current stalled failure for which the recovery-review effect was durably scheduled. */
   reviewFailureId?: string
@@ -48,7 +47,7 @@ export interface StagnationView {
 }
 interface Host {
   store: Pick<Store, 'tickets' | 'atomic' | 'get' | 'set'>
-  plans: Pick<Plans, 'state' | 'repairSource'>
+  plans: Pick<Plans, 'state' | 'failedChecks'>
   limits: Pick<RunLimits, 'forDispatch' | 'blocked'>
   engine: Pick<Engine, 'retryTicket' | 'note' | 'withdrawPlanDiagnosis'>
   paused(): boolean
@@ -77,7 +76,7 @@ export class PlanStagnation {
     if (saved?.assignmentId === assignment.id) return saved
     return { assignmentId: assignment.id, stage: 'watching', roundAt: assignment.startedAt ?? assignment.createdAt,
       attempts: saved?.attempts ?? 0, roundAttempts: saved?.attempts ?? 0, failures: saved?.failures ?? [],
-      openTests: saved?.openTests ?? false, passes: saved?.passes ?? [], progressId: saved?.progressId, reviewFailureId: saved?.reviewFailureId }
+      openTests: saved?.openTests ?? false, progressId: saved?.progressId, reviewFailureId: saved?.reviewFailureId }
   }
 
   private save(ticket: Ticket, record: StagnationRecord) {
@@ -141,35 +140,27 @@ export class PlanStagnation {
   }
 
   observeTests(ticketId: string, observation: TestObservation): void {
-    const ticket = this.host.store.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
-    if (!ticket || !assignment || !this.claimed(ticket)) return
+    const ticket = this.host.store.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket), plan = ticket?.plan
+    if (!ticket || !plan || !assignment || !this.claimed(ticket)) return
     const events = ticket.deliveryCheck?.events, index = (events?.length ?? 0) - 1, entry = events?.[index]
     // Trust the appended, inspected observation, not a caller-supplied summary or replacement pointer.
     if (entry?.kind !== 'tests' || entry.revision.candidate !== observation.candidate || entry.result !== observation.result
       || observation.read !== `ticket/${ticketId}/delivery-observation/${index}` || entry.revision.generation !== assignment.writer?.generation) return
-    const record = this.record(ticket, assignment)
     if (entry.result === 'unverified') return
-    const failed = entry.result === 'failed'
-    const checks = entry.evidence.checks.filter(check => check.status === (failed ? 'failed' : 'passed'))
-    if (!checks.length) return
-    // Index and time vary on replay. Only a distinct observation within a progress episode counts as another failure.
-    const id = key('check-run', entry.result, entry.revision.candidate, entry.revision.base, String(entry.revision.generation), entry.reference,
-      ...(failed && record.progressId ? [record.progressId] : []), ...checks.map(c => JSON.stringify([c.directory, c.command, c.observed])).sort())
-    if (failed) {
-      if (!this.addFailure(record, { id, kind: 'tests', at: entry.at, assignmentId: assignment.id, candidate: entry.revision.candidate,
-        summary: `${checks[0]!.directory}: ${checks[0]!.command}: ${checks[0]!.observed}`, read: observation.read })) return
+    const inherited = this.host.plans.failedChecks(plan.planId, plan.nodeId) ?? []
+    const progress = latestTestProgress(ticket.id, ticket.deliveryCheck, entry.revision, inherited)
+    if (!progress) return
+    const record = this.record(ticket, assignment), { read } = observation
+    if (progress.status === 'failed') {
+      const { directory, command, observed } = progress.check
+      if (record.failures.some(failure => failure.read === read) || !this.addFailure(record, { id: key('check-run', read), kind: 'tests',
+        at: entry.at, assignmentId: assignment.id, candidate: entry.revision.candidate, summary: `${directory}: ${command}: ${observed}`, read })) return
       record.openTests = true
-      this.save(ticket, record)
-      return
-    }
-    if (record.passes.includes(id)) return
-    record.passes.push(id)
-    const plan = ticket.plan
-    const inherited = plan && this.host.plans.repairSource(plan.planId, plan.nodeId)?.checks
-    if (!failedCheckObligations(ticket.id, ticket.deliveryCheck, entry.revision, inherited).some(obligation => !obligation.rerun)) {
+    } else {
+      if (record.progressId === read) return
       this.withdraw(ticket, record)
       record.attempts = 0; record.roundAttempts = 0; record.roundAt = entry.at; record.stage = 'watching'; record.openTests = false
-      record.progressId = id
+      record.progressId = read
       delete record.reason
     }
     this.save(ticket, record)

@@ -69,7 +69,7 @@ type PlanVersion = { plan: Plan; revision: number; goal: string; acceptance: Spe
 type ReplanCause = { kind: 'technical'; nodeId: string; failureId: string; reason: string; scope: string[]; repair?: true }
   | { kind: 'requirements'; proposalId: string; approval: PlanMessage; goal: string; acceptance: Spec['acceptance'] }
 export type PlanRevision = Omit<PlanVersion, 'plan'> & PlanTopology & { at: string; cause: ReplanCause }
-export interface PlanRepairSource { nodeId: string; ticketId: string; failureId: string; summary: string; checks: FailedCheck[] }
+export interface PlanRepairSource { nodeId: string; ticketId: string; failureId: string; summary: string }
 
 type PlanNodeView = PlanNode & {
   status: PlanNodeState['status'] | 'blocked' | 'waiting-for-slot' | 'superseded'
@@ -131,6 +131,7 @@ export class Plans {
       const origins = new Map<string, string>()
       const handovers = new Map<string, Set<string>>()
       const repairs = new Map<string, PlanRepairSource>()
+      const inheritedChecks = new Map<string, Map<string, FailedCheck>>()
       const instructions = new Map<string, Map<string, PlanMessage>>()
       for (const [oldId, successorIds] of Object.entries(replacements)) {
         if (!previous.has(oldId) || next.has(oldId) || !successorIds.length) refuse(`Invalid replacement of node ${oldId}`)
@@ -151,9 +152,13 @@ export class Plans {
               !isDeepStrictEqual({ ...previous.get(oldId), id: successorIds[0] }, next.get(successorIds[0]!))) {
             throw new UserError('invalidPlan', { detail: 'A repair must preserve one active node and its recorded failure' })
           }
-          source = { nodeId: oldId, ticketId: oldTicket.id, failureId: failure.id, summary: failure.summary.slice(0, 500),
-            checks: failedCheckObligations(oldTicket.id, oldTicket.deliveryCheck, undefined, source?.checks).map(item => item.failure) }
+          source = { nodeId: oldId, ticketId: oldTicket.id, failureId: failure.id, summary: failure.summary.slice(0, 500) }
         }
+        // Failure evidence is bound to observations, not to criteria a product revision can change.
+        const inherited = this.failedChecks(id, oldId)
+        const checks = oldTicket?.deliveryCheck
+          ? failedCheckObligations(oldTicket.id, oldTicket.deliveryCheck, undefined, inherited).map(item => item.failure)
+          : inherited
         for (const successor of successorIds) {
           if (!next.has(successor) || previous.has(successor) || this.store.get(KV.plans.retired(id, successor)) || this.state(id, successor)) {
             refuse(`Replacement node ${successor} is not new`)
@@ -161,6 +166,11 @@ export class Plans {
           if (origins.has(successor) && origins.get(successor) !== origin) refuse(`Replacement node ${successor} would combine separate budget pools`)
           origins.set(successor, origin)
           if (source) repairs.set(successor, source)
+          if (checks?.length) {
+            const unique = inheritedChecks.get(successor) ?? new Map<string, FailedCheck>()
+            for (const check of checks) unique.set(check.id, check)
+            inheritedChecks.set(successor, unique)
+          }
           if (draining.length) {
             const writers = handovers.get(successor) ?? new Set<string>()
             for (const node of draining) writers.add(node)
@@ -189,6 +199,7 @@ export class Plans {
       for (const [nodeId, origin] of origins) this.store.set(KV.plans.budgetOrigin(id, nodeId), origin)
       for (const [nodeId, writers] of handovers) this.store.set(KV.plans.handover(id, nodeId), [...writers])
       for (const [nodeId, source] of repairs) this.store.set(KV.plans.repairSource(id, nodeId), source)
+      for (const [nodeId, checks] of inheritedChecks) this.store.set(KV.plans.failedChecks(id, nodeId), [...checks.values()])
       for (const [nodeId, messages] of instructions) this.store.set(KV.plans.instructions(id, nodeId), [...messages.values()])
       this.store.set(KV.plans.revision(id, revision), { revision, draft, replacements, cause, goal, acceptance, at: new Date().toISOString() })
       this.store.set(KV.plans.head(id), revision)
@@ -209,8 +220,12 @@ export class Plans {
       testInterfaces: handoff.spec.testInterfaces, outOfScope: handoff.spec.outOfScope } : undefined
   }
 
-  /** The repair's immutable source of failed checks and audit history. */
+  /** The technical repair's recovery source, also used to pin the original rules and CI. */
   repairSource(id: string, nodeId: string): PlanRepairSource | undefined { return this.store.get(KV.plans.repairSource(id, nodeId)) }
+
+  /** Failed observations inherited from every replaced ancestor, including on an unclaimed node. */
+  failedChecks(id: string, nodeId: string): FailedCheck[] | undefined { return this.store.get(KV.plans.failedChecks(id, nodeId)) }
+
   list(): Plan[] { return this.store.keys(KV.plans.record).map(name => this.get(name.slice(KV.plans.record.prefix.length))).filter((plan): plan is Plan => !!plan) }
   state(id: string, nodeId: string): PlanNodeState | undefined {
     const raw = this.store.get(KV.plans.node(id, nodeId))

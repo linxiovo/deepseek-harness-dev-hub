@@ -11,6 +11,7 @@ import { key, latestAssignment, liveTicket, type ReviewAxis, type Ticket } from 
 import { mandateInstructions, ticketOfSession, workerSessionId } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { physicalPath } from '../infra/paths.ts'
+import { sameDirectory } from '../infra/environment.ts'
 import { AgentDelivery, messageId } from './delivery.ts'
 import type { Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
@@ -22,6 +23,8 @@ import type { ProjectMeter } from './project-meter.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
+import { registerScopeTool, scopeHistory, scopeProposalId, scopeRequest, scopeSessionId, scopeToolName } from './tools/requirement-scope.ts'
+import type { RequirementScopeTask, ScopeVerdict } from './plan-requirements.ts'
 
 /** Host dependencies used by `Sessions`. */
 export interface SessionsHost {
@@ -47,6 +50,9 @@ export interface SessionsHost {
   plannerActive(handoffId: string): boolean
   /** Workspace authorized by a persisted published specification, including after registration for idempotent replay. */
   splitterWorkspace(handoffId: string): string | undefined
+  scopeTask(proposalId: string): RequirementScopeTask | undefined
+  verifyScopeWorkspace(task: RequirementScopeTask): Promise<void>
+  recordScopeReview(proposalId: string, reviewer: string, verdict: ScopeVerdict): void
   /** In-process writer grant; a stored lease cannot authorize worker turns after a restart. */
   workerAuthorized(ticketId: string, sessionId: string): boolean
   credentialBlocked?(ticketId: string): boolean
@@ -60,6 +66,7 @@ export interface SessionsHost {
  */
 interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; names: Set<string>; dispose: () => void };
   role?: PromptRole; subagent?: true; ready?: Promise<void>; observeDelegation?: (initial?: UserMessage) => void; ticketId?: string;
+  scopeReviewer?: true;
   review?: { ticketId: string; grant: z.infer<typeof ReviewAssignmentSchema> } }
 
 /** The agent presets Executor, planner and main Sessions are created with, which the bundle's patch defines. */
@@ -158,6 +165,8 @@ export class Sessions {
   private readonly agentDelivery: AgentDelivery
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
+  /** A durable pin alone cannot open model admission before this mount verifies the checkout. */
+  private readonly verifiedScopeRoots = new WeakSet<Agent>()
   private readonly retryHealth = new RetryHealth()
   private readonly ctx: Context
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
@@ -293,6 +302,94 @@ export class Sessions {
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
     return result.agent
   }
+  /** Return only an original root, in its confirmed checkout and with the preset it was created under. */
+  private scopeRoot(agent: Agent, task: RequirementScopeTask): boolean {
+    const { header, inheritedEventCount } = agent.session
+    const projections = this.ctx.get('sessionProjections') as { stateOf(session: Agent['session'], name: 'agentPreset'): unknown } | undefined
+    const preset = projections ? projections.stateOf(agent.session, 'agentPreset') :
+      agent.session.snapshotEvents().some(event => (event.type as string) === 'agent-preset/selected') ? undefined : header.agentPreset
+    return agent.id === scopeSessionId(task.input.proposalId) && this.ctx.agents.get(agent.id) === agent && header.id === agent.id
+      && header.agentPreset === PLANNER_PRESET && preset === PLANNER_PRESET && !header.isSeeded && header.origin === undefined && header.parentSession === undefined
+      && inheritedEventCount === 0 && !!header.cwd && isAbsolute(header.cwd) && sameDirectory(task.workspace, header.cwd)
+  }
+  private scopeTaskFor(agent: Agent): RequirementScopeTask {
+    const id = scopeProposalId(agent.id)
+    const pin = id && this.host.store.get(KV.planRequirements.reviewer(id))
+    const task = id && this.host.scopeTask(id)
+    if (!task || !pin || pin.sessionId !== agent.id || pin.createdAt !== agent.session.header.createdAt || !this.scopeRoot(agent, task)) {
+      throw new Error('The Session is not the assigned reviewer of a current requirement preview')
+    }
+    return task
+  }
+  /** Model admission rechecks the live native task, not just the append-only business binding. */
+  scopeModelAllowed(id: string): boolean {
+    const agent = this.ctx.agents.get(id as SessionId)
+    if (!agent || !this.bindings.get(agent)?.scopeReviewer) return false
+    try { return scopeHistory(agent, scopeRequest(this.scopeTaskFor(agent))).taskSeq !== undefined } catch { return false }
+  }
+  /** Resolve one sealed request, with the same pinned physical Session on every restart. */
+  async deliverScope(id: string, admit: () => void): Promise<void> {
+    const host = this.host, ctx = this.ctx
+    const task = host.scopeTask(id)
+    if (!task) return
+    const sessionId = scopeSessionId(id) as SessionId, pinKey = KV.planRequirements.reviewer(id)
+    const request = scopeRequest(task)
+    const pending = () => {
+      host.lifetime.throwIfAborted()
+      admit()
+      const current = host.scopeTask(id)
+      if (!current || current.planId !== task.planId || current.workspace !== task.workspace || scopeRequest(current).text !== request.text) {
+        throw new Error('Requirement preview is no longer available for review')
+      }
+    }
+    await host.verifyScopeWorkspace(task)
+    pending()
+    const pin = host.store.get(pinKey)
+    let result = await ctx.sessionController.resolveAgent(sessionId)
+    pending()
+    if ('error' in result && result.error.code === 'session/not-found' && !pin) {
+      const workspace = await ctx.workspaceRegistry.create(task.workspace)
+      pending()
+      // This reservation authorizes no model request. A crash during create can recover only a clean original root.
+      host.projectMeter.bind({ session_id: sessionId, plan_id: task.planId, parent_session_id: host.masterId, role: 'review' })
+      await ctx.sessionController.create({ sessionId, workspaceId: workspace.id, agentPreset: PLANNER_PRESET })
+      pending()
+      result = await ctx.sessionController.resolveAgent(sessionId)
+      pending()
+    }
+    if ('error' in result) throw result.error
+    const { agent } = result
+    const binding = host.store.get(KV.projectMeter.binding(sessionId))
+    if (!this.scopeRoot(agent, task) || binding?.plan_id !== task.planId || binding.ticket_id !== null
+      || binding.parent_session_id !== host.masterId || !binding.roles.includes('review')) throw new Error('Foreign requirement scope Session')
+    if (!pin) {
+      await ctx.sessionPersistence.flush()
+      pending()
+      if (!this.scopeRoot(agent, task)) throw new Error('Requirement scope Session changed before pinning')
+      const { taskSeq, pending: inbox } = scopeHistory(agent, request)
+      if (taskSeq !== undefined || inbox || agent.status !== 'idle' || agent.session.requestHeader()) throw new Error('Expected a fresh scope reviewer')
+      host.store.set(pinKey, { sessionId, createdAt: agent.session.header.createdAt })
+    }
+    const authorize = () => { pending(); this.scopeTaskFor(agent); scopeHistory(agent, request) }
+    authorize()
+    this.verifiedScopeRoots.add(agent)
+    await this.decorate(agent)
+    authorize()
+    await initializeRoleModel(ctx, agent, host.store.settings().executor.model)
+    authorize()
+    await ctx.sessionController.rename({ sessionId, title: `Requirement scope: ${id}` })
+    authorize()
+    const state = scopeHistory(agent, request)
+    const next = state.taskSeq === undefined ? request : agent.status === 'idle' ? state.wake : undefined
+    if (next && agent.status === 'idle' && state.pending && state.pending.id === this.promptedId(next.id) && agent.inbox.remove(state.pending.id)) {
+      agent.followup(state.pending)
+      await ctx.sessionPersistence.flush()
+    } else if (next) {
+      await this.agentDelivery.send(agent, key(next.id), next.text, 'queue', host.lifetime, authorize)
+    }
+    const received = scopeHistory(agent, request)
+    if (received.taskSeq === undefined && !received.pending) throw new Error('The native scope reviewer did not receive its sealed task')
+  }
   /** Trusted host dispatch/receipt seam. A binding records attribution, never permission to start a turn. */
   bindWorker(ticketId: string, sessionId: string, retry = false): void {
     const scope = { session_id: sessionId, ticket_id: ticketId,
@@ -408,6 +505,29 @@ export class Sessions {
     try { return relative(realpathSync.native(workspace), realpathSync.native(cwd)) === '' } catch { return false }
   }
   private async decorate(agent: Agent): Promise<void> {
+    const scopeId = scopeProposalId(agent.id)
+    if (scopeId !== undefined) {
+      let binding = this.bindings.get(agent)
+      if (!binding) {
+        binding = { disposers: [agent.ctx.tools.restrict({ allow: [] }), agent.ctx.tools.guard(({ name }) => {
+          if (name !== scopeToolName || !this.scopeModelAllowed(agent.id)) return PLANNER_DENIED
+          return undefined
+        })] }
+        this.bindings.set(agent, binding)
+      }
+      if (binding.scopeReviewer || !this.verifiedScopeRoots.has(agent)) return
+      this.scopeTaskFor(agent)
+      binding.disposers.push(agent.ctx.systemPrompt.section({ name: 'dsh-superagent-scope-review', order: 9999, complete: true,
+        interpolate: false, text: promptFile('plan-requirement-scope-review') }),
+        registerScopeTool(agent, () => this.scopeTaskFor(agent), task => this.host.verifyScopeWorkspace(task),
+          verdict => this.host.recordScopeReview(scopeId, agent.id, verdict)))
+      binding.scopeReviewer = true
+      binding.ready = Promise.resolve()
+      this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
+      if (agent.status === 'idle') this.retryHealth.clear(agent.id)
+      this.updateModelHealth()
+      return
+    }
     const prior = this.bindings.get(agent)
     if (prior) {
       if (prior.role !== 'splitter' || prior.ready || !this.isSplitterSession(agent)) { await prior.ready; return }

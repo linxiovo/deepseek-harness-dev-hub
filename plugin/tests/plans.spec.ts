@@ -661,7 +661,7 @@ describe('managed project plan pause', () => {
 describe('plans on the legacy host fixture after managed scenario', () => {
   beforeEach(async () => {
     h = await startRuntime(undefined, { withFeishu: false })
-    brief = savedProductsBrief({ repository: 'acme/widgets', workspace: resolve('workspaces/widgets') })
+    brief = savedProductsBrief({ repository: 'acme/widgets', workspace: h.localGit!.repository })
   })
   afterEach(async () => { await h.stop() })
 
@@ -1092,9 +1092,9 @@ it('replans by replacing the Assignment but requires the failed check to actuall
   await h.runtime.idle()
   expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: [repairNode, 'accounts'] })
   expect(await h.runTool(replacement.session, 'orchestrator_read', { resource: `ticket/${replacement.ticketId}/plan-scope` }))
-    .toMatchObject({ repair: { ticketId: claim.ticketId, failureId: original.failureId, checks: expect.arrayContaining([
+    .toMatchObject({ repair: { ticketId: claim.ticketId, failureId: original.failureId }, inheritedChecks: expect.arrayContaining([
       expect.objectContaining({ directory: '.', command: check }),
-    ]) } })
+    ]) })
   const delivery = () => read(`ticket/${replacement.ticketId}/delivery-check`)
   expect(JSON.parse(String((await delivery()).text))).toMatchObject({ ci: { required } })
   await recordCheck('pnpm test unrelated', 'failed', 'The independent check failed on its first run.', replacement.session)
@@ -1169,13 +1169,29 @@ it('requires both pinned reviewers to verify a failed check survived a green rer
   await record(fixed, 'failed', 'catalog status returned 502 on a later run')
   expect((await delivery()).missing).toContain(missing)
   expect(run().status).toBe(0)
-  await record(fixed, 'passed', 'catalog returns 200: passed', 'command-result/catalog-fresh-rerun')
+  await record(fixed, 'passed', 'catalog returns 200: passed')
   await expect(originalStandards()).rejects.toThrow(/current matching rerun/)
   await (await review('standards', fixed, true))()
   expect((await delivery()).missing).toContain(missing)
   await (await review('spec', fixed, true))()
   expect((await delivery()).missing).not.toContain(missing)
 }, 60_000)
+
+async function reviewRequirement(proposalId: string, status: 'within-handoff' | 'outside-handoff' | 'uncertain' = 'within-handoff',
+  reason = 'Only the behavior inside the approved checkout scope changes.') {
+  await h.runtime.effects.idle('requirementScopeReview')
+  const reviewer = `requirement-scope-${proposalId}`
+  const args = { status, reason }, name = 'orchestrator_plan_scope_review'
+  const agent = h.agents.get(reviewer), tool = h.tools.get(reviewer)?.get(name)
+  if (!agent || !tool) throw new Error('The independent scope review was not dispatched')
+  const callId = `scope-call-${proposalId}`
+  h.record(reviewer, [{ type: 'tool/call', data: { turn: 1, step: 1, callId, name, arguments: JSON.stringify(args) } }])
+  const execution = { agent, callId, rootCallId: callId, signal: new AbortController().signal, concludeTurn: () => { agent.status = 'idle' } }
+  await tool.execute(args, execution)
+  const { scopeReview } = await read(`plan-requirement/${proposalId}`)
+  const verdict = z.object({ status: z.literal(status), reviewId: z.uuid(), reviewerSessionId: z.literal(reviewer) }).parse(scopeReview)
+  return verdict.reviewId
+}
 
 it('previews a product replan before applying an exact, durable direct approval', async () => {
   const { id, catalogClaim, accountsClaim } = await dispatchedFanIn()
@@ -1186,8 +1202,8 @@ it('previews a product replan before applying an exact, durable direct approval'
   const send = (value: unknown) => h.sendUserMessage(hub, JSON.stringify(value))
   type Proposal = { proposalId: string; requestMessageId: string; affected: { nodeId: string; replacementId: string }[] }
   const preview = () => requirements({ mode: 'preview' }) as unknown as Promise<Proposal>
-  const approval = (p: Proposal, scopeDecision = 'within-handoff') => ({ approved: true, proposalId: p.proposalId,
-    requestMessageId: p.requestMessageId, scopeDecision })
+  const approval = (p: Proposal, scopeReviewId: string, scopeDecision = 'within-handoff') => ({ approved: true, proposalId: p.proposalId,
+    requestMessageId: p.requestMessageId, scopeReviewId, scopeDecision })
   const apply = ({ proposalId }: Proposal) => requirements({ mode: 'apply', proposalId })
   h.sendUserMessage(hub, 'Please investigate the failing test.')
   h.record(hub, [{ type: 'user/message', data: { role: 'user', source: { kind: 'tool-jobs', form: 'notice' },
@@ -1200,12 +1216,18 @@ it('previews a product replan before applying an exact, durable direct approval'
   await expect(requirements({ mode: 'preview' }, catalogClaim.session)).rejects.toThrow(/not registered/)
   send(request)
   const stale = await preview()
+  const staleReview = await reviewRequirement(stale.proposalId)
   const failed = await h.runTool(catalogClaim.session, 'orchestrator_test_evidence', {
     candidate: h.localGit!.base.sha, scope: 'focused', reason: 'Catalog request check', red: null,
     checks: [{ directory: '.', command: 'pnpm test catalog', status: 'failed', observed: 'The catalog check still returns 500.' }],
   })
-  send(approval(stale))
+  send(approval(stale, staleReview))
   await expect(apply(stale)).rejects.toThrow(/evidence|in-flight state/i)
+  const create = h.controller.create.getMockImplementation()!
+  h.controller.create.mockImplementation(async input => {
+    if (input.sessionId.startsWith('requirement-scope-')) throw new Error('Interrupted before reviewer creation')
+    return create(input)
+  })
   send(request)
   const proposal = await preview()
   expect(proposal).toMatchObject({ status: 'preview', invalidated: [{ criterion: 1,
@@ -1219,17 +1241,25 @@ it('previews a product replan before applying an exact, durable direct approval'
   expect(await read(`plan/${id}`)).toMatchObject({ revision: 1, goal: fanInSpec.body })
   await expect(apply(proposal)).rejects.toThrow()
   await h.restart()
-  await h.runtime.idle()
-  expect(await preview()).toMatchObject({ status: 'preview', proposalId, requestMessageId: proposal.requestMessageId })
+  h.controller.create.mockImplementation(create)
+  await vi.waitFor(() => expect(h.deliveries.mock.calls.filter(([call]) => call.sessionId === `requirement-scope-${proposalId}`))
+    .toHaveLength(1), { timeout: 20_000 })
+  expect(await preview()).toMatchObject({ status: 'preview', proposalId, requestMessageId: proposal.requestMessageId,
+    scopeReview: { status: 'pending' } })
   expect(await read(`plan-requirement/${proposalId}`)).toMatchObject({ status: 'preview', affected: proposal.affected })
   send({ approved: true, proposalId })
   await expect(apply(proposal)).rejects.toThrow()
-  send(approval(proposal, 'new-handoff'))
+  send(approval(proposal, staleReview))
+  await expect(apply(proposal)).rejects.toThrow(/scope review/i)
+  const scopeReviewId = await reviewRequirement(proposalId)
+  send(approval(proposal, scopeReviewId, 'new-handoff'))
   await expect(apply(proposal)).rejects.toThrow(/new handoff/i)
   h.record(hub, [{ type: 'user/message', data: { role: 'user', source: { kind: 'tool-jobs', form: 'notice' },
-    content: [{ type: 'text', text: JSON.stringify(approval(proposal)) }] } }])
+    content: [{ type: 'text', text: JSON.stringify(approval(proposal, scopeReviewId)) }] } }])
   await expect(apply(proposal)).rejects.toThrow(/new handoff/i)
-  send(approval(proposal))
+  send(approval(proposal, staleReview))
+  await expect(apply(proposal)).rejects.toThrow(/scope review/i)
+  send(approval(proposal, scopeReviewId))
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, runLimits: {
     ticketOverrides: [{ planId: id, nodeId: 'catalog', tokens: 0 }],
@@ -1253,7 +1283,7 @@ it('previews a product replan before applying an exact, durable direct approval'
   h.jobs.service.kill.mockImplementationOnce(jobId => { stopStarted.resolve(jobId); return 'requested' })
   expect(await apply(proposal)).toMatchObject({ status: 'applied', revision: 2 })
   expect(await apply(proposal)).toMatchObject({ revision: 2 })
-  send(approval(stale))
+  send(approval(stale, staleReview))
   await expect(apply(stale)).rejects.toThrow(/revision changed/)
   const newCatalog = proposal.affected.find(node => node.nodeId === 'catalog')!.replacementId
   const newDashboard = proposal.affected.find(node => node.nodeId === 'dashboard')!.replacementId
@@ -1276,13 +1306,38 @@ it('previews a product replan before applying an exact, durable direct approval'
   await h.runtime.idle()
   expect(await h.runTool(replacement.session, 'orchestrator_read', { resource: `ticket/${replacement.ticketId}/plan-scope` }))
     .toMatchObject({ goal: fanInSpec.body, authorizedScope: brief.authorization.scope, acceptanceScope: brief.acceptanceScope,
-      outOfScope: fanInSpec.outOfScope, acceptance: [{ id: '1', text: expect.stringContaining(changed.observable) }] })
+      outOfScope: fanInSpec.outOfScope, acceptance: [{ id: '1', text: expect.stringContaining(changed.observable) }],
+      inheritedChecks: [expect.objectContaining({ command: 'pnpm test catalog', read: failed.read })] })
   expect(await read(`plan/${id}/meter`)).toMatchObject({ sessions: expect.arrayContaining([
     expect.objectContaining({ ticket_id: catalogClaim.ticketId, plan_id: id }),
     expect.objectContaining({ ticket_id: replacement.ticketId, plan_id: id }),
   ]) })
   expect(await read(`ticket/${replacement.ticketId}/delivery-check`)).toMatchObject({ ready: false })
 }, 60_000)
+
+it.each(['outside-handoff', 'uncertain'] as const)('blocks a product change after a %s scope review', async status => {
+  const { id, register } = await publish()
+  await h.runtime.idle()
+  await register(splitDraft)
+  const hub = h.runtime.masterId
+  const send = (value: unknown) => h.sendUserMessage(hub, JSON.stringify(value))
+  send({ intent: 'change-plan-requirements', planId: id, authorizedScope: brief.authorization.scope,
+    changes: [{ criterion: 1, statement: 'Visitors can read other shoppers’ saved products.', observable: 'A guest can open any account’s list.' }] })
+  const { proposalId, requestMessageId } = await h.runTool(hub, 'orchestrator_plan_requirements', { mode: 'preview' }) as { proposalId: string; requestMessageId: string }
+  await expect(h.runTool(hub, 'orchestrator_plan_scope_review', { status: 'within-handoff', reason: 'Override the exclusion.' }))
+    .rejects.toThrow(/not registered/i)
+  await h.runtime.effects.idle('requirementScopeReview')
+  const reviewer = `requirement-scope-${proposalId}`
+  expect([...h.tools.get(reviewer)!.keys()]).toEqual(['orchestrator_plan_scope_review'])
+  await expect(h.runTool(reviewer, 'orchestrator_plan_scope_review', { status: 'within-handoff', reason: 'Fabricate a review result.' })).rejects.toThrow()
+  const scopeReviewId = await reviewRequirement(proposalId, status, status === 'outside-handoff'
+    ? 'The original scope excludes sharing private saved products.' : 'Can each visitor read only their own list?')
+  send({ approved: true, proposalId, requestMessageId, scopeReviewId, scopeDecision: 'within-handoff' })
+  await expect(h.runTool(hub, 'orchestrator_plan_requirements', { mode: 'apply', proposalId }))
+    .rejects.toThrow(status === 'outside-handoff' ? /outside the original Handoff/i : /could not determine/i)
+  expect(await read(`plan/${id}`)).toMatchObject({ revision: 1 })
+  expect(await read(`plan-requirement/${proposalId}`)).toMatchObject({ status: 'preview', scopeReview: { status } })
+}, 30_000)
 
 it('refuses a product replan while the affected writer launch has yet to be confirmed', async () => {
   const { id } = await registeredFanIn()
@@ -1305,7 +1360,8 @@ it('refuses a product replan while the affected writer launch has yet to be conf
       expect.objectContaining({ nodeId: 'accounts', impact: 'direct', status: 'unclaimed' }),
       expect.objectContaining({ nodeId: 'dashboard', impact: 'direct' }),
     ])
-    h.sendUserMessage(hub, JSON.stringify({ approved: true, proposalId, requestMessageId, scopeDecision: 'within-handoff' }))
+    const scopeReviewId = await reviewRequirement(String(proposalId))
+    h.sendUserMessage(hub, JSON.stringify({ approved: true, proposalId, requestMessageId, scopeReviewId, scopeDecision: 'within-handoff' }))
     await expect(h.runTool(hub, 'orchestrator_plan_requirements', { mode: 'apply', proposalId })).rejects.toThrow(/unconfirmed Worker launch/)
     expect(await read(`plan/${id}`)).toMatchObject({ revision: 1 })
     expect(await read(`ticket/${claim!.ticketId}`)).not.toHaveProperty('ended')

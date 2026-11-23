@@ -20,6 +20,14 @@ The Hub also owns `orchestrator_handoff_confirm`, `orchestrator_handoff_answer`,
 
 The Hub alone owns `orchestrator_queue_merge`; it requests the checked, durable operation in [Merging](003-execution.md#merging), not a general Git command. Worker and planning tools cannot start it.
 
+## Hub Session rotation
+
+The project Hub identity remains stable while its physical DSH Session may rotate. `HubAuthority` persists a monotonic physical generation and a `rotating` intent in the project Store. `Runtime.rotateHub()` first fences the old generation, waits for registered Hub operations and the old turn to settle, creates a deterministic explicit-ID target Session, then activates it. A restart adopts the same target instead of creating another Session.
+
+Relay and notice effects address the logical Hub, not a physical Session. They remain queued while no generation is active. `AgentDelivery` records a durable receipt after the target Session's persistence flush and scans prior Hub generations before retrying, so a crash after delivery does not replay the same request. Pending inbox messages move to the new Session at the quiescent point; durable project state, not a transcript copy, is the continuation summary.
+
+Retired Hub generations remain readable and metered as historical Sessions, but `agent/pre-step`, tool registration and the Hub operation lease reject their model turns and coordination tools. Worker and Plan recovery effects use their existing durable claims and do not require a live Hub generation.
+
 ## Worker Session
 
 An Executor Session is created with `WORKER_PRESET` (`dsh-superagent-worker`) and keeps the file, search, shell, job, web, skill, todo and subagent tools listed in `WORK_TOOLS` (`src/app/sessions.ts`). `Sessions.workOnly` adds only the MCP tools named in `DEV_MCP_TOOLS`, the read-only Context7 lookups `mcp__context7__resolve-library-id` and `mcp__context7__query-docs`. No other MCP server is allowed: a mounted tool such as `mcp__feishu__send_message` is not in the allow list, so a Worker cannot send a person a message through MCP. The preset also keeps the shell's network access: a worker installs dependencies and reaches the Context7 service its MCP tools use. It works in its Ticket directory and may create subagents, which run under DeepSeek Harness's `standard` preset with the worker's permissions. It receives no tool for asking or presenting to a person, changing the deployment profile, scheduling work outside the worker slots, or sending a Channel message.
@@ -98,6 +106,10 @@ The agreed contract for this boundary:
 | --- | --- |
 | `plugin/cordis.patch.yml` | Defines `dsh-superagent-worker` and the read-only `dsh-superagent-router` preset rows |
 | `plugin/src/app/sessions.ts` | `ROUTER_PRESET`, `WORKER_PRESET`, `HUB_TOOLS`, `WORK_TOOLS`, `DEV_MCP_TOOLS`, `Sessions.decorate`, `Sessions.workOnly`, `Sessions.owningTicket` and `Sessions.limitSubagent` (role restrictions and Worker/descendant guards) |
+| `plugin/src/app/hub-authority.ts` | Durable logical Hub identity, physical generation fence, deterministic rotation target and restart-safe resume marker |
+| `plugin/src/app/delivery.ts` | Cross-generation delivery history and durable flush receipt used by Hub relay/notice retries |
+| `plugin/src/app/runtime.ts` | `Runtime.rotateHub()`, project-fact continuation summary, authority activation and historical Hub shutdown |
+| `plugin/tests/hub-rotation.spec.ts` | Public Runtime rotation seam: pending direct input transfer, stale old-tool refusal, stable Worker Assignment and restart adoption |
 | `plugin/src/executor/background.ts` | `stopSubagents` and `stopBackground`: Worker and descendant tracked-job shutdown and subagent release on Ticket close and hand-off |
 | `plugin/src/app/tools/main.ts` | The Hub's coordination, inspection and evaluation tools |
 | `plugin/src/app/plan-dispatch.ts` | Hub-only Frontier selection, slot reservation, durable Plan Ticket claims and restart rearming |

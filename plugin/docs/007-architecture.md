@@ -428,12 +428,13 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
 | `src/app/sessions.ts` | Sessions |
+| `src/app/hub-authority.ts` | `HubAuthority`: durable logical Hub identity, physical generation fence, deterministic target Session and resume receipt |
 | `src/app/session-meter.ts` | `SessionMeter`: one Session's context snapshot and cumulative usage from its durable event log, with provenance, missing and in-flight ranges, and the persisted exclusive cursor; forked prefixes are excluded |
 | `src/app/project-meter.ts` | `ProjectMeter`: project-local Session bindings and deduplicated scoped usage; contract in `plugin/docs/014-project-metering.md` |
 | `src/app/run-limits.ts` | Mounted project and Ticket budget reservations, authoritative settlements and scoped hold notifications; contract in `016-run-limits.md` |
 | `src/app/model-admission.ts` | Pre-provider DSH stream admission and once-per-attempt usage receipt |
 | `src/app/meter-recovery.ts` | Restores detached review attribution from durable review receipts and verified Session parent metadata |
-| `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
+| `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id across restored and rotated Hub Sessions |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
 | `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers |
@@ -548,6 +549,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/followups.spec.ts` | A person's follow-up on a Ticket's Thread: its notice to the main Session, the tools that act on it, what a burst costs; a worker's hand-back and context follow, and the main Session's note |
 | `tests/health.spec.ts` | One health entry per part, each cleared by its own next success |
 | `tests/delivery.spec.ts` | `AgentDelivery` |
+| `tests/hub-rotation.spec.ts` | Runtime Hub generation rotation: queued direct-input transfer, retired-tool refusal, stable Worker Assignment and restart adoption |
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
 | `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |

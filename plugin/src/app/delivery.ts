@@ -2,8 +2,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { freezeMessage, MessageId, type ContextFormed, type UserMessage } from '@deepseek-ai/dsh-llm'
-import type { Session } from '@deepseek-ai/dsh-session'
-import type {} from '@deepseek-ai/dsh-session-persistence'
+import type { Session, SessionId } from '@deepseek-ai/dsh-session'
+import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -61,6 +61,23 @@ export class AgentDelivery {
   async holds(agent: Agent, requestId: string): Promise<boolean> {
     const id = messageId(requestId)
     return (await this.history(agent)).ids.has(id) || [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => deliveryId(message) === id)
+  }
+  /** Checks a cold physical Hub log without resuming its Agent, so rotation can deduplicate a flushed old delivery. */
+  async holdsIn(sessionId: string, requestId: string): Promise<boolean> {
+    const id = messageId(requestId)
+    await this.ctx.sessionPersistence.flush()
+    try {
+      await using handle = await this.ctx.sessionPersistence.open(sessionId as SessionId, 'read')
+      for (let offset = 0; ; ) {
+        const { events } = await handle.read(offset, 512)
+        if (!events.length) return false
+        for (const event of events) if (event.type === 'user/message' && deliveryId(event.data) === id) return true
+        offset += events.length
+      }
+    } catch (error) {
+      if (error instanceof SessionPersistenceNotFoundError) return false
+      throw error
+    }
   }
   /** Delivers once to the selected inbox, or injects into history without waking the agent, and flushes Session persistence before acknowledging the producer. */
   async send(agent: Agent, requestId: string, text: string, mode: 'queue' | 'steer' | { inject: string }, signal: AbortSignal, authorize?: () => void,

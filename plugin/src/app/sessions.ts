@@ -13,8 +13,10 @@ import type { HealthEntry } from '../infra/health.ts'
 import { physicalPath } from '../infra/paths.ts'
 import { sameDirectory } from '../infra/environment.ts'
 import { AgentDelivery, messageId } from './delivery.ts'
-import type { Effects } from './effects.ts'
+import { Later, type Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
+import type { HubRotation } from './hub-authority.ts'
+import type { HubDeliveryReceipt } from '../kv.ts'
 import { RetryHealth } from './retry-health.ts'
 import { initializeRoleModel } from './role-models.ts'
 import { bundledSkills, isBundledSkill, promptFile, splitterSkill } from './skill-files.ts'
@@ -36,13 +38,23 @@ export interface SessionsHost {
   readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'idle' | 'pending'>
   /** The `models` health entry, which reports managed sessions waiting on a model-budget retry. */
   readonly health: HealthEntry
+  /** Legacy physical Hub ID used only as the initial fallback while authority is loaded. */
   readonly masterId: string
+  /** Current physical Hub Session; undefined while a durable rotation is provisioning. */
+  readonly currentHubId: () => string | undefined
+  /** Deterministic target physical Session recorded by a rotation intent, if any. */
+  readonly hubTargetId: () => string | undefined
+  readonly hubGenerations: () => readonly string[]
+  readonly isHubGeneration: (sessionId: string) => boolean
+  readonly beginHubRotation: () => HubRotation
+  readonly activateHub: (sessionId: string) => void
+  readonly hubResume: () => { epoch: number; requestId: string; text: string } | undefined
+  readonly hubResumeDelivered: (requestId: string) => void
   readonly lifetime: AbortSignal
   /** Called immediately before delivering an ordered relay to the Hub inbox. */
   relayAvailable(requestId: string): boolean
   closing(): boolean
   readonly boundWorkspace?: string | undefined
-  /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
   environment(ticket: Ticket): Variable[]
   /** Whether the mounted project owns this persisted planning handoff, even when it is not active. */
   ownsPlanner(handoffId: string): boolean
@@ -161,7 +173,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
  * `Runtime`, `DshExecutor`, `MasterAssessor`, `Settings`, and management routes/tools use it to ensure sessions, deliver deduplicated messages via `AgentDelivery`, and process ordered `relay` and `notice` effects.
  * Feeds session events into `RetryHealth` to report model budget waits on the `models` `HealthEntry`, and durably records which prompt revisions each session has worked under in `Store` (`KV.sessions.prompts`) to authorize prompt version reads.
  */
-export class Sessions {
+ export class Sessions {
   private readonly agentDelivery: AgentDelivery
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
@@ -169,6 +181,10 @@ export class Sessions {
   private readonly verifiedScopeRoots = new WeakSet<Agent>()
   private readonly retryHealth = new RetryHealth()
   private readonly ctx: Context
+  private hubOperations = 0
+  private hubIdle?: PromiseWithResolvers<void>
+  private rotationRequested = false
+  private rotationTask?: Promise<string>
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
   constructor(private readonly host: SessionsHost) {
     this.ctx = host.context
@@ -210,13 +226,17 @@ export class Sessions {
         const ticketId = ticketOfSession(sessionId), agent = ctx.agents.get(sessionId as SessionId)
         const plannerId = plannerHandoffId(sessionId)
         const planner = plannerId !== undefined && this.host.ownsPlanner(plannerId)
-        const ours = sessionId === this.host.masterId ? ROUTER_PRESET
+        const ours = (sessionId === this.host.currentHubId() || sessionId === this.host.hubTargetId()) ? ROUTER_PRESET
           : planner || (agent && this.isSplitterSession(agent)) ? PLANNER_PRESET
           : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
         if (!ours || preset === ours || !agent) return
         const presets = child.get('agentPresets') as { select(agent: Agent, preset: string): Promise<string> }
         presets.select(agent, ours).catch(() => {})
       })
+    })
+    ctx.on('agent/pre-step', async ({ agent }, next) => {
+      if (this.host.isHubGeneration(agent.id) && this.host.currentHubId() !== agent.id) return { kind: 'reject' }
+      return next()
     })
     ctx.on('agent/status', ({ agent, status }) => {
       if (status === 'idle' && !this.host.closing()) { this.retryHealth.clear(agent.id); this.updateModelHealth() }
@@ -234,6 +254,118 @@ export class Sessions {
     const agent = this.ctx.agents.get(id as SessionId)
     return agent !== undefined && this.bindings.get(agent)?.subagent === true
   }
+  /** Ensure the authority's current or provisioned physical Hub exists and replay its factual continuation once. */
+  async ensureHub(cwd: string, title: string): Promise<Agent> {
+    const target = this.host.hubTargetId()
+    if (target) this.rotationRequested = true
+    const id = target ?? this.host.currentHubId() ?? this.host.masterId
+    const agent = await this.ensure(id, cwd, title, 'orchestrator')
+    if (target) {
+      this.host.activateHub(id)
+      this.rotationRequested = false
+      await this.resumeHub()
+      for (const old of this.host.hubGenerations()) if (old !== id) await this.transferHubInbox(old, agent)
+    } else {
+      this.rotationRequested = false
+      await this.resumeHub()
+    }
+    return agent
+  }
+
+  /** Quiesce the old physical Session, provision the deterministic target and atomically grant it Hub authority. */
+  async rotateHub(cwd: string, title: string): Promise<string> {
+    if (this.rotationTask) return this.rotationTask
+    this.rotationRequested = true
+    const task = this.performRotation(cwd, title)
+    this.rotationTask = task
+    try { return await task }
+    finally { if (this.rotationTask === task) this.rotationTask = undefined; this.rotationRequested = false }
+  }
+
+  private async performRotation(cwd: string, title: string): Promise<string> {
+    await this.waitHubOperations()
+    const rotation = this.host.beginHubRotation()
+    const old = this.ctx.agents.get(rotation.fromSessionId as SessionId)
+    old?.cancel({ kind: 'user' }, { keepInbox: true })
+    await old?.whenIdle()
+    const target = await this.ensure(rotation.targetSessionId, cwd, title, 'orchestrator')
+    this.host.activateHub(target.id)
+    this.rotationRequested = false
+    await this.resumeHub()
+    await this.transferHubInbox(rotation.fromSessionId, target)
+    return target.id
+  }
+
+  private async resumeHub(): Promise<void> {
+    const resume = this.host.hubResume()
+    if (!resume) return
+    await this.promptHub(resume.requestId, resume.text, 'queue')
+    this.host.hubResumeDelivered(resume.requestId)
+  }
+
+  /** Deliver a logical Hub message to whichever physical Session currently owns the authority. */
+  async promptHub(requestId: string, text: string, mode: 'queue' | 'steer' | { inject: string }, authorize?: () => void,
+    accepted?: () => void): Promise<void> {
+    const id = this.host.currentHubId()
+    if (!id || this.rotationRequested) throw new Later('Hub Session is rotating')
+    const release = this.beginHubOperation(id)
+    try {
+      const hash = key(text)
+      const receipt = this.host.store.get(KV.runtime.delivery(requestId))
+      if (receipt?.hash === hash) { accepted?.(); return }
+      for (const generation of this.host.hubGenerations()) {
+        if (generation === id) continue
+        if (!await this.agentDelivery.holdsIn(generation, requestId)) continue
+        const found: HubDeliveryReceipt = { hash, sessionId: generation, at: new Date().toISOString() }
+        this.host.store.set(KV.runtime.delivery(requestId), found)
+        accepted?.()
+        return
+      }
+      const result = await this.ctx.sessionController.resolveAgent(id as SessionId)
+      if ('error' in result) throw result.error
+      await this.agentDelivery.send(result.agent, requestId, text, mode, this.host.lifetime, () => {
+        authorize?.()
+        if (this.rotationRequested || this.host.currentHubId() !== id) throw new Later('Hub Session changed during delivery')
+      }, () => { this.host.store.set(KV.runtime.delivery(requestId), { hash, sessionId: id, at: new Date().toISOString() }); accepted?.() })
+    } finally { release() }
+  }
+
+  private beginHubOperation(id: string): () => void {
+    if (this.rotationRequested || this.host.currentHubId() !== id) throw new Later('Hub Session is not current')
+    this.hubOperations++
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      if (--this.hubOperations === 0) this.hubIdle?.resolve()
+    }
+  }
+
+  private async waitHubOperations(): Promise<void> {
+    if (!this.hubOperations) return
+    this.hubIdle ??= Promise.withResolvers<void>()
+    if (!this.hubOperations) { this.hubIdle.resolve(); return }
+    await this.hubIdle.promise
+    this.hubIdle = undefined
+  }
+
+  private async transferHubInbox(oldId: string, target: Agent): Promise<void> {
+    const old = this.ctx.agents.get(oldId as SessionId)
+    if (!old || old === target) return
+    const inbox = [...old.inbox.nextStep, ...old.inbox.nextTurn]
+    for (const message of inbox) {
+      if (!old.inbox.remove(message.id)) continue
+      const source = message.source as { kind?: string; plugin?: unknown }
+      if (source.kind === 'dsh-superagent' || (source.kind === 'plugin' && source.plugin === 'dsh-superagent')) {
+        const requestId = String(message.id).replace(/^dsh-superagent:/, '')
+        const text = message.content.filter(block => block.type === 'text').map(block => block.text).join('')
+        this.host.store.set(KV.runtime.delivery(requestId), { hash: key(text), sessionId: oldId, at: new Date().toISOString() })
+      }
+      target.followup(message)
+    }
+    if (inbox.length) await this.ctx.sessionPersistence.flush()
+  }
+
   /** Resolves or creates a role session in `cwd`, sets its preset and model, decorates it, and renames it to `title`. */
   async ensure(id: string, cwd: string, title: string, role: PromptRole): Promise<Agent> {
     const plannerId = role === 'planner' ? plannerHandoffId(id) : undefined
@@ -251,7 +383,8 @@ export class Sessions {
     const bind = () => {
       if (this.host.closing()) throw new Error('Session dispatch is stopping')
       if (role === 'orchestrator') {
-        if (id !== this.host.masterId) throw new Error('The Hub Session must match its persisted project identity')
+        const expected = this.host.currentHubId() ?? this.host.hubTargetId()
+        if (id !== expected) throw new Error('The Hub Session is not the current persisted authority target')
       } else if (ticketId !== undefined) {
         if (!this.host.workerAuthorized(ticketId, id)) throw new Error(`Worker ${id} lost its writer grant before Session setup`)
         this.bindWorker(ticketId, id)
@@ -260,7 +393,7 @@ export class Sessions {
           throw new Error('Planning dispatch changed before Session setup')
         }
         this.host.projectMeter.bind({ session_id: id, role,
-          ...this.host.projectMeter.owns(id) ? {} : { parent_session_id: this.host.masterId } })
+          ...this.host.projectMeter.owns(id) ? {} : { parent_session_id: this.host.currentHubId() ?? this.host.masterId } })
       }
     }
     const ctx = this.ctx
@@ -351,7 +484,7 @@ export class Sessions {
       const workspace = await ctx.workspaceRegistry.create(task.workspace)
       pending()
       // This reservation authorizes no model request. A crash during create can recover only a clean original root.
-      host.projectMeter.bind({ session_id: sessionId, plan_id: task.planId, parent_session_id: host.masterId, role: 'review' })
+      host.projectMeter.bind({ session_id: sessionId, plan_id: task.planId, parent_session_id: host.currentHubId() ?? host.masterId, role: 'review' })
       await ctx.sessionController.create({ sessionId, workspaceId: workspace.id, agentPreset: PLANNER_PRESET })
       pending()
       result = await ctx.sessionController.resolveAgent(sessionId)
@@ -361,7 +494,7 @@ export class Sessions {
     const { agent } = result
     const binding = host.store.get(KV.projectMeter.binding(sessionId))
     if (!this.scopeRoot(agent, task) || binding?.plan_id !== task.planId || binding.ticket_id !== null
-      || binding.parent_session_id !== host.masterId || !binding.roles.includes('review')) throw new Error('Foreign requirement scope Session')
+      || !binding.parent_session_id || !host.isHubGeneration(binding.parent_session_id) || !binding.roles.includes('review')) throw new Error('Foreign requirement scope Session')
     if (!pin) {
       await ctx.sessionPersistence.flush()
       pending()
@@ -393,7 +526,7 @@ export class Sessions {
   /** Trusted host dispatch/receipt seam. A binding records attribution, never permission to start a turn. */
   bindWorker(ticketId: string, sessionId: string, retry = false): void {
     const scope = { session_id: sessionId, ticket_id: ticketId,
-      ...this.host.projectMeter.owns(sessionId) ? {} : { parent_session_id: this.host.masterId } }
+      ...this.host.projectMeter.owns(sessionId) ? {} : { parent_session_id: this.host.currentHubId() ?? this.host.masterId } }
     this.host.projectMeter.bind({ ...scope, role: 'implementation' })
     if (retry) this.host.projectMeter.bind({ ...scope, role: 'retry' })
   }
@@ -411,6 +544,11 @@ export class Sessions {
   async prompt(sessionId: string, requestId: string, text: string, mode: 'queue' | 'steer' | { inject: string }, authorize?: () => void,
     accepted?: () => void): Promise<void> {
     const ticketId = ticketOfSession(sessionId)
+    if (!ticketId && this.host.isHubGeneration(sessionId)) {
+      if (this.host.currentHubId() !== sessionId) throw new Later('Hub Session is inactive')
+      await this.promptHub(key(requestId), text, mode, authorize, accepted)
+      return
+    }
     const granted = () => {
       if (ticketId && !this.host.workerAuthorized(ticketId, sessionId)) {
         throw new Error(`Worker ${sessionId} has no verified writer grant; refusing its turn`)
@@ -427,13 +565,10 @@ export class Sessions {
   /** Enqueues a steering relay to the main Session; relays are durable and retried by `Effects` until delivered, at most once per `requestId`. */
   relay(requestId: string, text: string): void { this.host.effects.enqueue('relay', requestId, { text }) }
   private async deliverRelay(requestId: string, text: string): Promise<void> {
-    const result = await this.ctx.sessionController.resolveAgent(this.host.masterId as SessionId)
-    if ('error' in result) throw result.error
-    try {
-      await this.agentDelivery.send(result.agent, key(requestId), text, 'steer', this.host.lifetime, () => {
-        if (!this.host.relayAvailable(requestId)) throw withdrawnRelay
-      })
-    } catch (error) { if (error !== withdrawnRelay) throw error }
+    try { await this.promptHub(key(requestId), text, 'steer', () => {
+      if (!this.host.relayAvailable(requestId)) throw withdrawnRelay
+    }) }
+    catch (error) { if (error !== withdrawnRelay) throw error }
   }
   /** Enqueues a durable background notice for injection into the main Session; a new notice with the same `name` replaces a still-waiting notice of that `name`. */
   notify(name: string, value: Record<string, unknown>, summary: string): void { this.host.effects.enqueue('notice', name, { value, summary }) }
@@ -442,13 +577,10 @@ export class Sessions {
     await this.host.effects.idle('notice')
     return this.host.effects.pending('notice', name) ? 'pending' : 'injected'
   }
-  /** Injects a notice into the main Session without waking it; no-op if the main Session does not exist yet. */
+  /** Injects a notice into the current Hub without waking it; unavailable authority keeps the effect durable for retry. */
   private async inject(name: string, value: Record<string, unknown>, summary: string): Promise<void> {
-    const resolved = await this.ctx.sessionController.resolveAgent(this.host.masterId as SessionId)
-    if ('error' in resolved) return
-    // Deduplicate by notice name and payload hash so retries are idempotent while updated payloads still deliver.
     const text = JSON.stringify(value)
-    await this.agentDelivery.send(resolved.agent, `notice:${name}:${key(text)}`, text, { inject: summary }, this.host.lifetime)
+    await this.promptHub(`notice:${name}:${key(text)}`, text, { inject: summary })
   }
   /** Returns the current prompt revision, the active prompt revision of each loaded Session, and whether the main Session still has a pending `'prompts'` notice. */
   status() {
@@ -476,7 +608,11 @@ export class Sessions {
           const image = value && typeof value === 'object' && 'image' in value ? (value as { image: never }).image : undefined
           return image ? [text, { type: 'image' as const, attachment: image }] : [text]
         } },
-        execute: (args, execution) => execute(schema.parse(args), execution.signal) }))
+        execute: async (args, execution) => {
+          const release = binding.role === 'orchestrator' ? this.beginHubOperation(agent.id) : undefined
+          try { return await execute(schema.parse(args), execution.signal) }
+          finally { release?.() }
+        } }))
     }
   }
   /** Returns `sessionId`'s active model-budget retry state (`{ model_retry }`) for status listings, or `{}` when not waiting on one. */
@@ -538,13 +674,13 @@ export class Sessions {
     // A native child can carry a caller-selected id. Never decorate one as a privileged root by its prefix.
     if (agent.session.header.parentSession !== undefined) {
       const planner = plannerHandoffId(agent.id), splitter = splitterHandoffId(agent.id), worker = ticketOfSession(agent.id)
-      if (agent.id === host.masterId || (planner && host.ownsPlanner(planner)) || (splitter && host.splitterWorkspace(splitter))
+      if (host.isHubGeneration(agent.id) || (planner && host.ownsPlanner(planner)) || (splitter && host.splitterWorkspace(splitter))
         || (worker && host.store.tickets.get(worker))) {
         this.bindings.set(agent, { disposers: [agent.ctx.tools.guard(() => WORKER_ANCESTRY_PENDING)] })
       } else await this.limitSubagent(agent)
       return
     }
-    const master = agent.id === host.masterId
+    const master = host.isHubGeneration(agent.id)
     const plannerId = master ? undefined : plannerHandoffId(agent.id)
     const splitterId = master ? undefined : splitterHandoffId(agent.id)
     const ticket = master || plannerId || splitterId ? undefined : this.ticketOf(agent)
@@ -565,6 +701,7 @@ export class Sessions {
       // The router preset omits the shell, jobs and every write tool; restrict the inherited surface too, so a profile that
       // still mounts one cannot hand it to the Hub. The Hub's own orchestrator_* tools are scoped registrations and stay.
       binding.disposers.push(agent.ctx.tools.restrict({ allow: HUB_TOOLS }))
+      binding.disposers.push(agent.ctx.tools.guard(() => host.currentHubId() === agent.id ? undefined : 'Hub Session is inactive'))
     } else if (plannerId) {
       binding.disposers.push(...this.plannerOnly(agent, plannerId))
       if (!host.ownsPlanner(plannerId)) return

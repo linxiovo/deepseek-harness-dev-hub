@@ -22,10 +22,10 @@ let transfers: string[]
 let losePushReply: boolean
 
 function commands(repository = slug): Commands {
-  return new Commands(() => testDeployment({ repository }), {
+  return new Commands(() => testDeployment({ repository }), gitEnv({
     GIT_CONFIG_GLOBAL: join(directory, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'never',
-  }, new AbortController().signal)
+  }), new AbortController().signal)
 }
 
 beforeEach(() => {

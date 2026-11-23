@@ -328,11 +328,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
       return
     }
     for (const message of messages.values()) {
-      if (!await this.agentDelivery.holdsMessage(target, message.id)) {
-        target.followup(message)
-        await this.ctx.sessionPersistence.flush()
-        if (!await this.agentDelivery.holdsMessage(target, message.id)) throw new Error(`Hub inbox transfer was not persisted for ${message.id}`)
-      }
+      if (!await this.agentDelivery.holdsMessage(target, message.id)) target.followup(message)
       const source = message.source as { kind?: string; plugin?: unknown }
       if (source.kind === 'dsh-superagent' || (source.kind === 'plugin' && source.plugin === 'dsh-superagent')) {
         const requestId = String(message.id).replace(/^dsh-superagent:/, '')
@@ -341,8 +337,11 @@ const withdrawnRelay = Symbol('withdrawn relay')
       }
       old?.inbox.remove(message.id)
     }
-    this.host.store.delete(transferKey)
     await this.ctx.sessionPersistence.flush()
+    for (const message of messages.values()) {
+      if (!await this.agentDelivery.holdsMessage(target, message.id)) throw new Error(`Hub inbox transfer was not persisted for ${message.id}`)
+    }
+    this.host.store.delete(transferKey)
   }
 
   private async resumeHub(): Promise<void> {

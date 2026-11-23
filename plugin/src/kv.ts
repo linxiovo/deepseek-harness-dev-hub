@@ -7,7 +7,6 @@ import type { Handoff, ProjectRef, Spec } from './core/handoff.ts'
 import type { Plan, PlanMessage, PlanNodeState } from './core/plan.ts'
 import type { HubAuthorityState } from './app/hub-authority.ts'
 export type HubDeliveryReceipt = { hash: string; sessionId: string; at: string }
-export type HubInboxTransfer = { fromSessionId: string; targetSessionId: string; messages: UserMessage[] }
 import type { TestHistory } from './core/delivery-check.ts'
 import type { PlanIntegrationView } from './core/plan-integration.ts'
 import type { PromptVersion } from './app/prompts.ts'
@@ -50,10 +49,11 @@ export const KV = {
     proposal: family<number>('ticket-prompt-proposal:'),
     /** The built-in text of a prompt part an override was edited from, by its `base`, which shows what an upgrade changed. */
     builtIn: family<string, [base: string]>('prompt-built-in:') },
-  /** Runtime: legacy/current physical Hub ID and the durable authority used for safe Session rotation. */
+  /** Runtime: authority is canonical; masterId mirrors its physical Session and seeds only one-time legacy import. */
   runtime: { masterId: record<string>('master-id'), authority: record<HubAuthorityState>('hub-authority'),
     delivery: family<HubDeliveryReceipt, [requestId: string]>('hub-delivery:'),
-    transfer: family<HubInboxTransfer, [targetSessionId: string]>('hub-transfer:') },
+    transfer: family<UserMessage[], [fromSessionId: string]>('hub-inbox-transfer:'),
+    transferred: family<true, [fromSessionId: string, messageId: string]>('hub-inbox-receipt:', (from, id) => JSON.stringify([from, id])) },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
   sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
   /** Session meter: durable exclusive log cursor and its cumulative, own-event projection. */

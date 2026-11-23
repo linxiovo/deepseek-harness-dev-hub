@@ -10,6 +10,7 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-skill'
 import type {} from '@deepseek-ai/dsh-subprocess'
+import { DatabaseSync } from 'node:sqlite'
 import { existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
@@ -38,6 +39,7 @@ import { InstallationError } from './installation-api.ts'
 import { Planning } from './planning.ts'
 import { Plans, planDeliveryWriter } from './plans.ts'
 import { PlanRequirements } from './plan-requirements.ts'
+import { hubResumeText } from './hub-resume.ts'
 import { PlanStagnation } from './plan-stagnation.ts'
 import { PlanIntegration } from './plan-integration.ts'
 import { ScopedAttention } from './scoped-attention.ts'
@@ -229,7 +231,8 @@ export class Runtime extends Service implements SourceHost {
         hubGenerations: () => authority.generations(), isHubGeneration: id => authority.isGeneration(id),
         beginHubRotation: () => authority.beginRotation(),
         activateHub: id => { authority.activate(id); runtime.masterId = id; projectMeter.bind({ session_id: id, role: 'hub' }) },
-        hubResume: () => { const resume = authority.pendingResume(); return resume && { ...resume, text: runtime.hubResumeText(resume.epoch) } },
+        hubResume: () => { const resume = authority.pendingResume(); return resume && { ...resume,
+          text: hubResumeText({ store, handoffs, effects, project: installation.project, hubId: runtime.hubId, epoch: resume.epoch }) } },
         hubResumeDelivered: requestId => authority.resumeDelivered(requestId),
         lifetime: this.lifetime, boundWorkspace: project?.workspace,
         relayAvailable: requestId => this.planIntegration.relayAvailable(requestId),
@@ -573,45 +576,15 @@ export class Runtime extends Service implements SourceHost {
   }
   /** Current physical Hub Session ID; the project identity is `hubId`. */
   get hubSessionId(): string { return this.masterId }
-  private hubResumeText(epoch: number): string {
-    const MAX_TICKETS = 64, MAX_HANDOFFS = 32, MAX_EVENTS = 128, MAX_EFFECTS = 64, MAX_TEXT = 2000, MAX_LIST = 16
-    const excerpt = (value: string | undefined | null): string | null => value == null ? null : value.length > MAX_TEXT ? `${value.slice(0, MAX_TEXT)}…` : value
-    const list = (values: readonly string[]): string[] => values.slice(0, MAX_LIST).map(value => excerpt(value) ?? '')
-    const openTickets = this.store.tickets.open(), allHandoffs = this.handoffs.list()
-    const tickets = openTickets.slice(0, MAX_TICKETS).map(ticket => {
-      const assignment = latestAssignment(ticket)
-      return { id: ticket.id, title: excerpt(ticket.title), state: ticket.ended ? 'ended' : assignment?.state ?? 'open', ended: ticket.ended ?? null,
-        assignment: assignment && { id: assignment.id, state: assignment.state, report: assignment.report?.state ?? null,
-          result: excerpt(assignment.report?.summary) }, session: ticket.execution?.session ?? null, read: `ticket/${ticket.id}` }
-    })
-    const pendingEvents = openTickets.flatMap(ticket => ticket.undelivered.map(inputId => {
-      const input = ticket.inputs.find(item => item.id === inputId)
-      return { ticket_id: ticket.id, input_id: inputId, kind: input?.kind ?? 'unknown', at: input?.at ?? null, read: `ticket/${ticket.id}/input/${key(inputId)}` }
-    })).slice(0, MAX_EVENTS)
-    const actions = openTickets.slice(0, MAX_TICKETS).map(ticket => {
-      const assignment = latestAssignment(ticket)
-      return { ticket_id: ticket.id, assignment_id: assignment?.id ?? null, state: assignment?.state ?? 'open',
-        result: excerpt(assignment?.report?.summary), outcome: ticket.ended?.outcome ?? null, read: `ticket/${ticket.id}` }
-    })
-    const handoffs = allHandoffs.slice(0, MAX_HANDOFFS).map(handoff => ({
-      id: handoff.id, status: handoff.status, project: handoff.project, goal: excerpt(handoff.goal), constraints: list(handoff.constraints),
-      acceptanceScope: list(handoff.acceptanceScope), authorization: { ...handoff.authorization, scope: excerpt(handoff.authorization.scope) },
-      read: `handoff/${handoff.id}` }))
-    const pendingEffects = this.effects.pendingSummary(MAX_EFFECTS), effectCount = this.effects.count()
-    return `${promptFile('hub-resume')}\n${JSON.stringify({ hub_id: this.hubId, epoch, project: this.installation.project && {
-      id: this.installation.project.id, repository: this.installation.project.repository, workspace: this.installation.project.workspace },
-      tickets, ticket_count: openTickets.length, handoffs, handoff_count: allHandoffs.length, pending_events: pendingEvents,
-      pending_event_count: openTickets.reduce((count, ticket) => count + ticket.undelivered.length, 0), actions,
-      pending_effects: pendingEffects, pending_effect_count: effectCount,
-      truncated: { tickets: openTickets.length > MAX_TICKETS, handoffs: allHandoffs.length > MAX_HANDOFFS,
-        pending_events: openTickets.some(ticket => ticket.undelivered.length) && pendingEvents.length >= MAX_EVENTS, effects: effectCount > MAX_EFFECTS },
-      reads: ['tickets', 'plans', 'threads', 'project/attention'] })}`
-  }
 
   async idle(): Promise<void> {
+    await this.effects.idle('hubInbox')
+    await this.sessions.idleHubTransfers()
     await this.passes.idle()
     await this.executor.idleHandoffs()
     await this.passes.idle()
+    await this.effects.idle('hubInbox')
+    await this.sessions.idleHubTransfers()
   }
   pump(): Promise<void> { return this.passes.pump() }
   sendReplies(): Promise<void> { return this.outbox.sent() }
@@ -673,9 +646,15 @@ export class Runtime extends Service implements SourceHost {
     if (sameDirectory(stateDir, this.machine.stateDir)) return this.masterId
     const path = join(stateDir, 'orchestrator.sqlite')
     if (!existsSync(path)) return projectHubId(stateDir)
-    const store = new Store(path)
-    try { return store.get(KV.runtime.masterId) ?? projectHubId(stateDir) }
-    finally { store.close() }
+    const database = new DatabaseSync(path, { readOnly: true })
+    try {
+      const row = database.prepare('SELECT value FROM kv WHERE key = ?').get(KV.runtime.masterId) as { value: string } | undefined
+      if (row) {
+        const saved = JSON.parse(row.value) as unknown
+        if (typeof saved === 'string' && saved.trim()) return saved
+      }
+      return projectHubId(stateDir)
+    } finally { database.close() }
   }
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
@@ -774,7 +753,7 @@ export class Runtime extends Service implements SourceHost {
       },
       meter: { read: (id, signal) => this.readScopedMeter(id, signal) },
       topicBinding: this.topicBinding, verifyTopicBinding: () => this.verifyTopicBinding(),
-      get ready() { return runtime.ready }, assertNewWork: () => installation.assertNewWork(),
+      get ready() { return runtime.ready }, assertNewWork: () => installation.assertNewWork(), rotateHub: () => runtime.rotateHub(),
       ownsSession: id => this.ownsSession(id),
       get deployment() { return setup.deployment },
       get setupProblem() { return runtime.setupProblem }, get feishuProblem() { return setup.feishuProblem },
@@ -827,7 +806,7 @@ export class Runtime extends Service implements SourceHost {
       const pin = this.store.get(KV.planRequirements.reviewer(scopeId))
       const preview = this.store.get(KV.planRequirements.preview(scopeId))
       const workspace = preview && this.handoffs.get(preview.handoffId)?.project.workspace
-      return roles.includes('review') && parentId === this.masterId && preview?.planId === binding.plan_id && pin?.sessionId === id
+      return roles.includes('review') && !!parentId && this.hubAuthority.isGeneration(parentId) && preview?.planId === binding.plan_id && pin?.sessionId === id
         && pin.createdAt === header.createdAt && header.agentPreset === PLANNER_PRESET && workspace && header.cwd && isAbsolute(header.cwd)
         && sameDirectory(workspace, header.cwd) ? { header } : 'unverified'
     }
@@ -860,6 +839,7 @@ export class Runtime extends Service implements SourceHost {
       const lateHandoffs = live([...handoffSessions(), ...reviewSessions()]).filter(agent => !agents.includes(agent))
       for (const agent of lateHandoffs) agent.cancel({ kind: 'user' }, { keepInbox: true })
       await Promise.allSettled(lateHandoffs.map(agent => agent.whenIdle()))
+      await this.sessions.idleHubTransfers()
       // The workers' jobs and subagents stop too: their ends would start worker turns without the tool limits released below.
       await this.executor.shutdown()
       this.executor.dispose()

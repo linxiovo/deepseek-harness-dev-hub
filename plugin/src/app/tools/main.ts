@@ -82,7 +82,7 @@ function latestRequirementMessage(agent: Agent) {
     if (event?.type !== 'user/message' || event.data.source.kind !== 'user') continue
     const [block] = event.data.content
     if (event.data.content.length === 1 && block?.type === 'text' && event.data.id) {
-      return { sessionId: agent.id, messageId: event.data.id, seq: event.seq, text: block.text }
+      return { sessionId: agent.id, messageId: event.data.id, seq: event.seq, at: event.time, text: block.text }
     }
     break
   }

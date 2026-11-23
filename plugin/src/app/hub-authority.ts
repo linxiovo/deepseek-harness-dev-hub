@@ -28,14 +28,10 @@ export class HubAuthority {
     if (saved !== undefined) {
       const parsed = AuthoritySchema.safeParse(saved)
       if (!parsed.success) throw new Error('The persisted Hub authority is invalid; refusing to start')
-      const override = store.get(KV.runtime.masterId)
-      if (parsed.data.phase === 'active' && typeof override === 'string' && override.trim() && override !== parsed.data.sessionId) {
-        const generations = parsed.data.generations.map(generation => generation.sessionId === parsed.data.sessionId
-          ? { ...generation, status: 'retired' as const } : generation)
-        generations.push({ sessionId: override, epoch: parsed.data.epoch + 1, status: 'active' })
-        this.stateValue = { ...parsed.data, sessionId: override, epoch: parsed.data.epoch + 1, generations }
-        store.atomic(() => { store.set(KV.runtime.authority, this.stateValue) })
-      } else this.stateValue = parsed.data
+      this.stateValue = parsed.data
+      if (store.get(KV.runtime.masterId) !== parsed.data.sessionId) {
+        store.atomic(() => store.set(KV.runtime.masterId, parsed.data.sessionId))
+      }
       return
     }
     const sessionId = legacySessionId.trim() || stableHubId

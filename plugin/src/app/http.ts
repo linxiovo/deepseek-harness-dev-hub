@@ -45,6 +45,7 @@ export interface HttpHost {
   /** Verify the workspace under the write lock, before the final scope check and bind. */
   readonly verifyTopicBinding?: (() => Promise<void>) | undefined
   assertNewWork?(): void
+  rotateHub?(): Promise<string>
   ownsSession?(id: string): boolean | Promise<boolean>
   readonly store: Store
   /** Feishu message links resolved since startup, used by search to match AppLink URLs. */
@@ -135,7 +136,7 @@ function setupView(runtime: HttpHost) {
 /** Build the `/orchestrator/api/state` response consumed by the management panel and `scripts/dsh-superagent status` (`docs/006-deployment.md`). */
 export function stateView(runtime: HttpHost) {
   const settings = runtime.store.settings()
-  const projectId = runtime.installation?.projects().activeProjectId
+  const projectId = runtime.installation?.runtime().projectId
   return { setup: setupView(runtime), load: { ...executorLoad(runtime.store, runtime.executor.activeCount()),
     maxWorkers: settings.executor.maxWorkers },
     masterId: runtime.masterId, paused: settings.paused, health: runtime.health, ...(projectId ? { projectId } : {}) }
@@ -319,6 +320,11 @@ function routes(runtime: HttpHost): Routes {
       const { project, restarting } = await installationOf(runtime).selectProject(params.projectId)
       return { project: projectView(project), restarting }
     }),
+    'POST hub/rotate': ({ write }) => {
+      const rotateHub = runtime.rotateHub
+      if (!rotateHub) throw new RouteError(404, 'Hub rotation is not available')
+      return write(async () => ({ hubSessionId: await rotateHub.call(runtime) }))
+    },
     'GET topic-binding': () => topicBindingOf(runtime).view(),
     'POST topic-binding': async ({ body, write }) => {
       const request = TopicBindingRequest.safeParse(await body())
@@ -409,7 +415,7 @@ function routes(runtime: HttpHost): Routes {
     'GET models': () => runtime.models(),
     'GET sessions/:id/meter': async ({ params }) => {
       // The Hub reads the same view; a corrupt Session log is not a missing Session and keeps its 500.
-      if (runtime.installation?.projects().activeProjectId && !(await runtime.ownsSession?.(params.id))) throw new RouteError(404, 'Session not found')
+      if (runtime.installation?.runtime().projectId && !(await runtime.ownsSession?.(params.id))) throw new RouteError(404, 'Session not found')
       const view = await runtime.meter.read(params.id)
       if (!view) throw new RouteError(404, 'Session not found')
       return view
@@ -464,11 +470,10 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
   let retiring = false
   let closed = false
   function readableMount(scope: string | string[] | undefined, requirement: 'optional' | 'required'): string | null {
-    const { installation } = runtime
-    if (retiring || writing === 'installation' || installation?.runtime().reason === 'switching') {
-      throw new InstallationError(409, 'switching')
-    }
-    const active = installation?.projects().activeProjectId ?? null
+    if (retiring || writing === 'installation') throw new InstallationError(409, 'switching')
+    const mount = runtime.installation?.runtime()
+    if (mount?.reason === 'switching') throw new InstallationError(409, 'switching')
+    const active = mount?.projectId ?? null
     assertProjectScope(active, scope, requirement)
     return active
   }
@@ -478,18 +483,22 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
     const installationRoute = installationRoutes.has(route)
     const requirement = topicBindingRoutes[route] || attentionRoutes[route] ? 'required' : 'when-active'
     const { installation } = runtime
+    const mount = installation?.runtime()
+    if (route === 'POST hub/rotate' && mount?.reason === 'noProject') throw new InstallationError(409, 'noProject')
     if (!installationRoute || scope !== undefined) {
-      assertProjectScope(installation?.projects().activeProjectId ?? null, scope, requirement)
+      assertProjectScope(mount?.projectId ?? null, scope, requirement)
     }
     if (!installation) return operation()
-    if (writing === 'installation' || installation.runtime().reason === 'switching') throw new InstallationError(409, 'switching')
+    if (writing === 'installation' || mount?.reason === 'switching') throw new InstallationError(409, 'switching')
     if (writing) throw new InstallationError(409, 'projectConflict')
     writing = installationRoute ? 'installation' : 'project'
     try {
       const pending = verify ? verify().then(() => {
         // Workspace verification may suspend; recheck the mounted scope at the mutation itself.
-        if (retiring || installation.runtime().reason === 'switching') throw new InstallationError(409, 'switching')
-        assertProjectScope(installation.projects().activeProjectId, scope, requirement)
+        if (retiring) throw new InstallationError(409, 'switching')
+        const current = installation.runtime()
+        if (current.reason === 'switching') throw new InstallationError(409, 'switching')
+        assertProjectScope(current.projectId, scope, requirement)
         return operation()
       }) : Promise.resolve(operation())
       activeWrite = pending
@@ -520,7 +529,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         const requirement = requiredProject ? 'required' : 'optional'
         if (mountedRoute) mounted = readableMount(scope, requirement)
         else if (!installationRoute && scope !== undefined && (route.key.startsWith('GET ') || route.key === 'POST prompts/preview')) {
-          assertProjectScope(runtime.installation?.projects().activeProjectId ?? null, scope, 'optional')
+          assertProjectScope(runtime.installation?.runtime().projectId ?? null, scope, 'optional')
         }
         const query = Object.fromEntries(url.searchParams)
         if (attentionRoute && (route.key === 'GET attention/summary'

@@ -33,6 +33,7 @@ export interface Api {
   'GET projects': { response: ProjectsView }
   'POST projects': { body: CreateProjectInput; response: CreateProjectResult }
   'POST projects/:projectId/select': { response: SelectProjectResult }
+  'POST hub/rotate': { response: { hubSessionId: string } }
   'GET topic-binding': { response: TopicBindingView }
   'POST topic-binding': { body: { triggerId: string; allowedActors: string[] }; response: NonNullable<TopicBindingView> }
   'POST topic-binding/unbind': { response: null }

@@ -39,6 +39,7 @@ The six installation-wide routes under `/orchestrator/api/` are available before
 | `GET /orchestrator/api/projects` | None | `{activeProjectId: string \| null, projects: ProjectView[]}` |
 | `POST /orchestrator/api/projects` | `{repository: string, workspace: string, baseRef: string, policy?: PolicyConfig}` | `{project: ProjectView, reused: boolean, restarting: boolean}` |
 | `POST /orchestrator/api/projects/:projectId/select` | None. URL-encode the ID as one path segment. | `{project: ProjectView, restarting: boolean}` |
+| `POST /orchestrator/api/hub/rotate` | None | `{hubSessionId: string}` for the newly active physical Hub Session. The mounted project identity remains unchanged; the rotation drains the old turn and recovers its queued inputs before reporting success. |
 | `GET /orchestrator/api/runtime` | None | `RuntimeView` |
 
 - `PolicyConfig` is the `policy` settings block with `rules` and `sources` optional on input. Omitting it uses the default rules and no allowed accounts for a new project. See [006 Deployment](006-deployment.md#management-api).
@@ -57,7 +58,7 @@ The six installation-wide routes under `/orchestrator/api/` are available before
 | `403 {error}` | Same-origin management check failed |
 | `404 {error, code}` | `projectNotFound` for an unknown selection ID or `installationUnavailable` if the host does not provide installation management |
 | `404 {error}` | Unknown path or method under the API prefix |
-| `409 {error, code}` | `githubSetupRequired` for create/select without a verified account, `switching` for a transition or an installation change already in progress, `projectConflict` for conflicting registration or an active project write, `legacyProjectRequired` or `legacyProjectMismatch` for adoption refusals |
+| `409 {error, code}` | `githubSetupRequired` for create/select without a verified account, `switching` for a transition or installation change already in progress, `projectConflict` for conflicting registration or an active project write, `projectScopeRequired` for a managed-project rotation without the mounted project header, `operatorPaused` when new work is paused, `legacyProjectRequired` or `legacyProjectMismatch` for adoption refusals |
 | `500 {error}` | Unexpected failure with the message `Installation operation failed.` |
 
 Identity check failures such as `agentCliMissing`, `agentCliSignedOut`, `agentCliNoAccount` or `agentAccountChanged` return HTTP 200 with `OnboardingView` and `status: "blocked"`.
@@ -80,6 +81,12 @@ The verified legacy runtime may still accept an operation into its queue during 
 
 Registering A with B's checkout returns `400 invalidProject` before registration or selection changes. A request with A's project header after switching to B returns `409 staleProject` without mutating B, even if the record ID is valid there.
 
+### Hub Session rotation
+
+`POST /orchestrator/api/hub/rotate` takes no body. It requires the same-origin management headers and the explicit scope of a mounted managed project. No managed mount returns `409 noProject`; missing or stale scope is refused without invoking rotation. A host without rotation support returns `404`. This is a management operation, not a model tool.
+
+Rotation uses the project write lock: a concurrent project selection is refused with `409 projectConflict`, and selection already in progress prevents rotation with `409 switching`. Success is `200 {hubSessionId: string}` with the new physical Hub Session ID. The project ID and its durable work stay unchanged. If rotation fails, HTTP returns an error without confirming a new Session. On restart, Runtime recovers any persisted in-progress rotation; the HTTP adapter does not retry it.
+
 ## Code and verification
 
 | Entry | Evidence |
@@ -89,7 +96,7 @@ Registering A with B's checkout returns `400 invalidProject` before registration
 | [projects.spec.ts](../tests/projects.spec.ts) | Durable first and explicit selection, independent suspension records, checkout conflicts and alias retargeting |
 | [project-work.spec.ts](../tests/project-work.spec.ts) | Hub → Planner → Splitter isolation across remounts and repeated headless polling of authorized events through the GitHub Source with simulated responses |
 | [deployment.spec.ts](../tests/deployment.spec.ts), [github-onboarding.spec.ts](../tests/github-onboarding.spec.ts) | Runtime modes, token-free identity and canonical repository probes, and managed setup without a legacy identity fallback |
-| [http.spec.ts](../tests/http.spec.ts) | Same-origin transport, typed lifecycle and installation responses, private-field redaction, missing and stale scope, concurrent selection and owned Session meters |
+| [http.spec.ts](../tests/http.spec.ts) | Same-origin transport, typed lifecycle and installation responses, private-field redaction, missing and stale scope, concurrent selection, owned Session meters, and Hub rotation responses and write exclusion |
 | [runtime.spec.ts](../tests/runtime.spec.ts) | Simulated DSH host with real local Git worktrees, mode and project scope checks, same-Assignment resume, and persistent PR reconciliation across repeated graceful restarts |
 | [runtime-crash.spec.ts](../tests/runtime-crash.spec.ts) | Real OS process termination and restart against the same SQLite and local Git state. IPC barriers stop the old process after selection commits, after the DSH substitute stores the assignment but before confirmation, and after the GitHub substitute merges but before the runtime observes it. Assert the mounted project, exactly one Worker delivery (verify its message ID in the persisted Session before recovery, and retain the writer lease), and exactly one merge attempt with a reconciled Ticket outcome. Only DSH and GitHub boundaries are simulated. |
 | [Live headless connection smoke check](006-deployment.md#live-headless-connection-smoke-check) | Separate check against real DSH over SSH; the process tests do not verify this connection. |

@@ -29,7 +29,7 @@ export const RequirementScopeVerdictSchema = z.strictObject({
 })
 export type ScopeVerdict = z.infer<typeof RequirementScopeVerdictSchema>
 type ScopeReview = { status: 'pending' } | ScopeVerdict & { reviewId: string; reviewerSessionId: string; at: string }
-type OperatorMessage = PlanMessage & { seq: number }
+type OperatorMessage = PlanMessage & { seq: number; at: number }
 
 const PROPOSAL_TTL = 30 * 60_000
 const targetQuestion = promptFile('plan-requirements-target')
@@ -306,8 +306,10 @@ export class PlanRequirements {
       if (!preview) refuse('Unknown requirement proposal')
       this.requireOwner(preview.handoffId, message.sessionId)
       if (!this.sameHub(preview.ownerSession, message.sessionId)) refuse('Requirement proposal belongs to another Session')
-      if (approval.requestMessageId !== preview.requestMessageId || message.messageId === preview.requestMessageId ||
-          message.seq <= preview.requestSequence || store.get(KV.planRequirements.request(preview.ownerSession, approval.requestMessageId)) !== proposalId) {
+      const later = message.sessionId === preview.ownerSession ? message.seq > preview.requestSequence
+        : Number.isFinite(message.at) && message.at > Date.parse(preview.createdAt)
+      if (approval.requestMessageId !== preview.requestMessageId || message.messageId === preview.requestMessageId || !later
+        || store.get(KV.planRequirements.request(preview.ownerSession, approval.requestMessageId)) !== proposalId) {
         refuse('Approval must be a separate, later direct message bound to this preview and its original product request')
       }
       const review = preview.scopeReview

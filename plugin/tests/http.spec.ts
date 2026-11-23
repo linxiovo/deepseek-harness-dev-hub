@@ -364,8 +364,50 @@ const projectHeader = (id: string) => ({ 'x-orchestrator-project-id': id })
 const alpha = { id: 'alpha', repository: 'org/alpha', workspace: 'D:/repos/alpha', hubSessionId: 'hub-alpha' }
 const beta = { id: 'beta', repository: 'org/beta', workspace: 'D:/repos/beta', hubSessionId: 'hub-beta' }
 const bindingInstallation = (activeProjectId: () => string = () => alpha.id) => ({
-  projects: () => ({ activeProjectId: activeProjectId(), projects: [alpha, beta] }),
   runtime: (): RuntimeView => ({ mode: 'desktop', status: 'ready', reason: null, projectId: activeProjectId(), resumedFrom: null }),
+})
+
+it('rotates the Hub only for a same-origin request scoped to the mounted project', async () => {
+  let rotations = 0
+  const rotateHub = async () => { rotations++; return 'hub-new' }
+  const call = serve({ installation: bindingInstallation(), rotateHub })
+  const scope = projectHeader(alpha.id)
+  expect(await call('POST', 'hub/rotate', undefined, { ...scope, origin: 'http://untrusted.example' }))
+    .toMatchObject({ status: 403 })
+  expect(await call('POST', 'hub/rotate')).toMatchObject({ status: 409, body: { code: 'projectScopeRequired' } })
+  expect(await call('POST', 'hub/rotate', undefined, projectHeader(beta.id)))
+    .toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  expect(await serve({ installation: { runtime: idleRuntime }, rotateHub })('POST', 'hub/rotate'))
+    .toMatchObject({ status: 409, body: { code: 'noProject' } })
+  expect(rotations).toBe(0)
+  expect(await call('POST', 'hub/rotate', undefined, scope)).toEqual({ status: 200, body: { hubSessionId: 'hub-new' } })
+  expect(rotations).toBe(1)
+})
+
+it('reports unavailable and failed Hub rotation without returning a replacement Session', async () => {
+  const installation = bindingInstallation()
+  const scope = projectHeader(alpha.id)
+  expect(await serve({ installation })('POST', 'hub/rotate', undefined, scope)).toMatchObject({ status: 404 })
+  const call = serve({ installation, rotateHub: async () => { throw new Error('Hub rotation failed') } })
+  expect(await call('POST', 'hub/rotate', undefined, scope)).toEqual({ status: 500, body: { error: 'Hub rotation failed' } })
+})
+
+it('holds the mounted project while rotating its Hub', async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<string>()
+  let switched = false
+  const installation = { ...bindingInstallation(), selectProject: () => { switched = true; return { project: beta, restarting: true } } }
+  const call = serve({ installation, rotateHub: async () => { entered.resolve(); return release.promise } })
+  const rotation = call('POST', 'hub/rotate', undefined, projectHeader(alpha.id))
+  await Promise.race([entered.promise, rotation])
+  const selection = call('POST', `projects/${beta.id}/select`)
+  try {
+    const nextTick = Promise.withResolvers<string>()
+    setImmediate(() => nextTick.resolve('waiting for rotation'))
+    const result = await Promise.race([selection, nextTick.promise])
+    expect(result).toMatchObject({ status: 409, body: { code: 'projectConflict' } })
+    expect(switched).toBe(false)
+  } finally { release.resolve('hub-new') }
+  expect(await rotation).toEqual({ status: 200, body: { hubSessionId: 'hub-new' } })
 })
 
 it('rejects a topic binding when the project changes before the request body finishes', async () => {
@@ -440,7 +482,7 @@ it('rechecks topic binding scope at mutation after asynchronous project verifica
 it('fences project writes and blocks new work without blocking a scoped pause change', async () => {
   let setupReady = false, retries = 0, requeues = 0
   const call = serve({
-    installation: { projects: () => ({ activeProjectId: alpha.id, projects: [alpha] }), runtime: () => ({ reason: null }) },
+    installation: bindingInstallation(),
     assertNewWork: () => { if (!setupReady) throw new InstallationError(409, 'projectSetupRequired') },
     store: { tickets: { get: () => ({}) } },
     engine: { retryTicket: () => { retries++ }, reevaluate: () => { requeues++; return true } },
@@ -464,8 +506,7 @@ it('rejects a body-bearing project mutation whose mounted runtime starts switchi
   const bodyStarted = Promise.withResolvers<void>(), sendBody = Promise.withResolvers<void>()
   let switching = false, paused = false
   const call = serve({
-    installation: { projects: () => ({ activeProjectId: alpha.id, projects: [alpha, beta] }),
-      runtime: () => ({ reason: switching ? 'switching' : null }),
+    installation: { runtime: () => ({ projectId: alpha.id, reason: switching ? 'switching' : null }),
       selectProject: () => { switching = true; return { project: beta, restarting: true } } },
     settings: { pause: (value: boolean) => ({ paused: paused = value }) },
   })
@@ -486,8 +527,9 @@ it('does not start a project switch during an asynchronous project write or admi
   const selectStarted = Promise.withResolvers<void>(), finishSelect = Promise.withResolvers<void>()
   let retries = 0
   const call = serve({
-    installation: { projects: () => ({ activeProjectId: alpha.id, projects: [alpha, beta] }), runtime: () => ({ reason: null }),
+    installation: { ...bindingInstallation(),
       selectProject: async () => { selectStarted.resolve(); await finishSelect.promise; return { project: beta, restarting: true } } },
+    rotateHub: async () => 'hub-new',
     store: { tickets: { get: () => ({}) } }, engine: { retryTicket: () => { retries++ } },
     settings: { pause: async (paused: boolean) => { writeStarted.resolve(); await finishWrite.promise; return { paused } } },
   })
@@ -505,6 +547,8 @@ it('does not start a project switch during an asynchronous project write or admi
   try {
     expect(await call('POST', 'tickets/t1/retry', undefined, projectHeader(alpha.id)))
       .toMatchObject({ status: 409, body: { code: 'switching' } })
+    expect(await call('POST', 'hub/rotate', undefined, projectHeader(alpha.id)))
+      .toMatchObject({ status: 409, body: { code: 'switching' } })
     expect(retries).toBe(0)
   } finally { finishSelect.resolve() }
   expect(await select).toEqual({ status: 200, body: { project: beta, restarting: true } })
@@ -521,9 +565,7 @@ it('fences executor settings from the old mount during selection and after recov
     settings: { save: (...args: unknown[]) => { saves.push(args); return { saved: true, revision: revision + 1, restarting: false } } },
   })
   const expectedBlock = (projectTokens: number) => ({ status: 200, body: { blocks: { executor: { revision, value: value(projectTokens) } } } })
-  const unmounted = serve({ ...settingsHost(300), installation: {
-    projects: () => ({ activeProjectId: null, projects: [] }), runtime: idleRuntime,
-  } })
+  const unmounted = serve({ ...settingsHost(300), installation: { runtime: idleRuntime } })
   expect(await unmounted('GET', 'settings')).toMatchObject(expectedBlock(300))
 
   const selectionStarted = Promise.withResolvers<void>(), finishSelection = Promise.withResolvers<void>()
@@ -550,7 +592,7 @@ it('fences executor settings from the old mount during selection and after recov
   const pendingResult = await pending
   const retiredRead = await oldMount('GET', 'settings', undefined, oldScope)
 
-  const newMount = serve({ ...settingsHost(200), installation: { ...bindingInstallation(() => beta.id), runtime: (): RuntimeView => ({
+  const newMount = serve({ ...settingsHost(200), installation: { runtime: (): RuntimeView => ({
     mode: 'desktop', status: 'paused', reason: 'recoveryPending', projectId: beta.id, resumedFrom: null,
   }) } })
   const newReadWithOldScope = await newMount('GET', 'settings', undefined, oldScope)
@@ -568,7 +610,7 @@ it('fences executor settings from the old mount during selection and after recov
 
 it('rejects a stale scoped read and hides meters from outside the mounted project', async () => {
   const call = serve({
-    installation: { projects: () => ({ activeProjectId: alpha.id, projects: [alpha, beta] }) },
+    installation: bindingInstallation(),
     ownsSession: (id: string) => id === alpha.hubSessionId,
     meter: { read: async (id: string) => ({ session_id: id }) },
   })

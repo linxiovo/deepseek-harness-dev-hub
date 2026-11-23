@@ -36,6 +36,8 @@ Startup registers management routes, initializes the installation binding and ru
 
 Source plugins inject Runtime as the `orchestrator` service through the narrow `SourceHost` interface.
 Ticket review evidence is submitted only by a Worker descendant through `orchestrator_review_submit`; `Sessions` binds the real descendant Session ID, `DshExecutor` verifies the clean current worktree HEAD against the pinned base, and the Engine atomically records evidence on the current Assignment and writer generation. `ticket/<id>/reviews` returns current-generation evidence and pending when the live Worker lease, worktree HEAD or cleanliness no longer matches; `ticket/<id>/review/<review-id>` reads one persisted review.
+`hubResumeText` (`src/app/hub-resume.ts`) builds a read-only Hub restart context from the mounted Store, Handoffs and Effects. It emits the fixed `hub-resume` prompt followed by JSON fields `hub_id`, `epoch`, `project` (`null` for legacy), `tickets`, `handoffs`, `plans`, `pending_events`, `actions`, `pending_effects`, `counts` and `truncated`. Pending and evaluating Source events retain `trigger/<id>` pointers and short observed-text previews; unresolved events are not treated as processed. Ticket summaries retain mandate scope and basis, undelivered Input pointers (`ticket/<id>/input/<key>`), and the latest Assignment result with its Ticket resource source. Handoff/spec and registered Plan references use `handoff/<id>` and `plan/<id>`; a Handoff with a published spec but no registered Plan is not invented as a Plan. The projection never reads Worker history to derive authorization and includes only the supplied mounted project's handoffs. Prompt plus JSON is kept below 16,384 characters; `truncated` marks omitted records. Full reports, history and internal diagnostics stay out of this summary and remain behind readable resources.
+
 
 | Part | Module | Does |
 | --- | --- | --- |
@@ -194,6 +196,7 @@ Failures retry with exponential backoff. Throwing `Later` defers work without co
 | `mainlineDelivery` | MainlineQueue | Rechecks one verified intent for [formal Plan closure](003-execution.md#formal-plan-closure) | 8, only when configured | Resumes pending work on restart; evidence gaps stay on the Ticket until rechecked |
 | `planIntegration` | PlanIntegration | Verifies the actual target, full regression jobs and the attempt-matched package after all formal Plan receipts exist | 4, only when configured and unpaused | Persists the exact revision/configuration before dispatch; resumes by observing that context |
 | `requirementScopeReview` | Runtime | Dispatches the sealed requirement scope comparison to its read-only reviewer | 1, when configured and unpaused | Reconciles the same Session and dispatch on restart |
+| `hubInbox` | Sessions | Moves a message claimed by a retired physical Hub generation into the current Hub through a durable per-source inbox queue, marking transferred user input as a relay rather than a new direct approval | 1 per current target | 2 s doubling to 60 s; resumes from the persisted queue after restart |
 | `relay` | Sessions | Steers a worker's report or question, or a person's follow-up, into the main Session's turn | 1, in queue order | 2 s doubling to 60 s |
 | `notice` | Sessions | Injects a notice into the main Session without waking it | 1, in queue order | 2 s doubling to 60 s |
 | `reply` | Outbox | Sends a message for a Channel through its Source, after the earlier messages of its Ticket to its conversation that have not failed three times; withdrawing the message cancels it | 1, none while paused | 5 s doubling to 300 s; one whose Source is off, or behind an earlier message, tries again after 5 s |
@@ -428,7 +431,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
 | `src/app/sessions.ts` | Sessions |
-| `src/app/hub-authority.ts` | `HubAuthority`: durable logical Hub identity, physical generation fence, deterministic target Session and resume receipt |
+| `src/app/hub-authority.ts` | `HubAuthority`: durable project Hub identity, monotonic physical Session generations, and crash-recoverable rotation intent |
+| `src/app/hub-resume.ts` | `hubResumeText`: bounded continuation from mounted durable tickets, unresolved Source events, authorized Handoffs, Plans, and effect metadata with readable resource pointers |
 | `src/app/session-meter.ts` | `SessionMeter`: one Session's context snapshot and cumulative usage from its durable event log, with provenance, missing and in-flight ranges, and the persisted exclusive cursor; forked prefixes are excluded |
 | `src/app/project-meter.ts` | `ProjectMeter`: project-local Session bindings and deduplicated scoped usage; contract in `plugin/docs/014-project-metering.md` |
 | `src/app/run-limits.ts` | Mounted project and Ticket budget reservations, authoritative settlements and scoped hold notifications; contract in `016-run-limits.md` |

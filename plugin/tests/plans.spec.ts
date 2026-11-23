@@ -4,7 +4,6 @@ import { unlinkSync, writeFileSync } from 'node:fs'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { z } from 'zod'
 import { resolve } from 'node:path'
-import { KV } from '../src/kv.ts'
 import { startManagedProject, startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host
@@ -726,15 +725,14 @@ it('counts a forked review once and keeps one Hub call across two active Tickets
   expect(await h.api('GET', 'tickets/unknown/meter')).toMatchObject({ status: 404 })
   await expect(h.runTool(catalog.session, 'orchestrator_read', { resource: `ticket/${catalog.ticketId}/meter` })).rejects.toThrow()
 
-  // Reopen with a new Hub identity and the business child unloaded, while all old logs stay durable.
-  h.agents.delete(review)
-  h.runtime.store.set(KV.runtime.masterId, 'rotated-hub')
+  // Rotate through the public Runtime seam while the business child remains unloaded.
+  const rotated = await h.runtime.rotateHub()
   await h.restart()
-  expect(h.runtime.masterId).toBe('rotated-hub')
+  expect(h.runtime.masterId).toBe(rotated)
   const after = await h.api('GET', 'project/meter')
   expect(after).toMatchObject({ status: 200, body: { ...expected, sessions: expect.arrayContaining([
     expect.objectContaining({ session_id: master, roles: ['hub'] }),
-    expect.objectContaining({ session_id: 'rotated-hub', roles: ['hub'] }),
+    expect.objectContaining({ session_id: rotated, roles: ['hub'] }),
     expect.objectContaining({ session_id: catalog.session, parent_session_id: master }),
   ]) } })
   expect(await h.api('GET', `sessions/${review}/meter`)).toMatchObject({ status: 200, body: { inherited_events: 2,
@@ -1209,7 +1207,7 @@ async function reviewRequirement(proposalId: string, status: 'within-handoff' | 
 
 it('previews a product replan before applying an exact, durable direct approval', async () => {
   const { id, catalogClaim, accountsClaim } = await dispatchedFanIn()
-  const hub = h.runtime.masterId
+  let hub = h.runtime.masterId
   const requirements = (args: unknown, session = hub) => h.runTool(session, 'orchestrator_plan_requirements', args)
   const changed = { criterion: 1, statement: 'Search matches product prefixes.', observable: 'The catalog API excludes non-prefix matches.' }
   const request = { intent: 'change-plan-requirements', planId: id, authorizedScope: brief.authorization.scope, changes: [changed] }
@@ -1321,6 +1319,16 @@ it('previews a product replan before applying an exact, durable direct approval'
   await expect(apply(proposal)).rejects.toThrow(/new handoff/i)
   send(approval(proposal, staleReview))
   await expect(apply(proposal)).rejects.toThrow(/scope review/i)
+  const retired = h.agents.get(hub)!
+  retired.status = 'running'
+  retired.followup({ id: 'retired-product-approval', role: 'user', source: { kind: 'user' }, content: [{ type: 'text',
+    text: JSON.stringify(approval(proposal, scopeReviewId)) }] } as never)
+  hub = await h.runtime.rotateHub()
+  await h.runtime.idle()
+  await expect(apply(proposal)).rejects.toThrow(/single text message/i)
+  const approvalReady = Promise.withResolvers<void>()
+  setTimeout(approvalReady.resolve, 2)
+  await approvalReady.promise
   send(approval(proposal, scopeReviewId))
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, runLimits: {

@@ -34,6 +34,8 @@ export interface EffectPayloads {
   planIntegration: Record<string, never>
   /** Steer a report or a candidate into the main Session; the key is the request ID. */
   relay: { text: string }
+  /** Move a retired Hub's saved pending input; the key is the originating physical Session. */
+  hubInbox: Record<string, never>
   /** Ask the Hub to revisit a stalled technical failure without holding the user-facing relay queue. */
   replanReview: { ticketId: string; failureId: string }
   /** Inject a notice into the main Session without waking it; the key names what it reports, such as `prompts`. */

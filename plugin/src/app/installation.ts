@@ -26,7 +26,7 @@ interface InstallationHost {
   recoveryPending(): boolean
   recoverable(): ProjectSuspension['recoverable']
   settings(): Settings
-  legacyHubId(): string
+  legacyHubId(stateDir: string): string
   legacyHandoffsMatch(project: { repository: string; workspace: string }): boolean
 }
 
@@ -107,7 +107,7 @@ export class Installation implements InstallationApi {
 
   private view(project: Project): ProjectView {
     const { id, repository, workspace, stateDir } = project
-    const hubSessionId = sameDirectory(stateDir, this.host.machine.stateDir) ? this.host.legacyHubId() : hubId(stateDir)
+    const hubSessionId = this.host.legacyHubId(stateDir)
     return { id, repository, workspace, hubSessionId }
   }
 

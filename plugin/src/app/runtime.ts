@@ -148,7 +148,7 @@ export class Runtime extends Service implements SourceHost {
         probe: workerProbe(ctx.subprocess, machine.stateDir, machine.stateDir, this.lifetime),
         restart: () => { setTimeout(restart, 0) }, configured: () => this.configured(), paused: () => this.store.settings().paused,
         recoveryPending: () => this.recoveryPending,
-        recoverable: () => this.recoverable(), settings: () => this.store.settings(), legacyHubId: () => this.legacyHubId(machine.stateDir),
+        recoverable: () => this.recoverable(), settings: () => this.store.settings(), legacyHubId: stateDir => this.legacyHubId(stateDir),
         legacyHandoffsMatch: ({ repository, workspace }) => this.handoffs.list().every(handoff =>
           handoff.project.repository.toLowerCase() === repository.toLowerCase() && sameDirectory(handoff.project.workspace, workspace)) })
       const project = installation.project

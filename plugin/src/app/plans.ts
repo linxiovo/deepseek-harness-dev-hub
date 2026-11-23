@@ -117,11 +117,33 @@ export class Plans {
 
   /** A predecessor unlocks only through a persisted formal delivery receipt, never through a Worker report. */
   waitingOn(id: string, node: PlanNode): string[] {
+    const plan = this.get(id)
     return node.blockedBy.filter(blocked => {
-      const state = this.state(id, blocked), predecessor = this.get(id)?.nodes.find(item => item.id === blocked)
-      return state?.status !== 'delivered' || state.claim.role !== predecessor?.role || state.delivery?.ticketId !== state.claim.ticketId ||
-        this.store.tickets.get(state.claim.ticketId)?.ended?.by !== 'delivery'
+      const predecessor = plan?.nodes.find(item => item.id === blocked)
+      return !predecessor || !this.formalReceipt(id, predecessor)
     })
+  }
+
+  private formalReceipt(id: string, node: PlanNode): PlanDeliveryReceipt | undefined {
+    const state = this.state(id, node.id), receipt = state?.delivery
+    if (state?.status !== 'delivered' || state.claim.role !== node.role || receipt?.ticketId !== state.claim.ticketId) return undefined
+    const ticket = this.store.tickets.get(receipt.ticketId)
+    if (ticket?.ended?.by === 'delivery' && ticket.ended.outcome === 'merged' &&
+        ticket.plan?.planId === id && ticket.plan.nodeId === node.id && ticket.plan.role === node.role) return receipt
+    return undefined
+  }
+
+  /** Registered nodes carry immutable acceptance; optional retro backlog does not create Plan nodes. */
+  requiredDelivery(id: string): { waitingFor: string[]; integrations: string[] } | undefined {
+    const plan = this.get(id)
+    if (!plan) return undefined
+    const waitingFor: string[] = [], integrations: string[] = []
+    for (const node of plan.nodes) {
+      const receipt = this.formalReceipt(id, node)
+      if (receipt) integrations.push(receipt.integration)
+      else waitingFor.push(node.id)
+    }
+    return { waitingFor, integrations }
   }
 
   frontier(id: string): string[] {

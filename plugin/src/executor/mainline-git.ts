@@ -204,14 +204,28 @@ async function contains(scratch: Scratch, ancestor: string, descendant: string):
   }
 }
 
+async function fetchMainline(scratch: Scratch, target: MainlineTarget): Promise<string> {
+  await scratch.git('fetch the authoritative mainline branch', [...scratch.transport, 'fetch', '--no-tags', '--no-recurse-submodules',
+    '--no-auto-maintenance', '--no-write-fetch-head', '--', scratch.url, `${target.ref}:${observed}`])
+  const id = outputLine(await scratch.git('resolve the fetched mainline branch', ['rev-parse', '--verify', observed]))
+  await requireCommit(scratch, id)
+  return id
+}
+
 /** Fetch the configured GitHub branch into an isolated ref and shared object database; return its full commit ID. */
 export function readMainline(commands: Commands, target: MainlineTarget): Promise<string> {
+  return inScratch(commands, target, scratch => fetchMainline(scratch, target))
+}
+
+/** Sample the authoritative target and prove every formal integration against that same commit. */
+export function readPlanIntegrationTarget(commands: Commands, target: MainlineTarget, integrations: readonly string[]):
+Promise<{ sha: string; includesIntegrations: boolean }> {
   return inScratch(commands, target, async scratch => {
-    await scratch.git('fetch the authoritative mainline branch', [...scratch.transport, 'fetch', '--no-tags', '--no-recurse-submodules',
-      '--no-auto-maintenance', '--no-write-fetch-head', '--', scratch.url, `${target.ref}:${observed}`])
-    const id = outputLine(await scratch.git('resolve the fetched mainline branch', ['rev-parse', '--verify', observed]))
-    await requireCommit(scratch, id)
-    return id
+    const sha = await fetchMainline(scratch, target)
+    for (const integration of integrations) {
+      if (!await contains(scratch, integration, sha)) return { sha, includesIntegrations: false }
+    }
+    return { sha, includesIntegrations: true }
   })
 }
 

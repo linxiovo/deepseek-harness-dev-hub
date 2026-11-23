@@ -2,6 +2,7 @@
 export const USER_ERRORS = {
   unknownTicket: ['missing', 'Unknown ticket'],
   unknownPlan: ['missing', 'Unknown Plan {id}'],
+  planArtifactUnavailable: ['missing', 'Verified Plan artifact {id} is unavailable'],
   unknownPlanNode: ['missing', 'Unknown Plan node {id}/{node}'],
   invalidPlan: ['refused', 'Plan refused: {detail}'],
   unknownProblem: ['missing', 'Unavailable Eval not found'],

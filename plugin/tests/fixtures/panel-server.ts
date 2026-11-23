@@ -85,11 +85,14 @@ export const MACHINE = { stateDir: '/srv/dsh-superagent', promptMaxChars: 100000
 
 type Settings = ReturnType<typeof SettingsSchema.parse>
 export interface PanelServer {
+  projectId?: string
   joined?: Record<string, string>; joining?: Record<string, string>
   joinError?: string
   settings: Settings; revisions: Record<string, number>
   prompts: PromptsView
   tickets: { open: TicketRow[]; ended: TicketRow[] }; ticketDetails: Record<string, TicketPageView>
+  planDeliveries: Record<string, ApiResponse<'GET plans/:id/delivery'>>
+  planArtifacts: Record<string, ArrayBuffer>
   threads: ThreadRow[]
   threadPages: (key: string, query: { before?: string; around?: string }) => ThreadPageView | undefined
   /** Session meter views keyed by Session id; an id absent here is answered as a missing Session. */
@@ -161,7 +164,7 @@ function sourceStatuses(): SourceStatusRow[] {
 }
 const stateView = (): StateView => ({
   setup: server.setup, load: { running: server.setup.problem ? 0 : 2, queued: 0, maxWorkers: server.settings.executor.maxWorkers },
-  masterId: 'master', paused: server.settings.paused,
+  masterId: 'master', paused: server.settings.paused, ...(server.projectId ? { projectId: server.projectId } : {}),
   // The panel does not read health; the service script does.
   health: {},
 })
@@ -280,6 +283,7 @@ function initial(): PanelServer {
       defaults: defaultPrompts(), parts: Object.entries(builtInParts()).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) })),
       defaultChanged: [], revisions: [{ ...defaults, changed: [], state: 'active' }], sessions: [], notificationPending: false, next_offset: null },
     tickets: { open: [ticketSummary()], ended: [ended] }, ticketDetails: { t1: ticketDetail() },
+    planDeliveries: {}, planArtifacts: {},
     threads: [threadSummary()], threadPages: threadPage, meters: { master: meterView('master') },
     person: [ticketSummary({ attention: { id: 'q1', question: '需要确认按钮颜色' }, note: { text: '需要确认按钮颜色', error: false }, reply },
       { stage: 'person', action: 'answer' }),
@@ -305,7 +309,7 @@ const refuse = (status: Refusal['status'], error: string, more: Record<string, u
 type Query<K extends keyof Api> = Api[K] extends { query?: infer Q } ? keyof NonNullable<Q> & string : never
 type Body<K extends keyof Api> = Api[K] extends { body: infer B } ? B : undefined
 interface Request<K extends keyof Api> { params: RouteParams<K>; query: Partial<Record<Query<K>, string>>; body: Body<K> }
-type Answer<K extends keyof Api> = ApiResponse<K> | Refusal
+type Answer<K extends keyof Api> = (ApiResponse<K> extends Blob ? ArrayBuffer : ApiResponse<K>) | Refusal
 type Route<K extends keyof Api> = { query?: readonly Query<K>[]; answer: (request: Request<K>) => Answer<K> | Promise<Answer<K>> }
   & (Api[K] extends { body: unknown } ? { body: true } : { body?: never })
 const page = <T>(items: T[]) => ({ items, total: items.length, next_offset: null })
@@ -413,6 +417,8 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET sessions/:id/meter': { answer: ({ params }) => server.meters[params.id] ?? refuse(404, 'Session not found') },
   'GET tickets/:id/meter': { answer: () => refuse(404, 'Ticket meter not available in the panel fixture') },
   'GET plans/:id/meter': { answer: () => refuse(404, 'Plan meter not available in the panel fixture') },
+  'GET plans/:id/delivery': { answer: ({ params }) => server.planDeliveries[params.id] ?? refuse(404, 'Plan not found') },
+  'GET plans/:id/artifact': { answer: ({ params }) => server.planArtifacts[params.id] ?? refuse(404, 'Plan artifact not found') },
   'GET project/meter': { answer: () => refuse(404, 'Project meter not available in the panel fixture') },
   'GET project/run-limits': { answer: () => refuse(404, 'Project run limits not available in the panel fixture') },
   'GET tickets/:id/run-limits': { answer: () => refuse(404, 'Ticket run limits not available in the panel fixture') },
@@ -478,13 +484,19 @@ async function run<K extends keyof Api>(key: K, params: Record<string, string>, 
   return route.answer({ params: params as RouteParams<K>, query: values, body: body as Body<K> })
 }
 /**
- * Response wrapper that increments `server.pending` when constructed and decrements it when `.text()` is consumed.
+ * Response wrapper that increments `server.pending` when constructed and decrements it when `.text()`, `.json()` or `.blob()` consumes it.
  * Requests held back by `server.searching` are not constructed until `searching` resolves, so they do not count as pending early.
  */
 class Reply extends Response {
-  constructor(value: unknown, status: number) { super(JSON.stringify(value), { status,
-    headers: { 'content-type': 'application/json' } }); server.pending++ }
+  constructor(value: unknown, status: number) {
+    const binary = value instanceof ArrayBuffer
+    super(binary ? value : JSON.stringify(value), { status,
+      headers: { 'content-type': binary ? 'application/octet-stream' : 'application/json' } })
+    server.pending++
+  }
   override async text() { server.pending--; return super.text() }
+  override async json() { server.pending--; return super.json() }
+  override async blob() { server.pending--; return super.blob() }
 }
 
 export function usePanelServer(cleanup: () => void) {

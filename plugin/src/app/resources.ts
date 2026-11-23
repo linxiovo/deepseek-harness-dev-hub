@@ -36,6 +36,7 @@ import type { SessionMeter } from './session-meter.ts'
 import type { Sessions } from './sessions.ts'
 import type { Settings } from './settings.ts'
 import type { Store } from './store.ts'
+import type { PlanIntegrationView } from '../core/plan-integration.ts'
 import type { TextCache } from './cache.ts'
 
 /** Resource descriptors exposed via orchestrator_read, marking which resources worker sessions may also read for their own ticket. */
@@ -49,6 +50,7 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'handoff/<id>', holds: 'confirmed project, intent and planner question/answer' },
   { name: 'spec/<id>', holds: 'published acceptance and test interfaces, or pending' },
   { name: 'plan/<id>', holds: 'Plan graph, role totals, Frontier and claims with background' },
+  { name: 'plan/<id>/delivery', holds: 'integrated commit, regression result and artifact' },
   { name: 'plan/<id>/node/<node-id>', holds: 'node claim or waiting reason, delivery and instructions' },
   { name: 'plan/<id>/attention', holds: 'Plan status counts and credential actions' },
   { name: 'ticket/<id>', holds: 'ticket, claim, worktree, active writer and work history', executor: true },
@@ -117,6 +119,7 @@ export interface MainResourceHost extends ResourceHost {
   readonly sessions: Pick<Sessions, 'status' | 'modelRetry'>
   readonly settings: Pick<Settings, 'view' | 'block'>
   readonly handoffs: Pick<Handoffs, 'get' | 'spec'>
+  readonly planIntegration?: { view(id: string): PlanIntegrationView | undefined }
   readonly plans: Pick<Plans, 'get' | 'view' | 'node'>
 }
 
@@ -660,7 +663,8 @@ const ROUTES: readonly Route[] = [
     const [id, section, nodeId, ...extra] = read.rest.split('/')
     if (id && section === 'meter' && nodeId === undefined) return projectMeter(read, 'plan', id)
     if (id && section === 'attention' && nodeId === undefined) return attention.summary(id)
-    if (!id || extra.length || (section !== undefined && (section !== 'node' || !nodeId))) throw new Error('Unknown plan resource')
+    if (!id || extra.length || (section !== undefined && section !== 'delivery' && (section !== 'node' || !nodeId))
+      || (section === 'delivery' && nodeId !== undefined)) throw new Error('Unknown plan resource')
     if (nodeId) {
       const node = plans.node(id, nodeId)
       if (!node) throw new UserError('unknownPlanNode', { id, node: nodeId })
@@ -671,6 +675,11 @@ const ROUTES: readonly Route[] = [
     }
     const handoff = handoffs.get(id)
     if (!handoff) throw new UserError('unknownPlan', { id })
+    if (section === 'delivery') {
+      const view = main(read).planIntegration?.view(id)
+      if (!view) throw new UserError('unknownPlan', { id })
+      return view
+    }
     const graph = plans.view(id)
     if (graph) {
       const { nodes, context, ...header } = graph
@@ -679,7 +688,8 @@ const ROUTES: readonly Route[] = [
         return action ? { ...node, attention: action } : node
       }))
       const contextPage = list(read, (offset, count) => context.slice(offset, offset + count))
-      return { ...header, nodes: nodePage.items, context: contextPage.items, next_offset: nodePage.next_offset ?? contextPage.next_offset }
+      return { ...header, delivery: `plan/${id}/delivery`, nodes: nodePage.items, context: contextPage.items,
+        next_offset: nodePage.next_offset ?? contextPage.next_offset }
     }
     if (!handoff.spec) return { id, handoffId: id, status: 'awaiting-spec' }
     return { id, handoffId: id, specId: handoff.spec.id,

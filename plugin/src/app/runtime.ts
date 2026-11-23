@@ -36,16 +36,19 @@ import { Installation, projectDatabase, projectHubId } from './installation.ts'
 import { InstallationError } from './installation-api.ts'
 import { Planning } from './planning.ts'
 import { Plans, planDeliveryWriter } from './plans.ts'
+import { PlanIntegration } from './plan-integration.ts'
 import { ScopedAttention } from './scoped-attention.ts'
 import { PlanDispatcher } from './plan-dispatch.ts'
 import { MainlineQueue } from './mainline-queue.ts'
-import { advanceMainline, precedes, prepareMainline, readMainline, verifyDeliveryOnTarget } from '../executor/mainline-git.ts'
+import { advanceMainline, precedes, prepareMainline, readMainline, readPlanIntegrationTarget, verifyDeliveryOnTarget } from '../executor/mainline-git.ts'
 import { Prompts, promptByteLimit, PromptConflict } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
-import { projectNavigationLink } from '../navigation.ts'
+import { projectNavigationLink, ticketNavigationLink } from '../navigation.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice, promptsNotice } from './notices.ts'
+import { dispatchPlanActions, isLatestPlanActions, observePlanActions } from '../sources/actions-evidence.ts'
+import { cleanupPlanArtifactStaging, commitPlanArtifact, discardPlanArtifact, downloadPlanArtifact, openPlanArtifact, planArtifactExists } from './plan-artifacts.ts'
 import { pullEndNotices, recoverPulls } from '../sources/github-pull.ts'
 import { githubKind } from '../sources/github.ts'
 import { HealthBoard } from '../infra/health.ts'
@@ -85,6 +88,7 @@ export class Runtime extends Service implements SourceHost {
   readonly handoffs: Handoffs
   readonly topicBinding?: TopicBinding
   readonly plans: Plans
+  private readonly planIntegration: PlanIntegration
   readonly planDispatcher: PlanDispatcher
   readonly attention: ScopedAttention
   readonly planning: Planning
@@ -141,6 +145,7 @@ export class Runtime extends Service implements SourceHost {
           handoff.project.repository.toLowerCase() === repository.toLowerCase() && sameDirectory(handoff.project.workspace, workspace)) })
       const project = installation.project
       const projectMachine = this.machine = { ...machine, stateDir: installation.stateDir }
+      cleanupPlanArtifactStaging(projectMachine.stateDir)
       const store = opened = this.store = new Store(projectDatabase(installation), report)
       if (project?.initial && store.get(KV.settings.revision) === undefined) {
         const { baseRef, policy } = project.initial
@@ -211,6 +216,7 @@ export class Runtime extends Service implements SourceHost {
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
       const sessions = this.sessions = new Sessions({ context: ctx, store, projectMeter, prompts, effects, health: board.claim('models'), masterId,
         lifetime: this.lifetime, boundWorkspace: project?.workspace,
+        relayAvailable: requestId => this.planIntegration.relayAvailable(requestId),
         closing: () => this.closing(), environment, ownsPlanner: id => handoffs.get(id) !== undefined,
         plannerActive: id => this.configured() && handoffs.isPlanning(id),
         splitterWorkspace: id => {
@@ -223,6 +229,30 @@ export class Runtime extends Service implements SourceHost {
         tools: (agent, ticket, role) => role === 'planner' ? plannerTools(this.toolHost, agent)
           : role === 'splitter' ? splitterTools(this.toolHost, agent)
           : ticket ? executorTools(this.toolHost, ticket, agent.id, role === 'review') : mainTools(this.toolHost, agent) })
+      const planIntegration = this.planIntegration = new PlanIntegration({ store, effects, plans, handoffs, lifetime: this.lifetime,
+        verification: project && machine.planVerification?.find(check => check.projectId === project.id),
+        paused: () => this.paused(), target: () => {
+          if (!project || !setup.configured()) return undefined
+          const ref = store.settings().executor.baseRef?.trim()
+          return ref?.startsWith('refs/heads/') ? { repository: project.workspace, slug: project.repository, ref } : undefined
+        },
+        readTarget: (target, integrations) => readPlanIntegrationTarget(commands, target, integrations),
+        observe: request => observePlanActions(commands, request),
+        isLatestRun: (request, run) => isLatestPlanActions(commands, request, run),
+        downloadArtifact: (planId, request, run, artifact) => downloadPlanArtifact(commands, projectMachine.stateDir, planId, request, run, artifact),
+        commitArtifact: commitPlanArtifact, discardArtifact: discardPlanArtifact,
+        artifactAvailable: async (planId, view) => !!await openPlanArtifact(projectMachine.stateDir, planId, view),
+        artifactExists: (planId, view) => planArtifactExists(projectMachine.stateDir, planId, view),
+        dispatch: request => dispatchPlanActions(commands, request),
+        deliveryLink: planId => {
+          const ticketId = plans.get(planId)?.nodes.map(node => plans.state(planId, node.id)?.claim.ticketId).find(Boolean)
+          const origin = `http://127.0.0.1:${ctx.webServer.port}`
+          return project && ticketId ? ticketNavigationLink(origin, project.id, ticketId)
+            : project ? projectNavigationLink(origin, project.id, 'project') : origin
+        },
+        relay: message => sessions.relay(message.id, message.text),
+        cancelRelay: id => effects.cancel('relay', id),
+      })
       const verifyProjectBinding = installation.validateWorkspace.bind(installation)
       this.planning = new Planning({ handoffs, plans, effects, sessions, verifyProjectBinding,
         paused: () => this.paused(), closing: () => this.closing() })
@@ -357,6 +387,7 @@ export class Runtime extends Service implements SourceHost {
                 sessions.notify(...promptsNotice(approval.rulesRevision))
               }
               planDelivery.deliver(plan.planId, plan.nodeId, receipt)
+              planIntegration.enqueue(plan.planId)
             })
           } catch (error) {
             if (error instanceof PromptConflict) return 'shared_rules_proposal_changed'
@@ -414,7 +445,7 @@ export class Runtime extends Service implements SourceHost {
           return passes.receive(trigger)
         } }
       this.toolHost = { context: ctx, engine, store, sessions, executor, mainline, planDispatcher: this.planDispatcher, settings: this.settings,
-        assessor, resources, projectMeter, runLimits, attention, handoffs, plans, lifetime: this.lifetime,
+        assessor, resources, projectMeter, runLimits, attention, handoffs, plans, planIntegration, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
@@ -564,7 +595,9 @@ export class Runtime extends Service implements SourceHost {
     if (this.closing()) return
     if (project && !await this.reconcilePulls()) return
     for (const id of this.settings.syncable()) await this.settings.sync(id).catch(() => { /* sync() records its failure in health. */ })
-    // If stop() was called while awaiting setup, session creation, or policy sync, do not start background loops.
+    // Reconcile the package receipt before restarting other Plan work or background loops.
+    if (this.closing()) return
+    await this.planIntegration.resume()
     if (this.closing()) return
     this.planDispatcher.resume()
     this.planning.resume()
@@ -603,7 +636,11 @@ export class Runtime extends Service implements SourceHost {
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, setup, passes, installation,
       projectMeter } = this
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, projectMeter, installation,
-      attention: this.attention, runLimits: this.runLimits,
+      attention: this.attention, runLimits: this.runLimits, planIntegration: this.planIntegration,
+      planArtifact: async id => {
+        const view = this.planIntegration.view(id)
+        return view && await openPlanArtifact(machine.stateDir, id, view)
+      },
       meter: { read: (id, signal) => this.readScopedMeter(id, signal) },
       topicBinding: this.topicBinding, verifyTopicBinding: () => this.verifyTopicBinding(),
       get ready() { return runtime.ready }, assertNewWork: () => installation.assertNewWork(),

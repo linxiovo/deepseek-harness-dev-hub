@@ -203,8 +203,8 @@ function Pages({ route, openTab, deploymentForm, target }: { route: Route; openT
 /** Root panel component managing route history and shared panel state. */
 export function App({ t, openSession, deploymentForm }: AppProps) {
   const [target] = useState(() => projectNavigation(window.location.search))
-  const [location, setLocation] = useState<Location>(() => target ? { stack: [],
-    route: target.view === 'settings' ? settingsRoute('source', { source: 'feishu' }) : HOME } : initialLocation())
+  const [location, setLocation] = useState<Location>(() => target ? { stack: [], route: target.ticketId
+    ? { page: 'execution', id: target.ticketId } : target.view === 'settings' ? settingsRoute('source', { source: 'feishu' }) : HOME } : initialLocation())
   useEffect(() => { remember(location) }, [location])
   // Preserve the last opened settings group across navigation so the Settings tab reopens at it.
   const move = useCallback((next: (current: Location) => Pick<Location, 'route' | 'stack'>) =>

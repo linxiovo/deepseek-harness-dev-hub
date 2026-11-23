@@ -2,7 +2,7 @@
 import { expect, it, vi } from 'vitest'
 import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import { openKnownSession } from '../src/navigation.ts'
+import { openKnownSession, projectNavigation, ticketNavigationLink } from '../src/navigation.ts'
 import { initialLocation, parseRoute, remember, setupPage } from '../src/client/route.ts'
 const id = 'orchestrator-test' as SessionId
 function fixture(ready = false) {
@@ -63,4 +63,13 @@ it('reads each page a tab remembered with the parameters it takes, and leaves ou
 it('opens the settings that fix each setup problem: the Deployment group, or the card of the Source it names', () => {
   expect(setupPage('deployment')).toEqual({ page: 'settings', query: { group: 'deployment' } })
   for (const place of ['github', 'feishu'] as const) expect(setupPage(place)).toEqual({ page: 'settings', query: { group: 'source', source: place } })
+})
+it('builds a Harness project deep link that opens one validated Ticket', () => {
+  const projectId = 'a'.repeat(32), ticketId = 'b'.repeat(32)
+  const url = ticketNavigationLink('http://127.0.0.1:3082', projectId, ticketId)
+  expect(url).toContain('superagentProject=' + projectId)
+  expect(projectNavigation(new URL(url).search)).toEqual({ projectId, view: 'project', ticketId })
+  expect(projectNavigation(`?superagentProject=${projectId}&superagentView=settings&superagentTicket=${ticketId}`)).toBeUndefined()
+  expect(projectNavigation(`?superagentProject=${projectId}&superagentView=project&superagentTicket=${ticketId}&superagentTicket=${ticketId}`))
+    .toBeUndefined()
 })

@@ -1,3 +1,9 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { PassThrough } from 'node:stream'
+import { finished } from 'node:stream/promises'
+import type { PlanIntegrationView } from '../src/core/plan-integration.ts'
 import { expect, it } from 'vitest'
 import { z } from 'zod'
 import { registerHttp } from '../src/app/http.ts'
@@ -12,13 +18,26 @@ import type { Ticket } from '../src/core/index.ts'
 
 type Handler = (req: unknown, res: unknown) => Promise<void>
 type Headers = Record<string, string | undefined>
+/** Minimal ServerResponse-shaped stream for the management router's JSON and binary outputs. */
+class TestResponse extends PassThrough {
+  headersSent = false
+  constructor(private readonly recordHeaders: (code: number, headers: Record<string, unknown>) => void) { super() }
+  writeHead(code: number, headers: Record<string, unknown> = {}) {
+    this.recordHeaders(code, headers)
+    this.headersSent = true
+    return this
+  }
+}
 /** Mount management HTTP routes on a fake web server and return a request helper that includes default panel headers. */
 function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.0.1') {
   let handler: Handler = async () => {}
   const ctx = { webServer: { host, port: 3082, register: (route: { handler: Handler }) => { handler = route.handler; return () => {} } } }
   registerHttp(ctx as never, { ready: Promise.resolve(), ...runtime } as unknown as HttpHost)
   return async (method: string, path: string, body?: unknown, headers: Headers = {}, beforeBody?: () => Promise<void>) => {
-    let status = 0, text = ''
+    let status = 0, responseHeaders: Record<string, unknown> = {}
+    const output: Buffer[] = []
+    const response = new TestResponse((code, fields) => { status = code; responseHeaders = fields })
+    response.on('data', chunk => output.push(Buffer.from(chunk)))
     const chunks = body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]
     const sent = Object.fromEntries(Object.entries({ host: '127.0.0.1:3082', 'x-orchestrator-request': '1', ...headers }).filter(([,
       value]) => value !== undefined))
@@ -26,8 +45,13 @@ function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.
       if (beforeBody) await beforeBody()
       yield* chunks
     } }
-    await handler(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
-    return { status, body: JSON.parse(text) as unknown }
+    const complete = finished(response)
+    await handler(req, response)
+    await complete
+    const bytes = Buffer.concat(output), text = bytes.toString('utf8')
+    let result: unknown
+    try { result = JSON.parse(text) as unknown } catch { result = bytes }
+    return { status, body: result, ...(responseHeaders['content-disposition'] ? { headers: responseHeaders } : {}) }
   }
 }
 
@@ -167,6 +191,104 @@ it('answers the Session meter view the Hub reads, decoded from the path, and 404
   expect(asked).toEqual([view.session_id, 'worker-t9'])
 })
 
+it('serves stored Plan delivery only within the required project scope', async () => {
+  const view: PlanIntegrationView = { planId: 'plan-a', status: 'delivered',
+    version: { repository: 'org/repo', ref: 'refs/heads/main', sha: 'a'.repeat(40), context: 'b'.repeat(64),
+      workflowId: 'ci.yml', configuration: 'Release', environment: 'production' },
+    run: { id: 17, attempt: 1, url: 'https://github.com/org/repo/actions/runs/17', checks: [] },
+    artifact: { id: 5, name: 'release', url: 'https://github.com/org/repo/actions/runs/17/artifacts/5',
+      fileName: 'release.tgz', contentType: 'application/gzip', size: 12, sha256: 'c'.repeat(64) }, verifiedAt: '2026-11-22T12:00:00.000Z' }
+  const lookedUp: string[] = []
+  const call = serve({ installation: bindingInstallation(),
+    planIntegration: { view: (id: string) => { lookedUp.push(id); return id === view.planId ? view : undefined } } })
+  expect(await call('GET', 'plans/plan-a/delivery', undefined, projectHeader(alpha.id)))
+    .toEqual({ status: 200, body: view })
+  expect(lookedUp).toEqual(['plan-a'])
+  expect(await call('GET', 'plans/plan-a/delivery')).toEqual({ status: 409, body: expect.objectContaining({ code: 'projectScopeRequired' }) })
+  expect(await call('GET', 'plans/plan-a/delivery', undefined, projectHeader(beta.id)))
+    .toEqual({ status: 409, body: { error: 'The request does not target the mounted project.', code: 'staleProject' } })
+  expect(await call('GET', 'plans/plan-a/delivery?refresh=1', undefined, projectHeader(alpha.id)))
+    .toEqual({ status: 400, body: { error: 'Invalid plan delivery query' } })
+  expect(await call('GET', 'plans/unknown/delivery', undefined, projectHeader(alpha.id)))
+    .toEqual({ status: 404, body: { error: 'Unknown Plan unknown', code: 'unknownPlan', values: { id: 'unknown' } } })
+  expect(await call('GET', 'plans/plan-a/delivery', undefined,
+    { ...projectHeader(alpha.id), 'x-orchestrator-request': undefined }))
+    .toEqual({ status: 403, body: { error: 'Same-origin management request required' } })
+  expect(lookedUp).toEqual(['plan-a', 'unknown'])
+})
+
+it('returns the established unknown-plan refusal when plan integration is unavailable', async () => {
+  const call = serve({ installation: bindingInstallation() })
+  expect(await call('GET', 'plans/plan-a/delivery', undefined, projectHeader(alpha.id)))
+    .toEqual({ status: 404, body: { error: 'Unknown Plan plan-a', code: 'unknownPlan', values: { id: 'plan-a' } } })
+})
+
+it('streams a verified executable with its declared media type to the selected project', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'plan-http-artifact-'))
+  const bytes = Buffer.from('verified package')
+  const path = join(directory, 'worker.exe')
+  writeFileSync(path, bytes)
+  const delivery: PlanIntegrationView = { planId: 'plan-a', status: 'blocked', reason: 'artifact_unavailable' }
+  const call = serve({ installation: bindingInstallation(), planIntegration: { view: () => delivery }, planArtifact: async (id: string) => id === 'plan-a'
+    ? { path, fileName: 'worker.exe', contentType: 'application/vnd.microsoft.portable-executable', size: bytes.length, sha256: 'c'.repeat(64) } : undefined })
+  try {
+    expect(await call('GET', 'plans/plan-a/artifact', undefined, projectHeader(alpha.id))).toEqual({ status: 200, body: bytes,
+      headers: { 'content-type': 'application/vnd.microsoft.portable-executable', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff',
+        'content-length': bytes.length, 'content-disposition': 'attachment; filename="worker.exe"', 'x-artifact-sha256': 'c'.repeat(64) } })
+    expect(await call('GET', 'plans/plan-a/artifact', undefined, projectHeader(beta.id)))
+      .toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  } finally { rmSync(directory, { recursive: true, force: true }) }
+})
+
+it('returns a typed missing-artifact refusal for an existing Plan', async () => {
+  const delivery: PlanIntegrationView = { planId: 'plan-a', status: 'blocked', reason: 'artifact_unavailable' }
+  const call = serve({ installation: bindingInstallation(), planIntegration: { view: () => delivery }, planArtifact: async () => undefined })
+  expect(await call('GET', 'plans/plan-a/artifact', undefined, projectHeader(alpha.id)))
+    .toEqual({ status: 404, body: { error: 'Verified Plan artifact plan-a is unavailable', code: 'planArtifactUnavailable', values: { id: 'plan-a' } } })
+})
+
+it('classifies malformed internal download metadata as a server error', async () => {
+  const delivery: PlanIntegrationView = { planId: 'plan-a', status: 'blocked', reason: 'artifact_unavailable' }
+  const malformed = { path: '', fileName: 'worker/evil.exe', contentType: 'text/html\r\n', size: -1, sha256: 'invalid' }
+  const call = serve({ installation: bindingInstallation(), planIntegration: { view: () => delivery },
+    planArtifact: async () => malformed as never })
+  expect(await call('GET', 'plans/plan-a/artifact', undefined, projectHeader(alpha.id)))
+    .toEqual({ status: 500, body: { error: 'Plan artifact transfer metadata is invalid' } })
+})
+
+it('returns unexpected retained-file I/O failures as server errors', async () => {
+  const delivery: PlanIntegrationView = { planId: 'plan-a', status: 'blocked', reason: 'artifact_unavailable' }
+  const call = serve({ installation: bindingInstallation(), planIntegration: { view: () => delivery },
+    planArtifact: async () => { throw new Error('disk I/O failure') } })
+  expect(await call('GET', 'plans/plan-a/artifact', undefined, projectHeader(alpha.id)))
+    .toEqual({ status: 500, body: { error: 'disk I/O failure' } })
+})
+
+it('holds the mounted project while streaming its artifact', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'plan-http-lease-'))
+  const bytes = Buffer.from('verified package'), path = join(directory, 'release.tgz')
+  writeFileSync(path, bytes)
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+  let switched = false
+  const installation = { ...bindingInstallation(), selectProject: () => { switched = true; return { project: beta, restarting: true } } }
+  const view: PlanIntegrationView = { planId: 'plan-a', status: 'blocked', reason: 'artifact_unavailable' }
+  const call = serve({ installation, planIntegration: { view: () => view }, planArtifact: async () => {
+    entered.resolve()
+    await release.promise
+    return { path, fileName: 'release.tgz', contentType: 'application/gzip', size: bytes.length, sha256: 'c'.repeat(64) }
+  } })
+  try {
+    const download = call('GET', 'plans/plan-a/artifact', undefined, projectHeader(alpha.id))
+    await entered.promise
+    expect(await call('POST', `projects/${beta.id}/select`)).toMatchObject({ status: 409, body: { code: 'projectConflict' } })
+    expect(switched).toBe(false)
+    release.resolve()
+    expect(await download).toMatchObject({ status: 200, body: bytes })
+  } finally {
+    release.resolve()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
 it('answers a corrupt Session log with 500 instead of claiming the Session is missing', async () => {
   const read = async (id: string): Promise<SessionMeterView | undefined> => {
     throw new Error(`Session log for ${id} is corrupt`)

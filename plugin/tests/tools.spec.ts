@@ -243,7 +243,8 @@ it('reacquires changed evidence after the final retro and only queues with curre
   const before = commit('export const label = value => value.trimStart()\n')
   await review(before)
   const original = await tests(before, "assert.equal(label(' alert'), 'alert'); assert.equal(label(''), '')")
-  const failed = await tests(before, "assert.equal(label(' alert '), 'alert')", 'failed')
+  const trailingSpaceCheck = "assert.equal(label(' alert '), 'alert')"
+  const failed = await tests(before, trailingSpaceCheck, 'failed')
   const unrun = await tests(before, "assert.equal(label(''), '')", 'not_run')
   const brokenDocs = await h.runTool(session, 'orchestrator_doc_impact', { candidate: before,
     root: 'missing-navigation.md', routes: [], leaves: [], impact: { kind: 'unchanged', reason: 'No changes to navigation.' } })
@@ -270,6 +271,8 @@ it('reacquires changed evidence after the final retro and only queues with curre
   await review(candidate, ['docs', 'acceptance:2', 'tests']) // An affected check cannot be carried even with approval.
   expect(await inspect()).toMatchObject({ ready: false, candidate, missing: expect.arrayContaining(['tests']) })
   const fixed = await tests(candidate, "assert.equal(label(' alert '), 'alert'); assert.equal(label(''), '')")
+  expect(await inspect()).toMatchObject({ missing: expect.arrayContaining(['failed_checks_require_recheck']) })
+  await tests(candidate, trailingSpaceCheck)
   const foreign = await h.acceptedTicket(feishu('retro-foreign-observation', '@bot Verify a separate label ticket.'))
   const foreignDir = foreign.ticket.execution!.directory
   h.localGit!.git('-C', foreignDir, 'merge', '--ff-only', candidate)
@@ -358,7 +361,7 @@ it('reacquires changed evidence after the final retro and only queues with curre
   const ledger = persisted.deliveryCheck!
   const fixedIndex = Number(String(fixed.read).split('/').at(-1))
   for (const events of [
-    ledger.events.filter((_, index) => index !== fixedIndex),
+    ledger.events.map((event, index) => index === fixedIndex && event.kind === 'tests' ? { ...event, result: 'unverified' as const } : event),
     ledger.events.map(event => event.kind === 'acceptance' && event.revision.candidate === candidate
       ? { ...event, results: event.results.map(result => ({ ...result, evidence: [String(original.read)] })) } : event),
   ]) {

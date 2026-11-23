@@ -6,6 +6,7 @@ import { PolicyConfigSchema, policyVersion, type Settings } from '../policy.ts'
 import { masterPrompt, workerPrompt, sharedPrompt, guides, mainAdmissionPolicy, handoffPolicy, teamDefaults, sourceSkills, cliNotes } from './context.ts'
 import { environmentLines, type Variable } from './execution-environment.ts'
 import { bundledSkills, isBundledSkill, promptFile, splitterSkill, workerSkills } from './skill-files.ts'
+import type { Plans } from './plans.ts'
 import type { Store } from './store.ts'
 import { Versions } from './versions.ts'
 import { KV } from '../kv.ts'
@@ -160,7 +161,7 @@ export const promptByteLimit = (maxChars: number): number => 4 * maxChars + 4096
 export class Prompts {
   private readonly versions: Versions<PromptVersion>
   constructor(private readonly store: Store, private readonly maxChars: () => number, private readonly environment: () => Variable[] | undefined,
-    private readonly feishu: () => boolean) {
+    private readonly feishu: () => boolean, private readonly plans: Pick<Plans, 'get'>) {
     this.versions = new Versions(store, KV.prompts.revision, KV.prompts.version)
     this.store.atomic(() => this.snapshot(this.current().revision))
   }
@@ -298,14 +299,15 @@ export class Prompts {
   stage(value: unknown, baseRevision: number, maintenanceTicketId: string): PromptVersion {
     const config = this.validate(value)
     return this.store.atomic(() => {
-      const previous = this.current(), priorId = this.proposal(maintenanceTicketId)
-      const prior = priorId === undefined ? undefined : this.version(priorId)
-      if (prior?.previousRevision === baseRevision && this.state(prior.revision) === 'pending' && isDeepStrictEqual(prior.config, config)) return prior
+      const previous = this.current()
       if (previous.revision !== baseRevision) throw new PromptConflict(`Prompt version changed to ${previous.revision}; compare the latest version before saving`)
       const ticket = this.store.tickets.get(maintenanceTicketId)
-      const plan = ticket?.plan && this.store.get(KV.plans.record(ticket.plan.planId))
-      if (!ticket?.plan || ticket.ended || plan?.nodes.length !== 1 || plan.nodes[0]?.id !== ticket.plan.nodeId)
+      const plan = ticket?.plan && !ticket.ended ? this.plans.get(ticket.plan.planId) : undefined
+      if (plan?.nodes.length !== 1 || plan.nodes[0]?.id !== ticket?.plan?.nodeId)
         throw new PromptConflict('Shared rules require an open, independent Plan maintenance Ticket', 'promptProposalRefused')
+      const priorId = this.proposal(maintenanceTicketId)
+      const prior = priorId === undefined ? undefined : this.version(priorId)
+      if (prior?.previousRevision === baseRevision && this.state(prior.revision) === 'pending' && isDeepStrictEqual(prior.config, config)) return prior
       const attempt = this.store.get(KV.mainline.ticket(maintenanceTicketId))?.at(-1)
       if (attempt && (attempt.status === 'queued' || attempt.status === 'applying' || attempt.status === 'verified'))
         throw new PromptConflict('Cannot replace a shared rule proposal while its mainline attempt is pending or verified', 'promptProposalRefused')

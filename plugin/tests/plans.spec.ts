@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { z } from 'zod'
 import { resolve } from 'node:path'
@@ -955,5 +955,278 @@ it('does not meter a preallocated Worker ID before its verified Session is hande
   expect(await read(meter)).toMatchObject(expected)
   await h.restart()
   expect(await read(meter)).toMatchObject(expected)
+})
+
+it('replans a repeatedly failing Plan check without loosening its successor gate', async () => {
+  const { id, catalogClaim } = await dispatchedFanIn()
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor,
+    runLimits: { stagnation: { maxAttemptsWithoutProgress: 2, idleSeconds: 3600 } } } })
+  for (const attempt of [1, 2]) {
+    await h.runTool(catalogClaim.session, 'orchestrator_report', {
+      state: 'failed', summary: `Catalog contract check failed on attempt ${attempt}: expected a 200 response`,
+    })
+  }
+  await h.runtime.pump()
+  await h.runtime.idle()
+  expect(await read(`plan/${id}/node/catalog`)).toMatchObject({
+    recovery: { status: 'diagnose', failureId: expect.any(String) },
+  })
+  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'] })
+  expect(h.jsonRelays(h.runtime.masterId, 'human-action')).toEqual([])
+  const { recovery: { failureId } } = await read(`plan/${id}/node/catalog`) as { recovery: { failureId: string } }
+  const replan = (change: unknown, extra = {}) => h.runTool(h.runtime.masterId, 'orchestrator_plan_replan', {
+    planId: id, nodeId: 'catalog', revision: 1, failureId, reason: 'Keep the account profile contract ahead of the dashboard', change, ...extra,
+  })
+  const dependencies = (nodeId: string, blockedBy: string[]) => ({ kind: 'dependencies', updates: [{ nodeId, blockedBy }] })
+  await expect(replan(dependencies('dashboard', ['accounts']))).rejects.toThrow(/undelivered dependency/)
+  await expect(replan(dependencies('dashboard', ['catalog', 'accounts', 'unknown']))).rejects.toThrow(/unknown node/i)
+  await expect(replan(dependencies('dashboard', ['catalog', 'accounts', 'dashboard']))).rejects.toThrow(/itself/)
+  await expect(replan(dependencies('dashboard', ['catalog', 'accounts']), { authorization: { release: 'authorized' } })).rejects.toThrow()
+  await expect(replan({ kind: 'split', nodeId: 'dashboard', groups: [[3], [1]] })).rejects.toThrow(/unknown|repeated/i)
+  expect(await read(`plan/${id}`)).toMatchObject({ revision: 1 })
+
+  const retry = () => h.runTool(h.runtime.masterId, 'orchestrator_ticket_retry', { ticket_id: catalogClaim.ticketId })
+  await expect(retry()).rejects.toThrow(/stagnation policy/)
+  expect(await read(`ticket/${catalogClaim.ticketId}/report/${catalogClaim.assignmentId}`)).toMatchObject({ text: expect.stringContaining('failed') })
+})
+
+it('replans by replacing the Assignment but requires the failed check to actually pass again', async () => {
+  const required = [{ id: 'catalog-contract', workflowId: '23' }]
+  const setRequiredChecks = (checks: typeof required) => {
+    const current = h.runtime.store.settings(), github = current.sources.github!
+    h.runtime.store.saveSettings({ ...current, sources: { ...current.sources, github: { ...github, config: { ...github.config, requiredChecks: checks } } } })
+  }
+  setRequiredChecks(required)
+  const { id, catalogClaim: claim } = await dispatchedFanIn()
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor,
+    runLimits: { stagnation: { maxAttemptsWithoutProgress: 1, idleSeconds: 3600 } } } })
+  const { directory } = await read(`ticket/${claim.ticketId}`)
+  const candidate = h.localGit!.git('-C', String(directory), 'rev-parse', 'HEAD')
+  const recordCheck = (command: string, status: 'passed' | 'failed', observed: string, worker = claim.session) =>
+    h.runTool(worker, 'orchestrator_test_evidence', { candidate, scope: 'focused', reason: 'Exercise the catalog API contract', red: null,
+      checks: [{ directory: '.', command, status, observed }] })
+  const check = 'pnpm test catalog-contract'
+  await recordCheck(check, 'failed', 'Expected HTTP 200; first run received 500.')
+  await h.runTool(claim.session, 'orchestrator_report', { state: 'failed', summary: 'The catalog contract failed.' })
+  await h.runtime.pump()
+  await h.runtime.idle()
+  expect(await read(`plan/${id}/node/catalog/recovery`)).toMatchObject({ status: 'diagnose', attempts: 1 })
+  await recordCheck(check, 'failed', 'Expected HTTP 200; diagnostic run received 503.')
+  await h.runtime.pump()
+  await h.runtime.idle()
+  const assignments = () => read(`ticket/${claim.ticketId}/assignments`)
+  expect(await assignments()).toMatchObject({ items: [
+    { id: expect.not.stringMatching(claim.assignmentId), state: 'running' },
+    { id: claim.assignmentId, state: 'ended', report: { state: 'failed' } },
+  ] })
+  expect((await read(`ticket/${claim.ticketId}`)).directory).toBe(directory)
+  await h.restart()
+  await h.runtime.idle()
+  expect((await assignments()).items).toHaveLength(2)
+  await recordCheck(check, 'failed', 'Expected HTTP 200; replacement run received 502.')
+  await h.runtime.pump()
+  await h.runtime.idle()
+  const notices = () => h.jsonRelays(h.runtime.masterId, 'plan-replan-review')
+  expect(notices()).toHaveLength(1)
+  await h.runtime.pump()
+  await h.runtime.idle()
+  expect(notices()).toHaveLength(1)
+  expect(h.jsonRelays(h.runtime.masterId, 'human-action')).toEqual([])
+  const original = await read(`plan/${id}/node/catalog/recovery`)
+  setRequiredChecks([])
+  const repaired = await h.runTool(h.runtime.masterId, 'orchestrator_plan_replan', {
+    planId: id, nodeId: 'catalog', revision: 1, failureId: original.failureId, reason: 'Isolate the repeated catalog contract failure', change: { kind: 'repair' },
+  }) as { replacements: { catalog: [string] } }
+  const [repairNode] = repaired.replacements.catalog
+  expect(await read(`ticket/${claim.ticketId}`)).toMatchObject({ ended: { by: 'replan' } })
+  await vi.waitFor(async () => {
+    expect(await read(`plan/${id}/node/${repairNode}`)).toMatchObject({ status: 'waiting-for-slot' })
+  }, { timeout: 20_000 })
+  // The automatic escalation was exercised above. Keep the repair's evidence reads stable while checking which observations count.
+  const afterRepair = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...afterRepair, executor: { ...afterRepair.executor,
+    runLimits: { ...afterRepair.executor.runLimits, stagnation: { maxAttemptsWithoutProgress: 100, idleSeconds: 3600 } },
+  } })
+  const repairDispatch = await dispatchPlan(id, repairNode)
+  expect(repairDispatch).toMatchObject({ status: 'claimed', claim: expect.anything() })
+  const replacement = repairDispatch.claim!
+  await h.runtime.idle()
+  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: [repairNode, 'accounts'] })
+  expect(await h.runTool(replacement.session, 'orchestrator_read', { resource: `ticket/${replacement.ticketId}/plan-scope` }))
+    .toMatchObject({ repair: { ticketId: claim.ticketId, failureId: original.failureId, checks: [{ directory: '.', command: check }] } })
+  const delivery = () => read(`ticket/${replacement.ticketId}/delivery-check`)
+  expect(JSON.parse(String((await delivery()).text))).toMatchObject({ ci: { required } })
+  await recordCheck('pnpm test unrelated', 'failed', 'The independent check failed on its first run.', replacement.session)
+  await recordCheck('pnpm test unrelated', 'passed', 'The unrelated check passed.', replacement.session)
+  expect(await delivery()).toMatchObject({ ready: false, missing: expect.arrayContaining(['failed_checks_require_recheck']) })
+  expect(await read(`plan/${id}/node/${repairNode}/recovery`)).toMatchObject({ attempts: 1 })
+  await recordCheck(check, 'failed', 'Expected HTTP 200, but received 500.', replacement.session)
+  await recordCheck(check, 'passed', 'The diagnostic check received HTTP 200.', replacement.session)
+  expect((await delivery()).missing).not.toContain('failed_checks_require_recheck')
+  await recordCheck(check, 'failed', 'Expected HTTP 200, but received 500.', replacement.session)
+  expect((await delivery()).missing).toContain('failed_checks_require_recheck')
+}, 60_000)
+
+it('previews a product replan before applying an exact, durable direct approval', async () => {
+  const { id, catalogClaim, accountsClaim } = await dispatchedFanIn()
+  const hub = h.runtime.masterId
+  const requirements = (args: unknown, session = hub) => h.runTool(session, 'orchestrator_plan_requirements', args)
+  const changed = { criterion: 1, statement: 'Search matches product prefixes.', observable: 'The catalog API excludes non-prefix matches.' }
+  const request = { planId: id, goal: 'Show catalog prefix matches and account details.', changes: [changed] }
+  const preview = () => requirements({ mode: 'preview', request }) as Promise<{ proposalId: string; affected: { nodeId: string; replacementId: string }[] }>
+  expect(await requirements({ mode: 'preview', request: { ...request, changes: [] } })).toMatchObject({ status: 'needs-target' })
+  await expect(requirements({ mode: 'preview', request: { ...request, release: 'authorized' } })).rejects.toThrow()
+  await expect(requirements({ mode: 'preview', request }, catalogClaim.session)).rejects.toThrow(/not registered/)
+  const failed = await h.runTool(catalogClaim.session, 'orchestrator_test_evidence', {
+    candidate: h.localGit!.base.sha, scope: 'focused', reason: 'Catalog request check', red: null,
+    checks: [{ directory: '.', command: 'pnpm test catalog', status: 'failed', observed: 'The catalog check still returns 500.' }],
+  })
+  const proposal = await preview(), stale = await preview()
+  expect(proposal).toMatchObject({ status: 'preview', invalidated: [{ criterion: 1,
+    after: { statement: changed.statement, observable: changed.observable } }], affected: [
+    { nodeId: 'catalog', impact: 'direct', tickets: [{ ticketId: catalogClaim.ticketId, evidence: expect.arrayContaining([
+      expect.objectContaining({ kind: 'tests', status: 'failed', read: failed.read }),
+    ]) }] },
+    { nodeId: 'dashboard', impact: 'transitive', revalidate: { criteria: [3] } },
+  ] })
+  const { proposalId } = proposal
+  expect(await read(`plan/${id}`)).toMatchObject({ revision: 1, goal: fanInSpec.body })
+  const approve = (id: string) => JSON.stringify({ approved: true, proposalId: id })
+  const message = approve(proposalId), apply = () => requirements({ mode: 'apply', proposalId, message })
+  await expect(apply()).rejects.toThrow(/latest direct Hub user approval/)
+  h.sendUserMessage(hub, 'I recommend a catalog change.')
+  await expect(apply()).rejects.toThrow(/latest direct Hub user approval/)
+  await h.restart()
+  await h.runtime.idle()
+  expect(await read(`plan-requirement/${proposalId}`)).toMatchObject({ status: 'preview', affected: proposal.affected })
+  h.sendUserMessage(hub, message)
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, runLimits: {
+    ticketOverrides: [{ planId: id, nodeId: 'catalog', tokens: 0 }],
+  } } })
+  await expect(apply()).rejects.toThrow(/quota-paused.*exhausted/)
+  expect(await read(`plan/${id}`)).toMatchObject({ revision: 1 })
+  expect(await read(`ticket/${catalogClaim.ticketId}`)).not.toHaveProperty('ended')
+  h.runtime.store.saveSettings(settings)
+
+  // Crash boundary: the revision and stop intent commit; the old host never drains its writer.
+  vi.spyOn(h.runtime.executor, 'stop').mockImplementationOnce(() => {})
+  vi.spyOn(h.runtime.executor, 'shutdown').mockResolvedValueOnce(undefined)
+  const owners = new Map([catalogClaim.session, accountsClaim.session].map(id => [id, h.agents.get(id)!]))
+  expect(owners.get(catalogClaim.session)).toBeDefined()
+  h.controller.resolveAgent.mockImplementation(async (id: string) => {
+    const worker = owners.get(id)
+    if (worker && !h.agents.has(id)) h.agents.set(id, worker)
+    return h.resolveDefault(id)
+  })
+  const job = h.jobs.run(catalogClaim.session), stopStarted = Promise.withResolvers<string>()
+  h.jobs.service.kill.mockImplementationOnce(jobId => { stopStarted.resolve(jobId); return 'requested' })
+  expect(await apply()).toMatchObject({ status: 'applied', revision: 2 })
+  expect(await apply()).toMatchObject({ revision: 2 })
+  h.sendUserMessage(hub, approve(stale.proposalId))
+  await expect(requirements({ mode: 'apply', proposalId: stale.proposalId, message: approve(stale.proposalId) })).rejects.toThrow(/revision changed/)
+  const newCatalog = proposal.affected.find(node => node.nodeId === 'catalog')!.replacementId
+  const newDashboard = proposal.affected.find(node => node.nodeId === 'dashboard')!.replacementId
+  expect(await dispatchPlan(id, newCatalog)).toMatchObject({ status: 'blocked', waitingOn: ['catalog'] })
+  await h.restart()
+  try {
+    expect(await stopStarted.promise).toBe(job)
+    expect(await dispatchPlan(id, newCatalog)).toMatchObject({ status: 'blocked', waitingOn: ['catalog'] })
+  } finally { h.jobs.end(job, 'killed') }
+  await h.runtime.idle()
+  expect(await read(`plan/${id}/node/catalog`)).toMatchObject({ status: 'superseded', superseded: { replacements: [newCatalog] } })
+  await expect(dispatchPlan(id, 'catalog')).rejects.toThrow(/unknown Plan node/i)
+  expect(await read(`ticket/${catalogClaim.ticketId}/plan-scope`)).toMatchObject({ goal: fanInSpec.body,
+    acceptance: [{ id: '1', text: expect.stringContaining(fanInSpec.acceptance[0]!.statement) }] })
+  expect(await dispatchPlan(id, newDashboard)).toMatchObject({ status: 'blocked', waitingOn: [newCatalog, 'accounts'] })
+  expect(await dispatchPlan(id, 'accounts')).toMatchObject({ reused: true, claim: { ticketId: accountsClaim.ticketId,
+    assignmentId: accountsClaim.assignmentId, session: accountsClaim.session, pendingAction: null } })
+  expect(await read(`ticket/${accountsClaim.ticketId}/plan-scope`)).toMatchObject({ goal: fanInSpec.body })
+  const replacement = (await dispatchPlan(id, newCatalog)).claim!
+  await h.runtime.idle()
+  expect(await h.runTool(replacement.session, 'orchestrator_read', { resource: `ticket/${replacement.ticketId}/plan-scope` }))
+    .toMatchObject({ goal: request.goal, acceptance: [{ id: '1', text: expect.stringContaining(changed.observable) }] })
+  expect(await read(`plan/${id}/meter`)).toMatchObject({ sessions: expect.arrayContaining([
+    expect.objectContaining({ ticket_id: catalogClaim.ticketId, plan_id: id }),
+    expect.objectContaining({ ticket_id: replacement.ticketId, plan_id: id }),
+  ]) })
+  expect(await read(`ticket/${replacement.ticketId}/delivery-check`)).toMatchObject({ ready: false })
+}, 60_000)
+
+it('refuses a product replan while the affected writer launch has yet to be confirmed', async () => {
+  const { id } = await registeredFanIn()
+  const prepare = Promise.withResolvers<void>()
+  h.hooks.prepare = prepare.promise
+  try {
+    const { claim } = await dispatchPlan(id, 'catalog')
+    expect(claim).toBeDefined()
+    await vi.waitFor(() => expect(h.runtime.store.tickets.get(claim!.ticketId)?.assignments.at(-1)?.writer?.state).toBe('preparing'), {
+      timeout: 20_000,
+    })
+    const hub = h.runtime.masterId
+    const { proposalId } = await h.runTool(hub, 'orchestrator_plan_requirements', { mode: 'preview', request: { planId: id,
+      changes: [{ criterion: 1, statement: 'Search by prefix.', observable: 'Search results share the requested prefix.' }] },
+    }) as { proposalId: string }
+    const message = JSON.stringify({ approved: true, proposalId })
+    h.sendUserMessage(hub, message)
+    await expect(h.runTool(hub, 'orchestrator_plan_requirements', { mode: 'apply', proposalId, message })).rejects.toThrow(/unconfirmed Worker launch/)
+    expect(await read(`plan/${id}`)).toMatchObject({ revision: 1 })
+    expect(await read(`ticket/${claim!.ticketId}`)).not.toHaveProperty('ended')
+  } finally { prepare.resolve() }
+  await h.runtime.idle()
+}, 60_000)
+
+it('replans pending slices under their original obligations and refuses the same work after quota exhaustion', async () => {
+  const specification = { ...fanInSpec, acceptance: [...fanInSpec.acceptance,
+    { statement: 'Show a catalogue empty state.', observable: 'The dashboard displays that no rows match.', delivery: 'frontend' as const }] }
+  const { id, register } = await publish({ ...brief, goal: specification.body }, specification)
+  await h.runtime.idle()
+  await register({ features: [...fanInDraft.features, { id: 'summary', kind: 'frontend' }], nodes: [
+    ...fanInDraft.nodes.map(node => node.id === 'dashboard' ? { ...node, acceptance: [3, 4] } : node),
+    { id: 'summary', featureId: 'summary', title: 'Read the dashboard totals', role: 'frontend', acceptance: [3],
+      demonstration: 'Read the totals that the dashboard displays.', blockedBy: ['dashboard'] },
+  ] })
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, runLimits: {
+    stagnation: { maxAttemptsWithoutProgress: 1 }, ticketOverrides: [{ planId: id, nodeId: 'catalog', tokens: 40 },
+      { planId: id, nodeId: 'dashboard', tokens: 20 }],
+  } } })
+  const claim = (await dispatchPlan(id, 'catalog')).claim!
+  await h.runtime.idle()
+  await h.runTool(claim.session, 'orchestrator_report', { state: 'failed', summary: 'Catalog contract check failed.' })
+  await h.runtime.pump()
+  await h.runtime.idle()
+  const { recovery: { failureId } } = await read(`plan/${id}/node/catalog`) as { recovery: { failureId: string } }
+  const replan = (revision: number, change: unknown) => h.runTool(h.runtime.masterId, 'orchestrator_plan_replan', {
+    planId: id, nodeId: 'catalog', revision, failureId, reason: 'Separate the empty-state check from the dashboard integration', change,
+  })
+  await expect(replan(1, { kind: 'dependencies', updates: [{ nodeId: 'dashboard', blockedBy: ['catalog', 'accounts', 'summary'] }] }))
+    .rejects.toThrow(/cycle/i)
+  await expect(replan(1, { kind: 'merge', nodeIds: ['dashboard', 'summary'] })).rejects.toThrow(/different budget pools/i)
+  const split = await replan(1, { kind: 'split', nodeId: 'dashboard', groups: [[3], [4]] }) as { replacements: { dashboard: string[] } }
+  const children = split.replacements.dashboard
+  expect(await read(`plan/${id}/revision/2`)).toMatchObject({ revision: 2, cause: { failureId, scope: ['dashboard', 'summary'] },
+    nodes: expect.arrayContaining(children.map((child, i) => expect.objectContaining({ id: child, acceptance: [3 + i], blockedBy: ['catalog', 'accounts'] }))) })
+  expect(await dispatchPlan(id, 'summary')).toMatchObject({ status: 'blocked', waitingOn: children })
+  const merged = await replan(2, { kind: 'merge', nodeIds: children }) as { replacements: Record<string, string[]> }
+  const combined = merged.replacements[children[0]!]![0]!
+  expect(await dispatchPlan(id, combined)).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'], limits: { ticketTokens: 20 } })
+
+  await h.modelRequest(claim.session, 40, async function* (): AsyncGenerator<StreamChunk> {
+    yield { type: 'usage', usage: { inputTokens: 34, outputTokens: 6, totalTokens: 40 } }
+  })
+  await h.idleRelay()
+  await expect(replan(3, { kind: 'split', nodeId: combined, groups: [[3], [4]] })).rejects.toThrow(/available run authorization/i)
+  expect(await read(`plan/${id}`)).toMatchObject({ revision: 3 })
+  expect(await read(`plan/${id}/node/catalog`)).toMatchObject({ recovery: { status: 'quota-paused', failureId, canReplan: false } })
+  expect(await dispatchPlan(id, 'accounts')).toMatchObject({ status: 'claimed' })
+  await h.restart()
+  await h.runtime.idle()
+  expect(h.jsonRelays(h.runtime.masterId, 'quota-paused')).toHaveLength(1)
+  expect(await read(`plan/${id}/revision/1`)).toMatchObject({ revision: 1, nodes: expect.arrayContaining([
+    expect.objectContaining({ id: 'dashboard', acceptance: [3, 4] }),
+  ]) })
 })
 })

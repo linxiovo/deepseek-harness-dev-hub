@@ -1,0 +1,1 @@
+Preview the effect of an explicit product request; apply only the latest direct Hub user's exact approval of that preview. A technical recommendation, relay or plain assent is not approval.

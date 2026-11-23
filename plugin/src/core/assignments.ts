@@ -89,7 +89,9 @@ export class Assignments extends EnginePart {
     const report = running.report
     const busy = !!running.deliveredAt && !!report && running.deliveredAt >= report.at
     const settled = !!report && ['waiting', 'ready', 'blocked', 'failed'].includes(report.state) && !busy
-    if (!settled) this.tickets.recover(ticket, running, recoveryNote)
+    const diagnosis = ticket.plan && ticket.inputs.some(input => input.kind === 'note' && input.diagnosisFor === assignmentId &&
+      ticket.undelivered.includes(input.id))
+    if (!settled && !diagnosis) this.tickets.recover(ticket, running, recoveryNote)
     else if (ticket.undelivered.length) this.options.executor.deliver(ticket, running)
   }
   /**

@@ -290,8 +290,8 @@ export type TicketInput =
   | { id: string; kind: 'text'; text: string; at: string }
   /** An inspected repair survives a crash before delivery; the original candidate remains the writer's lineage anchor. */
   | (MainlineRepair & { kind: 'mainline-repair'; at: string; generation: number; deliveredTo?: string; readAt: string | null })
-  /** A fact the main Session gave the ticket from other work: context, which asks for nothing and grants nothing. */
-  | { id: string; kind: 'note'; text: string; at: string }
+  /** Unprivileged context, or a host-scheduled diagnosis bound to a Plan Assignment. Neither grants new authority. */
+  | { id: string; kind: 'note'; text: string; at: string; diagnosisFor?: string }
 
 /**
  * How a Policy change bears on a ticket: the rules it was accepted under that changed, with their instruction now, or no
@@ -305,7 +305,7 @@ export interface PolicyEffect {
   requester?: ActorRef
 }
 
-export type TicketEndBy = 'executor' | 'human' | 'delivery'
+export type TicketEndBy = 'executor' | 'human' | 'delivery' | 'replan'
 /** How a ticket ended: with its result, with its pull request merged or closed unmerged, with nothing to do, or stopped by a person. */
 export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
 /** A question for a person; `triggerId` is the human message that raised it, whose conversation it goes back to. */

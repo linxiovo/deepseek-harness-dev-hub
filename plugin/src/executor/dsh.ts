@@ -8,6 +8,7 @@ import { key, latestAssignment, latestReport, liveTicket, runningAssignment, thr
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, ExecutionClaim, ExecutionIdentity, Executor, MainlineRepair, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
+import { KV } from '../kv.ts'
 import { runAsWorker, sameDirectory, verifyDirectory } from '../infra/environment.ts'
 import { physicalPath } from '../infra/paths.ts'
 import { worktreePreparationConfig, type Settings } from '../policy.ts'
@@ -89,7 +90,7 @@ export interface ExecutorHost {
     | 'assignmentInterrupted' | 'resumeVerifiedCredential' | 'report' | 'reserveExecution' | 'recordExecutionVerified' | 'rejectExecution'
     | 'pinMainlineRepair' | 'acquireExecutionWriter' | 'releaseExecutionWriter'>
   readonly commands: Pick<Commands, 'git' | 'repository'>
-  readonly store: Pick<Store, 'tickets' | 'triggers' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
+  readonly store: Pick<Store, 'tickets' | 'triggers' | 'get' | 'keys' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
   /** Durable effect queue through which launches and input deliveries run. */
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
   /** The `worker` health entry, which reports whether background worker event handling failed. */
@@ -103,6 +104,8 @@ export interface ExecutorHost {
   paused(): boolean
   /** Live read of this ticket's durable credential blocker, including inside the verification transaction. */
   credentialBlocked?(ticketId: string): boolean
+  diagnosisAllowed(ticket: Ticket, inputId: string): boolean
+  reassignmentAllowed(ticket: Ticket): boolean
   quota?: { blocked(ticketId: string): boolean; inFlight(ticketId: string): boolean }
   /** Execution environment variables for `ticket`, passed to its workspace prepare command. */
   environment(ticket: Ticket): Variable[]
@@ -435,6 +438,9 @@ export class DshExecutor implements Executor {
     const assignment = ticket && latestAssignment(ticket)
     if (!ticket || !liveTicket(ticket) || assignment?.id !== assignmentId || assignment.state !== 'pending') return
     if (this.workHeld(ticketId)) { this.slots.free(ticketId); return Park }
+    if (ticket.assignments.at(-2)?.endedReason === 'reassigned' && !this.host.reassignmentAllowed(ticket)) {
+      throw new Later('Plan reassignment is held by the active recovery guard')
+    }
     this.slots.reserve(ticketId, 'launch')
     const attempt = this.launch(ticket, assignment)
     this.launching.set(assignmentId, attempt)
@@ -481,8 +487,13 @@ export class DshExecutor implements Executor {
         const ticket = this.host.store.tickets.get(ticketId)
         const assignment = ticket && liveTicket(ticket) ? runningAssignment(ticket) : undefined
         if (!ticket || !assignment) return
-        let inputId = ticket.undelivered[0]
-        if (inputId === undefined) return
+        const authorized = (id: string) => {
+          const item = ticket.inputs.find(candidate => candidate.id === id)
+          return item?.kind !== 'note' || !item.diagnosisFor || item.diagnosisFor === assignment.id && this.host.diagnosisAllowed(ticket, id)
+        }
+        if (!ticket.undelivered.length) return
+        let inputId = ticket.undelivered.find(authorized)
+        if (inputId === undefined) throw new Later('Plan diagnosis is held by the active recovery guard')
         let input = ticket.inputs.find(item => item.id === inputId)
         if (input?.kind === 'mainline-repair' && waitsForPerson(ticket)) {
           inputId = ticket.undelivered.find(id => fromPerson(ticket.inputs.find(item => item.id === id)))
@@ -557,6 +568,9 @@ export class DshExecutor implements Executor {
       this.requireWorkAllowed(ticket.id)
       const current = this.host.store.tickets.get(ticket.id)
       if (!current || !liveTicket(current) || runningAssignment(current)?.id !== assignment.id) throw new Error('The ticket ended or another Assignment took it over')
+      if (input.kind === 'note' && input.diagnosisFor && (input.diagnosisFor !== assignment.id || !this.host.diagnosisAllowed(current, input.id))) {
+        throw new Later('Plan diagnosis is no longer authorized for this Assignment')
+      }
       if (input.kind === 'mainline-repair' && waitsForPerson(current)) throw new Later('Worker repair is blocked')
       if (!this.writerAuthorized(ticket.id, workerSessionId(ticket.id))) {
         throw new PrepareFailed('The worker writer grant ended before Input delivery')
@@ -740,29 +754,55 @@ export class DshExecutor implements Executor {
     if (this.claims.get(claim.assignment) !== claim) return
     const sessionId = workerSessionId(claim.ticket)
     const ticket = this.host.store.tickets.get(claim.ticket)
-    const writerSession = ticket?.assignments.find(item => item.id === claim.assignment)?.writer?.session
+    const assignment = ticket?.assignments.find(item => item.id === claim.assignment)
+    const writerSession = assignment?.writer?.session
+    const recoveringStop = this.restoredClaims.has(claim) && assignment?.state === 'ended'
+    if (recoveringStop && (!claim.verified || writerSession !== sessionId || ticket?.execution?.session !== sessionId
+      || ticket.execution.active_writer?.assignment !== claim.assignment || ticket.execution.active_writer.session !== sessionId)) {
+      throw new PrepareFailed(`Cannot prove ownership of the superseded Plan writer of ticket ${claim.ticket}`)
+    }
     if (writerSession !== undefined && writerSession !== sessionId) throw new Error(`Ticket ${claim.ticket} has another writer Session`)
     let agent = this.host.context.agents.get(sessionId as SessionId)
+    let mustStop = !stopped || recoveringStop
     if (!agent && writerSession) {
-      // A Session unloaded in this process can be restored and checked; another process has no local claim to release.
+      // A durable writer bound to an unloaded Session is not proof of idle. Restore the root Worker first.
       const resolved = await this.host.context.sessionController.resolveAgent(sessionId as SessionId)
       if ('error' in resolved) throw new Error(`Cannot confirm worker ${sessionId} idle: ${String(resolved.error)}`)
-      if (resolved.agent.id !== sessionId || (ticket?.plan && !matchesWorker(ticket, resolved.agent))) {
-        throw new Error(`Cannot confirm worker ${sessionId}: another Session was resolved`)
-      }
+      if (resolved.agent.id !== sessionId) throw new Error(`Cannot confirm worker ${sessionId}: another Session was resolved`)
       agent = resolved.agent
-      agent.cancel({ kind: 'user' }, { keepInbox })
-      await stopBackground(this.host.context, sessionId, reason, keepInbox, this.host.credentialBlocked?.(claim.ticket) ? 'credential-suspension' : undefined)
+      mustStop = true
     }
-    if (!stopped) {
+    if (agent && ticket?.plan && !matchesWorker(ticket, agent)) throw new Error(`Cannot confirm worker ${sessionId}: another Session was resolved`)
+    if (recoveringStop && (!agent || this.host.context.agents.get(sessionId as SessionId) !== agent)) {
+      throw new Error(`Cannot confirm the loaded Worker for ticket ${claim.ticket}`)
+    }
+    // Superseded writers need the same full descendant drain as credential suspension, including external activations.
+    const drain = async () => {
+      const stop = stopBackground(this.host.context, sessionId, reason, keepInbox,
+        recoveringStop || this.host.credentialBlocked?.(claim.ticket) ? 'credential-suspension' : undefined)
+      if (!recoveringStop) await stop
+      else if (await until(stop, this.host.lifetime, SHUTDOWN_STOP_MS) === false) {
+        throw new Error(`Background work of ${sessionId} did not stop; its writer remains held`)
+      }
+    }
+    if (mustStop) {
       agent?.cancel({ kind: 'user' }, { keepInbox })
-      await stopBackground(this.host.context, sessionId, reason, keepInbox)
+      await drain()
     }
     if (agent) {
-      await agent.whenIdle()
+      if (recoveringStop) {
+        if (await until(agent.whenIdle(), this.host.lifetime, SHUTDOWN_STOP_MS) === false) {
+          throw new Error(`Worker ${sessionId} did not stop; its writer remains held`)
+        }
+        if (this.host.context.agents.get(sessionId as SessionId) !== agent) throw new Error(`Worker ${sessionId} changed during stop`)
+        await drain() // A tool unwinding on the cancelled turn may have registered another job or subagent.
+      } else await agent.whenIdle()
       if (!await untilQuiet(this.host.context, agent, AbortSignal.timeout(SHUTDOWN_STOP_MS))) {
         throw new Error(`Worker ${sessionId} still has an active turn, job or subagent; its writer remains held`)
       }
+    }
+    if (recoveringStop && (!agent || agent.status !== 'idle' || this.host.context.agents.get(sessionId as SessionId) !== agent)) {
+      throw new Error(`Cannot confirm the stopped Session for ticket ${claim.ticket}`)
     }
     if (runningJobs(this.host.context, sessionId).length) throw new Error(`Worker ${sessionId} still owns jobs; its writer remains held`)
     if (this.claims.get(claim.assignment) !== claim) return
@@ -965,11 +1005,16 @@ export class DshExecutor implements Executor {
   }
   private relay({ id, text }: { id: string; text: string }): void { this.host.sessions.relay(id, text) }
   private async launch(ticket: Ticket, assignment: Assignment): Promise<void> {
+    const previousAssignment = ticket.assignments.at(-2)
+    const reassigned = previousAssignment?.endedReason === 'reassigned'
     const current = () => {
       this.requireWorkAllowed(ticket.id)
       if (this.host.closing()) throw new Error('dsh-superagent is stopping')
       if (this.host.paused()) throw new Later('Processing is paused')
       const stored = this.host.store.tickets.get(ticket.id)
+      if (stored && liveTicket(stored) && latestAssignment(stored)?.id === assignment.id && reassigned && !this.host.reassignmentAllowed(stored)) {
+        throw new Later('Plan reassignment is held by the active recovery guard')
+      }
       return !!stored && liveTicket(stored) && latestAssignment(stored)?.id === assignment.id
     }
     if (!current()) return
@@ -1018,7 +1063,7 @@ export class DshExecutor implements Executor {
     let fresh: boolean
     try { await lstat(workspace); fresh = false }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; fresh = true }
-    if (fresh && (persisted?.verified || repairOf(ticket))) throw new PrepareFailed('The previously verified Plan worktree no longer exists; refusing to create a replacement')
+    if (fresh && (claim.verified || repairOf(ticket))) throw new PrepareFailed('The previously verified worktree no longer exists; refusing to create a replacement')
     if (fresh) {
       await validateWorktreeDestination(this.host.commands, claim.repository, workspace)
       if (!current()) throw new PrepareFailed('The ticket ended before its directory was prepared')
@@ -1057,7 +1102,9 @@ export class DshExecutor implements Executor {
     const later = ticket.assignments.length > 1
     const told = later && await this.host.sessions.holds(sessionId, first)
     if (!current() || !this.writerAuthorized(ticket.id, sessionId)) throw new PrepareFailed('The worker writer grant ended before delivery')
-    const retried = ticket.assignments.at(-2)?.endedReason === 'retried' ? { note: RETRIED } : {}
+    const diagnostic = reassigned && ticket.inputs.findLast(input => input.kind === 'note' && input.diagnosisFor === previousAssignment.id)
+    if (reassigned && (!diagnostic || diagnostic.kind !== 'note')) throw new PrepareFailed('Reassigned Worker lacks its technical diagnosis')
+    const retried = diagnostic && diagnostic.kind === 'note' ? { note: diagnostic.text } : previousAssignment?.endedReason === 'retried' ? { note: RETRIED } : {}
     const assignmentText = ticket.execution?.assignment ?? ''
     const { text: brief, chars, read } = capped(assignmentText, ASSIGNMENT_CHARS, `ticket/${ticket.id}/assignment`)
     const card = told || !source ? undefined : await this.triggerCard(ticket, source.id)
@@ -1139,15 +1186,51 @@ export class DshExecutor implements Executor {
     for (const dispose of this.disposers.splice(0)) dispose()
     for (const id of this.resuming.keys()) void this.cancelRetries(id)
   }
+  /** Reconcile a committed stop whose external drain or final release receipt did not survive the restart. */
+  private recoverPlanStop(ticket: Ticket, assignment: Assignment): void {
+    if (this.stopping.has(ticket.id) || this.claims.has(assignment.id)) return
+    const claim = this.persistedPlanClaim(ticket, assignment)
+    this.track(ticket.id, (async () => {
+      if (!claim || assignment.state !== 'ended') throw new PrepareFailed(`Cannot prove ownership of the superseded Plan writer of ticket ${ticket.id}`)
+      this.claims.set(assignment.id, claim)
+      this.restoredClaims.add(claim)
+      try { await this.releaseClaim(claim, 'Completing the superseded Plan Assignment stop') }
+      finally {
+        // On refusal the durable writer stays held. A later recovery must prove its ownership afresh.
+        if (this.claims.get(assignment.id) === claim) this.claims.delete(assignment.id)
+        this.restoredClaims.delete(claim)
+      }
+    })())
+  }
   /**
    * Reconciles running and pending assignments across open tickets after a host restart: notifies Engine of interrupted
    * running assignments and re-queues pending launches (which earlier versions may have kept outside the effect queue),
    * while failed launches (`waitsForPerson`) wait for a person's message or a retry.
    */
   resume(): void {
+    // Retired nodes no longer occur in the current graph or the open Ticket set. Recover their stop, never their launch.
+    const { store } = this.host
+    for (const row of store.keys(KV.plans.node)) {
+      const node = store.get(row)
+      if (!node || !store.get(KV.plans.retired(node.planId, node.nodeId))) continue
+      const ticket = store.tickets.get(node.claim.ticketId)
+      if (!ticket?.ended) continue
+      const old = ticket.assignments.find(item => item.writer?.state === 'stopping')
+      if (!old) continue
+      const binding = ticket.plan
+      if (binding?.planId !== node.planId || binding.nodeId !== node.nodeId || binding.role !== node.claim.role
+        || node.claim.session !== workerSessionId(ticket.id) || node.claim.assignmentId !== ticket.assignments[0]?.id) {
+        this.host.health.set({ state: 'error', detail: `Cannot confirm the retired Plan node binding for ticket ${ticket.id}`, at: now() })
+        continue
+      }
+      this.recoverPlanStop(ticket, old)
+    }
     // Launch pending tickets oldest first (in acceptance order).
     for (const ticket of this.host.store.tickets.open().sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
       const running = runningAssignment(ticket), latest = latestAssignment(ticket)
+      // The replacement can commit before the old stop's after-commit callback. Finish that stop even while launches are paused.
+      const old = ticket.assignments.find(item => item.endedReason === 'reassigned' && item.writer?.state === 'stopping')
+      if (old) this.recoverPlanStop(ticket, old)
       if (latest && !this.claims.has(latest.id)) {
         const persisted = this.persistedPlanClaim(ticket, latest)
         if (persisted) {

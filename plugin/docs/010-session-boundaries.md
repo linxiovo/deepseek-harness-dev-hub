@@ -16,6 +16,8 @@ If DeepSeek Harness selects another preset for the main Session before its first
 
 The Hub also owns `orchestrator_handoff_confirm`, `orchestrator_handoff_answer`, `orchestrator_plan_context` and `orchestrator_plan_answer`. Neither planning Session owns these tools. [009 Handoff](009-handoff.md) describes the planner and splitter scopes; they can submit only their own planning artifact, never issue a Channel reply or start a Worker. Planner questions still use `orchestrator_handoff_answer`.
 
+`orchestrator_plan_replan` and `orchestrator_plan_requirements` are also Hub-only. Technical recovery does not confer product authority, and requirement changes require a direct Harness approval after preview. Workers can read their own `ticket/<id>/plan-scope`, not the Plan's approvals or graph history. See `018-plan-replanning.md`.
+
 The Hub alone owns `orchestrator_queue_merge`; it requests the checked, durable operation in [Merging](003-execution.md#merging), not a general Git command. Worker and planning tools cannot start it.
 
 ## Worker Session

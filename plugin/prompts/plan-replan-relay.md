@@ -1,0 +1,1 @@
+Use `orchestrator_read` to inspect the actual technical failure and current Plan. Consider a bounded dependency adjustment, split, or merge only if it keeps commitments and helps the work. Do not ask the person to fix a technical problem or announce this internal recovery notice.

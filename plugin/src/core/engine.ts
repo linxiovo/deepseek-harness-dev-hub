@@ -116,7 +116,7 @@ export class Engine {
       const mandate = { strength: 'explicit' as const, policyVersion: `plan:${planId}`,
         basis: { via: 'addressed' as const, addressed: 'direct' as const, source: 'plan', scope: { planId, nodeId: node.id }, row: 'registered' },
         actor: { source: 'plan', id: 'hub' }, scope: `Plan ${planId} node ${node.id}` }
-      const note = `Plan node ${node.id}; execution role ${node.role}. Read plan/${planId}/node/${node.id} before working. `
+      const note = `Plan node ${node.id}; execution role ${node.role}. Plan scope: ticket/${id}/plan-scope. `
         + `Demonstrate: ${node.demonstration}`
         + (node.interfaceContract ? ` Interface contract: ${node.interfaceContract.path}; ${node.interfaceContract.requirements}` : '')
       this.tickets.create(id, key('plan-decision', planId, node.id), mandate, { triggerIds: [key('plan-trigger', planId, node.id)] },
@@ -189,15 +189,24 @@ export class Engine {
    */
   stopTicket(ticketId: string, reason?: string): Ticket { return this.repo.atomic(() => this.tickets.stop(ticketId, reason)) }
   /**
-   * A person retries a ticket whose worker reported failed or blocked (or whose input delivery failed): the stalled
-   * Assignment ends and a new one starts under the same Mandate.
+   * Retry a failed or blocked ticket under the same Mandate. The host's automatic Plan recovery pins the failed Assignment.
    * @throws UserError when the ticket is unknown, has ended, or is not retryable.
    */
-  retryTicket(ticketId: string): Ticket {
+  retryTicket(ticketId: string, reassignFrom?: string): Ticket {
     return this.repo.atomic(() => {
       if (this.options.credentialBlocked?.(ticketId)) throw new UserError('credentialBlocked')
       if (this.options.quotaBlocked?.(ticketId)) throw new UserError('quotaPaused')
-      return this.tickets.retry(ticketId)
+      return this.tickets.retry(ticketId, reassignFrom)
+    })
+  }
+
+  /** Retire a replaced Plan Ticket without claiming delivery or a human stop. */
+  supersedePlanTicket(ticketId: string, reason: string): void {
+    this.repo.atomic(() => {
+      const ticket = this.repo.tickets.get(ticketId)
+      if (!ticket?.plan || ticket.ended) throw new UserError('ticketEnded')
+      if (this.options.credentialBlocked?.(ticketId)) throw new UserError('credentialBlocked')
+      this.tickets.end(ticketId, 'replan', 'stopped', undefined, reason)
     })
   }
 
@@ -300,10 +309,12 @@ export class Engine {
     return this.repo.atomic(() => this.tickets.followForContext(ticketId, thread))
   }
   /**
-   * A fact the main Session gives an open ticket's Executor: see `Tickets.note`.
+   * Write context, or a host-verified Plan diagnosis bound to one Assignment.
    * @throws UserError when the ticket is unknown or has ended.
    */
-  note(ticketId: string, text: string): Ticket { return this.repo.atomic(() => this.tickets.note(ticketId, text)) }
+  note(ticketId: string, text: string, diagnosisFor?: string): Ticket {
+    return this.repo.atomic(() => this.tickets.note(ticketId, text, diagnosisFor))
+  }
   /**
    * An Executor's hand-back of a message that reached its ticket but asks for more than it: see `Evals.handback`.
    * @returns whether it was queued for Eval: false while another ticket still decides it, and for one this ticket did not decide (see `Evals.handback`).

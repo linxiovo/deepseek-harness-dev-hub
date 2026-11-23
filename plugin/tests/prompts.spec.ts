@@ -10,11 +10,14 @@ import { SettingsSchema, policyVersion } from '../src/policy.ts'
 import { guides, handoffPolicy, mainAdmissionPolicy, masterPrompt, sharedPrompt, workerPrompt } from '../src/app/context.ts'
 import { promptFile } from '../src/app/skill-files.ts'
 import type { Variable } from '../src/app/execution-environment.ts'
+import type { Plans } from '../src/app/plans.ts'
+import { startRuntime, type Host } from './fixtures/host.ts'
 
 /** The execution environment outside any ticket, as the runtime passes it once setup has finished. */
 const variables = (): Variable[] => [{ key: 'DSH_SUPERAGENT_GITHUB_REPOSITORY', value: 'acme/widgets', description: { zh: '仓库', en: 'The repository' }, owner: 'github' }]
 const ENVIRONMENT_LINE = '- DSH_SUPERAGENT_GITHUB_REPOSITORY = "acme/widgets": The repository.'
-const promptsOf = (store: Store, maxChars = 100000) => new Prompts(store, () => maxChars, variables, () => true)
+const noPlans: Pick<Plans, 'get'> = { get: () => undefined }
+const promptsOf = (store: Store, maxChars = 100000) => new Prompts(store, () => maxChars, variables, () => true, noPlans)
 function withStore(body: (store: Store, dir: string) => void): void {
   const dir = mkdtempSync(join(tmpdir(), 'prompts-')); const store = new Store(join(dir, 'db'))
   try { body(store, dir) } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
@@ -48,6 +51,82 @@ it('keeps a legacy published revision and its Ticket binding across restart', ()
     expect(() => prompts.stage(defaultPrompts(), 1, 'not-a-ticket')).toThrow('independent Plan maintenance Ticket')
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
 })
+
+const maintenanceNode = { id: 'rules', featureId: 'rules', title: 'Maintain shared rules', role: 'backend' as const,
+  acceptance: [1, 2], demonstration: 'Show the revision and Ticket binding.', blockedBy: [] }
+
+async function registerRulesPlan(h: Host) {
+  const goal = 'Publish reviewed shared rules.'
+  const brief = { project: { repository: 'acme/widgets', workspace: h.localGit!.repository }, goal, constraints: [],
+    acceptanceScope: [goal], authorization: { scope: 'Review and publish only the shared rule manifest', release: 'not-authorized' } }
+  const confirmation = JSON.stringify({ confirmed: true, brief })
+  h.sendUserMessage(h.runtime.masterId, confirmation)
+  const hub = (tool: string, input: object) => h.runTool(h.runtime.masterId, tool, input)
+  const { id } = await hub('orchestrator_handoff_confirm', { ...brief, confirmation }) as { id: string }
+  await h.idlePlanning()
+  const { spec } = await h.runTool(`planner-${id}`, 'orchestrator_spec_publish', { handoffId: id, body: goal,
+    acceptance: [
+      { statement: goal, observable: 'The reviewed revision is active for new Tickets.', delivery: 'backend' },
+      { statement: 'Keep already launched Tickets pinned.', observable: 'A previously launched Ticket retains its rules.', delivery: 'backend' },
+    ], testInterfaces: [{ seam: 'GET prompts', kind: 'existing', note: 'Read active and pending revisions.' }], outOfScope: [] }) as { spec: { id: string } }
+  await h.runtime.idle()
+  await h.runTool(`splitter-${id}`, 'orchestrator_plan_register', { handoffId: id, specId: spec.id,
+    features: [{ id: 'rules', kind: 'backend' }], nodes: [maintenanceNode] })
+  const dispatch = async (nodeId: string) => (await hub('orchestrator_plan_dispatch', { planId: id, nodeId }) as { claim: { ticketId: string } }).claim.ticketId
+  const proposal = (maintenanceTicketId: string) => h.api('PUT', 'prompts', { maintenanceTicketId,
+    baseRevision: 0, config: { ...defaultPrompts(), scope: 'Verify release notes before reporting.' } })
+  return { id, hub, dispatch, proposal }
+}
+
+it('stages prompt rules for a replacement singleton after restart, but refuses a retired or ended Ticket', async () => {
+  const h = await startRuntime()
+  try {
+    const { id, hub, dispatch, proposal } = await registerRulesPlan(h)
+    const original = await dispatch('rules')
+    await h.runtime.idle()
+    expect(await proposal(original)).toMatchObject({ status: 200, body: { revision: 1, effect: 'pending-review' } })
+    expect(await proposal(original)).toMatchObject({ status: 200, body: { revision: 1 } })
+
+    const plans = h.runtime.plans, version = plans.current(id)!
+    const replacementId = 'rules-reviewed', proposalId = 'f8f09bfb-a49e-4a6f-be1e-08ec0cae5fd5'
+    const [publication, ...remaining] = version.acceptance
+    plans.revise(id, 1, { draft: { features: version.plan.features, nodes: [{ ...maintenanceNode, id: replacementId }] },
+      replacements: { rules: [replacementId] } }, { kind: 'requirements', proposalId, goal: version.goal,
+      approval: { sessionId: h.runtime.masterId, messageId: 'approve-replacement', text: JSON.stringify({ approved: true, proposalId }) },
+      acceptance: [{ ...publication!, observable: 'New Tickets use the reviewed release-note rules.' }, ...remaining] })
+    // Check the replay while the retired Ticket is still open; closure alone must not be the guard.
+    expect(await proposal(original)).toMatchObject({ status: 409, body: { code: 'promptProposalRefused' } })
+    h.runtime.engine.stopTicket(original, 'Requirements superseded the original Ticket')
+    await h.runtime.idle()
+    await h.restart()
+    await h.runtime.idle()
+
+    const replacement = await dispatch(replacementId)
+    await h.runtime.idle()
+    expect(await proposal(original)).toMatchObject({ status: 409, body: { code: 'promptProposalRefused' } })
+    expect(await proposal(replacement)).toMatchObject({ status: 200, body: { revision: 2, effect: 'pending-review' } })
+    expect(await h.api('GET', 'prompts')).toMatchObject({ status: 200, body: { revision: 0 } })
+    for (const ticketId of [original, replacement]) {
+      expect(await hub('orchestrator_read', { resource: `ticket/${ticketId}` })).toMatchObject({ rules_revision: 0 })
+    }
+    h.runtime.engine.stopTicket(replacement, 'Stop shared rules maintenance')
+    expect(await proposal(replacement)).toMatchObject({ status: 409, body: { code: 'promptProposalRefused' } })
+  } finally { await h.stop() }
+}, 90_000)
+
+it('refuses prompt rules staging for an open Ticket in a technically split Plan', async () => {
+  const h = await startRuntime()
+  try {
+    const { id, dispatch, proposal } = await registerRulesPlan(h)
+    h.runtime.plans.revise(id, 1, { draft: {
+      features: [{ id: 'rules', kind: 'backend' }, { id: 'binding', kind: 'backend' }],
+      nodes: [{ ...maintenanceNode, id: 'publish', acceptance: [1] }, { ...maintenanceNode, id: 'binding', featureId: 'binding', acceptance: [2] }],
+    }, replacements: { rules: ['publish', 'binding'] } },
+    { kind: 'technical', nodeId: 'rules', failureId: 'rules-failure', reason: 'Isolate the two maintenance checks', scope: ['rules'] })
+    const ticket = await dispatch('publish')
+    expect(await proposal(ticket)).toMatchObject({ status: 409, body: { code: 'promptProposalRefused' } })
+  } finally { await h.stop() }
+}, 90_000)
 
 it('assembles every role from fixed sections around the team sections, whatever the configuration says', () => {
   const config = { communication: 'Say little.', scope: '', delivery: 'Attach screenshots.', skills: {} }
@@ -114,7 +193,7 @@ it('lists a ticket\'s execution environment in its prompt, and says setup is inc
     expect(promptsOf(store).compose(defaultPrompts(), 'worker', ticket).endsWith('- DSH_SUPERAGENT_DIR = "/srv/work/fix-1": This ticket\'s directory.')).toBe(true)
     expect(promptParts(defaultPrompts(), 'worker', 'env').at(-1)).toEqual({ name: 'runtime/environment', kind: 'generated', key: 'runtime/environment',
       text: 'env' })
-    expect(new Prompts(store, () => 100000, () => undefined, () => false).compose(defaultPrompts(), 'worker')).toContain('dsh-superagent is waiting for setup')
+    expect(new Prompts(store, () => 100000, () => undefined, () => false, noPlans).compose(defaultPrompts(), 'worker')).toContain('dsh-superagent is waiting for setup')
   })
 })
 
@@ -125,7 +204,7 @@ it('registers the built-in Source skills, Feishu only with a Feishu bot, before 
     expect(skills.map(([name]) => name)).toEqual(['feishu', 'github', 'release'])
     expect(skills[1]![1]).toContain('## CLI usage')
     expect(skills[2]![1]).toBe('Tag releases.')
-    expect(new Prompts(store, () => 100000, variables, () => false).skills(config, 'orchestrator').map(([name]) => name)).toEqual(['github', 'release'])
+    expect(new Prompts(store, () => 100000, variables, () => false, noPlans).skills(config, 'orchestrator').map(([name]) => name)).toEqual(['github', 'release'])
   })
 })
 

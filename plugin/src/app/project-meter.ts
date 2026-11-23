@@ -1,7 +1,7 @@
 /** Business attribution over SessionMeter's durable, session-local usage. */
 import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import { KV } from '../kv.ts'
-import type { Plan } from '../core/plan.ts'
+import type { Plans } from './plans.ts'
 import { SessionMeterIdentityError, sessionMeterView, type Range, type SessionMeter, type SessionMeterView } from './session-meter.ts'
 import type { Store } from './store.ts'
 
@@ -148,17 +148,19 @@ function* subtree(root: Sample, children: ReadonlyMap<string, Sample[]>): Iterab
   }
 }
 
-/** The mounted project Store isolates binding identities and is the authority for plans and tickets. */
+/** Attributes Sessions to mounted Tickets and keeps superseded Plan work in the same historical totals. */
 export class ProjectMeter {
   private readonly store: MeterStore
   private readonly meter: Pick<SessionMeter, 'read'>
+  private readonly plans: Pick<Plans, 'get' | 'definition'>
   private readonly canSample: ((binding: MeterSessionBinding) => MeterLogAccess | Promise<MeterLogAccess>) | undefined
 
-  constructor(options: { store: MeterStore; meter: Pick<SessionMeter, 'read'>; masterId: string;
+  constructor(options: { store: MeterStore; meter: Pick<SessionMeter, 'read'>; plans: Pick<Plans, 'get' | 'definition'>; masterId: string;
     /** Runtime may require independent proof of log identity after reserving a business binding. */
     canSample?: (binding: MeterSessionBinding) => MeterLogAccess | Promise<MeterLogAccess> }) {
     this.store = options.store
     this.meter = options.meter
+    this.plans = options.plans
     this.canSample = options.canSample
     this.bind({ session_id: options.masterId, role: 'hub' })
   }
@@ -182,10 +184,10 @@ export class ProjectMeter {
         const association = ticket.plan
         if (plan_id !== null && plan_id !== association?.planId) throw new Error(`Meter ticket ${ticket_id} belongs to a different plan`)
         plan_id = association?.planId ?? null
-        if (association && !this.plan(association.planId)?.nodes.some(node => node.id === association.nodeId && node.role === association.role)) {
+        if (association && this.plans.definition(association.planId, association.nodeId)?.node.role !== association.role) {
           throw new Error(`Meter ticket ${ticket_id} has no matching registered plan node`)
         }
-      } else if (plan_id !== null && !this.plan(plan_id)) {
+      } else if (plan_id !== null && !this.plans.get(plan_id)) {
         throw new Error(`Unknown meter plan ${plan_id}`)
       }
       if ((role === 'hub' || prior?.roles.includes('hub')) && (ticket_id !== null || plan_id !== null)) {
@@ -216,7 +218,7 @@ export class ProjectMeter {
     signal?.throwIfAborted()
     // Snapshot identity and membership synchronously. A concurrent bind belongs to the next query.
     const bindings = this.store.atomic(() => {
-      if (scope === 'project' ? id !== undefined : !id || (scope === 'plan' ? !this.plan(id) : !this.store.tickets.get(id))) return undefined
+      if (scope === 'project' ? id !== undefined : !id || (scope === 'plan' ? !this.plans.get(id) : !this.store.tickets.get(id))) return undefined
       const selected: MeterSessionBinding[] = []
       for (const key of this.store.keys(KV.projectMeter.binding).sort()) {
         const binding = this.store.get(key)
@@ -251,11 +253,6 @@ export class ProjectMeter {
         return { ...binding, log_status, cursor: view?.cursor ?? null, inherited_events: view?.inherited_events ?? null, context, own,
           including_children: children.has(binding.session_id) ? subtotal(subtree(sample, children)) : own }
       }) }
-  }
-
-  private plan(id: string): Plan | undefined {
-    const plan = this.store.get(KV.plans.record(id))
-    return plan?.status === 'registered' && plan.id === id && Array.isArray(plan.nodes) ? plan : undefined
   }
 
   private async sample(binding: MeterSessionBinding, signal?: AbortSignal): Promise<Sample> {

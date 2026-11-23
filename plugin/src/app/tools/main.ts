@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
-import { UserError, followupOwners, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople }
+import { UserError, followupOwners, reasonText, type Decision, type DecisionKind, type Engine, type EngineForMainSession, type EngineForPeople }
   from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
@@ -10,6 +10,8 @@ import type { Handoffs } from '../handoffs.ts'
 import { InstallationError } from '../installation-api.ts'
 import { PlanTargetSchema, type Plans } from '../plans.ts'
 import type { PlanDispatcher } from '../plan-dispatch.ts'
+import { replanTechnical, TechnicalReplanSchema } from '../plan-replan.ts'
+import { RequirementApprovalSchema, RequirementRequestSchema, type PlanRequirements } from '../plan-requirements.ts'
 import type { MainlineQueue } from '../mainline-queue.ts'
 import type { ProjectMeter } from '../project-meter.ts'
 import { ticketCard } from '../cards.ts'
@@ -71,8 +73,9 @@ function latestDirectUserMessageId(agent: Agent, expected: string | ((text: stri
 }
 export interface MainToolsHost {
   readonly context: Context
-  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note' | 'answerPlanQuestion'> & EngineForPeople
-  readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
+  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note' | 'answerPlanQuestion'> &
+    EngineForPeople & Pick<Engine, 'supersedePlanTicket'>
+  readonly store: Pick<Store, 'get' | 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
@@ -82,7 +85,9 @@ export interface MainToolsHost {
   readonly attention: Pick<ScopedAttention, 'summary' | 'forTicket'>
   readonly planIntegration?: MainResourceHost['planIntegration']
   readonly handoffs: Pick<Handoffs, 'confirm' | 'answer' | 'get' | 'spec'>
-  readonly plans: Pick<Plans, 'get' | 'view' | 'node' | 'append'>
+  readonly plans: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'view' | 'node' | 'append' | 'at' | 'revision' | 'current' | 'state' | 'requiredDelivery' | 'revise'>
+  readonly stagnation: MainResourceHost['stagnation']
+  readonly requirements: Pick<PlanRequirements, 'preview' | 'apply' | 'get'>
   readonly planDispatcher: Pick<PlanDispatcher, 'dispatch'>
   readonly mainline: Pick<MainlineQueue, 'enqueue'>
   assertNewWork?(): void
@@ -218,7 +223,7 @@ function routeTool(host: MainToolsHost): Tool {
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings,
     handoffs: host.handoffs, plans: host.plans, projectMeter: host.projectMeter, runLimits: host.runLimits, attention: host.attention,
-    planIntegration: host.planIntegration }
+    planIntegration: host.planIntegration, stagnation: host.stagnation, requirements: host.requirements }
   return [
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
@@ -309,6 +314,37 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       },
     }),
     tool({
+      name: 'orchestrator_plan_replan',
+      description: promptFile('plan-replan-tool'),
+      schema: TechnicalReplanSchema,
+      execute: async args => {
+        if (agent.id !== host.resources.masterId) throw new Error('Only the Hub may replan technical work')
+        host.assertNewWork?.()
+        return replanTechnical(host, args)
+      },
+    }),
+    tool({
+      name: 'orchestrator_plan_requirements',
+      description: promptFile('plan-requirements-tool'),
+      schema: z.discriminatedUnion('mode', [
+        z.strictObject({ mode: z.literal('preview'), request: RequirementRequestSchema }),
+        z.strictObject({ mode: z.literal('apply'), proposalId: RequirementApprovalSchema.shape.proposalId, message: z.string().min(1).max(4000) }),
+      ]),
+      execute: async args => {
+        if (agent.id !== host.resources.masterId) throw new Error('Only the Hub may handle Plan requirement changes')
+        if (args.mode === 'preview') return host.requirements.preview(args.request, agent.id)
+        const replay = host.requirements.get(args.proposalId)?.status === 'applied'
+        if (!replay) {
+          host.assertNewWork?.()
+          await host.verifyProjectBinding?.()
+        }
+        const messageId = latestDirectUserMessageId(agent, args.message, 'A requirement change needs the latest direct Hub user approval of this preview')
+        const result = host.requirements.apply(args.proposalId, { sessionId: agent.id, messageId, text: args.message })
+        if (!replay) host.requestPass()
+        return result
+      },
+    }),
+    tool({
       name: 'orchestrator_queue_merge',
       description: promptFile('queue-merge-tool'),
       schema: z.object({ ticket_id: z.string().trim().min(1), candidate: z.string().regex(/^[0-9a-f]{40}$/) }).strict(),
@@ -325,6 +361,9 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       schema: z.object({ ticket_id: z.string() }).strict(),
       execute: async args => {
         host.assertNewWork?.()
+        if (host.store.tickets.get(args.ticket_id)?.plan) {
+          throw new UserError('invalidPlan', { detail: 'Plan recovery follows the effective stagnation policy; manual retry requires an operator' })
+        }
         return routed(host, { reason: 'Started a new assignment', ticketId: host.engine.retryTicket(args.ticket_id).id })
       },
     }),

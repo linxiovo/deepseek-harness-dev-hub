@@ -4,7 +4,7 @@ One mounted project has one effective run-limit configuration. The management AP
 
 ## Preset and operator override
 
-The `default` preset has `maxWorkers: 3`, `projectTokens: null`, `ticketTokens: null`, and `stagnation: {maxAttemptsWithoutProgress: 3, idleSeconds: 900}`. `null` leaves that pool uncapped; `0` permits no calls. An operator sets caps explicitly rather than relying on unsupported model accounting by default. Stagnation values describe the effective policy for scheduling consumers; this interface does not change technical-failure retry or replan behavior.
+The `default` preset has `maxWorkers: 3`, `projectTokens: null`, `ticketTokens: null`, and `stagnation: {maxAttemptsWithoutProgress: 3, idleSeconds: 900}`. `null` leaves that pool uncapped; `0` permits no calls. An operator sets caps explicitly rather than relying on unsupported model accounting by default. For the policy's effect on failure handling, see `018-plan-replanning.md`.
 
 Use the existing `PUT /orchestrator/api/settings/executor` with the mounted project header and `{revision, value}`. Copy `blocks.executor.value` (the whole Executor block) and `blocks.executor.revision` from `GET /orchestrator/api/settings`; do not use the global revision. Set concurrency with `maxWorkers` (integer 1–16). Set any of the following with the optional strict `runLimits` object:
 
@@ -12,7 +12,7 @@ Use the existing `PUT /orchestrator/api/settings/executor` with the mounted proj
 | --- | --- |
 | `projectTokens` | `null` or nonnegative safe integer. An aggregate ceiling across the project's managed Sessions, including shared Hub/planning calls. |
 | `ticketTokens` | `null` or nonnegative safe integer. A separate pool for each Ticket and its bound children. |
-| `ticketOverrides` | Up to 256 distinct `{planId, nodeId, tokens}` records for registered Plan nodes; `tokens` replaces the Ticket default, not the project ceiling. Match on the exact, case-sensitive pair, which is available before claiming the Ticket. Each ID is 1–200 characters without whitespace, `/` or control characters. An unknown Plan or node on save returns `404` with `unknownPlan` or `unknownPlanNode`. |
+| `ticketOverrides` | Up to 256 distinct `{planId, nodeId, tokens}` records for originally registered Plan nodes. `tokens` replaces the Ticket default, not the project ceiling. A replacement uses the original node's exact, case-sensitive pair; new IDs cannot get a separate pool. IDs are 1–200 characters without whitespace, `/` or control characters. Unknown Plans or original nodes return `404` with `unknownPlan` or `unknownPlanNode`. |
 | `stagnation` | Partial object with `maxAttemptsWithoutProgress` (1–100 attempts) and/or `idleSeconds` (1–86,400 seconds), both integers. Omitted fields use the preset. |
 
 For example, with no aggregate project cap, `runLimits: {"ticketTokens":1000000,"ticketOverrides":[{"planId":"…","nodeId":"accounts","tokens":2000000}]}` gives independent Ticket pools. Omitted values use the preset; omitting `runLimits` removes all its saved overrides. `maxWorkers` remains the same Executor value used to allocate slots, with the existing priority for human follow-ups. A stale write returns `409`; malformed configuration returns `400`. `orchestrator_settings_save` cannot change `maxWorkers` or any `runLimits` setting, including by omission; it refuses with `panelOnlyRunLimits`. A scope header prevents mistakes across mounts; the [operator-only loopback transport](006-deployment.md#management-api) is not an OS-level sandbox.
@@ -36,6 +36,8 @@ Neither route takes a request body or query arguments. URL-encode `:id` as one p
 | `trackedSince`, `reportedCalls` | UTC ISO timestamp of the first instrumented project mount and the number of settled calls included in `accountedTokens`. |
 | `inFlight` | `{sessionId, ticketId, startedAt, maximumTokens}[]` for currently authorized calls. `ticketId` is `null` for shared use; `maximumTokens` is `null` for a call admitted without a known bound under uncapped pools. |
 | `missing` | `{sessionId, calls, interrupted, lastAt}[]` for settled calls without a usable total, grouped by Session. `interrupted` counts the subset recovered without a receipt. `lastAt` and `startedAt` are UTC ISO timestamps. These are not reservations. |
+
+For a replanned node, the Ticket budget is the shared original pool, including prior usage and sibling reservations. In-flight entries still name the actual Ticket and may carry `poolId` for that original pool. Use the project meter for historical attribution to each consuming Ticket.
 
 | HTTP refusal | Conditions |
 | --- | --- |

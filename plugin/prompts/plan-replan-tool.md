@@ -1,0 +1,1 @@
+Use only the current failure reported by `plan/<id>/node/<node-id>`. Reorder, split or combine pending work to resolve that failure; never change acceptance, required checks, authorization or budgets.

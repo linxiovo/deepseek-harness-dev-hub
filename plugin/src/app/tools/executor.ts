@@ -1,12 +1,13 @@
 /** Executor Session tools for reading ticket context, taking requests up internally, managing threads, handing back out-of-scope triggers, and reporting status. */
 import { z } from 'zod'
-import { liveTicket, UserError, type EngineForExecutor, type Ticket } from '../../core/index.ts'
+import { latestAssignment, liveTicket, UserError, type EngineForExecutor, type Ticket } from '../../core/index.ts'
 import { credentialIdPattern } from '../../deployment.ts'
 import { claimPull, readPull } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
 import type { DshExecutor } from '../../executor/dsh.ts'
 import { docTreeImpactSchema, docTreeScopeSchema } from '../../executor/doc-tree.ts'
 import { deliveryAcceptance, readResource, type ResourceHost } from '../resources.ts'
+import type { PlanStagnation } from '../plan-stagnation.ts'
 import type { ScopedAttention } from '../scoped-attention.ts'
 import type { Store } from '../store.ts'
 import { reportRelay, threadFollowedNotice } from '../notices.ts'
@@ -20,6 +21,7 @@ export interface ExecutorToolsHost {
   readonly sessions: Pick<Sessions, 'relay' | 'notify' | 'authorizeReviewSession'>
   readonly resources: ResourceHost
   readonly attention: Pick<ScopedAttention, 'block'>
+  readonly stagnation: Pick<PlanStagnation, 'observeTests' | 'observeReport'>
   readonly executor: Pick<DshExecutor, 'inspectDocImpact' | 'inspectTestEvidence' | 'inspectReviewCandidate' | 'inspectDeliveryCandidate'>
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
@@ -151,9 +153,13 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId
         const allPassed = checks.length > 0 && checks.every(check => check.status === 'passed')
         const redCovered = red === null || red.length > 0 && red.every(run => checks.some(check => check.directory === run.directory && check.command === run.command))
         const result = checks.some(check => check.status === 'failed') ? 'failed' : allPassed && redCovered ? 'reported_passed' : 'unverified'
-        const index = host.engine.recordDeliveryEvidence(ticketId, sessionId, revision, { kind: 'tests', result, evidence: { scope, reason, checks, red },
-          reference: reference ?? `ticket/${ticketId}/delivery-check` })
-        return { ...args, base: revision.base, result, source: 'worker', read: `ticket/${ticketId}/delivery-observation/${index}` }
+        return host.store.atomic(() => {
+          const index = host.engine.recordDeliveryEvidence(ticketId, sessionId, revision, { kind: 'tests', result, evidence: { scope, reason, checks, red },
+            reference: reference ?? `ticket/${ticketId}/delivery-check` })
+          const read = `ticket/${ticketId}/delivery-observation/${index}`
+          if (ticket.plan) host.stagnation.observeTests(ticketId, { candidate, result, checks, read, reference })
+          return { ...args, base: revision.base, result, source: 'worker', read }
+        })
       },
     }),
     tool({
@@ -220,12 +226,20 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket, sessionId
         const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
         // Claim the PR, record the report, and queue any eligible relay in the same transaction.
         return host.store.atomic(() => {
+          if (pull && current.plan) {
+            const owner = host.store.tickets.get(ticketId), writer = owner && latestAssignment(owner), before = latestAssignment(current)
+            if (!owner || !liveTicket(owner) || !writer || writer.id !== before?.id || writer.writer?.generation !== before.writer?.generation
+              || writer.writer?.state !== 'active' || owner.execution?.active_writer?.session !== sessionId) {
+              throw new UserError('assignmentEnded')
+            }
+          }
           const refused = pull && claimPull(host.github, ticketId, pull)
           if (refused) throw new Error(refused)
           const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
           const updated = host.engine.report(ticketId, report)
+          if (updated.plan) host.stagnation.observeReport(updated)
           const relay = reportRelay(updated, report)
           if (relay) host.sessions.relay(relay.id, relay.text)
           const notification = relay ? 'orchestrator' : 'internal_only'

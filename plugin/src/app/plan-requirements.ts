@@ -1,0 +1,362 @@
+import { createHash, randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
+import { z } from 'zod'
+import { UserError } from '../core/errors.ts'
+import type { Handoff, Spec } from '../core/handoff.ts'
+import { key } from '../core/ids.ts'
+import type { Ticket } from '../core/model.ts'
+import type { Plan, PlanMessage, PlanNode, PlanNodeState } from '../core/plan.ts'
+import { KV } from '../kv.ts'
+import type { Handoffs } from './handoffs.ts'
+import { mainlineAttempts, type MainlineIntent } from './mainline-queue.ts'
+import type { Plans } from './plans.ts'
+import type { RunLimits } from './run-limits.ts'
+import { promptFile } from './skill-files.ts'
+import type { Store } from './store.ts'
+
+const Text = z.string().max(4000).regex(/\S/, 'Expected non-blank text')
+export const RequirementRequestSchema = z.strictObject({
+  planId: Text,
+  goal: Text.optional(),
+  changes: z.array(z.strictObject({ criterion: z.number().int().positive(), statement: Text, observable: Text })).max(100),
+})
+export type RequirementRequest = z.infer<typeof RequirementRequestSchema>
+export const RequirementApprovalSchema = z.strictObject({ approved: z.literal(true), proposalId: z.uuid() })
+
+const PROPOSAL_TTL = 30 * 60_000
+const targetQuestion = promptFile('plan-requirements-target')
+const demonstration = promptFile('plan-requirements-revalidate')
+
+type CriterionChange = { criterion: number; before: Spec['acceptance'][number]; after: Spec['acceptance'][number] }
+type EvidenceRef = {
+  kind: 'failure' | 'tests' | 'docs' | 'retrospective' | 'acceptance' | 'repair' | 'review' | 'mainline' | 'formal-delivery'
+  read: string
+  status: string
+  at: string
+  evidenceId?: string
+  candidate?: string
+  integration?: string
+  actual?: string
+}
+type AffectedTicket = { ticketId: string; nodeId: string; open: boolean; evidence: EvidenceRef[] }
+type AffectedNode = Pick<PlanNode, 'featureId' | 'role' | 'interfaceContract'> & {
+  nodeId: string
+  replacementId: string
+  impact: 'direct' | 'transitive'
+  status: PlanNodeState['status'] | 'unclaimed'
+  blockedBy: string[]
+  replacementBlockedBy: string[]
+  instructions: 'historical-only'
+  revalidate: { criteria: number[]; demonstration: string; freshEvidence: true }
+  tickets: AffectedTicket[]
+}
+
+/** The approval applies to the exact published impact, not a fresh proposal reconstructed after a restart. */
+export type RequirementPreview = {
+  proposalId: string
+  ownerSession: string
+  planId: string
+  handoffId: string
+  expectedRevision: number
+  createdAt: string
+  expiresAt: string
+  previousGoal: string
+  goal: string
+  invalidated: CriterionChange[]
+  affected: AffectedNode[]
+  retained: { handoff: string; testInterfaces: string }
+  evidenceFingerprint: string
+} & ({ status: 'preview' } | {
+  status: 'applied'; revision: number; appliedAt: string; approvedBy: Pick<PlanMessage, 'sessionId' | 'messageId'>
+})
+type PendingPreview = Extract<RequirementPreview, { status: 'preview' }>
+type AppliedPreview = Extract<RequirementPreview, { status: 'applied' }>
+type NeedsTarget = { status: 'needs-target'; planId: string; question: string; criteria: { criterion: number; statement: string }[] }
+
+type Host = {
+  store: Pick<Store, 'atomic' | 'get' | 'set' | 'tickets'>
+  plans: Pick<Plans, 'current' | 'state' | 'requiredDelivery' | 'revision' | 'revise'>
+  handoffs: Pick<Handoffs, 'get'>
+  limits: Pick<RunLimits, 'forDispatch'>
+  stop: (ticketId: string, reason: string) => void
+  authorize: () => void
+}
+type ActivePlan = { plan: Plan; revision: number; goal: string; acceptance: Spec['acceptance']; handoff: Handoff; waitingFor: string[] }
+
+function refuse(detail: string): never { throw new UserError('invalidPlan', { detail }) }
+
+function checkApproval(proposalId: string, message: PlanMessage): void {
+  let input: unknown
+  try { input = JSON.parse(message.text) } catch { refuse('Explicit approval must identify the requirement proposal') }
+  const approval = RequirementApprovalSchema.safeParse(input)
+  if (!approval.success || approval.data.proposalId !== proposalId || !Text.safeParse(message.sessionId).success ||
+      !Text.safeParse(message.messageId).success) refuse('Explicit approval must identify the requirement proposal')
+}
+
+function evidenceRefs(ticket: Ticket, state: PlanNodeState | undefined, attempts: MainlineIntent[]): EvidenceRef[] {
+  const read = `ticket/${ticket.id}`, refs: EvidenceRef[] = []
+  if (ticket.delivery) refs.push({ kind: 'failure', read, status: 'input-delivery-failed', at: ticket.delivery.at })
+  if (ticket.ended && ticket.ended.outcome !== 'merged' && ticket.ended.outcome !== 'completed') {
+    refs.push({ kind: 'failure', read, status: ticket.ended.outcome, at: ticket.ended.at })
+  }
+  for (const assignment of ticket.assignments) {
+    const report = assignment.report
+    if (report?.state === 'failed' || report?.state === 'blocked' || report?.state === 'dropped') {
+      refs.push({ kind: 'failure', read: `${read}/report/${assignment.id}`, status: report.state, at: report.at })
+    }
+    for (const review of assignment.reviews?.evidence ?? []) {
+      refs.push({ kind: 'review', read: `${read}/review/${review.id}`, evidenceId: review.id,
+        status: review.conclusion, at: review.at, candidate: review.candidate })
+    }
+  }
+  for (const [index, event] of (ticket.deliveryCheck?.events ?? []).entries()) {
+    const observation = `${read}/delivery-observation/${index}`
+    const { at, revision: { candidate } } = event
+    if (event.kind === 'tests') refs.push({ kind: 'tests', read: observation, status: event.result, at, candidate })
+    else if (event.kind === 'docs') refs.push({ kind: 'docs', read: observation, status: event.structure, at, candidate })
+    else if (event.kind === 'acceptance') {
+      for (const result of event.results) refs.push({ kind: 'acceptance', read: observation, evidenceId: result.id,
+        status: result.status, at, candidate })
+    } else if (event.kind === 'repair') {
+      for (const fix of event.fixes) refs.push({ kind: 'repair', read: observation, evidenceId: fix.id,
+        status: 'recorded', at, candidate })
+    } else if (event.kind === 'first-retro' || event.kind === 'final-retro') {
+      refs.push({ kind: 'retrospective', read: observation, status: event.kind, at, candidate })
+    }
+  }
+  for (const attempt of attempts) {
+    refs.push({ kind: 'mainline', read: `${read}/mainline`, evidenceId: attempt.id, status: attempt.status,
+      at: attempt.observed_at ?? attempt.applying_at ?? attempt.queued_at, candidate: attempt.candidate,
+      ...(attempt.integration ? { integration: attempt.integration } : {}), ...(attempt.actual ? { actual: attempt.actual } : {}) })
+  }
+  const delivery = state?.delivery
+  if (state?.status === 'delivered' && delivery && delivery.ticketId === ticket.id &&
+      ticket.ended?.by === 'delivery' && ticket.ended.outcome === 'merged' && ticket.assignments.at(-1)?.id === delivery.assignmentId) {
+    refs.push({ kind: 'formal-delivery', read: `plan/${state.planId}/node/${state.nodeId}`, evidenceId: delivery.receiptId,
+      status: 'delivered', at: delivery.verifiedAt, candidate: delivery.candidate, integration: delivery.integration, actual: delivery.actual })
+  }
+  return refs
+}
+
+/** An acceptance change invalidates all direct consumers and their transitive successors, never their predecessors. */
+function impactedNodes(plan: Plan, targets: ReadonlySet<number>) {
+  const successors = new Map<string, string[]>(), direct = new Set<string>()
+  for (const node of plan.nodes) {
+    if (node.acceptance.some(criterion => targets.has(criterion))) direct.add(node.id)
+    for (const predecessor of node.blockedBy) {
+      const items = successors.get(predecessor)
+      if (items) items.push(node.id)
+      else successors.set(predecessor, [node.id])
+    }
+  }
+  const queue = [...direct], affected = new Set(direct)
+  for (let i = 0; i < queue.length; i++) for (const successor of successors.get(queue[i]!) ?? []) {
+    if (!affected.has(successor)) { affected.add(successor); queue.push(successor) }
+  }
+  return { direct, affected }
+}
+
+/** Product reapproval is explicit and replayable; evidence and graph writes are fenced by one Store transaction. */
+export class PlanRequirements {
+  constructor(private readonly host: Host) {}
+
+  get(proposalId: string): RequirementPreview | undefined { return this.host.store.get(KV.planRequirements.preview(proposalId)) }
+
+  preview(request: RequirementRequest, ownerSession: string): PendingPreview | NeedsTarget {
+    const { planId, goal, changes } = RequirementRequestSchema.parse(request)
+    return this.host.store.atomic(() => {
+      const active = this.active(planId, ownerSession)
+      const previousGoal = active.goal, nextGoal = goal?.trim() ?? previousGoal
+      if (!changes.length || changes.some(item => item.criterion > active.acceptance.length)) {
+        return { status: 'needs-target', planId, question: targetQuestion,
+          criteria: active.acceptance.map(({ statement }, index) => ({ criterion: index + 1, statement })) }
+      }
+      const seen = new Set<number>(), invalidated: CriterionChange[] = []
+      for (const item of changes) {
+        if (seen.has(item.criterion)) refuse(`Acceptance criterion ${item.criterion} appears more than once`)
+        seen.add(item.criterion)
+        const before = active.acceptance[item.criterion - 1]!
+        const statement = item.statement.trim(), observable = item.observable.trim()
+        if (nextGoal !== previousGoal || statement !== before.statement || observable !== before.observable) {
+          invalidated.push({ criterion: item.criterion, before, after: { ...before, statement, observable } })
+        }
+      }
+      if (!invalidated.length) refuse('The proposed requirements make no change to the current Plan')
+      this.host.authorize()
+      const proposalId = randomUUID(), now = Date.now()
+      const { affected, evidenceFingerprint } = this.impact(active, invalidated, nextGoal, proposalId)
+      const preview: PendingPreview = {
+        status: 'preview', proposalId, ownerSession, planId, handoffId: active.handoff.id,
+        expectedRevision: active.revision, createdAt: new Date(now).toISOString(), expiresAt: new Date(now + PROPOSAL_TTL).toISOString(),
+        previousGoal, goal: nextGoal, invalidated, affected, evidenceFingerprint,
+        retained: { handoff: `handoff/${active.handoff.id}`, testInterfaces: `spec/${active.handoff.id}` },
+      }
+      this.host.store.set(KV.planRequirements.preview(proposalId), preview)
+      return preview
+    })
+  }
+
+  apply(proposalId: string, message: PlanMessage): AppliedPreview {
+    checkApproval(proposalId, message)
+    const { store, plans } = this.host
+    return store.atomic(() => {
+      const preview = this.get(proposalId)
+      if (!preview) refuse('Unknown requirement proposal')
+      this.requireOwner(preview.handoffId, message.sessionId)
+      if (preview.ownerSession !== message.sessionId) refuse('Requirement proposal belongs to another Session')
+      const approvalKey = KV.planRequirements.approval(message.sessionId, message.messageId)
+      const priorApproval = store.get(approvalKey)
+      if (priorApproval !== undefined && priorApproval !== proposalId) refuse('This user event already approved another requirement proposal')
+      if (preview.status === 'applied') {
+        // A repeated approval can read the receipt, but never becomes a new approving event for an old revision.
+        if (priorApproval === undefined && preview.approvedBy.messageId === message.messageId) store.set(approvalKey, proposalId)
+        return preview
+      }
+      const expires = Date.parse(preview.expiresAt), now = Date.now()
+      if (!Number.isFinite(expires) || now >= expires) refuse('Requirement proposal expired; preview the changes again')
+      const active = this.active(preview.planId, message.sessionId)
+      if (active.revision !== preview.expectedRevision || active.handoff.id !== preview.handoffId) {
+        refuse('Plan revision changed after the preview; preview the changes again')
+      }
+      const observed = this.impact(active, preview.invalidated, preview.goal, proposalId)
+      if (observed.evidenceFingerprint !== preview.evidenceFingerprint || !isDeepStrictEqual(observed.affected, preview.affected)) {
+        refuse('Plan evidence or in-flight state changed after the preview; preview the changes again')
+      }
+      this.host.authorize()
+      const { affected } = preview
+      const planId = active.plan.id
+      for (const { nodeId, role } of observed.affected) {
+        const ticketId = key('plan-ticket', planId, nodeId)
+        const { block } = this.host.limits.forDispatch(ticketId, { planId, nodeId, role })
+        if (block) {
+          const status = block.state === 'reserved' ? 'waiting-for-budget' : 'quota-paused'
+          refuse(`Cannot apply requirement proposal: Plan node ${nodeId} is ${status} (${block.scope} budget: ${block.state})`)
+        }
+      }
+      const byNode = new Map(affected.map(node => [node.nodeId, node]))
+      const nodes = active.plan.nodes.map(node => {
+        const replacement = byNode.get(node.id)
+        return replacement ? { ...node, id: replacement.replacementId, blockedBy: replacement.replacementBlockedBy,
+          demonstration: replacement.revalidate.demonstration } : node
+      })
+      const acceptance = [...active.acceptance]
+      for (const { criterion, after } of preview.invalidated) acceptance[criterion - 1] = after
+      const replacements = Object.fromEntries(affected.map(node => [node.nodeId, [node.replacementId]]))
+      const { revision } = plans.revise(preview.planId, preview.expectedRevision,
+        { draft: { features: active.plan.features, nodes }, replacements },
+        { kind: 'requirements', proposalId, approval: message, goal: preview.goal, acceptance })
+      const stopped = new Set<string>()
+      for (const node of affected) for (const ticket of node.tickets) if (ticket.open && !stopped.has(ticket.ticketId)) {
+        stopped.add(ticket.ticketId)
+        this.host.stop(ticket.ticketId, `Requirement proposal ${proposalId} superseded Plan node ${ticket.nodeId}`)
+        if (!store.tickets.get(ticket.ticketId)?.ended) refuse(`Superseded Ticket ${ticket.ticketId} is still open`)
+      }
+      const applied: AppliedPreview = { ...preview, status: 'applied', revision, appliedAt: new Date(now).toISOString(),
+        approvedBy: { sessionId: message.sessionId, messageId: message.messageId } }
+      store.set(KV.planRequirements.preview(proposalId), applied)
+      store.set(approvalKey, proposalId)
+      return applied
+    })
+  }
+
+  private requireOwner(handoffId: string, sessionId: string): Handoff {
+    const handoff = this.host.handoffs.get(handoffId)
+    if (!handoff || handoff.status !== 'specified' || handoff.confirmedBy.sessionId !== sessionId) {
+      refuse('Only the Session that confirmed the original Handoff can change its product requirements')
+    }
+    return handoff
+  }
+
+  private active(planId: string, ownerSession: string): ActivePlan {
+    const active = this.host.plans.current(planId)
+    if (!active) throw new UserError('unknownPlan', { id: planId })
+    const handoff = this.requireOwner(active.plan.handoffId, ownerSession)
+    const required = this.host.plans.requiredDelivery(planId)
+    if (!required?.waitingFor.length) refuse('A fully delivered Plan cannot be replanned')
+    return { ...active, handoff, waitingFor: required.waitingFor }
+  }
+
+  private impact(active: ActivePlan, changes: CriterionChange[], goal: string, proposalId: string) {
+    const { plans, store } = this.host, { plan, revision } = active
+    const targets = new Set(changes.map(change => change.criterion))
+    const { direct, affected } = impactedNodes(plan, targets)
+    if (!affected.size) refuse('No current Plan nodes implement the requested criteria')
+    const lineage = this.lineage(plan.id, revision, affected)
+    const nextIds = new Map<string, string>()
+    for (const nodeId of affected) {
+      const suffix = `-r${revision + 1}-${key('requirement-node', proposalId, nodeId)}`
+      nextIds.set(nodeId, `${nodeId.slice(0, 80 - suffix.length).replace(/-$/, '')}${suffix}`)
+    }
+    const fingerprint = createHash('sha256')
+    fingerprint.update(JSON.stringify([plan, active.goal, active.acceptance, active.handoff.constraints, active.handoff.authorization,
+      active.handoff.acceptanceScope, active.handoff.spec?.testInterfaces, active.handoff.spec?.outOfScope,
+      store.get(KV.plans.background(plan.id))]))
+    const observations = new Map<string, { state: PlanNodeState | undefined; ticket: AffectedTicket | undefined }>()
+    const observe = (nodeId: string, inScope: boolean) => {
+      const prior = observations.get(nodeId)
+      if (prior) return prior
+      const state = plans.state(plan.id, nodeId)
+      const ticketId = state?.claim.ticketId ?? key('plan-ticket', plan.id, nodeId)
+      const ticket = store.tickets.get(ticketId)
+      if ((state && !ticket) || (ticket && (ticket.plan?.planId !== plan.id || ticket.plan.nodeId !== nodeId))) {
+        refuse(`Ticket or claim for Plan node ${nodeId} does not match the registered Plan`)
+      }
+      const attempts = ticket ? mainlineAttempts(store, ticketId) : []
+      if (inScope && attempts.some(attempt => attempt.status === 'queued' || attempt.status === 'applying')) {
+        refuse(`Ticket ${ticketId} has a queued or unreconciled mainline write; reconcile it before replanning`)
+      }
+      // Recovery reacquires a writer generation on the same Assignment. Evidence keeps its own recorded generation;
+      // superseding this work requires fresh evidence and drains the actual writer, independent of its current lease.
+      const assignments = ticket?.assignments.map(({ id, state, report, reviews }) => [id, state, report, reviews])
+      fingerprint.update(JSON.stringify([nodeId, state?.status, state?.delivery, ticketId, ticket?.ended, ticket?.delivery, assignments,
+        ticket?.deliveryCheck, ticket?.execution?.base, ticket?.execution?.ownership?.identity, attempts,
+        store.get(KV.plans.instructions(plan.id, nodeId))]))
+      const result = { state, ticket: ticket && inScope ? { ticketId, nodeId, open: !ticket.ended, evidence: evidenceRefs(ticket, state, attempts) } : undefined }
+      observations.set(nodeId, result)
+      return result
+    }
+    const result: AffectedNode[] = []
+    const prerequisites = new Set<string>()
+    for (const node of plan.nodes) {
+      const replacementId = nextIds.get(node.id)
+      if (!replacementId) continue
+      const tickets: AffectedTicket[] = []
+      for (const historical of lineage.get(node.id)!) {
+        const { ticket } = observe(historical, true)
+        if (ticket) tickets.push(ticket)
+      }
+      for (const predecessor of node.blockedBy) if (!affected.has(predecessor)) prerequisites.add(predecessor)
+      const revised = direct.has(node.id)
+      result.push({ nodeId: node.id, replacementId, impact: revised ? 'direct' : 'transitive',
+        featureId: node.featureId, role: node.role, ...(node.interfaceContract ? { interfaceContract: node.interfaceContract } : {}),
+        status: observations.get(node.id)?.state?.status ?? 'unclaimed', blockedBy: node.blockedBy,
+        replacementBlockedBy: node.blockedBy.map(id => nextIds.get(id) ?? id), instructions: 'historical-only',
+        revalidate: { criteria: node.acceptance, demonstration: revised || goal !== active.goal ? demonstration : node.demonstration,
+          freshEvidence: true }, tickets })
+    }
+    const waiting = new Set(active.waitingFor)
+    for (const predecessor of prerequisites) {
+      observe(predecessor, false)
+      fingerprint.update(JSON.stringify([predecessor, waiting.has(predecessor)]))
+    }
+    return { affected: result, evidenceFingerprint: fingerprint.digest('hex') }
+  }
+
+  private lineage(planId: string, revision: number, affected: ReadonlySet<string>): Map<string, Set<string>> {
+    const lineage = new Map<string, Set<string>>()
+    const descendants = new Map<string, Set<string>>()
+    for (const nodeId of affected) { lineage.set(nodeId, new Set([nodeId])); descendants.set(nodeId, new Set([nodeId])) }
+    for (let version = revision; version > 1; version--) {
+      const history = this.host.plans.revision(planId, version)
+      if (!history) refuse(`Missing Plan revision ${version}; cannot reconstruct affected historical tickets`)
+      for (const [oldNode, replacements] of Object.entries(history.replacements)) for (const replacement of replacements) {
+        const currentIds = descendants.get(replacement)
+        if (!currentIds) continue
+        let roots = descendants.get(oldNode)
+        if (!roots) { roots = new Set(); descendants.set(oldNode, roots) }
+        for (const id of currentIds) { roots.add(id); lineage.get(id)!.add(oldNode) }
+      }
+    }
+    return lineage
+  }
+}

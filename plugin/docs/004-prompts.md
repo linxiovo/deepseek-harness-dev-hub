@@ -37,6 +37,8 @@ The mainline queue uses `prompts/queue-merge-tool.md` for its Hub tool, `prompts
 
 `prompts/worker-credential-report.md` describes the Worker tool for a missing Plan credential. `prompts/credential-action.md` supplies the Hub relay request. `prompts/worker-credential-resume.md` supplies the continuation for the Worker after verification. These are fixed assets, not editable system-prompt parts.
 
+`prompts/plan-stagnation.md` supplies the Worker diagnosis, and `prompts/plan-replan-relay.md` wakes the Hub for internal coordination if recovery stalls. `prompts/plan-replan-tool.md` and `prompts/plan-requirements-tool.md` describe the Hub tools. The product change flow uses `prompts/plan-requirements-target.md` for an ambiguous target and `prompts/plan-requirements-revalidate.md` for the replacement's verification guidance. These are packaged templates, not editable prompt parts.
+
 The generated sections are editable templates. They must retain these placeholders:
 
 - `runtime/environment`: `{variables}`, filled with execution environment lines.

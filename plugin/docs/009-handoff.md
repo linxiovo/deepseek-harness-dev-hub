@@ -122,6 +122,8 @@ A credential pause keeps the claim and does not add a node status. `plan/<id>/no
 
 Budget admission can also pause or defer dispatch without issuing a formal delivery receipt. See `016-run-limits.md` for the refusal and replay contract.
 
+An active Plan can publish a revised graph and acceptance view without overwriting its original registration; see `018-plan-replanning.md`. Only the current graph contributes required work and Frontier nodes. A superseded claim and its evidence stay readable.
+
 ## Optional Feishu entry
 
 A selected, registered project can use one Feishu private chat or group topic as a second entrance. This does not create a second Hub or change a Worker's tools. Harness confirmation, questions, and specification reads do not require a binding.
@@ -143,4 +145,4 @@ Run `pnpm test tests/handoff.spec.ts tests/topic-binding.spec.ts tests/http.spec
 ## Limitations
 
 - The Feishu entry answers product questions; it does not accept configuration approvals. Other IM connectors and interactive confirmation cards are not part of this contract.
-- One immutable specification: revision `1` is the only revision and publication is one-way. A changed brief is a new handoff after the prior one is `specified`.
+- Specification publication is one-way. Changes within an active Plan use the explicit approval in `018-plan-replanning.md`; a different authorized scope requires a new handoff.

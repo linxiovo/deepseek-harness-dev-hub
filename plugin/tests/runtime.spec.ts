@@ -2071,7 +2071,7 @@ it('recovers only detached reviewer receipts with verified direct business paren
   }
 
   const priorWorker = binding(sessionId)
-  const rotated = new ProjectMeter({ store, meter: runtime.meter, masterId: 'rotated-recovery-hub' })
+  const rotated = new ProjectMeter({ store, meter: runtime.meter, plans: runtime.plans, masterId: 'rotated-recovery-hub' })
   const keys = store.keys(KV.projectMeter.binding).sort()
   stat.mockClear()
   await restoreReviewBindings(ctx, store, rotated, signal)

@@ -122,7 +122,7 @@ The output keeps skill names and call/result sequence references, fixture assert
 
 ## Delivery-check
 
-The delivery-check gate applies to Tickets linked to an immutable registered Plan and its specification. A missing Plan or specification for a Plan Ticket leaves the gate incomplete. Tickets without a Plan keep their own acceptance criteria, candidate verification, required CI and ordinary report/PR handoff; they do not receive canonical Plan IDs or a `ready_to_queue` result.
+The delivery-check gate applies to Tickets linked to a registered Plan and the acceptance contract of their active or superseded node. A missing Plan contract leaves the gate incomplete. Tickets without a Plan keep their own acceptance criteria, candidate verification, required CI and ordinary report/PR handoff; they do not receive canonical Plan IDs or a `ready_to_queue` result.
 
 ### Retro and acceptance
 

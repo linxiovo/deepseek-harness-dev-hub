@@ -5,3 +5,4 @@ Repeating the same question reuses its request; a different question replaces it
 Clear a resolved question explicitly rather than treating later progress as its resolution.
 The Hub asks Plan questions without a Source in Harness. Its direct user reply reaches this Ticket as input, not new authority or credential verification.
 Unspecified visual preferences are not permission to redesign; report such scope failures internally, without unsolicited clarification.
+For Plan work, read `ticket/<id>/plan-scope` and its delivery-check. Re-run failed checks on the new candidate; do not remove or weaken them. Only a missing product decision belongs in human_action.

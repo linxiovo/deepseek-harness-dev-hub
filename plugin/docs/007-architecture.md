@@ -391,6 +391,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/ids.ts` | `key`: ids derived from their inputs, equal for equal inputs |
 | `src/core/handoff.ts` | The handoff records: `ProjectRef`, `HandoffInput`, `HandoffQuestion`, `SpecInput`, `Spec` and `Handoff`, with the fields and statuses 009 Handoff describes |
 | `src/core/plan.ts` | Plan DAG records and domain validation: role separation, acceptance coverage and explicit dependencies |
+| `src/core/plan-topology.ts` | Technical graph transformations for unclaimed nodes; retain acceptance, dependency and interface commitments |
 | `src/core/plan-integration.ts` | Plan full-regression configuration, Actions run evidence, artifact reference and validated retained-file metadata |
 | `src/core/memory.ts` | `MemoryRepositories`: the Store's repositories in memory, in the Store's order and with its nested rollback, for domain tests |
 | `src/core/index.ts` | The core's exports, including `TakeUp` and the Plan integration evidence contract |
@@ -409,8 +410,11 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/handoffs.ts` | `Handoffs`: the durable project and handoff records, their single question, answer and immutable specification |
 | `src/app/topic-binding.ts` | Binds one observed Feishu destination to the selected project and accepts correlated answers from explicitly authorized senders; see `009-handoff.md` |
 | `src/app/planning.ts` | `Planning`: durable `planning` and `splitting` effects for the specification planner and the Plan DAG splitter |
-| `src/app/plans.ts` | `Plans`: validates and atomically registers authorized Plan DAGs; keeps plan background separate from node instructions |
+| `src/app/plans.ts` | `Plans`: validates and publishes immutable Plan revisions, retains old node definitions and claims, and gates Frontier and delivery |
 | `src/app/plan-dispatch.ts` | `PlanDispatcher`: validates Frontier predecessors, reserves a launch slot, atomically claims a node into a stable Ticket/Assignment, and rearms the same claim on restart |
+| `src/app/plan-replan.ts` | Binds a technical replan to the current failure, effective authorization and graph revision |
+| `src/app/plan-stagnation.ts` | `PlanStagnation`: durable technical failure and recovery state, diagnosis and reassignment policy, and failed-check gating |
+| `src/app/plan-requirements.ts` | `PlanRequirements`: computes affected nodes and evidence, consumes direct approval and applies one revision |
 | `src/app/mainline-queue.ts` | Durable per-target FIFO, Ticket attempts, Worker repair, actual Git verification and formal closure coordination |
 | `src/app/plan-integration.ts` | Durable Plan verification after formal Ticket receipts, exact Actions run/attempt checks, checksummed artifact acceptance, exactly-once relay and release hold |
 | `src/app/plan-artifacts.ts` | Downloads one exact Actions artifact into private staging, validates its identity manifest, safe filename, media type and file SHA-256, retains it by Plan/context/run/attempt, and serves only a checksum-matching file |
@@ -708,6 +712,7 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 | `session/<id>` | The `SessionMeterView` of one Session: its `context` snapshot and cumulative `usage`, with provenance, quality, sampled ranges and missing ranges; main Session only |
 | `project/meter`, `plan/<id>/meter`, `ticket/<id>/meter` | Hub-only scoped usage, shared overhead, and per-Session samples; contract in `plugin/docs/014-project-metering.md` |
 | `project/attention`, `plan/<id>/attention` | Hub-only Plan execution and awaiting-human summary, including credential actions; contract in `plugin/docs/015-scoped-attention.md` |
+| `plan/<id>/revision/<n>`, `plan-requirement/<id>`, `ticket/<id>/plan-scope` | Revision history, product-change previews and ticket-specific verification scope; contract in `plugin/docs/018-plan-replanning.md` |
 | `feishu/<trigger id>/…`, `github/…` | Original Source records, described in the Source skills |
 | `actions/<ticket\|plan>/<id>/commit/<40 lowercase hex SHA>` | GitHub Actions evidence for one owned commit, main Session only |
 

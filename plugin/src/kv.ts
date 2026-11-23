@@ -7,6 +7,9 @@ import type { Plan, PlanMessage, PlanNodeState } from './core/plan.ts'
 import type { PlanIntegrationView } from './core/plan-integration.ts'
 import type { PromptVersion } from './app/prompts.ts'
 import type { MainlineIntent } from './app/mainline-queue.ts'
+import type { PlanRepairSource, PlanRevision } from './app/plans.ts'
+import type { RequirementPreview } from './app/plan-requirements.ts'
+import type { StagnationRecord } from './app/plan-stagnation.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { SessionMeterState } from './app/session-meter.ts'
 import type { MeterSessionBinding } from './app/project-meter.ts'
@@ -85,9 +88,16 @@ export const KV = {
     spec: family<Spec, [handoffId: string]>('handoff-spec:'),
     confirmationReceipt: family<{ handoffId: string }, [sessionId: string, messageId: string]>(
       'handoff-confirmation:', (sessionId, messageId) => JSON.stringify([sessionId, messageId])) },
-  /** Plans: immutable DAGs plus mutable node execution claims and append-only context. */
+  /** Plans: immutable DAG versions, mutable node execution claims and append-only context. */
   plans: { record: family<Plan, [id: string]>('plan:'),
+    head: family<number>('plan-head:'),
+    revision: family<PlanRevision, [planId: string, revision: number]>('plan-revision:'),
+    retired: family<{ revision: number; replacements: string[] }, [planId: string, nodeId: string]>('plan-retired:'),
+    handover: family<string[], [planId: string, nodeId: string]>('plan-handover:'),
+    budgetOrigin: family<string, [planId: string, nodeId: string]>('plan-budget-origin:'),
+    repairSource: family<PlanRepairSource, [planId: string, nodeId: string]>('plan-repair-source:'),
     requiredChecks: family<GithubConfig['requiredChecks']>('plan-ticket-required-checks:'),
+    claimRevision: family<number, [planId: string, nodeId: string]>('plan-claim-revision:'),
     node: family<PlanNodeState, [id: string, nodeId: string]>('plan-node:', (id, nodeId) => JSON.stringify([id, nodeId])),
     integration: family<PlanIntegrationView>('plan-integration:'),
     integrationDispatch: family<true>('plan-integration-dispatch:'),
@@ -96,6 +106,12 @@ export const KV = {
       (id, nodeId) => JSON.stringify([id, nodeId])),
     receipt: family<string, [id: string, sessionId: string, messageId: string]>('plan-message-receipt:',
       (id, sessionId, messageId) => JSON.stringify([id, sessionId, messageId])) },
+  /** Only the product change flow writes previews and consumes direct operator approval events. */
+  planRequirements: { preview: family<RequirementPreview>('plan-requirement-preview:'),
+    approval: family<string, [sessionId: string, messageId: string]>('plan-requirement-approval:',
+      (sessionId, messageId) => JSON.stringify([sessionId, messageId])) },
+  /** Stagnation observations and scheduled recovery belong to the original Ticket. */
+  planStagnation: { ticket: family<StagnationRecord>('plan-stagnation:') },
   /** Mainline: versioned Ticket attempts and the FIFO per GitHub repo/ref. */
   mainline: { ticket: family<MainlineIntent[], [ticketId: string]>('mainline-ticket:'),
     pending: family<string[], [target: string]>('mainline-pending:') },

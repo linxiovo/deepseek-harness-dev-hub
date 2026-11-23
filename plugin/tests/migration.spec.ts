@@ -247,9 +247,11 @@ const opened = (records: Record<string, unknown>) => {
   return new Store(path)
 }
 
+const promptsOf = (store: Store) => new Prompts(store, () => 100000, () => undefined, () => true, { get: () => undefined })
+
 it('keeps custom skills but does not activate retired merge thresholds from old prompt versions', () => {
   const store = opened({ ...legacyPrompts(3, { notes: 'Call orchestrator_create_task with event_id, read event/<id>, follow guide/work and guide/release, load dsh-tag-github, cd "$DSH_TAG_DIR".' }) })
-  const prompts = new Prompts(store, () => 100000, () => undefined, () => true)
+  const prompts = promptsOf(store)
   const { config } = prompts.version(3)
   expect(config.communication).toBe(defaultPrompts().communication)
   expect(config.delivery).toBe(defaultPrompts().delivery)
@@ -270,7 +272,7 @@ it('writes saved team sections and skills under current names: earlier project n
     skills: { notes: 'Load dsh-freelancer-github; cd "$DSH_FREELANCER_DIR". List with orchestrator_tickets, then orchestrator_ticket_inspect.',
       routing: 'Accept with orchestrator_ticket_accept; stop with orchestrator_ticket_stop, never orchestrator_trigger_ignore.' } }
   const store = opened({ 'prompt-version:1': { revision: 1, previousRevision: 0, savedAt: '', source: 'web', config }, 'prompt-revision': 1, 'prompt-settings-text': 1 })
-  const { config: current } = new Prompts(store, () => 100000, () => undefined, () => true).current()
+  const { config: current } = promptsOf(store).current()
   expect(current.delivery).toBe('Merge with --repo $DSH_SUPERAGENT_GITHUB_REPOSITORY.')
   expect(current.skills.notes).toBe('Load dsh-superagent-github; cd "$DSH_SUPERAGENT_DIR". List with orchestrator_read tickets, then orchestrator_read ticket/<id>.')
   // The four routing tools are one.
@@ -281,7 +283,7 @@ it('writes saved team sections and skills under current names: earlier project n
 it('migrates cross-source identities but does not restore retired auto-merge settings', () => {
   const before = { policy: { autoMergeLineLimit: 350, members: [{ name: 'Alice', feishuId: 'ou_alice', github: 'alice' }, { name: 'Bob', feishuId: 'ou_bob', github: '' }] } }
   const store = opened({ 'settings-before-9': before })
-  const prompts = new Prompts(store, () => 100000, () => undefined, () => true)
+  const prompts = promptsOf(store)
   const migrated = prompts.current()
   expect(migrated).toMatchObject({ revision: 1, previousRevision: 0, source: 'settings-migration' })
   expect(migrated.config.delivery).toBe(defaultPrompts().delivery)
@@ -291,15 +293,15 @@ it('migrates cross-source identities but does not restore retired auto-merge set
   store.close()
   // Nobody with two identities and retired auto-merge settings change nothing.
   const unchanged = opened({ 'settings-before-9': { policy: { members: [{ name: 'Bob', feishuId: 'ou_bob', github: '' }] } } })
-  expect(new Prompts(unchanged, () => 100000, () => undefined, () => true).current().revision).toBe(0)
+  expect(promptsOf(unchanged).current().revision).toBe(0)
   unchanged.close()
   const own = opened({ 'settings-before-9': { policy: { autoMergeLineLimit: 80 } }, 'prompt-revision': 1,
     'prompt-version:1': { revision: 1, previousRevision: 0, savedAt: '', source: 'panel', config: { ...defaultPrompts(), delivery: 'Deliver PRs.' } } })
-  expect(new Prompts(own, () => 100000, () => undefined, () => true).current().config.delivery)
+  expect(promptsOf(own).current().config.delivery)
     .toBe('Deliver PRs.')
   own.close()
   const done = opened({ 'settings-before-9': before, 'prompt-settings-text': 1 })
-  expect(new Prompts(done, () => 100000, () => undefined, () => true).current().revision).toBe(0)
+  expect(promptsOf(done).current().revision).toBe(0)
   done.close()
 })
 
@@ -308,7 +310,7 @@ it('reads a current prompt version that does not read as the one before it, keep
   const store = opened({ 'prompt-revision': 2, 'prompt-settings-text': 1,
     'prompt-version:1': { revision: 1, previousRevision: 0, savedAt: '', source: 'web', config },
     'prompt-version:2': { revision: 2, previousRevision: 1, savedAt: '', source: 'web', config: { delivery: ['not text'] } } })
-  const prompts = new Prompts(store, () => 100000, () => undefined, () => true)
+  const prompts = promptsOf(store)
   expect(prompts.current()).toMatchObject({ revision: 2, config, legacy: { config: { delivery: ['not text'] } } })
   expect(prompts.history(0, 2).revisions.map(version => version.changed)).toEqual([['legacy'], []])
   store.close()

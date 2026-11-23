@@ -29,17 +29,19 @@ import { KV } from '../kv.ts'
 import { Store } from './store.ts'
 import { evalsHealth } from './views/overview.ts'
 import { TextCache } from './cache.ts'
-import { Effects } from './effects.ts'
+import { Effects, Later } from './effects.ts'
 import { Handoffs } from './handoffs.ts'
 import { TopicBinding } from './topic-binding.ts'
 import { Installation, projectDatabase, projectHubId } from './installation.ts'
 import { InstallationError } from './installation-api.ts'
 import { Planning } from './planning.ts'
 import { Plans, planDeliveryWriter } from './plans.ts'
+import { PlanRequirements } from './plan-requirements.ts'
+import { PlanStagnation } from './plan-stagnation.ts'
 import { PlanIntegration } from './plan-integration.ts'
 import { ScopedAttention } from './scoped-attention.ts'
 import { PlanDispatcher } from './plan-dispatch.ts'
-import { MainlineQueue } from './mainline-queue.ts'
+import { MainlineQueue, mainlineIntent } from './mainline-queue.ts'
 import { advanceMainline, precedes, prepareMainline, readMainline, readPlanIntegrationTarget, verifyDeliveryOnTarget } from '../executor/mainline-git.ts'
 import { Prompts, promptByteLimit, PromptConflict } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
@@ -92,6 +94,7 @@ export class Runtime extends Service implements SourceHost {
   readonly planDispatcher: PlanDispatcher
   readonly attention: ScopedAttention
   readonly planning: Planning
+  private readonly stagnation: PlanStagnation
   readonly sources: SourceRegistry
   readonly commands: Commands
   readonly meter: SessionMeter
@@ -162,7 +165,6 @@ export class Runtime extends Service implements SourceHost {
       const deployed = () => setup.configured()
         ? environmentOf({ deployment: setup.deployment, sources: this.sources, settings: store.settings() }) : undefined
       const feishu = () => setup.configured() && !!setup.deployment.feishu
-      const prompts = this.prompts = new Prompts(store, () => machine.promptMaxChars.get(), deployed, feishu)
       const masterId = this.masterId = store.get(KV.runtime.masterId) ?? projectHubId(installation.stateDir)
       store.set(KV.runtime.masterId, masterId)
       const commands = this.commands = new Commands(() => setup.deployment, setup.commandEnvironment, this.lifetime)
@@ -172,6 +174,7 @@ export class Runtime extends Service implements SourceHost {
       const handoffs = this.handoffs = new Handoffs(store, effects, project, () => installation.assertNewWork(),
         handoff => this.topicBinding?.changed(handoff))
       const plans = this.plans = new Plans(store, handoffs, effects)
+      const prompts = this.prompts = new Prompts(store, () => machine.promptMaxChars.get(), deployed, feishu, plans)
       const credentialChecks = new Map(projectMachine.credentialChecks?.filter(check => check.projectId === project?.id)
         .map(check => [check.id, check]))
       const attention = this.attention = new ScopedAttention({ store, plans, projectId: project?.id,
@@ -194,7 +197,7 @@ export class Runtime extends Service implements SourceHost {
         drained: ticketId => this.executor.drainedForCredential(ticketId),
         resume: (ticketId, blockerId) => this.executor.resumeAfterCredential(ticketId, blockerId),
       })
-      const projectMeter = this.projectMeter = new ProjectMeter({ store, meter, masterId, canSample: binding => this.canSample(binding) })
+      const projectMeter = this.projectMeter = new ProjectMeter({ store, meter, plans, masterId, canSample: binding => this.canSample(binding) })
       const runLimits = this.runLimits = new RunLimits({ store, relay: message => this.sessions.relay(message.id, message.text),
         changed: () => { if (!this.closing()) this.executor.reconcileQuotaPauses() } })
       const sources = this.sources = new SourceRegistry(() => store.settings(), board, kind => {
@@ -207,7 +210,7 @@ export class Runtime extends Service implements SourceHost {
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
       const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx,
-        meter: { read: (id, signal) => this.readScopedMeter(id, signal) }, plans, handoffs,
+        meter: { read: (id, signal) => this.readScopedMeter(id, signal) }, plans,
         rulesManifestMaxBytes: () => promptByteLimit(machine.promptMaxChars.get()),
         reviewGeneration: ticketId => runtime.executor?.reviewGeneration(ticketId),
         credentialBlocked: ticketId => attention.blocked(ticketId),
@@ -270,14 +273,15 @@ export class Runtime extends Service implements SourceHost {
           }
           const overrides = after.executor.runLimits?.ticketOverrides
           if (overrides !== before.executor.runLimits?.ticketOverrides) for (const { planId, nodeId } of overrides ?? []) {
-            const plan = plans.get(planId)
-            if (plan?.status !== 'registered') throw new UserError('unknownPlan', { id: planId })
-            if (!plan.nodes.some(node => node.id === nodeId)) throw new UserError('unknownPlanNode', { id: planId, node: nodeId })
+            if (!plans.get(planId)) throw new UserError('unknownPlan', { id: planId })
+            if (!plans.at(planId, 1)?.plan.nodes.some(node => node.id === nodeId)) throw new UserError('unknownPlanNode', { id: planId, node: nodeId })
           }
         } })
       this.executor = new DshExecutor({ context: ctx, commands, get engine() { return runtime.engine }, store, effects,
         health: board.claim('worker'), machine: projectMachine, lifetime: this.lifetime, sessions, closing: () => this.closing(),
         credentialBlocked: ticketId => attention.blocked(ticketId),
+        diagnosisAllowed: (ticket, inputId) => runtime.stagnation.allowed(ticket, inputId),
+        reassignmentAllowed: ticket => runtime.stagnation.allowed(ticket),
         quota: runLimits,
         paused: () => this.paused(), environment, sourceLink: link,
         repliedTo: trigger => repliedTo({ store, sources }, trigger) })
@@ -322,10 +326,13 @@ export class Runtime extends Service implements SourceHost {
         outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
           if (event.type === 'ticket.created') {
             const { ticketId } = event.data
-            prompts.bindTicket(ticketId)
-            if (store.tickets.get(ticketId)?.plan) {
-              const { requiredChecks } = githubKind.schema.parse(store.settings().sources.github?.config ?? {})
-              bindRequiredChecks(store, ticketId, requiredChecks)
+            const binding = store.tickets.get(ticketId)?.plan
+            const repair = binding && plans.repairSource(binding.planId, binding.nodeId)
+            prompts.bindTicket(ticketId, repair ? prompts.forTicket(repair.ticketId).revision : undefined)
+            if (binding) {
+              const inherited = repair && store.get(KV.plans.requiredChecks(repair.ticketId))
+              const required = inherited ?? githubKind.schema.parse(store.settings().sources.github?.config ?? {}).requiredChecks
+              bindRequiredChecks(store, ticketId, required)
             }
           }
           if (event.type === 'assignment.started') {
@@ -350,6 +357,33 @@ export class Runtime extends Service implements SourceHost {
         } })
       this.planDispatcher = new PlanDispatcher({ store, plans, engine, executor, attention, limits: runLimits,
         bindWorker: (ticket, id) => sessions.bindWorker(ticket, id) })
+      const stagnation = this.stagnation = new PlanStagnation({ store, plans, limits: runLimits, engine,
+        paused: () => this.paused(), eligible: ticket => {
+          const binding = ticket.plan
+          if (!binding || store.get(KV.plans.retired(binding.planId, binding.nodeId)) || attention.blocked(ticket.id)) return false
+          const merge = mainlineIntent(store, ticket.id)
+          return !merge || merge.status === 'waiting' || (merge.status === 'repair' && merge.repair_requested === true)
+        }, routeReplan: (ticket, failureId) => {
+          effects.enqueue('replanReview', key('plan-replan', ticket.id, failureId), { ticketId: ticket.id, failureId })
+        } })
+      effects.handle('replanReview', async ({ ticketId, failureId }, requestId) => {
+        const plan = store.tickets.get(ticketId)?.plan
+        if (!plan) return
+        const withdrawn = new Error('The Plan recovery review no longer applies')
+        const authorize = () => {
+          const recovery = stagnation.view(ticketId)
+          if (recovery?.failureId !== failureId) throw withdrawn
+          if (['quota-paused', 'waiting-for-budget', 'paused', 'held'].includes(recovery.status)) throw new Later()
+          if (recovery.status !== 'stalled' || !recovery.canReplan) throw withdrawn
+        }
+        try {
+          const { planId, nodeId } = plan
+          await sessions.prompt(masterId, requestId, JSON.stringify({ kind: 'plan-replan-review', plan: `plan/${planId}`,
+            failure: `plan/${planId}/node/${nodeId}/recovery/${failureId}`, instructions: promptFile('plan-replan-relay') }), 'steer', authorize)
+        } catch (error) { if (error !== withdrawn) throw error }
+      }, { limit: () => this.configured() && !this.closing() ? 1 : 0 })
+      const requirements = new PlanRequirements({ store, plans, handoffs, limits: runLimits,
+        stop: (ticketId, reason) => { engine.stopTicket(ticketId, reason) }, authorize: () => installation.assertNewWork() })
       const planDelivery = planDeliveryWriter(plans, id => engine.closePlanTicket(id))
       const mainline = new MainlineQueue({ store, effects, lifetime: this.lifetime,
         available: () => this.configured() && !this.closing(), paused: () => this.paused(),
@@ -423,13 +457,14 @@ export class Runtime extends Service implements SourceHost {
         }
         if (ticket.execution?.session) sessions.bindWorker(ticket.id, ticket.execution.session)
         for (const [index, assignment] of ticket.assignments.entries()) {
+          const replacement = ticket.assignments[index - 1]?.endedReason
           if (assignment.writer?.session) sessions.bindWorker(ticket.id, assignment.writer.session,
-            assignment.startedAt !== undefined && ticket.assignments[index - 1]?.endedReason === 'retried')
+            assignment.startedAt !== undefined && (replacement === 'retried' || replacement === 'reassigned'))
         }
       }
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
-      const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
+      const evaluateDue = () => { engine.evaluateDue(); stagnation.scan(); evals.set(evalsHealth(store)) }
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
         health: this.runtimeHealth, lifetime: this.lifetime, configured: () => this.configured(), closing: () => this.closing() })
       const sourceInactive = () => this.closing() || !installation.github
@@ -445,7 +480,7 @@ export class Runtime extends Service implements SourceHost {
           return passes.receive(trigger)
         } }
       this.toolHost = { context: ctx, engine, store, sessions, executor, mainline, planDispatcher: this.planDispatcher, settings: this.settings,
-        assessor, resources, projectMeter, runLimits, attention, handoffs, plans, planIntegration, lifetime: this.lifetime,
+        assessor, resources, projectMeter, runLimits, attention, handoffs, plans, planIntegration, stagnation, requirements, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }

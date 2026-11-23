@@ -110,7 +110,7 @@ it('shows the exact release hold and downloads its verified Plan package', async
     artifact: { id: 19, name: 'plugin-bundle', url: 'https://github.com/acme/widgets/actions/runs/12/artifacts/19',
       fileName: 'dsh-superagent-0.1.0.tgz', contentType: 'application/gzip', size: 128, sha256: 'c'.repeat(64) }, verifiedAt: '2026-11-23T00:00:00Z' }
   server.planDeliveries['plan-a'] = view
-  server.planArtifacts['plan-a'] = new Blob(['verified package'])
+  server.planArtifacts['plan-a'] = new Uint8Array([1, 2, 3]).buffer
   at({ page: 'execution', id: 't1' })
   await mount()
   expect(text()).toContain(zh['planDelivery.status.awaiting-release-verification'])

@@ -92,7 +92,7 @@ export interface PanelServer {
   prompts: PromptsView
   tickets: { open: TicketRow[]; ended: TicketRow[] }; ticketDetails: Record<string, TicketPageView>
   planDeliveries: Record<string, ApiResponse<'GET plans/:id/delivery'>>
-  planArtifacts: Record<string, Blob>
+  planArtifacts: Record<string, ArrayBuffer>
   threads: ThreadRow[]
   threadPages: (key: string, query: { before?: string; around?: string }) => ThreadPageView | undefined
   /** Session meter views keyed by Session id; an id absent here is answered as a missing Session. */
@@ -307,7 +307,7 @@ const refuse = (status: Refusal['status'], error: string, more: Record<string, u
 type Query<K extends keyof Api> = Api[K] extends { query?: infer Q } ? keyof NonNullable<Q> & string : never
 type Body<K extends keyof Api> = Api[K] extends { body: infer B } ? B : undefined
 interface Request<K extends keyof Api> { params: RouteParams<K>; query: Partial<Record<Query<K>, string>>; body: Body<K> }
-type Answer<K extends keyof Api> = ApiResponse<K> | Refusal
+type Answer<K extends keyof Api> = (ApiResponse<K> extends Blob ? ArrayBuffer : ApiResponse<K>) | Refusal
 type Route<K extends keyof Api> = { query?: readonly Query<K>[]; answer: (request: Request<K>) => Answer<K> | Promise<Answer<K>> }
   & (Api[K] extends { body: unknown } ? { body: true } : { body?: never })
 const page = <T>(items: T[]) => ({ items, total: items.length, next_offset: null })
@@ -472,8 +472,12 @@ async function run<K extends keyof Api>(key: K, params: Record<string, string>, 
  * Requests held back by `server.searching` are not constructed until `searching` resolves, so they do not count as pending early.
  */
 class Reply extends Response {
-  constructor(value: unknown, status: number) { super(value instanceof Blob ? value : JSON.stringify(value), { status,
-    headers: { 'content-type': value instanceof Blob ? value.type || 'application/octet-stream' : 'application/json' } }); server.pending++ }
+  constructor(value: unknown, status: number) {
+    const binary = value instanceof ArrayBuffer
+    super(binary ? value : JSON.stringify(value), { status,
+      headers: { 'content-type': binary ? 'application/octet-stream' : 'application/json' } })
+    server.pending++
+  }
   override async text() { server.pending--; return super.text() }
   override async json() { server.pending--; return super.json() }
   override async blob() { server.pending--; return super.blob() }

@@ -325,7 +325,7 @@ export class Runtime extends Service implements SourceHost {
         repliedTo: trigger => repliedTo({ store, sources }, trigger) })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
-        deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
+        deliver: (id, text) => sessions.prompt(runtime.masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
       const outbox = this.outbox = new Outbox({ store, effects, commands, paused: () => this.paused(), sources: {
         instance: sources.instance.bind(sources), channelAllowed: channel => channel.address.bindingEpoch !== undefined
           ? channel.source === FEISHU : sources.channelAllowed(channel),
@@ -422,7 +422,7 @@ export class Runtime extends Service implements SourceHost {
       }, { limit: () => this.configured() && !this.closing() ? 1 : 0 })
       const requirements = new PlanRequirements({ store, plans, handoffs, limits: runLimits,
         stop: (ticketId, reason) => { engine.stopTicket(ticketId, reason) }, authorize: () => installation.assertNewWork(),
-        requestScopeReview: id => effects.enqueue('requirementScopeReview', id, {}), isHubGeneration: id => authority.isGeneration(id) })
+        requestScopeReview: id => effects.enqueue('requirementScopeReview', id, {}), isHubGeneration: id => authority.isGeneration(id), isCurrentHub: id => authority.isCurrent(id) })
       const scopeDispatchOpen = () => {
         if (this.paused()) return false
         const state = runLimits.view()?.budget.state
@@ -577,15 +577,25 @@ export class Runtime extends Service implements SourceHost {
     const tickets = this.store.tickets.open().map(ticket => {
       const assignment = latestAssignment(ticket)
       return { id: ticket.id, title: ticket.title, state: ticket.ended ? 'ended' : assignment?.state ?? 'open', ended: ticket.ended ?? null,
-        assignment: assignment && { id: assignment.id, state: assignment.state, report: assignment.report?.state ?? null },
-        session: ticket.execution?.session ?? null, read: `ticket/${ticket.id}` }
+        assignment: assignment && { id: assignment.id, state: assignment.state, report: assignment.report?.state ?? null,
+          result: assignment.report?.summary ?? null }, session: ticket.execution?.session ?? null, read: `ticket/${ticket.id}` }
     })
-    const handoffs = this.handoffs.list().filter(handoff => handoff.status !== 'specified' || this.plans.get(handoff.id)).map(handoff => ({
+    const pendingEvents = this.store.tickets.open().flatMap(ticket => ticket.undelivered.map(inputId => {
+      const input = ticket.inputs.find(item => item.id === inputId)
+      return { ticket_id: ticket.id, input_id: inputId, kind: input?.kind ?? 'unknown', at: input?.at ?? null, read: `ticket/${ticket.id}/input/${key(inputId)}` }
+    }))
+    const actions = this.store.tickets.open().map(ticket => {
+      const assignment = latestAssignment(ticket)
+      return { ticket_id: ticket.id, assignment_id: assignment?.id ?? null, state: assignment?.state ?? 'open',
+        result: assignment?.report?.summary ?? null, outcome: ticket.ended?.outcome ?? null, read: `ticket/${ticket.id}` }
+    })
+    const handoffs = this.handoffs.list().map(handoff => ({
       id: handoff.id, status: handoff.status, project: handoff.project, goal: handoff.goal, constraints: handoff.constraints,
       acceptanceScope: handoff.acceptanceScope, authorization: handoff.authorization, read: `handoff/${handoff.id}` }))
     return `${promptFile('hub-resume')}\n${JSON.stringify({ hub_id: this.hubId, epoch, project: this.installation.project && {
       id: this.installation.project.id, repository: this.installation.project.repository, workspace: this.installation.project.workspace },
-      tickets, handoffs, pending_effects: this.effects.count(), reads: ['tickets', 'plans', 'threads', 'project/attention'] })}`
+      tickets, handoffs, pending_events: pendingEvents, actions, pending_effects: this.effects.pendingSummary(),
+      reads: ['tickets', 'plans', 'threads', 'project/attention'] })}`
   }
 
   async idle(): Promise<void> {
@@ -744,9 +754,9 @@ export class Runtime extends Service implements SourceHost {
   }
   private httpHost(): HttpHost {
     const runtime = this
-    const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, setup, passes, installation,
+    const { store, sources, prompts, sessions, settings, engine, executor, health, machine, sourceLinks, setup, passes, installation,
       projectMeter } = this
-    return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, projectMeter, installation,
+    return { store, sources, prompts, sessions, settings, engine, executor, health, machine, get masterId() { return runtime.masterId }, sourceLinks, projectMeter, installation,
       attention: this.attention, runLimits: this.runLimits, planIntegration: this.planIntegration,
       planArtifact: async id => {
         const view = this.planIntegration.view(id)

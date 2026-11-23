@@ -11,7 +11,7 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
-type Seen = { ids: Set<string>; loaded?: Promise<void> }
+type Seen = { ids: Set<string>; messages: Set<string>; loaded?: Promise<void> }
 /** The id of the message delivered under `requestId`, the same on every retry. */
 export const messageId = (requestId: string) => MessageId(`dsh-superagent:${requestId}`)
 /** Extracts the idempotency key from current or legacy plugin message sources. */
@@ -33,13 +33,16 @@ export class AgentDelivery {
   constructor(private readonly ctx: Context) {
     ctx.on('session/event', (session, event) => {
       if (event.type !== 'user/message') return
+      const seen = this.seen.get(session)
+      if (!seen) return
+      seen.messages.add(event.data.id)
       const id = deliveryId(event.data)
-      if (id) this.seen.get(session)?.ids.add(id)
+      if (id) seen.ids.add(id)
     })
   }
   private async history(agent: Agent): Promise<Seen> {
     let seen = this.seen.get(agent.session)
-    if (!seen) { seen = { ids: new Set() }; this.seen.set(agent.session, seen) }
+    if (!seen) { seen = { ids: new Set(), messages: new Set() }; this.seen.set(agent.session, seen) }
     const state = seen
     state.loaded ??= (async () => {
       await this.ctx.sessionPersistence.flush()
@@ -49,6 +52,7 @@ export class AgentDelivery {
         if (!events.length) break
         for (const event of events) {
           if (event.type !== 'user/message') continue
+          state.messages.add(event.data.id)
           const id = deliveryId(event.data)
           if (id) state.ids.add(id)
         }
@@ -61,6 +65,10 @@ export class AgentDelivery {
   async holds(agent: Agent, requestId: string): Promise<boolean> {
     const id = messageId(requestId)
     return (await this.history(agent)).ids.has(id) || [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => deliveryId(message) === id)
+  }
+  async holdsMessage(agent: Agent, messageId: string): Promise<boolean> {
+    const seen = await this.history(agent)
+    return seen.messages.has(messageId) || [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => message.id === messageId)
   }
   /** Checks a cold physical Hub log without resuming its Agent, so rotation can deduplicate a flushed old delivery. */
   async holdsIn(sessionId: string, requestId: string): Promise<boolean> {

@@ -16,7 +16,7 @@ import { AgentDelivery, messageId } from './delivery.ts'
 import { Later, type Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
 import type { HubRotation } from './hub-authority.ts'
-import type { HubDeliveryReceipt } from '../kv.ts'
+import type { HubDeliveryReceipt, HubInboxTransfer } from '../kv.ts'
 import { RetryHealth } from './retry-health.ts'
 import { initializeRoleModel } from './role-models.ts'
 import { bundledSkills, isBundledSkill, promptFile, splitterSkill } from './skill-files.ts'
@@ -32,7 +32,7 @@ import type { RequirementScopeTask, ScopeVerdict } from './plan-requirements.ts'
 export interface SessionsHost {
   /** DSH Cordis context: sessions, agents, persistence, and their events. */
   readonly context: Context
-  readonly store: Pick<Store, 'tickets' | 'settings' | 'get' | 'set' | 'keys'>
+  readonly store: Pick<Store, 'tickets' | 'settings' | 'get' | 'set' | 'keys' | 'delete'>
   readonly projectMeter: Pick<ProjectMeter, 'bind' | 'owns'>
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'effective' | 'forTicket' | 'compose' | 'skills'>
   readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'idle' | 'pending'>
@@ -260,15 +260,10 @@ const withdrawnRelay = Symbol('withdrawn relay')
     if (target) this.rotationRequested = true
     const id = target ?? this.host.currentHubId() ?? this.host.masterId
     const agent = await this.ensure(id, cwd, title, 'orchestrator')
-    if (target) {
-      this.host.activateHub(id)
-      this.rotationRequested = false
-      await this.resumeHub()
-      for (const old of this.host.hubGenerations()) if (old !== id) await this.transferHubInbox(old, agent)
-    } else {
-      this.rotationRequested = false
-      await this.resumeHub()
-    }
+    if (target) this.host.activateHub(id)
+    this.rotationRequested = false
+    await this.resumeHub()
+    await this.transferHubInboxes(agent)
     return agent
   }
 
@@ -286,14 +281,68 @@ const withdrawnRelay = Symbol('withdrawn relay')
     await this.waitHubOperations()
     const rotation = this.host.beginHubRotation()
     const old = this.ctx.agents.get(rotation.fromSessionId as SessionId)
+    this.persistHubInbox(rotation, old)
     old?.cancel({ kind: 'user' }, { keepInbox: true })
     await old?.whenIdle()
+    this.persistHubInbox(rotation, old)
     const target = await this.ensure(rotation.targetSessionId, cwd, title, 'orchestrator')
     this.host.activateHub(target.id)
     this.rotationRequested = false
     await this.resumeHub()
-    await this.transferHubInbox(rotation.fromSessionId, target)
+    await this.transferHubInboxes(target)
     return target.id
+  }
+
+  private persistHubInbox(rotation: HubRotation, old: Agent | undefined): void {
+    const transferKey = KV.runtime.transfer(rotation.targetSessionId)
+    const saved = this.host.store.get(transferKey)
+    const messages = new Map<string, UserMessage>()
+    for (const message of saved?.messages ?? []) messages.set(message.id, message)
+    for (const message of old ? [...old.inbox.nextStep, ...old.inbox.nextTurn] : []) messages.set(message.id, message)
+    const transfer: HubInboxTransfer = { fromSessionId: rotation.fromSessionId, targetSessionId: rotation.targetSessionId,
+      messages: [...messages.values()] }
+    this.host.store.set(transferKey, transfer)
+  }
+
+  private async transferHubInboxes(target: Agent): Promise<void> {
+    const transfer = this.host.store.get(KV.runtime.transfer(target.id))
+    const generations = new Set(this.host.hubGenerations())
+    if (transfer) generations.add(transfer.fromSessionId)
+    generations.delete(target.id)
+    const ordered = transfer ? [transfer.fromSessionId, ...[...generations].filter(id => id !== transfer.fromSessionId)] : [...generations]
+    for (const generation of ordered) await this.transferHubInbox(generation, target)
+  }
+  private async transferHubInbox(oldId: string, target: Agent): Promise<void> {
+    const transferKey = KV.runtime.transfer(target.id)
+    const saved = this.host.store.get(transferKey)
+    let old = this.ctx.agents.get(oldId as SessionId)
+    if (!old) {
+      const result = await this.ctx.sessionController.resolveAgent(oldId as SessionId)
+      if (!('error' in result)) old = result.agent
+    }
+    const messages = new Map<string, UserMessage>()
+    for (const message of saved?.messages ?? []) messages.set(message.id, message)
+    for (const message of old ? [...old.inbox.nextStep, ...old.inbox.nextTurn] : []) messages.set(message.id, message)
+    if (!messages.size) {
+      if (saved) this.host.store.delete(transferKey)
+      return
+    }
+    for (const message of messages.values()) {
+      if (!await this.agentDelivery.holdsMessage(target, message.id)) {
+        target.followup(message)
+        await this.ctx.sessionPersistence.flush()
+        if (!await this.agentDelivery.holdsMessage(target, message.id)) throw new Error(`Hub inbox transfer was not persisted for ${message.id}`)
+      }
+      const source = message.source as { kind?: string; plugin?: unknown }
+      if (source.kind === 'dsh-superagent' || (source.kind === 'plugin' && source.plugin === 'dsh-superagent')) {
+        const requestId = String(message.id).replace(/^dsh-superagent:/, '')
+        const text = message.content.filter(block => block.type === 'text').map(block => block.text).join('')
+        this.host.store.set(KV.runtime.delivery(requestId), { hash: key(text), sessionId: target.id, at: new Date().toISOString() })
+      }
+      old?.inbox.remove(message.id)
+    }
+    this.host.store.delete(transferKey)
+    await this.ctx.sessionPersistence.flush()
   }
 
   private async resumeHub(): Promise<void> {
@@ -323,6 +372,11 @@ const withdrawnRelay = Symbol('withdrawn relay')
       }
       const result = await this.ctx.sessionController.resolveAgent(id as SessionId)
       if ('error' in result) throw result.error
+      if (await this.agentDelivery.holds(result.agent, requestId)) {
+        this.host.store.set(KV.runtime.delivery(requestId), { hash, sessionId: id, at: new Date().toISOString() })
+        accepted?.()
+        return
+      }
       await this.agentDelivery.send(result.agent, requestId, text, mode, this.host.lifetime, () => {
         authorize?.()
         if (this.rotationRequested || this.host.currentHubId() !== id) throw new Later('Hub Session changed during delivery')
@@ -349,22 +403,6 @@ const withdrawnRelay = Symbol('withdrawn relay')
     this.hubIdle = undefined
   }
 
-  private async transferHubInbox(oldId: string, target: Agent): Promise<void> {
-    const old = this.ctx.agents.get(oldId as SessionId)
-    if (!old || old === target) return
-    const inbox = [...old.inbox.nextStep, ...old.inbox.nextTurn]
-    for (const message of inbox) {
-      if (!old.inbox.remove(message.id)) continue
-      const source = message.source as { kind?: string; plugin?: unknown }
-      if (source.kind === 'dsh-superagent' || (source.kind === 'plugin' && source.plugin === 'dsh-superagent')) {
-        const requestId = String(message.id).replace(/^dsh-superagent:/, '')
-        const text = message.content.filter(block => block.type === 'text').map(block => block.text).join('')
-        this.host.store.set(KV.runtime.delivery(requestId), { hash: key(text), sessionId: oldId, at: new Date().toISOString() })
-      }
-      target.followup(message)
-    }
-    if (inbox.length) await this.ctx.sessionPersistence.flush()
-  }
 
   /** Resolves or creates a role session in `cwd`, sets its preset and model, decorates it, and renames it to `title`. */
   async ensure(id: string, cwd: string, title: string, role: PromptRole): Promise<Agent> {

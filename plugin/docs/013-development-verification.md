@@ -27,6 +27,8 @@ When changing the test runner, verify cross-checkout exclusion, nonzero exits, a
 
 In recovery tests that use real Git worktrees, wait for the controlled teardown to start and for the Runtime to become idle after release; assert delivery without a separate short polling deadline.
 
+After restart, a replayed Hub notice does not imply the Worker has reclaimed its writer. Before testing a replan that requires a confirmed writer, wait for the pending Worker delivery and check verified preparation and active writer identity on the Ticket.
+
 ## Worker implementation and test evidence
 
 For an authorized implementation Ticket, the Worker loads `dsh-worker-implement` before editing. Read `ticket/<id>` with `orchestrator_read` to confirm the verified worktree and pinned base. Keep edits and checks in that worktree.

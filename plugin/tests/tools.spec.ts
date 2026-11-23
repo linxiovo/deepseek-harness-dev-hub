@@ -418,7 +418,7 @@ it('reacquires changed evidence after the final retro and only queues with curre
   await h.restart(); await h.runtime.idle()
   expect(await inspect()).toMatchObject({ ready: false, status: 'return_for_recheck', missing: expect.arrayContaining(['repair:1']) })
   expect(await read(`plan/${id}/node/labels`)).not.toHaveProperty('delivery')
-}, 90_000)
+}, 180_000) // Full delivery cycle with fresh Git checks at each evidence boundary on Windows CI.
 
 it('checks documentation impact in the active worker candidate and never approves its semantics', async () => {
   const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot Add a backend API contract'))

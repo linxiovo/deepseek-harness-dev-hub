@@ -1075,6 +1075,11 @@ it('replans by replacing the Assignment but requires the failed check to actuall
   expect(await read(`plan/${id}/node/catalog/recovery/${first.failureId}`)).toMatchObject({ id: first.failureId })
   expect(h.jsonRelays(h.runtime.masterId, 'human-action')).toEqual([])
   const original = await read(`plan/${id}/node/catalog/recovery`)
+  // Replaying the Hub notification does not wait for the Worker to reclaim its verified worktree.
+  await h.runtime.effects.idle('delivery')
+  expect(await read(`ticket/${claim.ticketId}`)).toMatchObject({ execution: {
+    preparation: { state: 'verified' }, active_writer: { assignment: original.assignmentId, session: claim.session },
+  } })
   setRequiredChecks([])
   const repaired = await h.runTool(h.runtime.masterId, 'orchestrator_plan_replan', {
     planId: id, nodeId: 'catalog', revision: 1, failureId: original.failureId, reason: 'Isolate the repeated catalog contract failure', change: { kind: 'repair' },

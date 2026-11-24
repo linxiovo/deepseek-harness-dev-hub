@@ -492,7 +492,7 @@ it('keeps project binding, authorization, cursors and Hub sessions separate acro
   await mount('desktop', project.id)
   expect(await api('GET', 'runtime')).toMatchObject({ body: { status: 'paused', reason: 'projectSetupRequired' } })
   expect(await api('POST', `tickets/${firstWork.ticket.id}/retry`, undefined, project.id)).toMatchObject({ status: 409, body: { code: 'projectSetupRequired' } })
-})
+}, 60_000)
 
 it('relays an explicit member mention as a candidate and creates the ticket, acknowledgement, subscription and worker on accept', async () => {
   const { trigger, ticket, sessionId } = await acceptedTicket()

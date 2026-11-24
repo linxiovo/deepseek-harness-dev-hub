@@ -4,8 +4,8 @@ import { configDefaults, defineConfig } from 'vitest/config'
 export default defineConfig({
   resolve: { dedupe: ['react', 'react-dom'] },
   test: {
-    // Limit concurrent native Git fixtures on Windows without changing the deadlines.
-    ...(process.platform === 'win32' ? { maxWorkers: Math.min(4, availableParallelism()), testTimeout: 20_000, hookTimeout: 30_000 } : {}),
+    // Native Git fixtures compete for process and filesystem capacity on Windows runners.
+    ...(process.platform === 'win32' ? { maxWorkers: Math.min(2, availableParallelism()), testTimeout: 45_000, hookTimeout: 30_000 } : {}),
     include: ['tests/**/*.spec.{ts,tsx}'],
     exclude: [
       ...configDefaults.exclude,

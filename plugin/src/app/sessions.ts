@@ -8,6 +8,7 @@ import { realpathSync } from 'node:fs'
 import { dirname, isAbsolute, relative } from 'node:path'
 import { z } from 'zod'
 import { key, latestAssignment, liveTicket, type ReviewAxis, type Ticket } from '../core/index.ts'
+import { until } from '../executor/background.ts'
 import { mandateInstructions, ticketOfSession, workerSessionId } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { physicalPath } from '../infra/paths.ts'
@@ -291,7 +292,6 @@ const withdrawnRelay = Symbol('withdrawn relay')
   /** Quiesce the old physical Session, provision the deterministic target and atomically grant it Hub authority. */
   async rotateHub(cwd: string, title: string): Promise<string> {
     if (this.rotationTask) return this.rotationTask
-    this.rotationRequested = true
     const task = this.performRotation(cwd, title)
     this.rotationTask = task
     try { return await task }
@@ -299,6 +299,14 @@ const withdrawnRelay = Symbol('withdrawn relay')
   }
 
   private async performRotation(cwd: string, title: string): Promise<string> {
+    const current = this.host.currentHubId()
+    const active = current ? this.ctx.agents.get(current as SessionId) : undefined
+    // A claimed input belongs to the old turn until it completes. Do not fence or cancel it.
+    while (active?.status === 'running') {
+      if (await until(active.whenIdle(), this.host.lifetime) === false) throw new Error('Session dispatch is stopping')
+    }
+    if (this.host.closing()) throw new Error('Session dispatch is stopping')
+    this.rotationRequested = true
     const rotation = this.host.beginHubRotation()
     await this.waitHubOperations()
     const old = this.ctx.agents.get(rotation.fromSessionId as SessionId)

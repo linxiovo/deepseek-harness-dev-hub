@@ -1,10 +1,10 @@
 import type { Handoff, ProjectRef } from '../core/handoff.ts'
-import type { Plan } from '../core/plan.ts'
 import type { Trigger } from '../core/model.ts'
 import { KV } from '../kv.ts'
 import { promptFile } from './skill-files.ts'
 import type { Effects } from './effects.ts'
 import type { Handoffs } from './handoffs.ts'
+import type { Plans } from './plans.ts'
 import type { Store } from './store.ts'
 
 const LIMIT = 16_384, MAX_TICKETS = 64, MAX_HANDOFFS = 32, MAX_PLANS = 64, MAX_EVENTS = 128, MAX_EFFECTS = 40
@@ -16,6 +16,7 @@ type ResumeEffects = Pick<Effects, 'pendingSummary' | 'count'>
 export interface HubResumeInput {
   store: ResumeStore
   handoffs: ResumeHandoffs
+  plans: Pick<Plans, 'current'>
   effects: ResumeEffects
   project: ProjectRef | undefined
   hubId: string
@@ -43,7 +44,7 @@ function eventRecord(trigger: Trigger, state: EventRecord['state'], thread: stri
 }
 
 /** Read-only, bounded prompt and durable-state projection used when a Hub Session resumes. */
-export function hubResumeText({ store, handoffs, effects, project, hubId, epoch }: HubResumeInput): string {
+export function hubResumeText({ store, handoffs, plans: planReader, effects, project, hubId, epoch }: HubResumeInput): string {
   const prompt = promptFile('hub-resume')
   let textTruncated = false, handoffListsTruncated = false
   const excerpt = (text: string, max: number): string => {
@@ -92,11 +93,15 @@ export function hubResumeText({ store, handoffs, effects, project, hubId, epoch 
       ...(item.question.answer ? { answer: excerpt(item.question.answer, 220) } : {}) } } : {}),
     ...(item.spec ? { spec: { id: item.spec.id, read: `spec/${item.id}` } } : {}), read: `handoff/${item.id}` }))
 
-  const allPlans = store.keys(KV.plans.record.prefix).map(key => key.slice(KV.plans.record.prefix.length))
-    .map(id => store.get(KV.plans.record(id))).filter((plan): plan is Plan => !!plan)
-    .filter(plan => handoffCandidates.some(item => item.id === plan.handoffId)).sort((a, b) => b.id.localeCompare(a.id))
-  const plans = allPlans.slice(0, MAX_PLANS).map(plan => ({ id: plan.id, handoff_id: plan.handoffId, status: plan.status, read: `plan/${plan.id}` }))
-
+  // A registered Plan is keyed by its Handoff ID; a published Spec alone is not a Plan.
+  const registeredPlanKeys = new Set(store.keys(KV.plans.record.prefix))
+  const plannedHandoffs = handoffCandidates.filter(item => registeredPlanKeys.has(KV.plans.record(item.id)))
+  const plans = plannedHandoffs.slice(0, MAX_PLANS).map(({ id }) => {
+    const active = planReader.current(id)
+    if (!active || active.plan.handoffId !== id) throw new Error(`Hub resume cannot resolve the active Plan revision for Handoff ${id}`)
+    return { id, handoff_id: active.plan.handoffId, status: active.plan.status, goal: excerpt(active.goal, 300), revision: active.revision,
+      read: `plan/${id}`, revision_read: `plan/${id}/revision/${active.revision}` }
+  })
 
   const ticketCandidates = allTickets.filter(ticket => !ticket.ended || ticket.undelivered.length > 0)
   const ticketRows = ticketCandidates.slice(0, MAX_TICKETS).map(ticket => {
@@ -117,11 +122,11 @@ export function hubResumeText({ store, handoffs, effects, project, hubId, epoch 
   const actionCount = ticketCandidates.reduce((count, ticket) => count + (ticket.assignments.at(-1)?.report ? 1 : 0), 0)
   const summarizedEffects = effects.pendingSummary(MAX_EFFECTS + 1)
   const pendingEffects = summarizedEffects.slice(0, MAX_EFFECTS).map(({ kind, key, attempts, state }) => ({ kind, key, attempts, state }))
-  const counts = { tickets: ticketCandidates.length, handoffs: handoffCandidates.length, plans: allPlans.length, pending_events: pendingEventCount,
+  const counts = { tickets: ticketCandidates.length, handoffs: handoffCandidates.length, plans: plannedHandoffs.length, pending_events: pendingEventCount,
     actions: actionCount, pending_effects: effects.count() }
   const projectView = project ? { id: project.id, repository: project.repository, workspace: project.workspace } : null
   const truncated = { tickets: ticketCandidates.length > ticketRows.length, handoffs: handoffCandidates.length > activeHandoffs.length,
-    plans: allPlans.length > plans.length, pending_events: pendingEventCount > pendingEvents.length, actions: actionCount > actionRows.length,
+    plans: plannedHandoffs.length > plans.length, pending_events: pendingEventCount > pendingEvents.length, actions: actionCount > actionRows.length,
     pending_effects: effects.count() > pendingEffects.length, text: textTruncated, handoff_lists: handoffListsTruncated }
   const result = { hub_id: hubId, epoch, project: projectView, tickets: ticketRows, handoffs: activeHandoffs, plans,
     pending_events: pendingEvents, actions: actionRows, pending_effects: pendingEffects, counts, truncated }

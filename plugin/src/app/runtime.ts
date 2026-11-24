@@ -232,7 +232,7 @@ export class Runtime extends Service implements SourceHost {
         beginHubRotation: () => authority.beginRotation(),
         activateHub: id => { authority.activate(id); runtime.masterId = id; projectMeter.bind({ session_id: id, role: 'hub' }) },
         hubResume: () => { const resume = authority.pendingResume(); return resume && { ...resume,
-          text: hubResumeText({ store, handoffs, effects, project: installation.project, hubId: runtime.hubId, epoch: resume.epoch }) } },
+          text: hubResumeText({ store, handoffs, plans, effects, project: installation.project, hubId: runtime.hubId, epoch: resume.epoch }) } },
         hubResumeDelivered: requestId => authority.resumeDelivered(requestId),
         lifetime: this.lifetime, boundWorkspace: project?.workspace,
         relayAvailable: requestId => this.planIntegration.relayAvailable(requestId),

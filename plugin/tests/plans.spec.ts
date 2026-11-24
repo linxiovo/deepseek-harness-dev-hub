@@ -726,6 +726,7 @@ it('counts a forked review once and keeps one Hub call across two active Tickets
   await expect(h.runTool(catalog.session, 'orchestrator_read', { resource: `ticket/${catalog.ticketId}/meter` })).rejects.toThrow()
 
   // Rotate through the public Runtime seam while the business child remains unloaded.
+  h.agents.get(master)!.status = 'idle'
   const rotated = await h.runtime.rotateHub()
   await h.restart()
   expect(h.runtime.masterId).toBe(rotated)
@@ -1205,6 +1206,45 @@ async function reviewRequirement(proposalId: string, status: 'within-handoff' | 
   return verdict.reviewId
 }
 
+it('resumes the approved Plan goal after restart without promoting pending or denied changes', async () => {
+  const { id, register } = await publish()
+  await h.runtime.idle()
+  await register(splitDraft)
+  const hub = h.runtime.masterId
+  const Proposal = z.object({ proposalId: z.uuid(), requestMessageId: z.string() })
+  const propose = async (goal: string) => {
+    h.sendUserMessage(hub, JSON.stringify({ intent: 'change-plan-requirements', planId: id,
+      authorizedScope: brief.authorization.scope, goal, changes: [] }))
+    return Proposal.parse(await h.runTool(hub, 'orchestrator_plan_requirements', { mode: 'preview' }))
+  }
+  const approve = (proposal: z.infer<typeof Proposal>, scopeReviewId: string) => {
+    h.sendUserMessage(hub, JSON.stringify({ approved: true, ...proposal, scopeReviewId, scopeDecision: 'within-handoff' }))
+    return h.runTool(hub, 'orchestrator_plan_requirements', { mode: 'apply', proposalId: proposal.proposalId })
+  }
+  const goal = 'Show each shopper their own saved products in most-recent-first order.'
+  const approved = await propose(goal)
+  expect(await approve(approved, await reviewRequirement(approved.proposalId))).toMatchObject({ status: 'applied', revision: 2 })
+  const deniedGoal = 'Share every shopper’s saved products publicly.'
+  const denied = await propose(deniedGoal)
+  const denial = await reviewRequirement(denied.proposalId, 'outside-handoff', 'Private lists must not be shared.')
+  await expect(approve(denied, denial)).rejects.toThrow(/outside the original Handoff/i)
+  const pendingGoal = 'Let a shopper group their private saved products by category.'
+  await propose(pendingGoal)
+
+  await h.restart()
+  const successor = await h.runtime.rotateHub()
+  const resume = h.deliveries.mock.calls.map(([message]) => message).find(message =>
+    message.sessionId === successor && message.id === 'dsh-superagent:hub-resume:1')
+  expect(resume).toBeDefined()
+  const text = resume!.text
+  expect(text).not.toContain(deniedGoal)
+  expect(text).not.toContain(pendingGoal)
+  const summary = JSON.parse(text.slice(text.lastIndexOf('\n') + 1))
+  expect(summary).toMatchObject({ handoffs: [{ id, goal: brief.goal, authorization: brief.authorization, read: `handoff/${id}` }],
+    plans: [{ id, handoff_id: id, revision: 2, goal, read: `plan/${id}`, revision_read: `plan/${id}/revision/2` }] })
+  expect(await read(summary.plans[0].revision_read)).toMatchObject({ goal, cause: { kind: 'requirements', proposalId: approved.proposalId } })
+}, 30_000)
+
 it('previews a product replan before applying an exact, durable direct approval', async () => {
   const { id, catalogClaim, accountsClaim } = await dispatchedFanIn()
   let hub = h.runtime.masterId
@@ -1323,6 +1363,7 @@ it('previews a product replan before applying an exact, durable direct approval'
   retired.status = 'running'
   retired.followup({ id: 'retired-product-approval', role: 'user', source: { kind: 'user' }, content: [{ type: 'text',
     text: JSON.stringify(approval(proposal, scopeReviewId)) }] } as never)
+  retired.status = 'idle'
   hub = await h.runtime.rotateHub()
   await h.runtime.idle()
   await expect(apply(proposal)).rejects.toThrow(/single text message/i)

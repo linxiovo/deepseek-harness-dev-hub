@@ -1,3 +1,4 @@
+import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import { afterEach, beforeEach, expect, it } from 'vitest'
 import { KV } from '../src/kv.ts'
 import { feishu, startRuntime, type Host } from './fixtures/host.ts'
@@ -11,6 +12,7 @@ it('rotates the Hub authority without losing a queued direct input or replaying 
   h.runtime.receive(feishu('2', '补充一个待处理事实', { mentions: [], root_id: 'om_1', sender_id: 'ou_guest' }))
   const oldId = h.runtime.masterId
   const old = h.agents.get(oldId)!
+  old.status = 'idle' // The fixture does not finish the earlier assessment turn automatically.
   const direct = { id: 'direct-user-pending', role: 'user', content: [{ type: 'text', text: '请继续处理这个项目' }], source: { kind: 'user' } }
   old.inbox.nextTurn.push(direct as never)
   const dispatchesBefore = h.deliveries.mock.calls.filter(([delivery]) => delivery.sessionId === sessionId).length
@@ -41,6 +43,29 @@ it('rotates the Hub authority without losing a queued direct input or replaying 
  expect(h.runtime.masterId).toBe(rotated)
  expect(h.agents.get(oldId)).toBeUndefined()
  expect(h.agents.get(rotated)).toBeDefined()
+})
+
+it('lets the current Hub finish a claimed direct input before granting authority to its successor', async () => {
+ const oldId = h.runtime.masterId
+ const old = h.agents.get(oldId)!
+ const message = { id: 'direct-already-claimed', role: 'user', content: [{ type: 'text', text: '请处理已经认领的工作' }], source: { kind: 'user' } }
+ old.followup(message as never)
+ // DSH removes claimed input from its inbox; the lightweight fixture retains it.
+ expect(old.inbox.nextTurn.shift()?.id).toBe(message.id)
+ expect(old.status).toBe('running')
+ const rotation = h.runtime.rotateHub()
+ try {
+   await new Promise<void>(resolve => setImmediate(resolve))
+   expect(h.runtime.masterId).toBe(oldId)
+   expect(old.status).toBe('running')
+ } finally {
+   old.status = 'idle'
+   await rotation
+ }
+ expect(h.runtime.masterId).toBe(await rotation)
+ expect(h.runtime.masterId).not.toBe(oldId)
+ expect(h.deliveries.mock.calls.filter(([delivery]) => delivery.id === message.id).map(([delivery]) => delivery.sessionId))
+   .toEqual([oldId])
 })
 
 it('delivers a post-rotation assessment to the current Hub Session', async () => {
@@ -99,14 +124,31 @@ it('reconciles a transferred input persisted before its receipt without deliveri
  const message = { id: 'dsh-superagent:late-transfer', role: 'user', content: [{ type: 'text', text: '一条待回执的迁移输入' }],
    source: { kind: 'dsh-superagent', form: 'relay' } }
  h.runtime.store.set(KV.runtime.transfer(oldId), [message as never])
- let flush = 0
- h.hooks.flushSessionLog = () => { if (++flush === 3) throw new Error('interrupt after target delivery receipt') }
+ const target = h.agents.get(rotated)!
+ target.status = 'idle' // Let the test host claim and record the transferred message.
+ const isTransferred = () => h.runtime.store.get(KV.runtime.transferred(oldId, message.id))
+ const isTargetMessage = (event: SessionEvent) => event.type === 'user/message' && event.data.id === message.id
+ let interrupted = false
+ h.hooks.flushSessionLog = () => {
+   if (!isTransferred() && h.deliveries.mock.calls.some(([delivery]) => delivery.sessionId === rotated && delivery.id === message.id)) {
+     interrupted = true
+     throw new Error('interrupt before recording the inbox transfer receipt')
+   }
+ }
  h.runtime.effects.enqueue('hubInbox', oldId, {})
  await h.runtime.effects.idle('hubInbox')
+ expect(interrupted).toBe(true)
+ expect(isTransferred()).toBeUndefined()
+ expect(h.runtime.store.get(KV.runtime.transfer(oldId))).toEqual([message])
+ {
+   await using log = await h.ctx.sessionPersistence.open(rotated as SessionId, 'read')
+   expect((await log.read(0, 512)).events.filter(isTargetMessage)).toHaveLength(1)
+ }
  expect(h.deliveries.mock.calls.filter(([delivery]) => delivery.id === message.id).map(([delivery]) => delivery))
    .toEqual([expect.objectContaining({ sessionId: rotated, id: message.id })])
  h.hooks.flushSessionLog = undefined
  await h.restart()
+ expect(isTransferred()).toBe(true)
  expect(h.deliveries.mock.calls.filter(([delivery]) => delivery.id === message.id).map(([delivery]) => delivery))
    .toEqual([expect.objectContaining({ sessionId: rotated, id: message.id })])
 })

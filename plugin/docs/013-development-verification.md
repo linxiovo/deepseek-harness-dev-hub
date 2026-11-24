@@ -21,11 +21,13 @@ Set the command timeout using the most recent duration for that check on the pla
 | Mainline queue or write permissions | `pnpm test tests/mainline-queue.spec.ts tests/mainline-git.spec.ts`; verify live server enforcement separately with [Verify queue-only writes on GitHub](006-deployment.md#verify-queue-only-writes-on-github). |
 | Plan integration and artifact delivery | Run `pnpm test tests/plan-integration-crash.spec.ts tests/actions-evidence.spec.ts tests/plan-artifacts.spec.ts tests/mainline-queue.spec.ts tests/http.spec.ts tests/panel-execution.spec.tsx tests/navigation.spec.ts`; cover SIGKILL before and after dispatch, a 4xx during pause, exact-attempt manifest and checksum binding, branch movement and reruns during verification, package loss before the Hub relay, restart with a damaged run directory, project-scoped download, Harness Ticket deep links and the release-verification panel state. |
 
-Run `pnpm check` once at the end. Vitest still limits concurrent Git fixtures within a Windows run. Local verification and CI use the same command and test coverage.
+Run `pnpm check` once at the end. Local verification and CI use the same command and test coverage. On Windows, Vitest caps parallel test files at two to limit contention between native Git fixtures and allows 45 seconds per test by default. The multi-project desktop and headless restart case has a 60-second deadline.
 
 When changing the test runner, verify cross-checkout exclusion, nonzero exits, and interrupted-run release with `node --test tests/probes/test-runner.mjs` from `plugin/`. Run this standalone probe while no other test runner is active, not inside Vitest.
 
 In recovery tests that use real Git worktrees, wait for the controlled teardown to start and for the Runtime to become idle after release; assert delivery without a separate short polling deadline.
+
+The scoped Plan credential acceptance case launches three real Git worktrees and restarts the Runtime three times. It has a 60-second deadline and fails immediately if the interrupted verification returns before invoking the verifier. For fixture cleanup after shutdown, use bounded retries for transient Windows file locks; a directory that remains locked still fails the test.
 
 After restart, a replayed Hub notice does not imply the Worker has reclaimed its writer. Before testing a replan that requires a confirmed writer, wait for the pending Worker delivery and check verified preparation and active writer identity on the Ticket.
 

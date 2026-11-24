@@ -135,7 +135,7 @@ async function start() {
         ctx.emit('agent/status', { agent, status: 'running' } as never)
       }
     }
-    const session = { id: sessionId, header: { cwd: workspaceId }, snapshotEvents: () => [], requestHeader: () => undefined, append: () => {} }
+    const session = { id: sessionId, header: { id: sessionId, cwd: workspaceId }, snapshotEvents: () => [], requestHeader: () => undefined, append: () => {} }
     let status = 'idle'
     const idle: (() => void)[] = []
     const agent = { id: sessionId, ctx: agentCtx, inbox, followup: deliver(inbox.nextTurn), steer: deliver(inbox.nextStep), inject: record,

@@ -36,6 +36,8 @@ Startup registers management routes, initializes the installation binding and ru
 
 Source plugins inject Runtime as the `orchestrator` service through the narrow `SourceHost` interface.
 Ticket review evidence is submitted only by a Worker descendant through `orchestrator_review_submit`; `Sessions` binds the real descendant Session ID, `DshExecutor` verifies the clean current worktree HEAD against the pinned base, and the Engine atomically records evidence on the current Assignment and writer generation. `ticket/<id>/reviews` returns current-generation evidence and pending when the live Worker lease, worktree HEAD or cleanliness no longer matches; `ticket/<id>/review/<review-id>` reads one persisted review.
+`hubResumeText` (`src/app/hub-resume.ts`) builds a read-only Hub continuation from the mounted project's durable records. The resume input and recovery contract are described in `plugin/docs/010-session-boundaries.md` under Hub Session rotation.
+
 
 | Part | Module | Does |
 | --- | --- | --- |
@@ -194,6 +196,7 @@ Failures retry with exponential backoff. Throwing `Later` defers work without co
 | `mainlineDelivery` | MainlineQueue | Rechecks one verified intent for [formal Plan closure](003-execution.md#formal-plan-closure) | 8, only when configured | Resumes pending work on restart; evidence gaps stay on the Ticket until rechecked |
 | `planIntegration` | PlanIntegration | Verifies the actual target, full regression jobs and the attempt-matched package after all formal Plan receipts exist | 4, only when configured and unpaused | Persists the exact revision/configuration before dispatch; resumes by observing that context |
 | `requirementScopeReview` | Runtime | Dispatches the sealed requirement scope comparison to its read-only reviewer | 1, when configured and unpaused | Reconciles the same Session and dispatch on restart |
+| `hubInbox` | Sessions | Moves a message claimed by a retired physical Hub generation into the current Hub through a durable per-source inbox queue, marking transferred user input as a relay rather than a new direct approval | 1 per current target | 2 s doubling to 60 s; resumes from the persisted queue after restart |
 | `relay` | Sessions | Steers a worker's report or question, or a person's follow-up, into the main Session's turn | 1, in queue order | 2 s doubling to 60 s |
 | `notice` | Sessions | Injects a notice into the main Session without waking it | 1, in queue order | 2 s doubling to 60 s |
 | `reply` | Outbox | Sends a message for a Channel through its Source, after the earlier messages of its Ticket to its conversation that have not failed three times; withdrawing the message cancels it | 1, none while paused | 5 s doubling to 300 s; one whose Source is off, or behind an earlier message, tries again after 5 s |
@@ -428,12 +431,15 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
 | `src/app/sessions.ts` | Sessions |
+| `src/app/hub-authority.ts` | `HubAuthority`: durable project Hub identity, monotonic physical Session generations, and crash-recoverable rotation intent |
+| `src/app/hub-session-root.ts` | `openHubRoot` creates a successor exclusively and verifies its own first log record, original root, workspace, and preset before resolving it; `matchesHubRoot` verifies the live Agent at ingress. |
+| `src/app/hub-resume.ts` | `hubResumeText`: bounded continuation from mounted durable tickets, unresolved Source events, authorized Handoffs, Plans, and effect metadata with readable resource pointers |
 | `src/app/session-meter.ts` | `SessionMeter`: one Session's context snapshot and cumulative usage from its durable event log, with provenance, missing and in-flight ranges, and the persisted exclusive cursor; forked prefixes are excluded |
 | `src/app/project-meter.ts` | `ProjectMeter`: project-local Session bindings and deduplicated scoped usage; contract in `plugin/docs/014-project-metering.md` |
 | `src/app/run-limits.ts` | Mounted project and Ticket budget reservations, authoritative settlements and scoped hold notifications; contract in `016-run-limits.md` |
 | `src/app/model-admission.ts` | Pre-provider DSH stream admission and once-per-attempt usage receipt |
 | `src/app/meter-recovery.ts` | Restores detached review attribution from durable review receipts and verified Session parent metadata |
-| `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
+| `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id across restored and rotated Hub Sessions |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
 | `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers |
@@ -488,6 +494,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
+| `src/client/hub-conversation.ts` | Follows a retired Hub to its published successor inside the mounted project's native Web conversation |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
 | `src/client/provider.tsx` | What every page reads from its host: copy, calls, navigation, notices, the state poll, and `restart`, which reads the state quickly while dsh-superagent restarts |
 | `src/client/api.ts` | Calls and polls of the management API, typed by `src/app/api.ts`, and the Decision filters of the Eval status |
@@ -548,6 +555,8 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/followups.spec.ts` | A person's follow-up on a Ticket's Thread: its notice to the main Session, the tools that act on it, what a burst costs; a worker's hand-back and context follow, and the main Session's note |
 | `tests/health.spec.ts` | One health entry per part, each cleared by its own next success |
 | `tests/delivery.spec.ts` | `AgentDelivery` |
+| `tests/hub-rotation.spec.ts` | Hub input fencing, crash windows before and after durable history, request retry deduplication, successor ownership, and stable Worker Assignment |
+| `tests/hub-conversation.spec.ts` | Native Web conversation continuation, including stale lookups and selecting another conversation while the host's catalog reloads |
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
 | `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |

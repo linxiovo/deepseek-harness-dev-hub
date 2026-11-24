@@ -2,8 +2,11 @@
  * Typed key-value store keys and key families grouped by the single component that owns and writes each family.
  * Readers and writers refer to a record by its entry here so each key is spelled once with its value type.
  */
+import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Handoff, ProjectRef, Spec } from './core/handoff.ts'
 import type { Plan, PlanMessage, PlanNodeState } from './core/plan.ts'
+import type { HubAuthorityState } from './app/hub-authority.ts'
+export type HubDeliveryReceipt = { hash: string; sessionId: string; at: string }
 import type { TestHistory } from './core/delivery-check.ts'
 import type { PlanIntegrationView } from './core/plan-integration.ts'
 import type { PromptVersion } from './app/prompts.ts'
@@ -46,8 +49,15 @@ export const KV = {
     proposal: family<number>('ticket-prompt-proposal:'),
     /** The built-in text of a prompt part an override was edited from, by its `base`, which shows what an upgrade changed. */
     builtIn: family<string, [base: string]>('prompt-built-in:') },
-  /** Runtime: the main Session's ID. */
-  runtime: { masterId: record<string>('master-id') },
+  /** Runtime: authority is canonical; masterId mirrors its physical Session and seeds only one-time legacy import. */
+  runtime: { masterId: record<string>('master-id'), authority: record<HubAuthorityState>('hub-authority'),
+    delivery: family<HubDeliveryReceipt, [requestId: string]>('hub-delivery:'),
+    transfer: family<UserMessage[], [fromSessionId: string]>('hub-inbox-transfer:'),
+    transferred: family<string, [fromSessionId: string, messageId: string]>('hub-inbox-consumed:', (from, id) => JSON.stringify([from, id])),
+    inboxTarget: family<string, [fromSessionId: string, messageId: string]>('hub-inbox-target:', (from, id) => JSON.stringify([from, id])),
+    inboxRequest: family<{ sessionId: string; messageId: string }, [kind: 'rpc' | 'message', id: string]>(
+      'hub-inbox-request:', (kind, id) => JSON.stringify([kind, id])),
+    inboxFence: family<number, [sessionId: string]>('hub-inbox-fence:') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
   sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
   /** Session meter: durable exclusive log cursor and its cumulative, own-event projection. */

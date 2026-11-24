@@ -185,8 +185,8 @@ function Pages({ route, openTab, deploymentForm, target }: { route: Route; openT
         paused={!!state?.paused} />
       case 'execution': return route.id !== undefined ? <TicketPage key={route.id} id={route.id} />
         : state ? <ExecutionStatus filter={route.query?.filter ?? 'open'} state={state} reload={reload} /> : waiting
-      case 'settings': return state ? <SettingsPage key={state.masterId} group={route.query.group} query={route.query} state={state}
-        deploymentForm={deploymentForm} /> : waiting
+      case 'settings': return state ? <SettingsPage key={state.projectId ? undefined : state.masterId} state={state}
+        group={route.query.group} query={route.query} deploymentForm={deploymentForm} /> : waiting
     }
   })()
   return <div className="dt-page">

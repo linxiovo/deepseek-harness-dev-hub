@@ -34,6 +34,8 @@ export interface EffectPayloads {
   planIntegration: Record<string, never>
   /** Steer a report or a candidate into the main Session; the key is the request ID. */
   relay: { text: string }
+  /** Move a retired Hub's saved pending input; the key is the originating physical Session. */
+  hubInbox: Record<string, never>
   /** Ask the Hub to revisit a stalled technical failure without holding the user-facing relay queue. */
   replanReview: { ticketId: string; failureId: string }
   /** Inject a notice into the main Session without waking it; the key names what it reports, such as `prompts`. */
@@ -42,6 +44,8 @@ export interface EffectPayloads {
   reply: Record<string, never>
 }
 export type EffectKind = keyof EffectPayloads
+export type EffectSummary = { kind: EffectKind; key: string; attempts: number; state: 'waiting' | 'retrying' | 'parked'; error?: string }
+
 interface Handler<K extends EffectKind> {
   run: (payload: EffectPayloads[K], key: string) => Promise<void | typeof Park>
   /** How many may run at once now; 0 holds the kind, such as while processing is paused. */
@@ -95,6 +99,12 @@ export class Effects {
     return key === undefined ? !!this.store.db.prepare('SELECT 1 FROM effect WHERE kind = ? LIMIT 1').get(kind) : !!this.store.db.prepare('SELECT 1 FROM effect WHERE kind = ? AND key = ?').get(kind, key)
   }
   count(): number { return Number(this.store.db.prepare('SELECT count(*) AS total FROM effect').get()!.total) }
+  pendingSummary(limit = 64): EffectSummary[] {
+    const rows = this.store.db.prepare('SELECT kind, key, attempts, error, due FROM effect ORDER BY seq LIMIT ?').all(limit) as unknown as
+      { kind: EffectKind; key: string; attempts: number; error: string; due: number }[]
+    return rows.map(row => ({ kind: row.kind, key: row.key, attempts: row.attempts,
+      state: row.due === PARKED_DUE ? 'parked' : row.attempts ? 'retrying' : 'waiting', ...(row.error ? { error: row.error } : {}) }))
+  }
   /** Drops a queued row by kind and key; if it is already running, that attempt finishes normally. */
   cancel(kind: EffectKind, key: string): void {
     this.store.db.prepare('DELETE FROM effect WHERE kind = ? AND key = ?').run(kind, key)

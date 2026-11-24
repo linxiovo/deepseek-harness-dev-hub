@@ -234,3 +234,16 @@ it('reuses an identical initialization after restart and rejects changes to the 
     .toThrow(/legacy project cannot have initial settings/i)
   expect(catalog.list()).toEqual([project])
 })
+
+it('projects the active managed Hub physical Session ID through the public project view', () => {
+  const project = catalog.register({ repository: 'Owner/Rotating', workspace: workspace('rotating') })
+  const currentHub = 'orchestrator-rotated-physical-session'
+  const installation = new Installation({ machine: testMachine({ stateDir }), signal: new AbortController().signal,
+    probe: async () => '', restart: vi.fn(), configured: () => true, paused: () => false, recoveryPending: () => false,
+    recoverable: () => ({ assignments: 0, handoffs: 0, effects: 0 }), settings: () => SettingsSchema.parse({}),
+    legacyHubId: () => currentHub, legacyHandoffsMatch: () => true })
+  try {
+    expect(installation.projects()).toMatchObject({ activeProjectId: project.id, projects: [expect.objectContaining({
+      id: project.id, hubSessionId: currentHub })] })
+  } finally { installation.close() }
+})

@@ -10,6 +10,7 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-skill'
 import type {} from '@deepseek-ai/dsh-subprocess'
+import { DatabaseSync } from 'node:sqlite'
 import { existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
@@ -38,6 +39,7 @@ import { InstallationError } from './installation-api.ts'
 import { Planning } from './planning.ts'
 import { Plans, planDeliveryWriter } from './plans.ts'
 import { PlanRequirements } from './plan-requirements.ts'
+import { hubResumeText } from './hub-resume.ts'
 import { PlanStagnation } from './plan-stagnation.ts'
 import { PlanIntegration } from './plan-integration.ts'
 import { ScopedAttention } from './scoped-attention.ts'
@@ -66,6 +68,7 @@ import { RunLimits } from './run-limits.ts'
 import { installModelAdmission } from './model-admission.ts'
 import { restoreReviewBindings } from './meter-recovery.ts'
 import { PLANNER_PRESET, ROUTER_PRESET, Sessions, splitterSessionId, WORKER_PRESET } from './sessions.ts'
+import { HubAuthority } from './hub-authority.ts'
 import { bindRequiredChecks, Settings } from './settings.ts'
 import { sourceContextOf, type SourceContextDeps } from './source-context.ts'
 import { approveMainline, authorizeMainline, inspectFormalDelivery, type ResourceHost } from './resources.ts'
@@ -113,7 +116,9 @@ export class Runtime extends Service implements SourceHost {
   readonly installation: Installation
   private readonly board = new HealthBoard()
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
-  readonly masterId: string
+  masterId: string
+  readonly hubId: string
+  private readonly hubAuthority: HubAuthority
   private readonly sourceLinks = new TextCache(200_000)
   private readonly stopped = new AbortController()
   private disposeHttp?: () => Promise<void>
@@ -145,7 +150,7 @@ export class Runtime extends Service implements SourceHost {
         probe: workerProbe(ctx.subprocess, machine.stateDir, machine.stateDir, this.lifetime),
         restart: () => { setTimeout(restart, 0) }, configured: () => this.configured(), paused: () => this.store.settings().paused,
         recoveryPending: () => this.recoveryPending,
-        recoverable: () => this.recoverable(), settings: () => this.store.settings(), legacyHubId: () => this.legacyHubId(machine.stateDir),
+        recoverable: () => this.recoverable(), settings: () => this.store.settings(), legacyHubId: stateDir => this.legacyHubId(stateDir),
         legacyHandoffsMatch: ({ repository, workspace }) => this.handoffs.list().every(handoff =>
           handoff.project.repository.toLowerCase() === repository.toLowerCase() && sameDirectory(handoff.project.workspace, workspace)) })
       const project = installation.project
@@ -167,8 +172,10 @@ export class Runtime extends Service implements SourceHost {
       const deployed = () => setup.configured()
         ? environmentOf({ deployment: setup.deployment, sources: this.sources, settings: store.settings() }) : undefined
       const feishu = () => setup.configured() && !!setup.deployment.feishu
-      const masterId = this.masterId = store.get(KV.runtime.masterId) ?? projectHubId(installation.stateDir)
-      store.set(KV.runtime.masterId, masterId)
+      const legacyMasterId = store.get(KV.runtime.masterId) ?? projectHubId(installation.stateDir)
+      const authority = this.hubAuthority = new HubAuthority(store, legacyMasterId, projectHubId(installation.stateDir))
+      this.hubId = authority.hubId()
+      const masterId = this.masterId = authority.visibleSessionId()
       const commands = this.commands = new Commands(() => setup.deployment, setup.commandEnvironment, this.lifetime)
       const meter = this.meter = new SessionMeter({ context: ctx, store, lifetime: this.lifetime })
       const board = this.board
@@ -211,7 +218,7 @@ export class Runtime extends Service implements SourceHost {
       const links: LinkHost = { store, links: this.sourceLinks, commands, sources, lifetime: this.lifetime }
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
-      const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx,
+      const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, get masterId() { return runtime.masterId }, context: ctx,
         meter: { read: (id, signal) => this.readScopedMeter(id, signal) }, plans,
         rulesManifestMaxBytes: () => promptByteLimit(machine.promptMaxChars.get()),
         reviewGeneration: ticketId => runtime.executor?.reviewGeneration(ticketId),
@@ -220,6 +227,21 @@ export class Runtime extends Service implements SourceHost {
         promptVersion: id => this.sessions.promptVersion(id),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
       const sessions: Sessions = this.sessions = new Sessions({ context: ctx, store, projectMeter, prompts, effects, health: board.claim('models'), masterId,
+        currentHubId: () => authority.currentSessionId(), readyHubId: () => authority.readySessionId(), hubTargetId: () => authority.targetSessionId(),
+        hubGenerations: () => authority.generations(), isHubGeneration: id => authority.isGeneration(id),
+        hubCreation: id => authority.creation(id), hubRequiresProof: id => authority.generationEpoch(id) !== 0,
+        hubRotation: () => authority.rotation(), beginHubRotation: (cwd, offset, turn) => authority.beginRotation(cwd, offset, turn),
+        sealHubRotation: cwd => authority.sealRotation(cwd),
+        activateHub: id => {
+          authority.activate(id, epoch => hubResumeText({ store, handoffs, plans, effects, project: installation.project, hubId: runtime.hubId, epoch }))
+          projectMeter.bind({ session_id: id, role: 'hub' })
+        },
+        hubResume: () => {
+          const resume = authority.pendingResume()
+          return resume && { ...resume, text: resume.text ?? hubResumeText({ store, handoffs, plans, effects,
+            project: installation.project, hubId: runtime.hubId, epoch: resume.epoch }) }
+        },
+        hubResumeDelivered: requestId => { authority.resumeDelivered(requestId); runtime.masterId = authority.visibleSessionId() },
         lifetime: this.lifetime, boundWorkspace: project?.workspace,
         relayAvailable: requestId => this.planIntegration.relayAvailable(requestId),
         closing: () => this.closing(), environment, ownsPlanner: id => handoffs.get(id) !== undefined,
@@ -314,7 +336,7 @@ export class Runtime extends Service implements SourceHost {
         repliedTo: trigger => repliedTo({ store, sources }, trigger) })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
-        deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
+        deliver: (id, text) => sessions.prompt(runtime.masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
       const outbox = this.outbox = new Outbox({ store, effects, commands, paused: () => this.paused(), sources: {
         instance: sources.instance.bind(sources), channelAllowed: channel => channel.address.bindingEpoch !== undefined
           ? channel.source === FEISHU : sources.channelAllowed(channel),
@@ -405,13 +427,13 @@ export class Runtime extends Service implements SourceHost {
         }
         try {
           const { planId, nodeId } = plan
-          await sessions.prompt(masterId, requestId, JSON.stringify({ kind: 'plan-replan-review', plan: `plan/${planId}`,
+          await sessions.prompt(this.masterId, requestId, JSON.stringify({ kind: 'plan-replan-review', plan: `plan/${planId}`,
             failure: `plan/${planId}/node/${nodeId}/recovery/${failureId}`, instructions: promptFile('plan-replan-relay') }), 'steer', authorize)
         } catch (error) { if (error !== withdrawn) throw error }
       }, { limit: () => this.configured() && !this.closing() ? 1 : 0 })
       const requirements = new PlanRequirements({ store, plans, handoffs, limits: runLimits,
         stop: (ticketId, reason) => { engine.stopTicket(ticketId, reason) }, authorize: () => installation.assertNewWork(),
-        requestScopeReview: id => effects.enqueue('requirementScopeReview', id, {}) })
+        requestScopeReview: id => effects.enqueue('requirementScopeReview', id, {}), isHubGeneration: id => authority.isGeneration(id), isCurrentHub: id => authority.isCurrent(id) })
       const scopeDispatchOpen = () => {
         if (this.paused()) return false
         const state = runLimits.view()?.budget.state
@@ -554,10 +576,28 @@ export class Runtime extends Service implements SourceHost {
   }
   checkSetup(): void { if (this.recoveryPending) this.setup.restart(); else this.setup.check() }
   receive(trigger: Trigger): ReceiveResult { return this.passes.receive(trigger) }
+  /** Rotate the physical Hub Session while retaining the project identity and durable work state. */
+  async rotateHub(): Promise<string> {
+    this.installation.assertNewWork()
+    const cwd = this.installation.project?.workspace ?? this.store.settings().executor.repository ?? this.machine.stateDir
+    return this.sessions.rotateHub(cwd, 'dsh-superagent orchestrator')
+  }
+  /** Current physical Hub Session ID; the project identity is `hubId`. */
+  get hubSessionId(): string { return this.masterId }
+  /** The published successor for a physical conversation retired by the mounted project. */
+  hubConversation(sessionId: string): string | undefined {
+    const target = this.hubAuthority.continuation(sessionId)
+    return target && this.sessions.isPublishedHub(target) ? target : undefined
+  }
+
   async idle(): Promise<void> {
+    await this.effects.idle('hubInbox')
+    await this.sessions.idleHubTransfers()
     await this.passes.idle()
     await this.executor.idleHandoffs()
     await this.passes.idle()
+    await this.effects.idle('hubInbox')
+    await this.sessions.idleHubTransfers()
   }
   pump(): Promise<void> { return this.passes.pump() }
   sendReplies(): Promise<void> { return this.outbox.sent() }
@@ -619,9 +659,15 @@ export class Runtime extends Service implements SourceHost {
     if (sameDirectory(stateDir, this.machine.stateDir)) return this.masterId
     const path = join(stateDir, 'orchestrator.sqlite')
     if (!existsSync(path)) return projectHubId(stateDir)
-    const store = new Store(path)
-    try { return store.get(KV.runtime.masterId) ?? projectHubId(stateDir) }
-    finally { store.close() }
+    const database = new DatabaseSync(path, { readOnly: true })
+    try {
+      const row = database.prepare('SELECT value FROM kv WHERE key = ?').get(KV.runtime.masterId) as { value: string } | undefined
+      if (row) {
+        const saved = JSON.parse(row.value) as unknown
+        if (typeof saved === 'string' && saved.trim()) return saved
+      }
+      return projectHubId(stateDir)
+    } finally { database.close() }
   }
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
@@ -667,7 +713,9 @@ export class Runtime extends Service implements SourceHost {
     }
     if (!project) this.sessions.install()
     this.executor.install()
-    await this.sessions.ensure(this.masterId, project?.initial ? project.workspace : this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
+    const initialHubCwd = project?.initial ? project.workspace : this.machine.stateDir
+    const hubCwd = this.hubAuthority.rotation() ? project?.workspace ?? settings.executor.repository ?? initialHubCwd : initialHubCwd
+    await this.sessions.ensureHub(hubCwd, 'dsh-superagent orchestrator')
     if (this.closing()) return
     if (project && !await this.reconcilePulls()) return
     for (const id of this.settings.syncable()) await this.settings.sync(id).catch(() => { /* sync() records its failure in health. */ })
@@ -710,9 +758,9 @@ export class Runtime extends Service implements SourceHost {
   }
   private httpHost(): HttpHost {
     const runtime = this
-    const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, setup, passes, installation,
+    const { store, sources, prompts, sessions, settings, engine, executor, health, machine, sourceLinks, setup, passes, installation,
       projectMeter } = this
-    return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, sourceLinks, projectMeter, installation,
+    return { store, sources, prompts, sessions, settings, engine, executor, health, machine, get masterId() { return runtime.masterId }, sourceLinks, projectMeter, installation,
       attention: this.attention, runLimits: this.runLimits, planIntegration: this.planIntegration,
       planArtifact: async id => {
         const view = this.planIntegration.view(id)
@@ -720,7 +768,8 @@ export class Runtime extends Service implements SourceHost {
       },
       meter: { read: (id, signal) => this.readScopedMeter(id, signal) },
       topicBinding: this.topicBinding, verifyTopicBinding: () => this.verifyTopicBinding(),
-      get ready() { return runtime.ready }, assertNewWork: () => installation.assertNewWork(),
+      get ready() { return runtime.ready }, assertNewWork: () => installation.assertNewWork(), rotateHub: () => runtime.rotateHub(),
+      hubConversation: id => runtime.hubConversation(id),
       ownsSession: id => this.ownsSession(id),
       get deployment() { return setup.deployment },
       get setupProblem() { return runtime.setupProblem }, get feishuProblem() { return setup.feishuProblem },
@@ -773,14 +822,16 @@ export class Runtime extends Service implements SourceHost {
       const pin = this.store.get(KV.planRequirements.reviewer(scopeId))
       const preview = this.store.get(KV.planRequirements.preview(scopeId))
       const workspace = preview && this.handoffs.get(preview.handoffId)?.project.workspace
-      return roles.includes('review') && parentId === this.masterId && preview?.planId === binding.plan_id && pin?.sessionId === id
+      return roles.includes('review') && !!parentId && this.hubAuthority.isGeneration(parentId) && preview?.planId === binding.plan_id && pin?.sessionId === id
         && pin.createdAt === header.createdAt && header.agentPreset === PLANNER_PRESET && workspace && header.cwd && isAbsolute(header.cwd)
         && sameDirectory(workspace, header.cwd) ? { header } : 'unverified'
     }
     const project = this.installation.project
     const handoff = planning ? this.handoffs.get(id.slice(id.indexOf('-') + 1)) : undefined
+    // Rotation generations were provisioned in the mounted workspace; the legacy first generation keeps its old directory.
+    const epoch = hub ? this.hubAuthority.generationEpoch(id) : undefined
     const cwd = worker ? execution?.worktree : planning ? handoff && (project?.workspace ?? handoff.project.workspace)
-      : project?.initial ? project.workspace : this.machine.stateDir
+      : epoch !== undefined && epoch > 0 ? project?.workspace : project?.initial ? project.workspace : this.machine.stateDir
     const preset = worker ? WORKER_PRESET : planning ? PLANNER_PRESET : ROUTER_PRESET
     return header.agentPreset === preset && cwd && header.cwd && isAbsolute(header.cwd) && sameDirectory(cwd, header.cwd)
       ? { header } : 'unverified'
@@ -799,13 +850,14 @@ export class Runtime extends Service implements SourceHost {
       })
       const live = (ids: string[]) => ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
       const reviewSessions = () => this.ctx.agents.list().filter(agent => scopeProposalId(agent.id) !== undefined && this.projectMeter.owns(agent.id)).map(agent => agent.id)
-      const agents = live([this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id)), ...handoffSessions(), ...reviewSessions()])
+      const agents = live([...this.hubAuthority.generations(), this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id)), ...handoffSessions(), ...reviewSessions()])
       for (const agent of agents) agent.cancel({ kind: 'user' }, { keepInbox: true })
       await Promise.allSettled([http, passes, this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
       // An effect may have been creating a planner or splitter when shutdown took the first snapshot.
       const lateHandoffs = live([...handoffSessions(), ...reviewSessions()]).filter(agent => !agents.includes(agent))
       for (const agent of lateHandoffs) agent.cancel({ kind: 'user' }, { keepInbox: true })
       await Promise.allSettled(lateHandoffs.map(agent => agent.whenIdle()))
+      await this.sessions.idleHubTransfers()
       // The workers' jobs and subagents stop too: their ends would start worker turns without the tool limits released below.
       await this.executor.shutdown()
       this.executor.dispose()

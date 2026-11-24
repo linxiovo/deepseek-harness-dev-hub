@@ -29,7 +29,7 @@ export const RequirementScopeVerdictSchema = z.strictObject({
 })
 export type ScopeVerdict = z.infer<typeof RequirementScopeVerdictSchema>
 type ScopeReview = { status: 'pending' } | ScopeVerdict & { reviewId: string; reviewerSessionId: string; at: string }
-type OperatorMessage = PlanMessage & { seq: number }
+type OperatorMessage = PlanMessage & { seq: number; at: number }
 
 const PROPOSAL_TTL = 30 * 60_000
 const targetQuestion = promptFile('plan-requirements-target')
@@ -102,7 +102,7 @@ export type RequirementScopeTask = {
   }
 }
 
-type Host = {
+ type Host = {
   store: Pick<Store, 'atomic' | 'get' | 'set' | 'tickets'>
   plans: Pick<Plans, 'current' | 'state' | 'requiredDelivery' | 'revision' | 'revise'>
   handoffs: Pick<Handoffs, 'get'>
@@ -110,7 +110,9 @@ type Host = {
   stop: (ticketId: string, reason: string) => void
   authorize: () => void
   requestScopeReview: (proposalId: string) => void
-}
+  isHubGeneration: (sessionId: string) => boolean
+  isCurrentHub: (sessionId: string) => boolean
+ }
 type ActivePlan = { plan: Plan; revision: number; goal: string; acceptance: Spec['acceptance']; handoff: Handoff; spec: Spec; waitingFor: string[] }
 
 function criterionText({ statement, observable }: Spec['acceptance'][number]): CriterionText { return { statement, observable } }
@@ -303,9 +305,11 @@ export class PlanRequirements {
       const preview = this.get(proposalId)
       if (!preview) refuse('Unknown requirement proposal')
       this.requireOwner(preview.handoffId, message.sessionId)
-      if (preview.ownerSession !== message.sessionId) refuse('Requirement proposal belongs to another Session')
-      if (approval.requestMessageId !== preview.requestMessageId || message.messageId === preview.requestMessageId ||
-          message.seq <= preview.requestSequence || store.get(KV.planRequirements.request(message.sessionId, approval.requestMessageId)) !== proposalId) {
+      if (!this.sameHub(preview.ownerSession, message.sessionId)) refuse('Requirement proposal belongs to another Session')
+      const later = message.sessionId === preview.ownerSession ? message.seq > preview.requestSequence
+        : Number.isFinite(message.at) && message.at > Date.parse(preview.createdAt)
+      if (approval.requestMessageId !== preview.requestMessageId || message.messageId === preview.requestMessageId || !later
+        || store.get(KV.planRequirements.request(preview.ownerSession, approval.requestMessageId)) !== proposalId) {
         refuse('Approval must be a separate, later direct message bound to this preview and its original product request')
       }
       const review = preview.scopeReview
@@ -370,21 +374,25 @@ export class PlanRequirements {
     })
   }
 
+  private sameHub(first: string, second: string): boolean {
+    return first === second || (this.host.isHubGeneration(first) && this.host.isHubGeneration(second))
+  }
+
   private currentScopePreview(preview: PendingPreview) {
     if (!(Date.now() < Date.parse(preview.expiresAt))) return undefined
     const { plans, handoffs } = this.host
     const active = plans.current(preview.planId)
     if (!active || active.revision !== preview.expectedRevision || active.plan.handoffId !== preview.handoffId) return undefined
     const handoff = handoffs.get(preview.handoffId)
-    if (handoff?.status !== 'specified' || handoff.confirmedBy.sessionId !== preview.ownerSession || !handoff.spec ||
+    if (handoff?.status !== 'specified' || !this.sameHub(handoff.confirmedBy.sessionId, preview.ownerSession) || !handoff.spec ||
         !plans.requiredDelivery(preview.planId)?.waitingFor.length) return undefined
     return handoff
   }
 
   private requireOwner(handoffId: string, sessionId: string): Handoff {
     const handoff = this.host.handoffs.get(handoffId)
-    if (!handoff || handoff.status !== 'specified' || handoff.confirmedBy.sessionId !== sessionId) {
-      refuse('Only the Session that confirmed the original Handoff can change its product requirements')
+    if (!this.host.isCurrentHub(sessionId) || !handoff || handoff.status !== 'specified' || !this.sameHub(handoff.confirmedBy.sessionId, sessionId)) {
+      refuse('Only the current Hub Session that confirmed the original Handoff can change its product requirements')
     }
     return handoff
   }

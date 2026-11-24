@@ -39,10 +39,11 @@ The six installation-wide routes under `/orchestrator/api/` are available before
 | `GET /orchestrator/api/projects` | None | `{activeProjectId: string \| null, projects: ProjectView[]}` |
 | `POST /orchestrator/api/projects` | `{repository: string, workspace: string, baseRef: string, policy?: PolicyConfig}` | `{project: ProjectView, reused: boolean, restarting: boolean}` |
 | `POST /orchestrator/api/projects/:projectId/select` | None. URL-encode the ID as one path segment. | `{project: ProjectView, restarting: boolean}` |
+| `POST /orchestrator/api/hub/rotate` | None | `{hubSessionId: string}` for the newly active physical Hub Session. The mounted project identity remains unchanged; the rotation drains the old turn and recovers its queued inputs before reporting success. |
 | `GET /orchestrator/api/runtime` | None | `RuntimeView` |
 
 - `PolicyConfig` is the `policy` settings block with `rules` and `sources` optional on input. Omitting it uses the default rules and no allowed accounts for a new project. See [006 Deployment](006-deployment.md#management-api).
-- `ProjectView` has `{id: string, repository: string, workspace: string, hubSessionId: string}`. Repository and workspace are canonical, and the ID is opaque. The list is ordered by registration.
+- `ProjectView` has `{id: string, repository: string, workspace: string, hubSessionId: string}`. Repository and workspace are canonical, and the ID is opaque. `hubSessionId` is the current physical Hub Session; the project ID remains the stable conversation identity when a Hub Session rotates. The list is ordered by registration.
 - `OnboardingView` is `{status: "unconfigured"}`, `{status: "ready", identity}`, or `{status: "blocked", identity?, problem?}`. `identity` is `{id: number, login: string, noreply: string}`. `problem` has `{place, code, values, detail}`. `place` is `deployment`, `github` or `feishu`, `code` is a `SetupCode`, `values` is a string map, and `detail` is a rendered message. The installation API retains only safe `account` and `repository` diagnostic values.
 - `RuntimeView` has `{mode, status, reason, projectId, resumedFrom}`. `mode` is `desktop` or `headless`. `status` is `starting`, `ready` or `paused`. `projectId` is the mounted ID or `null`. A `starting` or `ready` status has `reason: null`. The `paused` reasons in priority order are `switching`, `githubSetupRequired`, `noProject`, `recoveryPending`, `projectSetupRequired`, `operatorPaused`.
 - `resumedFrom` is `null` or `{reason, at, recoverable: {assignments: number, handoffs: number, effects: number}}`. `reason` is `hostStopped` after clean stop, `projectSwitched` after clean unmount to another project, or `interrupted` when the previous mount did not record a clean stop. `at` is the prior record's ISO timestamp. Recoverable counts reflect the newly opened Store before it resumes. Use `GET state` for full startup and component health.
@@ -57,7 +58,7 @@ The six installation-wide routes under `/orchestrator/api/` are available before
 | `403 {error}` | Same-origin management check failed |
 | `404 {error, code}` | `projectNotFound` for an unknown selection ID or `installationUnavailable` if the host does not provide installation management |
 | `404 {error}` | Unknown path or method under the API prefix |
-| `409 {error, code}` | `githubSetupRequired` for create/select without a verified account, `switching` for a transition or an installation change already in progress, `projectConflict` for conflicting registration or an active project write, `legacyProjectRequired` or `legacyProjectMismatch` for adoption refusals |
+| `409 {error, code}` | `githubSetupRequired` for create/select without a verified account, `switching` for a transition or installation change already in progress, `projectConflict` for conflicting registration or an active project write, `projectScopeRequired` for a managed-project rotation without the mounted project header, `operatorPaused` when new work is paused, `legacyProjectRequired` or `legacyProjectMismatch` for adoption refusals |
 | `500 {error}` | Unexpected failure with the message `Installation operation failed.` |
 
 Identity check failures such as `agentCliMissing`, `agentCliSignedOut`, `agentCliNoAccount` or `agentAccountChanged` return HTTP 200 with `OnboardingView` and `status: "blocked"`.
@@ -80,6 +81,16 @@ The verified legacy runtime may still accept an operation into its queue during 
 
 Registering A with B's checkout returns `400 invalidProject` before registration or selection changes. A request with A's project header after switching to B returns `409 staleProject` without mutating B, even if the record ID is valid there.
 
+### Hub Session rotation
+
+`POST /orchestrator/api/hub/rotate` takes no body. It requires the same-origin management headers and the explicit scope of a mounted managed project. No managed mount returns `409 noProject`; missing or stale scope is refused without invoking rotation. A host without rotation support returns `404`. This is a management operation, not a model tool.
+
+`GET /orchestrator/api/hub/conversation?sessionId=<id>` is a read-only scoped route. It publishes a completed retired Hub root of the mounted project as `{target: null | {projectId, sessionId}}`, naming its active successor. It requires the mounted project scope; no mount is `409 noProject`, and a missing or stale scope is refused without resolving anything. Non-member, active or unfinished identities return `target: null`. This route exposes no operation.
+
+For an adopted legacy deployment, the first physical Hub keeps the adoption-era state-directory working directory, while a generation created by rotation is verified in the mounted project workspace. After a restart following a completed rotation, the successor is still sampled in that workspace rather than reinterpreted from the legacy directory.
+
+Rotation uses the project write lock: a concurrent project selection is refused with `409 projectConflict`, and selection already in progress prevents rotation with `409 switching`. Success is `200 {hubSessionId: string}` with the new physical Hub Session ID. The project ID and its durable work stay unchanged. If rotation fails, HTTP returns an error without confirming a new Session. On restart, Runtime recovers any persisted in-progress rotation; the HTTP adapter does not retry it.
+
 ## Code and verification
 
 | Entry | Evidence |
@@ -89,7 +100,7 @@ Registering A with B's checkout returns `400 invalidProject` before registration
 | [projects.spec.ts](../tests/projects.spec.ts) | Durable first and explicit selection, independent suspension records, checkout conflicts and alias retargeting |
 | [project-work.spec.ts](../tests/project-work.spec.ts) | Hub → Planner → Splitter isolation across remounts and repeated headless polling of authorized events through the GitHub Source with simulated responses |
 | [deployment.spec.ts](../tests/deployment.spec.ts), [github-onboarding.spec.ts](../tests/github-onboarding.spec.ts) | Runtime modes, token-free identity and canonical repository probes, and managed setup without a legacy identity fallback |
-| [http.spec.ts](../tests/http.spec.ts) | Same-origin transport, typed lifecycle and installation responses, private-field redaction, missing and stale scope, concurrent selection and owned Session meters |
+| [http.spec.ts](../tests/http.spec.ts) | Same-origin transport, typed lifecycle and installation responses, private-field redaction, missing and stale scope, concurrent selection, owned Session meters, Hub rotation responses and write exclusion, and scoped retired-Hub conversation resolution |
 | [runtime.spec.ts](../tests/runtime.spec.ts) | Simulated DSH host with real local Git worktrees, mode and project scope checks, same-Assignment resume, and persistent PR reconciliation across repeated graceful restarts |
 | [runtime-crash.spec.ts](../tests/runtime-crash.spec.ts) | Real OS process termination and restart against the same SQLite and local Git state. IPC barriers stop the old process after selection commits, after the DSH substitute stores the assignment but before confirmation, and after the GitHub substitute merges but before the runtime observes it. Assert the mounted project, exactly one Worker delivery (verify its message ID in the persisted Session before recovery, and retain the writer lease), and exactly one merge attempt with a reconciled Ticket outcome. Only DSH and GitHub boundaries are simulated. |
 | [Live headless connection smoke check](006-deployment.md#live-headless-connection-smoke-check) | Separate check against real DSH over SSH; the process tests do not verify this connection. |

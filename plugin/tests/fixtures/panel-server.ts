@@ -164,7 +164,7 @@ function sourceStatuses(): SourceStatusRow[] {
 }
 const stateView = (): StateView => ({
   setup: server.setup, load: { running: server.setup.problem ? 0 : 2, queued: 0, maxWorkers: server.settings.executor.maxWorkers },
-  masterId: 'master', paused: server.settings.paused, ...(server.projectId ? { projectId: server.projectId } : {}),
+  masterId: server.prompts.masterId, paused: server.settings.paused, ...(server.projectId ? { projectId: server.projectId } : {}),
   // The panel does not read health; the service script does.
   health: {},
 })
@@ -327,6 +327,8 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET projects': { answer: installationUnavailable },
   'POST projects': { body: true, answer: installationUnavailable },
   'POST projects/:projectId/select': { answer: installationUnavailable },
+  'POST hub/rotate': { answer: installationUnavailable },
+  'GET hub/conversation': { query: ['sessionId'], answer: installationUnavailable },
   'GET topic-binding': { answer: installationUnavailable },
   'POST topic-binding': { body: true, answer: installationUnavailable },
   'POST topic-binding/unbind': { answer: installationUnavailable },

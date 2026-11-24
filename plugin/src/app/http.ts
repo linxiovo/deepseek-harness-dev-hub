@@ -45,6 +45,9 @@ export interface HttpHost {
   /** Verify the workspace under the write lock, before the final scope check and bind. */
   readonly verifyTopicBinding?: (() => Promise<void>) | undefined
   assertNewWork?(): void
+  rotateHub?(): Promise<string>
+  /** Successor of a completed retired Hub root in the mounted project; undefined for non-members or an unfinished map. */
+  hubConversation?(sessionId: string): string | undefined
   ownsSession?(id: string): boolean | Promise<boolean>
   readonly store: Store
   /** Feishu message links resolved since startup, used by search to match AppLink URLs. */
@@ -135,7 +138,7 @@ function setupView(runtime: HttpHost) {
 /** Build the `/orchestrator/api/state` response consumed by the management panel and `scripts/dsh-superagent status` (`docs/006-deployment.md`). */
 export function stateView(runtime: HttpHost) {
   const settings = runtime.store.settings()
-  const projectId = runtime.installation?.projects().activeProjectId
+  const projectId = runtime.installation?.runtime().projectId
   return { setup: setupView(runtime), load: { ...executorLoad(runtime.store, runtime.executor.activeCount()),
     maxWorkers: settings.executor.maxWorkers },
     masterId: runtime.masterId, paused: settings.paused, health: runtime.health, ...(projectId ? { projectId } : {}) }
@@ -165,7 +168,8 @@ function promptsView(runtime: HttpHost, revision: number | undefined, offset: nu
 export type PromptsView = ReturnType<typeof promptsView>
 
 interface Input<K extends keyof Api> {
-  params: RouteParams<K>; query: Record<string, string>; body: (maxBytes?: number) => Promise<unknown>
+  params: RouteParams<K>; query: Record<string, string>; projectId: string | null
+  body: (maxBytes?: number) => Promise<unknown>
   write<T>(operation: () => T | Promise<T>, verify?: () => Promise<void>): T | Promise<T>
 }
 type RouteOutput<K extends keyof Api> = K extends 'GET plans/:id/artifact' ? PlanArtifactFile : ApiResponse<K>
@@ -179,6 +183,7 @@ const DecisionsQuery = z.object({ kind: z.string().default(''), window: z.litera
   limit: limit(30, 200) })
 const count = z.coerce.number().int().nonnegative()
 const PromptsQuery = z.object({ revision: count.optional(), offset: count.default(0) })
+const HubConversationQuery = z.object({ sessionId: z.string().min(1) })
 const SourceBlock = z.templateLiteral(['source:', z.string().regex(/^[a-z][a-z0-9-]*$/)])
 const SettingsBlockSchema = z.union([z.enum(['policy', 'eval', 'executor']), SourceBlock])
 const SaveRequest = z.object({ value: z.unknown(), revision: z.number().int().nonnegative() })
@@ -263,7 +268,7 @@ const projectMeterRoutes: Partial<Record<keyof Api, true>> = {
 }
 
 const requiredProjectRoutes: Partial<Record<keyof Api, true>> = {
-  'GET plans/:id/delivery': true, 'GET plans/:id/artifact': true,
+  'GET hub/conversation': true, 'GET plans/:id/delivery': true, 'GET plans/:id/artifact': true,
 }
 
 const runLimitRoutes: Partial<Record<keyof Api, true>> = {
@@ -319,6 +324,19 @@ function routes(runtime: HttpHost): Routes {
       const { project, restarting } = await installationOf(runtime).selectProject(params.projectId)
       return { project: projectView(project), restarting }
     }),
+    'POST hub/rotate': ({ write }) => {
+      const rotateHub = runtime.rotateHub
+      if (!rotateHub) throw new RouteError(404, 'Hub rotation is not available')
+      return write(async () => ({ hubSessionId: await rotateHub.call(runtime) }))
+    },
+    'GET hub/conversation': ({ projectId, query }) => {
+      // The mounted scope is already verified; a host without a managed mount has no continuation to publish.
+      if (!projectId) throw new InstallationError(409, 'noProject')
+      const parsed = HubConversationQuery.safeParse(query)
+      if (!parsed.success) throw new RouteError(400, 'Invalid hub conversation query')
+      const successor = runtime.hubConversation?.(parsed.data.sessionId)
+      return { target: successor === undefined ? null : { projectId, sessionId: successor } }
+    },
     'GET topic-binding': () => topicBindingOf(runtime).view(),
     'POST topic-binding': async ({ body, write }) => {
       const request = TopicBindingRequest.safeParse(await body())
@@ -409,7 +427,7 @@ function routes(runtime: HttpHost): Routes {
     'GET models': () => runtime.models(),
     'GET sessions/:id/meter': async ({ params }) => {
       // The Hub reads the same view; a corrupt Session log is not a missing Session and keeps its 500.
-      if (runtime.installation?.projects().activeProjectId && !(await runtime.ownsSession?.(params.id))) throw new RouteError(404, 'Session not found')
+      if (runtime.installation?.runtime().projectId && !(await runtime.ownsSession?.(params.id))) throw new RouteError(404, 'Session not found')
       const view = await runtime.meter.read(params.id)
       if (!view) throw new RouteError(404, 'Session not found')
       return view
@@ -464,11 +482,10 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
   let retiring = false
   let closed = false
   function readableMount(scope: string | string[] | undefined, requirement: 'optional' | 'required'): string | null {
-    const { installation } = runtime
-    if (retiring || writing === 'installation' || installation?.runtime().reason === 'switching') {
-      throw new InstallationError(409, 'switching')
-    }
-    const active = installation?.projects().activeProjectId ?? null
+    if (retiring || writing === 'installation') throw new InstallationError(409, 'switching')
+    const mount = runtime.installation?.runtime()
+    if (mount?.reason === 'switching') throw new InstallationError(409, 'switching')
+    const active = mount?.projectId ?? null
     assertProjectScope(active, scope, requirement)
     return active
   }
@@ -478,18 +495,25 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
     const installationRoute = installationRoutes.has(route)
     const requirement = topicBindingRoutes[route] || attentionRoutes[route] ? 'required' : 'when-active'
     const { installation } = runtime
+    const mount = installation?.runtime()
     if (!installationRoute || scope !== undefined) {
-      assertProjectScope(installation?.projects().activeProjectId ?? null, scope, requirement)
+      assertProjectScope(mount?.projectId ?? null, scope, requirement)
+    }
+    // A verified legacy runtime can be ready without a managed mount; rotation still has no project identity to retain.
+    if (route === 'POST hub/rotate' && mount?.reason !== 'switching' && !mount?.projectId) {
+      throw new InstallationError(409, 'noProject')
     }
     if (!installation) return operation()
-    if (writing === 'installation' || installation.runtime().reason === 'switching') throw new InstallationError(409, 'switching')
+    if (writing === 'installation' || mount?.reason === 'switching') throw new InstallationError(409, 'switching')
     if (writing) throw new InstallationError(409, 'projectConflict')
     writing = installationRoute ? 'installation' : 'project'
     try {
       const pending = verify ? verify().then(() => {
         // Workspace verification may suspend; recheck the mounted scope at the mutation itself.
-        if (retiring || installation.runtime().reason === 'switching') throw new InstallationError(409, 'switching')
-        assertProjectScope(installation.projects().activeProjectId, scope, requirement)
+        if (retiring) throw new InstallationError(409, 'switching')
+        const current = installation.runtime()
+        if (current.reason === 'switching') throw new InstallationError(409, 'switching')
+        assertProjectScope(current.projectId, scope, requirement)
         return operation()
       }) : Promise.resolve(operation())
       activeWrite = pending
@@ -520,7 +544,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         const requirement = requiredProject ? 'required' : 'optional'
         if (mountedRoute) mounted = readableMount(scope, requirement)
         else if (!installationRoute && scope !== undefined && (route.key.startsWith('GET ') || route.key === 'POST prompts/preview')) {
-          assertProjectScope(runtime.installation?.projects().activeProjectId ?? null, scope, 'optional')
+          assertProjectScope(runtime.installation?.runtime().projectId ?? null, scope, 'optional')
         }
         const query = Object.fromEntries(url.searchParams)
         if (attentionRoute && (route.key === 'GET attention/summary'
@@ -541,7 +565,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         }
         let result: unknown
         try {
-          result = await route.run({ params: route.params as never, query, body: async maxBytes => {
+          result = await route.run({ params: route.params as never, query, projectId: mounted, body: async maxBytes => {
             const body = await readBody(req, maxBytes)
             if (closed) throw new InstallationError(409, 'switching')
             return body

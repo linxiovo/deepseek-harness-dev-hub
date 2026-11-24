@@ -43,6 +43,8 @@ The Ticket, Plan and project usage query contract is in `plugin/docs/014-project
   An upgrade that changes an overridden default marks it **Default updated** (默认内容已更新). The panel compares the old and new defaults above the team's text. If the old default was not recorded, it compares the team's text with the new default instead. Choose **Keep my text** or **Use the new default**. Overrides for removed parts are listed below the tab bar and dropped on the next save.
 - **Deployment:** startup problems with **Check again**, the state directory and machine limits. Saved limits apply without restart. The DeepSeek Harness Plugin Manager exposes the same page.
 
+Unsaved Source, Policy, Eval, Execution and Prompts edits are kept per project in this browser tab, including after a Hub Session rotation or page refresh. Selecting another project shows only its own drafts. Deployment settings are installation-wide.
+
 ## Search
 
 The header search finds Triggers by text, id, Feishu message id or a stored link, such as a GitHub comment URL. A Feishu link missing from the original message becomes searchable only after the host reads it during the current process lifetime.

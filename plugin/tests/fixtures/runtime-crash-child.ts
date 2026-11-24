@@ -93,7 +93,7 @@ type Event = { seq: number; time: number; type: 'user/message'; data: UserMessag
 type SessionLog = { cwd: string; events: Event[] }
 type HttpHandler = (req: unknown, res: unknown) => Promise<void>
 type Agent = {
-  id: string; ctx: Context; session: { id: string; header: { cwd: string }; snapshotEvents: () => Event[] }
+  id: string; ctx: Context; session: { id: string; header: { id: string; cwd: string }; snapshotEvents: () => Event[] }
   inbox: { nextStep: UserMessage[]; nextTurn: UserMessage[]; remove: () => boolean }; readonly status: string
   followup(message: UserMessage): void; steer(message: UserMessage): void; inject(): void; cancel(): void; whenIdle(): Promise<void>
 }
@@ -117,7 +117,7 @@ function mount(onRestart: () => void = () => {}): Host {
   let unexpectedReplay: Promise<string> | undefined
   function load(id: string) {
     const log = readLog(id)
-    const session = { id, header: { cwd: log.cwd }, snapshotEvents: () => log.events }
+    const session = { id, header: { id, cwd: log.cwd }, snapshotEvents: () => log.events }
     const sessionTools = new Map<string, Tool>()
     tools.set(id, sessionTools)
     const agentCtx = new Context()

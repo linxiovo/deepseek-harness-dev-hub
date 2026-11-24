@@ -21,6 +21,8 @@ function fixture(listed: string[]) {
     effect: (effect: () => unknown) => { effect() },
     sessions: { list: { getSnapshot: () => ({ phase: 'ready', byId: Object.fromEntries(listed.map(id => [id, {}])) }) }, refresh: vi.fn(async () => {}) },
     uiWorkspace: { openSession: vi.fn() },
+    sidebarRight: { mounted: { getSnapshot: () => undefined, subscribe: () => () => {} } },
+    layout: { selectPanel: vi.fn() },
     // Omit config form service so Deployment renders read-only.
     get: () => undefined,
   }
@@ -40,10 +42,10 @@ const openMaster = async (container: HTMLElement) => {
   await act(async () => { button.click() })
   for (let i = 0; i < 5; i++) await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
 }
-const serve = () => vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+const serve = (projectId?: string) => vi.stubGlobal('fetch', vi.fn(async (url: string) => {
   const path = new URL(url, 'http://127.0.0.1').pathname.replace('/orchestrator/api/', '')
   if (path === 'overview') return Response.json({ problems: [], person: [], executor: { running: 0, queued: 0, maxWorkers: 3, idle: 0 }, flow: { triggers: 0, filtered: 0, judged: 0, accepted: 0, evaluating: 0 }, policyVersion: 'v' })
-  if (path === 'state') return Response.json({ masterId: 'master', settings: SettingsSchema.parse({}), revisions: { policy: 0, eval: 0, executor: 0 }, sources: [], policy_version: 'v', health: {}, outgoing: [], load: { running: 0, queued: 0 },
+  if (path === 'state') return Response.json({ projectId, masterId: 'master', settings: SettingsSchema.parse({}), revisions: { policy: 0, eval: 0, executor: 0 }, sources: [], policy_version: 'v', health: {}, outgoing: [], load: { running: 0, queued: 0 },
     setup: { machine: { stateDir: '/srv/state', worktreeRoot: '/srv/state/worktrees', blockedCommands: [], promptMaxChars: 100000, admissionContextMaxPages: 10, admissionContextTimeoutMs: 15000 }, problem: null, feishuProblem: null, accounts: null } })
   return Response.json({ error: 'unavailable' }, { status: 503 })
 }))
@@ -66,6 +68,23 @@ it('opens a listed Session through the workspace from the main panel', async () 
   await openMaster(view.container)
   expect(ctx.uiWorkspace.openSession).toHaveBeenCalledExactlyOnceWith('master')
   view.dispose()
+})
+
+it('does not reopen a management deep link on refresh after the user opens the native Hub', async () => {
+  const projectId = 'a'.repeat(32)
+  const previous = window.location.href
+  window.history.replaceState(null, '', `/?superagentProject=${projectId}&superagentView=project&unrelated=keep#anchor`)
+  serve(projectId)
+  const { ctx, main } = fixture(['master'])
+  const view = await render(main, { t })
+  try {
+    await openMaster(view.container)
+    expect(ctx.uiWorkspace.openSession).toHaveBeenCalledExactlyOnceWith('master')
+    expect(`${window.location.search}${window.location.hash}`).toBe('?unrelated=keep#anchor')
+  } finally {
+    view.dispose()
+    window.history.replaceState(null, '', previous)
+  }
 })
 
 it('reports a Session missing from the catalog in the interface language', async () => {

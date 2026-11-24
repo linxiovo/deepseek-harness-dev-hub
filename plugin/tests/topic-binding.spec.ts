@@ -1,4 +1,5 @@
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
+import { mkdtempSync, realpathSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
@@ -23,7 +24,7 @@ beforeEach(async () => {
   await host.restart()
 })
 afterEach(async () => {
-  try { await host?.stop() } finally { rmSync(root, { recursive: true, force: true }) }
+  try { await host?.stop() } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) }
 })
 
 const receive = (event: Trigger) => host.runtime.context(feishuKind).receive(event)

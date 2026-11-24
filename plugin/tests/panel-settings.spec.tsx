@@ -5,7 +5,7 @@ import { createRoot } from 'react-dom/client'
 import { Fields } from '../src/client/settings-kit.tsx'
 import { expect, it, onTestFinished } from 'vitest'
 import { zh } from '../src/client/locales.ts'
-import { usePanel, mount, remount, settle, all, find, tab, click, type, text, field } from './fixtures/panel.tsx'
+import { usePanel, mount, remount, settle, all, find, tab, click, type, text, field, at } from './fixtures/panel.tsx'
 import { server } from './fixtures/panel-server.ts'
 
 usePanel()
@@ -151,4 +151,45 @@ it('lists the settings groups stages first, opens each stage\'s group from its s
   await remount()
   await click(tab(zh['tab.settings']))
   expect(document.querySelector('.dt-settings-link[aria-current="page"]')?.textContent).toBe(zh['promptPart.runtime/work'])
+})
+
+it('restores settings and prompt drafts after Hub rotation and refresh, without sharing them with another project or the legacy panel', async () => {
+  const group = (label: string) => click(find(label, '.dt-settings-link'))
+  const workers = () => field<HTMLInputElement>(zh.maxWorkers)
+  const prompt = () => field<HTMLTextAreaElement>(zh.promptBody)
+  const project = 'a'.repeat(32)
+  server.projectId = project
+  at({ page: 'settings', query: { group: 'execution' } })
+  await mount()
+  await type(workers(), '6')
+  await group(zh['settingsGroup.prompts'])
+  await type(prompt(), 'Project A draft')
+
+  server.prompts.masterId = 'hub-after-rotation'
+  await remount()
+  expect(prompt().value).toBe('Project A draft')
+  await group(zh['settingsGroup.execution'])
+  expect(workers().value).toBe('6')
+
+  server.projectId = 'b'.repeat(32)
+  server.prompts.masterId = 'other-hub'
+  await remount()
+  expect(workers().value).toBe('3')
+  await type(workers(), '8')
+  await group(zh['settingsGroup.prompts'])
+  expect(prompt().value).not.toBe('Project A draft')
+
+  delete server.projectId
+  server.prompts.masterId = 'hub-after-rotation'
+  await remount()
+  expect(prompt().value).not.toBe('Project A draft')
+  await type(prompt(), 'Legacy draft')
+  await remount()
+  expect(prompt().value).toBe('Legacy draft')
+
+  server.projectId = project
+  await remount()
+  expect(prompt().value).toBe('Project A draft')
+  await group(zh['settingsGroup.execution'])
+  expect(workers().value).toBe('6')
 })

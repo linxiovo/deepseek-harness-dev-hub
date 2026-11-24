@@ -1,19 +1,18 @@
 import { fork } from 'node:child_process'
-import { mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { tmpdir } from 'node:os'
+import { rmSync, mkdtempSync, readFileSync, realpathSync, statSync, utimesSync } from 'node:fs'
 import { build } from 'tsdown'
 import { afterAll, beforeAll, expect, it } from 'vitest'
 import type { CrashPoint, Evidence, Observation } from './fixtures/runtime-crash-child.ts'
 
-const fixture = fileURLToPath(new URL('./fixtures/runtime-crash-child.ts', import.meta.url))
+const fixture = join(process.cwd(), 'tests/fixtures/runtime-crash-child.ts')
 const entryName = 'runtime-crash-child.mjs'
 let bundleDir: string
 
 beforeAll(async () => {
   // Match the plugin build target: Node 22's native TypeScript loader leaves `await using` intact.
-  bundleDir = mkdtempSync(fileURLToPath(new URL('../node_modules/.runtime-crash-', import.meta.url)))
+  bundleDir = mkdtempSync(join(process.cwd(), 'node_modules', '.runtime-crash-'))
   await build({ config: false, entry: fixture, outDir: bundleDir, outputOptions: { entryFileNames: entryName },
     format: 'esm', platform: 'node', target: 'es2024', deps: { neverBundle: true }, dts: false, logLevel: 'warn' })
 })

@@ -11,7 +11,7 @@ import { join } from 'node:path'
 import { vi, type Mock } from 'vitest'
 import { markAgentLoopRequest, type GenerateOptions, type StreamChunk, type UserMessage } from '@deepseek-ai/dsh-llm'
 import type { SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
-import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
+import { SessionAlreadyExistsError, SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 import { Runtime } from '../../src/app/runtime.ts'
 import type { Machine } from '../../src/deployment.ts'
 import { Store } from '../../src/app/store.ts'
@@ -173,7 +173,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   }
   /** A prepare command (`sh -c`) waits for this while it is set. */
   const hooks: { prepare?: Promise<void>; openingLog?: (sessionId: string) => Promise<void> | undefined;
-    credentialCheck?: () => boolean | Promise<boolean>; flushSessionLog?: () => void } = {}
+    credentialCheck?: () => boolean | Promise<boolean>; flushSessionLog?: () => void; deferStep?: (delivery: Delivery) => boolean } = {}
   const subprocess = { spawn: vi.fn((spec: { argv: readonly string[]; cwd?: string; env?: Record<string, string> }) => {
     const argv = [...spec.argv]
     while (argv[0] === 'env' || /^[A-Z_]+=/.test(argv[0] ?? '')) argv.shift()
@@ -221,6 +221,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   Object.assign(agents, { list: () => [...agents.values()], currentInitiator: () => initiator.getStore() })
   /** Each Session's next step, which takes the messages that wait for one. */
   const steps = new Map<string, () => void>(), claims = new Map<string, () => void>()
+  const nativeSteps = new Map<string, (starts: boolean, beforeHistory?: () => void, cut?: boolean) => Promise<boolean>>()
   let reviewChildSequence = 0
   const tools = new Map<string, Map<string, RegisteredTool>>()
   const mountedSkills = new Map<string, Map<string, string>>()
@@ -235,10 +236,8 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   const toolLimits = new Map<string, Set<string>>()
   const deliveries = vi.fn<(request: Delivery) => void>()
   let http!: HttpHandler
-  const resolveDefault = async (id: string) => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }
-  const controller = {
-    create: vi.fn(async ({ sessionId, workspaceId, agentPreset }: { sessionId: string; workspaceId: string; agentPreset?: string }) => {
-      if (agents.has(sessionId)) return
+  const publishAgent = async (header: SessionHeader, source: 'startup' | 'resume') => {
+      const sessionId = header.id
       const agentCtx = new Context()
       const sessionTools = new Map<string, RegisteredTool>()
       tools.set(sessionId, sessionTools)
@@ -272,11 +271,30 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
       }
       steps.set(sessionId, () => { take(false) })
       claims.set(sessionId, () => { take(false, true) })
+      nativeSteps.set(sessionId, async (starts, beforeHistory, cut) => {
+        const agent = agents.get(sessionId)!
+        if (starts) { agent.status = 'running'; turn++ }
+        const next = starts ? inbox.nextTurn.find(message => !taken.has(message.id)) : undefined
+        const messages = inbox.nextStep.splice(0).filter(message => !taken.has(message.id))
+        if (next) { inbox.remove(next.id); messages.push(next) }
+        for (const message of messages) ctx.emit('agent/inbox/claimed', { agent, message, turn } as never)
+        beforeHistory?.()
+        if (cut) return false
+        const decision = await ctx.waterfall(agent as never, 'agent/pre-step', {
+          agent, messages, turn, step: starts ? 0 : 1, signal: new AbortController().signal,
+        } as never, async () => ({ kind: 'enter' as const, messages }))
+        if (decision.kind === 'reject') { agent.status = 'idle'; return false }
+        for (const message of decision.messages) session.append('user/message', message, { surfaceOp: 'append' })
+        return true
+      })
       const deliver = (mode: 'queue' | 'steer') => vi.fn((message: UserMessage) => {
         inbox[mode === 'queue' ? 'nextTurn' : 'nextStep'].push(message)
-        deliveries({ sessionId, mode, id: message.id, text: message.content.map(block => block.type === 'text' ? block.text : '').join('') })
-        // A message wakes an idle agent: its turn starts at once, and DSH says so, and its first step takes what waits.
+        const delivery = { sessionId, mode, id: message.id, text: message.content.map(block => block.type === 'text' ? block.text : '').join('') }
+        deliveries(delivery)
         const agent = agents.get(sessionId)!
+        ctx.emit('agent/inbox/inserted', { agent, message } as never)
+        if (hooks.deferStep?.(delivery)) return
+        // A message wakes an idle agent: the lightweight default fixture admits the first step synchronously.
         if (agent.status !== 'idle') return
         agent.status = 'running'
         ctx.emit('agent/status', { agent, status: 'running' } as never)
@@ -285,10 +303,17 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
       })
       const sessionEvents = sessionHistory.get(sessionId) ?? []
       sessionHistory.set(sessionId, sessionEvents)
-      const header: SessionHeader = { id: sessionId as SessionId, version: 4, createdAt: 0, isSeeded: false, cwd: workspaceId, agentPreset }
       sessionHeaders.set(sessionId, header)
-      const session = { id: sessionId, header, inheritedEventCount: 0, snapshotEvents: () => sessionEvents,
-        requestHeader: () => undefined, requestContext: () => modelContexts.get(sessionId), append: vi.fn() }
+      const session = { id: sessionId, header, inheritedEventCount: inheritedEvents.get(sessionId) ?? 0,
+        eventAt: (seq: number) => sessionEvents[seq], snapshotEvents: (from?: number, to?: number) =>
+          from === undefined && to === undefined ? sessionEvents : sessionEvents.slice(from, to),
+        requestHeader: () => undefined, requestContext: () => modelContexts.get(sessionId),
+        append: vi.fn((type: string, data: unknown, placement?: { surfaceOp: string }) => {
+          const event = { seq: sessionEvents.length, time: Date.now(), type, data, ...placement }
+          sessionEvents.push(event)
+          ctx.emit('session/event', session as never, event as never)
+          return event
+        }) }
       let status = 'idle'
       const idle: (() => void)[] = []
       // A cancel drops the inbox unless kept, and the turn it stops ends a moment later, which DSH says.
@@ -313,13 +338,44 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
         get status() { return status }, set status(next: string) { status = next; if (next === 'idle') for (const wake of idle.splice(0)) wake() },
         // Once its turn ended, as DSH's does.
         whenIdle: () => status === 'idle' ? Promise.resolve() : new Promise<void>(resolve => { idle.push(resolve) }) } as never)
+      await ctx.serial('agent/created', { agent: agents.get(sessionId), source } as never)
+  }
+  const resolveDefault = async (id: string) => {
+    if (!agents.has(id)) {
+      const header = sessionHeaders.get(id)
+      if (!header) return { error: { code: 'session/not-found' } }
+      await publishAgent(header, 'resume')
+    }
+    return { agent: agents.get(id) }
+  }
+  const controller = {
+    create: vi.fn(async ({ sessionId, workspaceId, agentPreset }: { sessionId: string; workspaceId: string; agentPreset?: string }) => {
+      if (!agents.has(sessionId)) {
+        const stored = sessionHeaders.get(sessionId)
+        await publishAgent(stored ?? { id: sessionId as SessionId, version: 4, createdAt: 0, isSeeded: false, cwd: workspaceId, agentPreset }, stored ? 'resume' : 'startup')
+      }
     }),
     selectModel: vi.fn(async () => {}), resolveAgent: vi.fn(resolveDefault), rename: vi.fn(async () => {}),
     prompt: vi.fn(() => { throw new Error('Plugin delivery must not use user RPC') }),
     inspect: vi.fn(async () => ({ events: [] })),
   }
   // A real backend knows only created Sessions and keeps the fork cut beside the log; the meter must see the same answers.
-  const persistence = { flush: vi.fn(async () => { hooks.flushSessionLog?.() }), stat: vi.fn(async (sessionId: string) => {
+  const createStored = async (header: SessionHeader) => {
+    if (sessionHeaders.has(header.id) || sessionHistory.has(header.id)) throw new SessionAlreadyExistsError(header.id)
+    const events: StoredEvent[] = []
+    sessionHeaders.set(header.id, structuredClone(header))
+    sessionHistory.set(header.id, events)
+    let closed = false
+    const close = async () => { closed = true }
+    return { id: header.id, header, inheritedEventCount: 0, access: 'write' as const,
+      append: async (batch: readonly StoredEvent[]) => {
+        if (closed || batch.some((event, i) => event.seq !== events.length + i)) throw new Error('Invalid append to stored Session')
+        events.push(...structuredClone(batch))
+      },
+      flush: async () => { if (closed) throw new Error('Closed stored Session'); hooks.flushSessionLog?.() },
+      close, [Symbol.asyncDispose]: close }
+  }
+  const persistence = { create: vi.fn(createStored), flush: vi.fn(async () => { hooks.flushSessionLog?.() }), stat: vi.fn(async (sessionId: string) => {
     const header = sessionHeaders.get(sessionId)
     return header ? { header, revision: 'fixture' } : undefined
   }), open: vi.fn(async (sessionId: string) => {
@@ -340,8 +396,17 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   const webServer = { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }
   const jobs = jobRegistry(id => agents.get(id))
   const subagents = subagentRuntime(agents)
+  const workspaceSessions = new Map<string, Set<string>>()
+  const workspaceRegistry = { create: async (cwd: string) => {
+    const attached = workspaceSessions.get(cwd) ?? new Set<string>()
+    workspaceSessions.set(cwd, attached)
+    return { id: cwd, path: cwd, get sessionIds() { return [...attached] }, attachSession: async (id: string) => {
+      if (!sessionHeaders.has(id)) throw new SessionPersistenceNotFoundError(id as SessionId)
+      attached.add(id)
+    } }
+  } }
   const services = { agents, llm: { resolveCallConfig: vi.fn(async (value: unknown) => value) }, sessionController: controller,
-    sessionPersistence: persistence, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }) }, permissionPresets: { set: () => {} }, subprocess, webServer,
+    sessionPersistence: persistence, workspaceRegistry, permissionPresets: { set: () => {} }, subprocess, webServer,
     jobs: jobs.service, subagents: subagents.service }
   let ctx = new Context()
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
@@ -518,7 +583,9 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
   return { get runtime() { return runtime }, get ctx() { return ctx }, get toolLimits() { return toolLimits }, restart, idlePlanning, idleRelay, directory, localGit, agents, tools, deliveries, relays, jsonRelays, candidates, runTool, sendUserMessage, record, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
-    jobs, subagents, reviewSubagent, useStoredLog, step, claim, modelRequest, mountedSkills }
+    jobs, subagents, reviewSubagent, useStoredLog, step, claim, modelRequest, mountedSkills,
+    nativeStep: (id: string, options: { starts: boolean; beforeHistory?: () => void; cut?: boolean }) =>
+      nativeSteps.get(id)!(options.starts, options.beforeHistory, options.cut) }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>
 interface ManagedProject {

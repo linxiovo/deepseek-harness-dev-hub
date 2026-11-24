@@ -5,7 +5,7 @@ import type { ApiResponse } from '../app/api.ts'
 import type { FieldSpec, Localized } from '../sources/kind.ts'
 import { usePoll, type HistoryView, type Settings, type SettingsView, type SourceView } from './api.ts'
 import { Button, DisclosureRow, Icon, InfoTip, Input, SegmentedControl, Switch } from './controls.tsx'
-import { useDraft } from './draft.tsx'
+import { draftScope, useDraft } from './draft.tsx'
 import { useAction, usePanel, usePanelData } from './provider.tsx'
 import { settingsRoute } from './route.ts'
 import { errorText, localized, valueLabel, when, type T } from './text.ts'
@@ -34,11 +34,12 @@ export function useBlockDraft<V>(block: string, saved: V, revision: number, toVa
   const { t, call, notify } = usePanel()
   const { state } = usePanelData()
   const { reload } = useSettings()
-  return useDraft({ key: `dsh-superagent/draft/${state?.masterId ?? ''}/${block}`, saved, revision, reload, save: async (value, from) => {
-    const result = await call('PUT settings/:block', { block, body: { value: toValue(value), revision: from } })
-    notify(t(result.restarting ? 'savedRestarting' : 'saved'))
-    return result
-  } })
+  return useDraft({ ...(state ? { key: `dsh-superagent/draft/${draftScope(state)}/${block}` } : {}), saved, revision, reload,
+    save: async (value, from) => {
+      const result = await call('PUT settings/:block', { block, body: { value: toValue(value), revision: from } })
+      notify(t(result.restarting ? 'savedRestarting' : 'saved'))
+      return result
+    } })
 }
 
 /** Fieldset wrapper that restores focus to the previously active input after a save completes and re-enables the form. */

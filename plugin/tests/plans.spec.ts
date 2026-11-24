@@ -2,9 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import { unlinkSync, writeFileSync } from 'node:fs'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { resolve } from 'node:path'
-import { KV } from '../src/kv.ts'
 import { startManagedProject, startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host
@@ -286,6 +286,41 @@ describe('managed project plan pause', () => {
     expect(await h.api('GET', 'project/run-limits', undefined, 'other-project')).toMatchObject({ status: 409, body: { code: 'staleProject' } })
     await h.restart()
     expect(await get()).toEqual(after)
+  })
+
+  it('keeps the legacy first Hub and every generation metered across rotation and restart', async () => {
+    const { host, project } = await startManagedProject({ withFeishu: false })
+    managedHost = h = host
+    // The fixture adopts the verified legacy repository, so its first Hub lives in the old state directory.
+    expect(h.runtime.installation.project?.initial).toBeUndefined()
+    const legacyHub = h.runtime.masterId
+    const at = Date.UTC(2026, 10, 24)
+    const context = { type: 'request/context', time: at, data: { provider: 'fixture', model: 'fixture-model', contextWindow: 8192 } }
+    const message = (totalTokens: number) => {
+      const usage = { inputTokens: totalTokens - 2, outputTokens: 1, cacheReadTokens: 1, totalTokens }
+      return { type: 'assistant/message', time: at + 1, data: { turn: 1, step: 1, usage, message: { role: 'assistant', content: [] },
+        stream: [{ type: 'chunk', time: at + 1, chunk: { type: 'usage', usage } }] } }
+    }
+    h.record(legacyHub, [context, message(5)])
+    h.agents.get(legacyHub)!.status = 'idle'
+    const firstSuccessor = await h.runtime.rotateHub()
+    h.record(firstSuccessor, [message(7)])
+    h.agents.get(firstSuccessor)!.status = 'idle'
+    const successor = await h.runtime.rotateHub()
+    h.record(successor, [message(11)])
+    await h.restart()
+    expect(h.runtime.masterId).toBe(successor)
+    expect(await h.api('GET', 'project/meter', undefined, project.id)).toMatchObject({ status: 200, body: {
+      shared: { reported_total_tokens: 23, counted_calls: 3 },
+      sessions: expect.arrayContaining([
+        expect.objectContaining({ session_id: legacyHub, roles: ['hub'], log_status: 'available',
+          own: expect.objectContaining({ reported_total_tokens: 5 }) }),
+        expect.objectContaining({ session_id: firstSuccessor, roles: ['hub'], log_status: 'available',
+          own: expect.objectContaining({ reported_total_tokens: 7 }) }),
+        expect.objectContaining({ session_id: successor, roles: ['hub'], log_status: 'available',
+          own: expect.objectContaining({ reported_total_tokens: 11 }) }),
+      ]),
+    } })
   })
 
   it('admits a native reviewer before its first skill call and charges its Worker ticket', async () => {
@@ -613,11 +648,13 @@ describe('managed project plan pause', () => {
     return verificationResult.promise
   }
   const interruptedVerification = h.api('POST', `${path}/verify`, {}, project.id)
-  await verificationStarted.promise
+  await Promise.race([verificationStarted.promise, interruptedVerification.then(result => {
+    throw new Error(`Verification returned before starting the verifier: ${JSON.stringify(result)}`)
+  })])
   const restart = h.restart()
   verificationResult.resolve(true)
-  expect(await interruptedVerification).toMatchObject({ status: 409, body: { code: 'switching' } })
-  await restart
+  const [interrupted] = await Promise.all([interruptedVerification, restart])
+  expect(interrupted).toMatchObject({ status: 409, body: { code: 'switching' } })
   await h.runtime.idle()
   expect(push()).toHaveLength(1)
   expect(await summary()).toMatchObject({ status: 200, body: { awaitingHuman: 1 } })
@@ -659,7 +696,7 @@ describe('managed project plan pause', () => {
   await h.restart()
   await h.runtime.idle()
   expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['accounts'] })
-})
+  }, 60_000)
 })
 describe('plans on the legacy host fixture after managed scenario', () => {
   beforeEach(async () => {
@@ -726,15 +763,15 @@ it('counts a forked review once and keeps one Hub call across two active Tickets
   expect(await h.api('GET', 'tickets/unknown/meter')).toMatchObject({ status: 404 })
   await expect(h.runTool(catalog.session, 'orchestrator_read', { resource: `ticket/${catalog.ticketId}/meter` })).rejects.toThrow()
 
-  // Reopen with a new Hub identity and the business child unloaded, while all old logs stay durable.
-  h.agents.delete(review)
-  h.runtime.store.set(KV.runtime.masterId, 'rotated-hub')
+  // Rotate through the public Runtime seam while the business child remains unloaded.
+  h.agents.get(master)!.status = 'idle'
+  const rotated = await h.runtime.rotateHub()
   await h.restart()
-  expect(h.runtime.masterId).toBe('rotated-hub')
+  expect(h.runtime.masterId).toBe(rotated)
   const after = await h.api('GET', 'project/meter')
   expect(after).toMatchObject({ status: 200, body: { ...expected, sessions: expect.arrayContaining([
     expect.objectContaining({ session_id: master, roles: ['hub'] }),
-    expect.objectContaining({ session_id: 'rotated-hub', roles: ['hub'] }),
+    expect.objectContaining({ session_id: rotated, roles: ['hub'] }),
     expect.objectContaining({ session_id: catalog.session, parent_session_id: master }),
   ]) } })
   expect(await h.api('GET', `sessions/${review}/meter`)).toMatchObject({ status: 200, body: { inherited_events: 2,
@@ -1207,9 +1244,48 @@ async function reviewRequirement(proposalId: string, status: 'within-handoff' | 
   return verdict.reviewId
 }
 
+it('resumes the approved Plan goal after restart without promoting pending or denied changes', async () => {
+  const { id, register } = await publish()
+  await h.runtime.idle()
+  await register(splitDraft)
+  const hub = h.runtime.masterId
+  const Proposal = z.object({ proposalId: z.uuid(), requestMessageId: z.string() })
+  const propose = async (goal: string) => {
+    h.sendUserMessage(hub, JSON.stringify({ intent: 'change-plan-requirements', planId: id,
+      authorizedScope: brief.authorization.scope, goal, changes: [] }))
+    return Proposal.parse(await h.runTool(hub, 'orchestrator_plan_requirements', { mode: 'preview' }))
+  }
+  const approve = (proposal: z.infer<typeof Proposal>, scopeReviewId: string) => {
+    h.sendUserMessage(hub, JSON.stringify({ approved: true, ...proposal, scopeReviewId, scopeDecision: 'within-handoff' }))
+    return h.runTool(hub, 'orchestrator_plan_requirements', { mode: 'apply', proposalId: proposal.proposalId })
+  }
+  const goal = 'Show each shopper their own saved products in most-recent-first order.'
+  const approved = await propose(goal)
+  expect(await approve(approved, await reviewRequirement(approved.proposalId))).toMatchObject({ status: 'applied', revision: 2 })
+  const deniedGoal = 'Share every shopper’s saved products publicly.'
+  const denied = await propose(deniedGoal)
+  const denial = await reviewRequirement(denied.proposalId, 'outside-handoff', 'Private lists must not be shared.')
+  await expect(approve(denied, denial)).rejects.toThrow(/outside the original Handoff/i)
+  const pendingGoal = 'Let a shopper group their private saved products by category.'
+  await propose(pendingGoal)
+
+  await h.restart()
+  const successor = await h.runtime.rotateHub()
+  await using log = await h.ctx.sessionPersistence.open(successor as SessionId, 'read')
+  const resume = (await log.read(0, 512)).events.find(event => event.type === 'user/message' && event.data.id === 'dsh-superagent:hub-resume:1')
+  const block = resume?.type === 'user/message' ? resume.data.content[0] : undefined
+  const text = block?.type === 'text' ? block.text : ''
+  expect(text).not.toContain(deniedGoal)
+  expect(text).not.toContain(pendingGoal)
+  const summary = JSON.parse(text.slice(text.lastIndexOf('\n') + 1))
+  expect(summary).toMatchObject({ handoffs: [{ id, goal: brief.goal, authorization: brief.authorization, read: `handoff/${id}` }],
+    plans: [{ id, handoff_id: id, revision: 2, goal, read: `plan/${id}`, revision_read: `plan/${id}/revision/2` }] })
+  expect(await read(summary.plans[0].revision_read)).toMatchObject({ goal, cause: { kind: 'requirements', proposalId: approved.proposalId } })
+}, 30_000)
+
 it('previews a product replan before applying an exact, durable direct approval', async () => {
   const { id, catalogClaim, accountsClaim } = await dispatchedFanIn()
-  const hub = h.runtime.masterId
+  let hub = h.runtime.masterId
   const requirements = (args: unknown, session = hub) => h.runTool(session, 'orchestrator_plan_requirements', args)
   const changed = { criterion: 1, statement: 'Search matches product prefixes.', observable: 'The catalog API excludes non-prefix matches.' }
   const request = { intent: 'change-plan-requirements', planId: id, authorizedScope: brief.authorization.scope, changes: [changed] }
@@ -1321,6 +1397,17 @@ it('previews a product replan before applying an exact, durable direct approval'
   await expect(apply(proposal)).rejects.toThrow(/new handoff/i)
   send(approval(proposal, staleReview))
   await expect(apply(proposal)).rejects.toThrow(/scope review/i)
+  const retired = h.agents.get(hub)!
+  retired.status = 'running'
+  retired.followup({ id: 'retired-product-approval', role: 'user', source: { kind: 'user' }, content: [{ type: 'text',
+    text: JSON.stringify(approval(proposal, scopeReviewId)) }] } as never)
+  retired.status = 'idle'
+  hub = await h.runtime.rotateHub()
+  await h.runtime.idle()
+  await expect(apply(proposal)).rejects.toThrow(/single text message/i)
+  const approvalReady = Promise.withResolvers<void>()
+  setTimeout(approvalReady.resolve, 2)
+  await approvalReady.promise
   send(approval(proposal, scopeReviewId))
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, runLimits: {

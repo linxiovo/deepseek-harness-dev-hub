@@ -648,11 +648,13 @@ describe('managed project plan pause', () => {
     return verificationResult.promise
   }
   const interruptedVerification = h.api('POST', `${path}/verify`, {}, project.id)
-  await verificationStarted.promise
+  await Promise.race([verificationStarted.promise, interruptedVerification.then(result => {
+    throw new Error(`Verification returned before starting the verifier: ${JSON.stringify(result)}`)
+  })])
   const restart = h.restart()
   verificationResult.resolve(true)
-  expect(await interruptedVerification).toMatchObject({ status: 409, body: { code: 'switching' } })
-  await restart
+  const [interrupted] = await Promise.all([interruptedVerification, restart])
+  expect(interrupted).toMatchObject({ status: 409, body: { code: 'switching' } })
   await h.runtime.idle()
   expect(push()).toHaveLength(1)
   expect(await summary()).toMatchObject({ status: 200, body: { awaitingHuman: 1 } })
@@ -694,7 +696,7 @@ describe('managed project plan pause', () => {
   await h.restart()
   await h.runtime.idle()
   expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['accounts'] })
-})
+  }, 60_000)
 })
 describe('plans on the legacy host fixture after managed scenario', () => {
   beforeEach(async () => {

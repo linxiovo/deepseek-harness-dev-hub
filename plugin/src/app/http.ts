@@ -46,6 +46,8 @@ export interface HttpHost {
   readonly verifyTopicBinding?: (() => Promise<void>) | undefined
   assertNewWork?(): void
   rotateHub?(): Promise<string>
+  /** Successor of a completed retired Hub root in the mounted project; undefined for non-members or an unfinished map. */
+  hubConversation?(sessionId: string): string | undefined
   ownsSession?(id: string): boolean | Promise<boolean>
   readonly store: Store
   /** Feishu message links resolved since startup, used by search to match AppLink URLs. */
@@ -166,7 +168,8 @@ function promptsView(runtime: HttpHost, revision: number | undefined, offset: nu
 export type PromptsView = ReturnType<typeof promptsView>
 
 interface Input<K extends keyof Api> {
-  params: RouteParams<K>; query: Record<string, string>; body: (maxBytes?: number) => Promise<unknown>
+  params: RouteParams<K>; query: Record<string, string>; projectId: string | null
+  body: (maxBytes?: number) => Promise<unknown>
   write<T>(operation: () => T | Promise<T>, verify?: () => Promise<void>): T | Promise<T>
 }
 type RouteOutput<K extends keyof Api> = K extends 'GET plans/:id/artifact' ? PlanArtifactFile : ApiResponse<K>
@@ -180,6 +183,7 @@ const DecisionsQuery = z.object({ kind: z.string().default(''), window: z.litera
   limit: limit(30, 200) })
 const count = z.coerce.number().int().nonnegative()
 const PromptsQuery = z.object({ revision: count.optional(), offset: count.default(0) })
+const HubConversationQuery = z.object({ sessionId: z.string().min(1) })
 const SourceBlock = z.templateLiteral(['source:', z.string().regex(/^[a-z][a-z0-9-]*$/)])
 const SettingsBlockSchema = z.union([z.enum(['policy', 'eval', 'executor']), SourceBlock])
 const SaveRequest = z.object({ value: z.unknown(), revision: z.number().int().nonnegative() })
@@ -264,7 +268,7 @@ const projectMeterRoutes: Partial<Record<keyof Api, true>> = {
 }
 
 const requiredProjectRoutes: Partial<Record<keyof Api, true>> = {
-  'GET plans/:id/delivery': true, 'GET plans/:id/artifact': true,
+  'GET hub/conversation': true, 'GET plans/:id/delivery': true, 'GET plans/:id/artifact': true,
 }
 
 const runLimitRoutes: Partial<Record<keyof Api, true>> = {
@@ -324,6 +328,14 @@ function routes(runtime: HttpHost): Routes {
       const rotateHub = runtime.rotateHub
       if (!rotateHub) throw new RouteError(404, 'Hub rotation is not available')
       return write(async () => ({ hubSessionId: await rotateHub.call(runtime) }))
+    },
+    'GET hub/conversation': ({ projectId, query }) => {
+      // The mounted scope is already verified; a host without a managed mount has no continuation to publish.
+      if (!projectId) throw new InstallationError(409, 'noProject')
+      const parsed = HubConversationQuery.safeParse(query)
+      if (!parsed.success) throw new RouteError(400, 'Invalid hub conversation query')
+      const successor = runtime.hubConversation?.(parsed.data.sessionId)
+      return { target: successor === undefined ? null : { projectId, sessionId: successor } }
     },
     'GET topic-binding': () => topicBindingOf(runtime).view(),
     'POST topic-binding': async ({ body, write }) => {
@@ -484,9 +496,12 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
     const requirement = topicBindingRoutes[route] || attentionRoutes[route] ? 'required' : 'when-active'
     const { installation } = runtime
     const mount = installation?.runtime()
-    if (route === 'POST hub/rotate' && mount?.reason === 'noProject') throw new InstallationError(409, 'noProject')
     if (!installationRoute || scope !== undefined) {
       assertProjectScope(mount?.projectId ?? null, scope, requirement)
+    }
+    // A verified legacy runtime can be ready without a managed mount; rotation still has no project identity to retain.
+    if (route === 'POST hub/rotate' && mount?.reason !== 'switching' && !mount?.projectId) {
+      throw new InstallationError(409, 'noProject')
     }
     if (!installation) return operation()
     if (writing === 'installation' || mount?.reason === 'switching') throw new InstallationError(409, 'switching')
@@ -550,7 +565,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         }
         let result: unknown
         try {
-          result = await route.run({ params: route.params as never, query, body: async maxBytes => {
+          result = await route.run({ params: route.params as never, query, projectId: mounted, body: async maxBytes => {
             const body = await readBody(req, maxBytes)
             if (closed) throw new InstallationError(409, 'switching')
             return body

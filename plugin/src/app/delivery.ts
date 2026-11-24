@@ -2,16 +2,16 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { freezeMessage, MessageId, type ContextFormed, type UserMessage } from '@deepseek-ai/dsh-llm'
-import type { Session, SessionId } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
-    'dsh-superagent': { kind: 'dsh-superagent' } & ContextFormed
+    'dsh-superagent': { kind: 'dsh-superagent'; originalRequestId?: string } & ContextFormed
   }
 }
 
-type Seen = { ids: Set<string>; messages: Set<string>; loaded?: Promise<void> }
+type Seen = { ids: Set<string>; messages: Map<string, number>; loaded?: Promise<void> }
 /** The id of the message delivered under `requestId`, the same on every retry. */
 export const messageId = (requestId: string) => MessageId(`dsh-superagent:${requestId}`)
 /** Extracts the idempotency key from current or legacy plugin message sources. */
@@ -35,14 +35,14 @@ export class AgentDelivery {
       if (event.type !== 'user/message') return
       const seen = this.seen.get(session)
       if (!seen) return
-      seen.messages.add(event.data.id)
+      seen.messages.set(event.data.id, event.seq)
       const id = deliveryId(event.data)
       if (id) seen.ids.add(id)
     })
   }
   private async history(agent: Agent): Promise<Seen> {
     let seen = this.seen.get(agent.session)
-    if (!seen) { seen = { ids: new Set(), messages: new Set() }; this.seen.set(agent.session, seen) }
+    if (!seen) { seen = { ids: new Set(), messages: new Map() }; this.seen.set(agent.session, seen) }
     const state = seen
     state.loaded ??= (async () => {
       await this.ctx.sessionPersistence.flush()
@@ -52,7 +52,7 @@ export class AgentDelivery {
         if (!events.length) break
         for (const event of events) {
           if (event.type !== 'user/message') continue
-          state.messages.add(event.data.id)
+          state.messages.set(event.data.id, event.seq)
           const id = deliveryId(event.data)
           if (id) state.ids.add(id)
         }
@@ -66,9 +66,33 @@ export class AgentDelivery {
     const id = messageId(requestId)
     return (await this.history(agent)).ids.has(id) || [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => deliveryId(message) === id)
   }
-  async holdsMessage(agent: Agent, messageId: string): Promise<boolean> {
+  /** A Hub successor is an original root. Only its own flushed user event, never its pending inbox, acknowledges transfer. */
+  async consumed(agent: Agent, message: UserMessage): Promise<boolean> {
     const seen = await this.history(agent)
-    return seen.messages.has(messageId) || [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => message.id === messageId)
+    const seq = seen.messages.get(message.id)
+    if (seq === undefined) return false
+    await this.ctx.sessionPersistence.flush()
+    await using handle = await this.ctx.sessionPersistence.open(agent.id, 'read')
+    if (handle.inheritedEventCount) throw new Error('Cannot confirm Hub input in a forked Session')
+    const event = (await handle.read(seq, 1)).events[0]
+    return this.matchesUserEvent(event, message) && event.seq === seq
+  }
+  /** Reconcile a previous transfer destination without loading or waking the retired Agent. */
+  async consumedIn(sessionId: string, message: UserMessage): Promise<boolean> {
+    await this.ctx.sessionPersistence.flush()
+    await using handle = await this.ctx.sessionPersistence.open(sessionId as SessionId, 'read')
+    if (handle.inheritedEventCount) throw new Error('Cannot confirm Hub input in a forked Session')
+    for (let offset = 0; ; ) {
+      const { events } = await handle.read(offset, 512)
+      if (events.some(event => this.matchesUserEvent(event, message))) return true
+      if (!events.length) return false
+      offset += events.length
+    }
+  }
+  private matchesUserEvent(event: SessionEvent | undefined, message: UserMessage): event is SessionEvent<'user/message'> {
+    return event?.type === 'user/message' && event.data.id === message.id
+      && JSON.stringify(event.data.source) === JSON.stringify(message.source)
+      && JSON.stringify(event.data.content) === JSON.stringify(message.content)
   }
   /** Checks a cold physical Hub log without resuming its Agent, so rotation can deduplicate a flushed old delivery. */
   async holdsIn(sessionId: string, requestId: string): Promise<boolean> {

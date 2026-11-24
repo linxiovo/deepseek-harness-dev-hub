@@ -2,10 +2,10 @@
 import { Fragment, useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react'
 import type { ApiResponse } from '../app/api.ts'
 import type { PromptConfig, PromptsView } from './api.ts'
-import { SaveBar, useDraft, type DraftWords } from './draft.tsx'
+import { draftScope, SaveBar, useDraft, type DraftWords } from './draft.tsx'
 import { changedSections, isPart, isSkill, lineDiff, partKey, partText, partWith, sectionLabel, sectionText, skillNameFree, withOverride,
   withOverrides, withSection, withSkillEnabled, withoutSkill, type BuiltInPart, type DiffLine } from './prompt-config.ts'
-import { useAction, usePanel } from './provider.tsx'
+import { useAction, usePanel, usePanelData } from './provider.tsx'
 import { errorText, valueLabel, when, type T } from './text.ts'
 import { Hint, LoadState } from './widgets.tsx'
 import { Button, Icon, Input, SegmentedControl } from './controls.tsx'
@@ -29,10 +29,11 @@ export function PromptsPage() {
 
 function PromptsEditor({ view, reload }: { view: PromptsView; reload: () => Promise<void> }) {
   const { t, call, notify } = usePanel()
+  const { state } = usePanelData()
   const saved = withOverrides(view.current.config)
   const [maintenanceTicketId, setMaintenanceTicketId] = useState('')
-  const draft = useDraft<PromptConfig, PromptNote>({ key: `dsh-superagent/prompts/${view.masterId}`, saved, revision: view.revision,
-    reload,
+  const draft = useDraft<PromptConfig, PromptNote>({ ...(state ? { key: `dsh-superagent/prompts/${draftScope(state)}` } : {}),
+    saved, revision: view.revision, reload,
     save: async (config, baseRevision) => {
       if (!maintenanceTicketId.trim()) throw new Error(t('promptMaintenanceTicketRequired'))
       const result = await call('PUT prompts', { body: { config, baseRevision, maintenanceTicketId: maintenanceTicketId.trim() } })

@@ -227,13 +227,21 @@ export class Runtime extends Service implements SourceHost {
         promptVersion: id => this.sessions.promptVersion(id),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
       const sessions: Sessions = this.sessions = new Sessions({ context: ctx, store, projectMeter, prompts, effects, health: board.claim('models'), masterId,
-        currentHubId: () => authority.currentSessionId(), hubTargetId: () => authority.targetSessionId(),
+        currentHubId: () => authority.currentSessionId(), readyHubId: () => authority.readySessionId(), hubTargetId: () => authority.targetSessionId(),
         hubGenerations: () => authority.generations(), isHubGeneration: id => authority.isGeneration(id),
-        beginHubRotation: () => authority.beginRotation(),
-        activateHub: id => { authority.activate(id); runtime.masterId = id; projectMeter.bind({ session_id: id, role: 'hub' }) },
-        hubResume: () => { const resume = authority.pendingResume(); return resume && { ...resume,
-          text: hubResumeText({ store, handoffs, plans, effects, project: installation.project, hubId: runtime.hubId, epoch: resume.epoch }) } },
-        hubResumeDelivered: requestId => authority.resumeDelivered(requestId),
+        hubCreation: id => authority.creation(id), hubRequiresProof: id => authority.generationEpoch(id) !== 0,
+        hubRotation: () => authority.rotation(), beginHubRotation: (cwd, offset, turn) => authority.beginRotation(cwd, offset, turn),
+        sealHubRotation: cwd => authority.sealRotation(cwd),
+        activateHub: id => {
+          authority.activate(id, epoch => hubResumeText({ store, handoffs, plans, effects, project: installation.project, hubId: runtime.hubId, epoch }))
+          projectMeter.bind({ session_id: id, role: 'hub' })
+        },
+        hubResume: () => {
+          const resume = authority.pendingResume()
+          return resume && { ...resume, text: resume.text ?? hubResumeText({ store, handoffs, plans, effects,
+            project: installation.project, hubId: runtime.hubId, epoch: resume.epoch }) }
+        },
+        hubResumeDelivered: requestId => { authority.resumeDelivered(requestId); runtime.masterId = authority.visibleSessionId() },
         lifetime: this.lifetime, boundWorkspace: project?.workspace,
         relayAvailable: requestId => this.planIntegration.relayAvailable(requestId),
         closing: () => this.closing(), environment, ownsPlanner: id => handoffs.get(id) !== undefined,
@@ -576,6 +584,11 @@ export class Runtime extends Service implements SourceHost {
   }
   /** Current physical Hub Session ID; the project identity is `hubId`. */
   get hubSessionId(): string { return this.masterId }
+  /** The published successor for a physical conversation retired by the mounted project. */
+  hubConversation(sessionId: string): string | undefined {
+    const target = this.hubAuthority.continuation(sessionId)
+    return target && this.sessions.isPublishedHub(target) ? target : undefined
+  }
 
   async idle(): Promise<void> {
     await this.effects.idle('hubInbox')
@@ -700,7 +713,9 @@ export class Runtime extends Service implements SourceHost {
     }
     if (!project) this.sessions.install()
     this.executor.install()
-    await this.sessions.ensureHub(project?.initial ? project.workspace : this.machine.stateDir, 'dsh-superagent orchestrator')
+    const initialHubCwd = project?.initial ? project.workspace : this.machine.stateDir
+    const hubCwd = this.hubAuthority.rotation() ? project?.workspace ?? settings.executor.repository ?? initialHubCwd : initialHubCwd
+    await this.sessions.ensureHub(hubCwd, 'dsh-superagent orchestrator')
     if (this.closing()) return
     if (project && !await this.reconcilePulls()) return
     for (const id of this.settings.syncable()) await this.settings.sync(id).catch(() => { /* sync() records its failure in health. */ })
@@ -754,6 +769,7 @@ export class Runtime extends Service implements SourceHost {
       meter: { read: (id, signal) => this.readScopedMeter(id, signal) },
       topicBinding: this.topicBinding, verifyTopicBinding: () => this.verifyTopicBinding(),
       get ready() { return runtime.ready }, assertNewWork: () => installation.assertNewWork(), rotateHub: () => runtime.rotateHub(),
+      hubConversation: id => runtime.hubConversation(id),
       ownsSession: id => this.ownsSession(id),
       get deployment() { return setup.deployment },
       get setupProblem() { return runtime.setupProblem }, get feishuProblem() { return setup.feishuProblem },
@@ -812,8 +828,10 @@ export class Runtime extends Service implements SourceHost {
     }
     const project = this.installation.project
     const handoff = planning ? this.handoffs.get(id.slice(id.indexOf('-') + 1)) : undefined
+    // Rotation generations were provisioned in the mounted workspace; the legacy first generation keeps its old directory.
+    const epoch = hub ? this.hubAuthority.generationEpoch(id) : undefined
     const cwd = worker ? execution?.worktree : planning ? handoff && (project?.workspace ?? handoff.project.workspace)
-      : project?.initial ? project.workspace : this.machine.stateDir
+      : epoch !== undefined && epoch > 0 ? project?.workspace : project?.initial ? project.workspace : this.machine.stateDir
     const preset = worker ? WORKER_PRESET : planning ? PLANNER_PRESET : ROUTER_PRESET
     return header.agentPreset === preset && cwd && header.cwd && isAbsolute(header.cwd) && sameDirectory(cwd, header.cwd)
       ? { header } : 'unverified'

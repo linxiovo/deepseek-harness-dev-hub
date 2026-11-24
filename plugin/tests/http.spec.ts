@@ -317,6 +317,7 @@ it('reports lifecycle status while startup is pending, and recovery once ready',
 })
 
 const idleRuntime = (): RuntimeView => ({ mode: 'desktop', status: 'paused', reason: 'noProject', projectId: null, resumedFrom: null })
+const legacyReady = (): RuntimeView => ({ mode: 'desktop', status: 'ready', reason: null, projectId: null, resumedFrom: null })
 
 it('lets the panel verify GitHub and create or select projects without returning private service fields', async () => {
   const identity = { id: 12, login: 'agent', noreply: '12+agent@users.noreply.github.com' }
@@ -379,9 +380,47 @@ it('rotates the Hub only for a same-origin request scoped to the mounted project
     .toMatchObject({ status: 409, body: { code: 'staleProject' } })
   expect(await serve({ installation: { runtime: idleRuntime }, rotateHub })('POST', 'hub/rotate'))
     .toMatchObject({ status: 409, body: { code: 'noProject' } })
+  // A verified legacy runtime can be ready while no managed project is mounted; rotation must not reach the mutator.
+  const legacy = serve({ installation: { runtime: legacyReady }, rotateHub })
+  expect(await legacy('POST', 'hub/rotate')).toMatchObject({ status: 409, body: { code: 'noProject' } })
+  expect(await legacy('POST', 'hub/rotate', undefined, projectHeader(beta.id)))
+    .toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  expect(await serve({ rotateHub })('POST', 'hub/rotate')).toMatchObject({ status: 409, body: { code: 'noProject' } })
   expect(rotations).toBe(0)
   expect(await call('POST', 'hub/rotate', undefined, scope)).toEqual({ status: 200, body: { hubSessionId: 'hub-new' } })
   expect(rotations).toBe(1)
+})
+
+it('resolves a retired Hub root only inside the mounted project', async () => {
+  const calls: string[] = []
+  const call = serve({
+    installation: bindingInstallation(),
+    hubConversation: (sessionId: string) => {
+      calls.push(sessionId)
+      return sessionId === 'retired' ? 'successor' : undefined
+    },
+  })
+  const scope = projectHeader(alpha.id)
+  // Without a mounted scope, or with another project's scope, no mapping is resolved.
+  expect(await call('GET', 'hub/conversation?sessionId=retired'))
+    .toMatchObject({ status: 409, body: { code: 'projectScopeRequired' } })
+  expect(await call('GET', 'hub/conversation?sessionId=retired', undefined, projectHeader(beta.id)))
+    .toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  expect(calls).toEqual([])
+  expect(await call('GET', 'hub/conversation?sessionId=retired', undefined, scope))
+    .toEqual({ status: 200, body: { target: { projectId: alpha.id, sessionId: 'successor' } } })
+  expect(await call('GET', 'hub/conversation?sessionId=active', undefined, scope))
+    .toEqual({ status: 200, body: { target: null } })
+  expect(calls).toEqual(['retired', 'active'])
+  expect(await call('GET', 'hub/conversation', undefined, scope)).toMatchObject({ status: 400 })
+  const unmounted = serve({ installation: { runtime: idleRuntime },
+    hubConversation: () => { throw new Error('a missing mount must not resolve a successor') } })
+  expect(await unmounted('GET', 'hub/conversation?sessionId=retired'))
+    .toMatchObject({ status: 409, body: { code: 'noProject' } })
+  expect(await unmounted('GET', 'hub/conversation?sessionId=retired', undefined, projectHeader(alpha.id)))
+    .toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  // Read-only: this route exposes no operation surface.
+  expect(await call('POST', 'hub/conversation?sessionId=retired', undefined, scope)).toMatchObject({ status: 404 })
 })
 
 it('reports unavailable and failed Hub rotation without returning a replacement Session', async () => {

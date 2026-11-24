@@ -13,10 +13,11 @@ import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { openKnownSession, projectNavigation, SessionNavigationError } from '../navigation.ts'
 import { App } from './app.tsx'
 import { PluginConfig, usePageForm } from './deployment.tsx'
+import { followHubConversation, type MountedConversation } from './hub-conversation.ts'
 import { en, zh } from './locales.ts'
 import type { T } from './text.ts'
 
-type ClientContext = Context & { sessions: ISessions }
+type ClientContext = Context & { sessions: ISessions; sidebarRight: { mounted: MountedConversation } }
 const NS = 'dshSuperagent'
 const PANEL_ID = 'dsh-superagent' as MainPanelId
 const ENTRY = 'dsh-superagent'
@@ -35,7 +36,16 @@ function Mounted({ ctx, t }: { ctx: ClientContext; t: T }) {
     pending.current?.abort()
     const request = new AbortController(); pending.current = request
     try {
-      await openKnownSession(ctx.sessions, id as SessionId, target => { ctx.uiWorkspace.openSession(target) }, request.signal)
+      await openKnownSession(ctx.sessions, id as SessionId, target => {
+        ctx.uiWorkspace.openSession(target)
+        // The link opened the management panel; refresh should now restore the native Conversation instead.
+        const url = new URL(window.location.href)
+        if (!projectNavigation(url.search)) return
+        url.searchParams.delete('superagentProject')
+        url.searchParams.delete('superagentView')
+        url.searchParams.delete('superagentTicket')
+        window.history.replaceState(window.history.state, '', url)
+      }, request.signal)
     } catch (error) {
       if (error instanceof SessionNavigationError) throw new Error(t(error.code === 'not-ready' ? 'sessionListNotReady' : 'sessionNotListed'))
       throw error
@@ -45,11 +55,14 @@ function Mounted({ ctx, t }: { ctx: ClientContext; t: T }) {
   return <App t={t} openSession={openSession} deploymentForm={form} />
 }
 
-export const inject = ['slots', 'locale', 'sessions', 'uiWorkspace', 'layout']
+export const inject = ['slots', 'locale', 'sessions', 'uiWorkspace', 'layout', 'sidebarRight']
 /** Registers the panel, sidebar icon, and Plugin Manager config view; `configForms` is optional (without it, machine settings are read-only). */
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-superagent: dictionaries')
   const t = ctx.locale.bind(NS)
+  ctx.effect(() => followHubConversation({ mounted: ctx.sidebarRight.mounted, sessions: ctx.sessions, t,
+    openSession: id => ctx.uiWorkspace.openSession(id),
+    reportError: failure => console.warn('dsh-superagent: could not follow the project Hub', failure) }), 'dsh-superagent: Hub conversation')
   const target = projectNavigation(window.location.search)
   let opened = false
   ctx.slots.inject('main', () => {

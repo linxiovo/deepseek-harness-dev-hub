@@ -53,7 +53,11 @@ export const KV = {
   runtime: { masterId: record<string>('master-id'), authority: record<HubAuthorityState>('hub-authority'),
     delivery: family<HubDeliveryReceipt, [requestId: string]>('hub-delivery:'),
     transfer: family<UserMessage[], [fromSessionId: string]>('hub-inbox-transfer:'),
-    transferred: family<true, [fromSessionId: string, messageId: string]>('hub-inbox-receipt:', (from, id) => JSON.stringify([from, id])) },
+    transferred: family<string, [fromSessionId: string, messageId: string]>('hub-inbox-consumed:', (from, id) => JSON.stringify([from, id])),
+    inboxTarget: family<string, [fromSessionId: string, messageId: string]>('hub-inbox-target:', (from, id) => JSON.stringify([from, id])),
+    inboxRequest: family<{ sessionId: string; messageId: string }, [kind: 'rpc' | 'message', id: string]>(
+      'hub-inbox-request:', (kind, id) => JSON.stringify([kind, id])),
+    inboxFence: family<number, [sessionId: string]>('hub-inbox-fence:') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
   sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
   /** Session meter: durable exclusive log cursor and its cumulative, own-event projection. */

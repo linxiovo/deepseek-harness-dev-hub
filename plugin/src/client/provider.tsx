@@ -1,10 +1,10 @@
 /** Shared panel React contexts, state polling, restart detection, and action runner hook. */
 import { Fragment, createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { caller, usePoll, type ApiMessages, type Call, type SetupView, type StateView } from './api.ts'
+import { apiMessages, caller, usePoll, type Call, type SetupView, type StateView } from './api.ts'
 import type { Route } from './route.ts'
 import STYLES from './client.css?raw'
-import { errorText, setupText, valueLabel, type T } from './text.ts'
+import { errorText, type T } from './text.ts'
 
 export interface PanelContext {
   t: T
@@ -55,13 +55,6 @@ export function useAction<A extends unknown[]>(action: (...args: A) => Promise<u
   return { run, busy }
 }
 
-const messages = (t: T): ApiMessages => ({
-  offline: t('offline'), notRunning: t('hostNotRunning'), serverError: status => t('serverError', { status }),
-    requestFailed: status => t('requestFailed', { status }),
-  setup: problem => problem.values.output ? `${setupText(t, problem)}\n${problem.values.output}` : setupText(t, problem),
-  // A refusal names a prompt part by its label.
-  user: ({ code, values }) => t(`userError.${code}`, values.part ? { ...values, part: valueLabel(t, 'promptPart', values.part) } : values),
-})
 function Toast({ text, onDone, holdMs = 3000 }: { text: string; onDone: () => void; holdMs?: number }) {
   const done = useRef(onDone)
   done.current = onDone
@@ -79,7 +72,7 @@ export function PanelProvider({ t, interval = 5000, openSession = noSession, nav
   // Read the current translator via ref so locale changes do not recreate `call` and restart polling.
   const copy = useRef(t)
   copy.current = t
-  const installationCall = useMemo(() => caller(() => messages(copy.current)), [])
+  const installationCall = useMemo(() => caller(() => apiMessages(copy.current)), [])
   const [toast, setToast] = useState<{ text: string; id: number }>()
   const notify = useCallback((text: string) => setToast({ text, id: Date.now() }), [])
   // Poll at 1s during a restart until the server goes down and answers again, or time out after 30s if the restart completed between polls.
@@ -87,7 +80,7 @@ export function PanelProvider({ t, interval = 5000, openSession = noSession, nav
   const [restarts, setRestarts] = useState(0)
   const restart = useCallback(() => setRestarting({ down: false }), [])
   const { data: state, error, reload } = usePoll(() => installationCall('GET state'), [installationCall], restarting ? 1000 : interval)
-  const call = useMemo(() => caller(() => messages(copy.current), state?.projectId), [state?.projectId])
+  const call = useMemo(() => caller(() => apiMessages(copy.current), state?.projectId), [state?.projectId])
   if (restarting && !!error !== restarting.down) {
     setRestarting(error ? { down: true } : undefined)
     if (!error) setRestarts(restarts + 1)

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import { unlinkSync, writeFileSync } from 'node:fs'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { resolve } from 'node:path'
 import { startManagedProject, startRuntime, type Host } from './fixtures/host.ts'
@@ -285,6 +286,41 @@ describe('managed project plan pause', () => {
     expect(await h.api('GET', 'project/run-limits', undefined, 'other-project')).toMatchObject({ status: 409, body: { code: 'staleProject' } })
     await h.restart()
     expect(await get()).toEqual(after)
+  })
+
+  it('keeps the legacy first Hub and every generation metered across rotation and restart', async () => {
+    const { host, project } = await startManagedProject({ withFeishu: false })
+    managedHost = h = host
+    // The fixture adopts the verified legacy repository, so its first Hub lives in the old state directory.
+    expect(h.runtime.installation.project?.initial).toBeUndefined()
+    const legacyHub = h.runtime.masterId
+    const at = Date.UTC(2026, 10, 24)
+    const context = { type: 'request/context', time: at, data: { provider: 'fixture', model: 'fixture-model', contextWindow: 8192 } }
+    const message = (totalTokens: number) => {
+      const usage = { inputTokens: totalTokens - 2, outputTokens: 1, cacheReadTokens: 1, totalTokens }
+      return { type: 'assistant/message', time: at + 1, data: { turn: 1, step: 1, usage, message: { role: 'assistant', content: [] },
+        stream: [{ type: 'chunk', time: at + 1, chunk: { type: 'usage', usage } }] } }
+    }
+    h.record(legacyHub, [context, message(5)])
+    h.agents.get(legacyHub)!.status = 'idle'
+    const firstSuccessor = await h.runtime.rotateHub()
+    h.record(firstSuccessor, [message(7)])
+    h.agents.get(firstSuccessor)!.status = 'idle'
+    const successor = await h.runtime.rotateHub()
+    h.record(successor, [message(11)])
+    await h.restart()
+    expect(h.runtime.masterId).toBe(successor)
+    expect(await h.api('GET', 'project/meter', undefined, project.id)).toMatchObject({ status: 200, body: {
+      shared: { reported_total_tokens: 23, counted_calls: 3 },
+      sessions: expect.arrayContaining([
+        expect.objectContaining({ session_id: legacyHub, roles: ['hub'], log_status: 'available',
+          own: expect.objectContaining({ reported_total_tokens: 5 }) }),
+        expect.objectContaining({ session_id: firstSuccessor, roles: ['hub'], log_status: 'available',
+          own: expect.objectContaining({ reported_total_tokens: 7 }) }),
+        expect.objectContaining({ session_id: successor, roles: ['hub'], log_status: 'available',
+          own: expect.objectContaining({ reported_total_tokens: 11 }) }),
+      ]),
+    } })
   })
 
   it('admits a native reviewer before its first skill call and charges its Worker ticket', async () => {
@@ -1233,10 +1269,10 @@ it('resumes the approved Plan goal after restart without promoting pending or de
 
   await h.restart()
   const successor = await h.runtime.rotateHub()
-  const resume = h.deliveries.mock.calls.map(([message]) => message).find(message =>
-    message.sessionId === successor && message.id === 'dsh-superagent:hub-resume:1')
-  expect(resume).toBeDefined()
-  const text = resume!.text
+  await using log = await h.ctx.sessionPersistence.open(successor as SessionId, 'read')
+  const resume = (await log.read(0, 512)).events.find(event => event.type === 'user/message' && event.data.id === 'dsh-superagent:hub-resume:1')
+  const block = resume?.type === 'user/message' ? resume.data.content[0] : undefined
+  const text = block?.type === 'text' ? block.text : ''
   expect(text).not.toContain(deniedGoal)
   expect(text).not.toContain(pendingGoal)
   const summary = JSON.parse(text.slice(text.lastIndexOf('\n') + 1))

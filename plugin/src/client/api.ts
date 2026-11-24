@@ -4,6 +4,7 @@ import { PROJECT_SCOPE_HEADER, type Api, type ApiRequest, type ApiResponse } fro
 import { USER_ERRORS, type UserErrorCode } from '../core/errors.ts'
 import type { TicketStage } from '../core/stage.ts'
 import type { SetupProblem } from '../setup.ts'
+import { setupText, valueLabel, type T } from './text.ts'
 
 /** Host rejection identified by a structured user error code and interpolation values. */
 export interface UserFailure { code: UserErrorCode; values: Record<string, string> }
@@ -27,15 +28,24 @@ export interface ApiMessages {
   setup: (problem: SetupProblem) => string
   user: (failure: UserFailure) => string
 }
+
+export const apiMessages = (t: T): ApiMessages => ({
+  offline: t('offline'), notRunning: t('hostNotRunning'), serverError: status => t('serverError', { status }),
+  requestFailed: status => t('requestFailed', { status }),
+  setup: problem => problem.values.output ? `${setupText(t, problem)}\n${problem.values.output}` : setupText(t, problem),
+  // A refusal names a prompt part by its label.
+  user: ({ code, values }) => t(`userError.${code}`, values.part ? { ...values, part: valueLabel(t, 'promptPart', values.part) } : values),
+})
 const isUserError = (code: unknown): code is UserErrorCode => typeof code === 'string' && Object.hasOwn(USER_ERRORS, code)
 
 /** Calls one management endpoint; the `x-orchestrator-request` header marks the request as originating from this page. */
-async function api<T>(messages: ApiMessages, path: string, method: string, body?: unknown, projectId?: string, binary = false): Promise<T> {
+async function api<T>(messages: ApiMessages, path: string, method: string, body: unknown, projectId: string | undefined, binary: boolean,
+  signal: AbortSignal | undefined): Promise<T> {
   let response: Response
   const json = body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }
   try {
     response = await fetch(`/orchestrator/api/${path}`, { method, ...json, headers: { 'x-orchestrator-request': '1', ...json.headers,
-      ...(projectId ? { [PROJECT_SCOPE_HEADER]: projectId } : {}) } })
+      ...(projectId ? { [PROJECT_SCOPE_HEADER]: projectId } : {}) }, ...(signal ? { signal } : {}) })
   } catch {
     throw new ApiError(messages.offline, 0, { unreachable: true })
   }
@@ -105,14 +115,14 @@ export const DECISION_KINDS: Readonly<Record<DecisionFilter, string>> = { work: 
 export type Call = <K extends keyof Api>(route: K, ...request: {} extends ApiRequest<K> ? [request?: ApiRequest<K>] : [request: ApiRequest<K>])
   => Promise<ApiResponse<K>>
 /** Build a typed route caller that resolves localized error messages on each request. */
-export function caller(messages: () => ApiMessages, projectId?: string): Call {
+export function caller(messages: () => ApiMessages, projectId?: string, signal?: AbortSignal): Call {
   return (route, ...[request]) => {
     const [method, pattern] = route.split(' ') as [string, string]
     const values = (request ?? {}) as Record<string, unknown> & { query?: Record<string, unknown>; body?: unknown }
     const path = pattern.replace(/:(\w+)/g, (_match, name: string) => encodeURIComponent(String(values[name])))
     const query = Object.entries(values.query ?? {}).filter(([, value]) => value !== undefined && value !== '')
       .map(([name, value]) => `${name}=${encodeURIComponent(String(value))}`).join('&')
-    return api(messages(), query ? `${path}?${query}` : path, method, values.body, projectId, route === 'GET plans/:id/artifact')
+    return api(messages(), query ? `${path}?${query}` : path, method, values.body, projectId, route === 'GET plans/:id/artifact', signal)
   }
 }
 

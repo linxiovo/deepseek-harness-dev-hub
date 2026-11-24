@@ -2,7 +2,7 @@
  * Optimistic settings draft state with sessionStorage persistence and three-way rebase against concurrent saves.
  */
 import { useEffect, useLayoutEffect, useReducer, useRef, type FormEvent } from 'react'
-import { ApiError } from './api.ts'
+import { ApiError, type StateView } from './api.ts'
 import { usePanel } from './provider.tsx'
 import { errorText, type T } from './text.ts'
 import { Button } from './controls.tsx'
@@ -123,6 +123,11 @@ export function saveBarText(t: T, { phase, sent, notice }: DraftState<unknown, u
   }
   if (phase === 'awaitingRevision') return { status: t(sent?.restarting ? 'savedRestarting' : 'saved') }
   return { status: phase === 'clean' ? t('saved') : words.editing ?? t(notice?.kind === 'restored' ? 'draftRestored' : 'draftKept') }
+}
+
+/** Managed drafts follow the project. A legacy install keeps its existing Session-keyed drafts. */
+export function draftScope(state: StateView): string {
+  return state.projectId ? `project/${state.projectId}` : state.masterId
 }
 
 export interface DraftOptions<V> {

@@ -1,24 +1,31 @@
 /** Durable Hub identity and physical-session authority across safe Session rotations. */
+import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { key } from '../core/ids.ts'
 import { KV } from '../kv.ts'
 import type { Store } from './store.ts'
 
-const GenerationSchema = z.strictObject({ sessionId: z.string().min(1), epoch: z.number().int().nonnegative(), status: z.enum(['active', 'retired']) })
-const RotationSchema = z.strictObject({ fromSessionId: z.string().min(1), fromEpoch: z.number().int().nonnegative(), targetSessionId: z.string().min(1), targetEpoch: z.number().int().positive(), startedAt: z.string().min(1) })
+const CreationSchema = z.strictObject({ token: z.string().min(1), cwd: z.string().min(1) })
+const GenerationSchema = z.strictObject({ sessionId: z.string().min(1), epoch: z.number().int().nonnegative(),
+  status: z.enum(['active', 'retired']), creation: CreationSchema.optional() })
+const RotationSchema = z.strictObject({ fromSessionId: z.string().min(1), fromEpoch: z.number().int().nonnegative(),
+  targetSessionId: z.string().min(1), targetEpoch: z.number().int().positive(), startedAt: z.string().min(1),
+  creation: CreationSchema.optional(), drainingTurn: z.number().int().nonnegative().optional(), inboxOffset: z.number().int().nonnegative().optional() })
 const AuthoritySchema = z.strictObject({
-  hubId: z.string().min(1), sessionId: z.string().min(1), epoch: z.number().int().nonnegative(), phase: z.enum(['active', 'rotating']),
-  generations: z.array(GenerationSchema).min(1), rotation: RotationSchema.optional(), resume: z.strictObject({ epoch: z.number().int().positive(), requestId: z.string().min(1) }).optional(),
+  hubId: z.string().min(1), sessionId: z.string().min(1), epoch: z.number().int().nonnegative(), phase: z.enum(['active', 'draining', 'rotating']),
+  generations: z.array(GenerationSchema).min(1), rotation: RotationSchema.optional(),
+  resume: z.strictObject({ epoch: z.number().int().positive(), requestId: z.string().min(1), text: z.string().optional() }).optional(),
 })
 
+export type HubCreation = z.infer<typeof CreationSchema>
 export type HubGeneration = z.infer<typeof GenerationSchema>
 export type HubRotation = z.infer<typeof RotationSchema>
 export type HubAuthorityState = z.infer<typeof AuthoritySchema>
 
 /**
  * Keeps the stable project Hub identity separate from the physical DSH Session that currently owns Hub tools.
- * `beginRotation` is the durable quiescence fence; callers must provision its deterministic target and call `activate` only
- * after that Session is verified. A process crash between either step is recovered by replaying the same target ID.
+ * Persists the intake fence before draining the admitted turn, then revokes the old generation before provisioning.
+ * The target and its creation proof stay fixed across restart; activation is not publication until the resume is durable.
  */
 export class HubAuthority {
   private stateValue: HubAuthorityState
@@ -44,10 +51,16 @@ export class HubAuthority {
 
   state(): HubAuthorityState { return structuredClone(this.stateValue) }
   hubId(): string { return this.stateValue.hubId }
-  currentSessionId(): string | undefined { return this.stateValue.phase === 'active' ? this.stateValue.sessionId : undefined }
+  currentSessionId(): string | undefined { return this.stateValue.phase !== 'rotating' ? this.stateValue.sessionId : undefined }
   targetSessionId(): string | undefined { return this.stateValue.rotation?.targetSessionId }
-  visibleSessionId(): string { return this.currentSessionId() ?? this.targetSessionId() ?? this.stateValue.sessionId }
-  isCurrent(sessionId: string): boolean { return this.stateValue.phase === 'active' && this.stateValue.sessionId === sessionId }
+  visibleSessionId(): string {
+    const { resume, generations, sessionId } = this.stateValue
+    return resume ? generations.find(generation => generation.epoch === resume.epoch - 1)?.sessionId ?? sessionId : sessionId
+  }
+  readySessionId(): string | undefined {
+    return this.stateValue.phase === 'active' && !this.stateValue.resume ? this.stateValue.sessionId : undefined
+  }
+  isCurrent(sessionId: string): boolean { return !this.stateValue.resume && this.currentSessionId() === sessionId }
   isGeneration(sessionId: string): boolean {
     return this.stateValue.sessionId === sessionId || this.stateValue.rotation?.fromSessionId === sessionId
       || this.stateValue.rotation?.targetSessionId === sessionId || this.stateValue.generations.some(generation => generation.sessionId === sessionId)
@@ -56,18 +69,46 @@ export class HubAuthority {
     return [...new Set([this.stateValue.sessionId, ...this.stateValue.generations.map(generation => generation.sessionId),
       ...(this.stateValue.rotation ? [this.stateValue.rotation.targetSessionId, this.stateValue.rotation.fromSessionId] : [])])]
   }
-  pendingResume(): { epoch: number; requestId: string } | undefined { return this.stateValue.resume }
+  generationEpoch(sessionId: string): number | undefined {
+    if (this.stateValue.sessionId === sessionId) return this.stateValue.epoch
+    return this.stateValue.generations.find(generation => generation.sessionId === sessionId)?.epoch
+  }
+  creation(sessionId: string): HubCreation | undefined {
+    const pending = this.stateValue.rotation
+    if (pending?.targetSessionId === sessionId) return pending.creation
+    return this.stateValue.generations.find(generation => generation.sessionId === sessionId)?.creation
+  }
+  rotation(): HubRotation | undefined { return this.stateValue.rotation }
+  continuation(sessionId: string): string | undefined {
+    if (!this.stateValue.generations.some(generation => generation.sessionId === sessionId && generation.status === 'retired')) return
+    return this.readySessionId()
+  }
+  pendingResume(): HubAuthorityState['resume'] { return this.stateValue.resume }
 
-  /** Persist the fence before any physical Session creation; repeated calls return the same target. */
-  beginRotation(now = new Date().toISOString()): HubRotation {
+  /** Fence inbound work while keeping the already admitted turn authorized. */
+  beginRotation(cwd: string, inboxOffset: number, drainingTurn?: number): HubRotation {
     return this.store.atomic(() => {
       this.reload()
-      const existing = this.stateValue.rotation
-      if (this.stateValue.phase === 'rotating' && existing) return existing
-      if (this.stateValue.phase !== 'active') throw new Error('Hub authority is already rotating without a valid target')
+      if (this.stateValue.rotation) return this.stateValue.rotation
+      if (this.stateValue.phase !== 'active' || this.stateValue.resume) throw new Error('The previous Hub rotation has not finished')
       const targetEpoch = this.stateValue.epoch + 1
+      const creation = { token: randomUUID(), cwd }
       const rotation: HubRotation = { fromSessionId: this.stateValue.sessionId, fromEpoch: this.stateValue.epoch,
-        targetSessionId: `orchestrator-${key('hub-rotation', this.stateValue.hubId, String(targetEpoch))}`, targetEpoch, startedAt: now }
+        targetSessionId: `orchestrator-${key('hub-rotation', this.stateValue.hubId, String(targetEpoch), creation.token)}`,
+        targetEpoch, startedAt: new Date().toISOString(), creation, drainingTurn, inboxOffset }
+      this.stateValue = { ...this.stateValue, phase: 'draining', rotation }
+      this.save()
+      return rotation
+    })
+  }
+
+  /** Revoke the old turn before any attempt to provision its successor. */
+  sealRotation(cwd: string): HubRotation {
+    return this.store.atomic(() => {
+      this.reload()
+      const pending = this.stateValue.rotation
+      if (!pending) throw new Error('No Hub rotation is pending')
+      const rotation = pending.creation ? pending : { ...pending, creation: { token: randomUUID(), cwd } }
       this.stateValue = { ...this.stateValue, phase: 'rotating', rotation }
       this.save()
       return rotation
@@ -75,25 +116,28 @@ export class HubAuthority {
   }
 
   /** Atomically grants the new physical Session the current Hub role and records a resume delivery still to be made. */
-  activate(sessionId: string): HubAuthorityState {
+  activate(sessionId: string, resumeText: (epoch: number) => string): HubAuthorityState {
     return this.store.atomic(() => {
       this.reload()
       const rotation = this.stateValue.rotation
-      if (!rotation || rotation.targetSessionId !== sessionId) throw new Error('The Hub rotation target does not match the persisted intent')
+      if (this.stateValue.phase !== 'rotating' || !rotation?.creation || rotation.targetSessionId !== sessionId) {
+        throw new Error('The Hub rotation target does not match the fenced intent')
+      }
       const generations = this.stateValue.generations.map(generation => generation.sessionId === rotation.fromSessionId
         ? { ...generation, status: 'retired' as const } : generation)
       if (!generations.some(generation => generation.sessionId === rotation.fromSessionId)) {
         generations.push({ sessionId: rotation.fromSessionId, epoch: rotation.fromEpoch, status: 'retired' })
       }
+      generations.push({ sessionId, epoch: rotation.targetEpoch, status: 'active', creation: rotation.creation })
       const requestId = `hub-resume:${rotation.targetEpoch}`
       this.stateValue = { hubId: this.stateValue.hubId, sessionId, epoch: rotation.targetEpoch, phase: 'active', generations,
-        resume: { epoch: rotation.targetEpoch, requestId } }
+        resume: { epoch: rotation.targetEpoch, requestId, text: resumeText(rotation.targetEpoch) } }
       this.save()
       return this.state()
     })
   }
 
-  /** Clear the durable resume marker only after the target Session has flushed the factual continuation. */
+  /** Publish the successor only after the target Session has durably recorded its factual continuation. */
   resumeDelivered(requestId: string): void {
     this.store.atomic(() => {
       this.reload()

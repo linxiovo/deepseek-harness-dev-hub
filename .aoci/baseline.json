@@ -1,7 +1,7 @@
 {
   "version": 1,
   "created_at": "2026-11-24T06:34:57Z",
-  "updated_at": "2026-11-25T11:25:35Z",
+  "updated_at": "2026-11-25T11:59:30Z",
   "files": {
     ".gitattributes": {
       "role": "index",
@@ -41,9 +41,9 @@
     },
     "aoci.code.txt": {
       "role": "index",
-      "sha256": "7bdf4cfcbac63a3051d8598a95b89e25265e7c11aa92e436b1764ed90c94b781",
-      "size": 111413,
-      "normalized_sha256": "7bdf4cfcbac63a3051d8598a95b89e25265e7c11aa92e436b1764ed90c94b781"
+      "sha256": "80b048af93089d9c7aed702ed5b3d2fbcff1fc04028108f598354d019304710c",
+      "size": 111449,
+      "normalized_sha256": "80b048af93089d9c7aed702ed5b3d2fbcff1fc04028108f598354d019304710c"
     },
     "aoci.meta.txt": {
       "role": "index",
@@ -215,9 +215,9 @@
     },
     "plugin/docs/017-plan-integration.md": {
       "role": "index",
-      "sha256": "106d44b97164fce2d980664c4b4e42e6d6aeb1d642a4ad3ad1d7cae9e65138ab",
-      "size": 16106,
-      "normalized_sha256": "106d44b97164fce2d980664c4b4e42e6d6aeb1d642a4ad3ad1d7cae9e65138ab"
+      "sha256": "ea9b9da50852cfb436a7a506a2529502fb137c86f581e1b6217b63350e2ca5fb",
+      "size": 16155,
+      "normalized_sha256": "ea9b9da50852cfb436a7a506a2529502fb137c86f581e1b6217b63350e2ca5fb"
     },
     "plugin/docs/018-plan-replanning.md": {
       "role": "index",
@@ -827,9 +827,9 @@
     },
     "plugin/src/app/plan-release.ts": {
       "role": "index",
-      "sha256": "80092952adcbba40890b259ae848b4951a2f8637ac8d121ef490d31645dacb4e",
-      "size": 12553,
-      "normalized_sha256": "80092952adcbba40890b259ae848b4951a2f8637ac8d121ef490d31645dacb4e"
+      "sha256": "6963c40aac137f6cee67042c0b4ce83aa8e6e9cf2c7235d1e859ec772e6b05ac",
+      "size": 12609,
+      "normalized_sha256": "6963c40aac137f6cee67042c0b4ce83aa8e6e9cf2c7235d1e859ec772e6b05ac"
     },
     "plugin/src/app/plan-replan.ts": {
       "role": "index",
@@ -1895,9 +1895,9 @@
     },
     "plugin/tests/plan-release.spec.ts": {
       "role": "observe",
-      "sha256": "3611d847011ebb933e8cb4ad3905f24b7e991961d58da365b89baf5133a1568c",
-      "size": 24939,
-      "normalized_sha256": "3611d847011ebb933e8cb4ad3905f24b7e991961d58da365b89baf5133a1568c"
+      "sha256": "d4c907e1c534a6794247ba22470a7512952ebe8c5dae8446381fda32c53e09af",
+      "size": 25731,
+      "normalized_sha256": "d4c907e1c534a6794247ba22470a7512952ebe8c5dae8446381fda32c53e09af"
     },
     "plugin/tests/plans.spec.ts": {
       "role": "observe",

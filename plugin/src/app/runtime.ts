@@ -768,7 +768,8 @@ export class Runtime extends Service implements SourceHost {
       attention: this.attention, runLimits: this.runLimits, planIntegration: this.planIntegration,
       planArtifact: async id => {
         const view = this.planIntegration.view(id)
-        return view && 'artifact' in view ? await openPlanArtifact(machine.stateDir, id, view) : undefined
+        return view && 'artifact' in view && (!('artifactAvailable' in view) || view.artifactAvailable !== false)
+          ? await openPlanArtifact(machine.stateDir, id, view) : undefined
       },
       meter: { read: (id, signal) => this.readScopedMeter(id, signal) },
       topicBinding: this.topicBinding, verifyTopicBinding: () => this.verifyTopicBinding(),

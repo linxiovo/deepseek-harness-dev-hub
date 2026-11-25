@@ -12,11 +12,8 @@ const verification = z.discriminatedUnion('status', [
   z.strictObject({ status: z.literal('passed'), at: z.iso.datetime(), deploymentId: z.string().min(1),
     sha: z.string().regex(/^[a-f0-9]{40}$/), sha256: z.string().regex(/^[a-f0-9]{64}$/) }),
 ])
-const absentRelease = z.discriminatedUnion('status', [
-  z.strictObject({ requestId: z.string().min(1), target, status: z.literal('missing') }),
-  z.strictObject({ requestId: z.string().min(1), target, status: z.literal('publishing') }),
-  z.strictObject({ requestId: z.string().min(1), target, status: z.literal('not-published') }),
-])
+const absentRelease = z.strictObject({ requestId: z.string().min(1), target,
+  status: z.enum(['missing', 'not-started', 'publishing', 'not-published']) })
 const publishedRelease = z.strictObject({ requestId: z.string().min(1), target, status: z.literal('published'), deployment, verification })
 const PlanReleaseObservationSchema = z.union([absentRelease, publishedRelease])
 

@@ -68,6 +68,8 @@ For Plan execution push, the allowlist is `human-action`, `quota-paused` and `pl
 
 The `plan-delivered` relay comes from the Plan-level delivery result, not Ticket closure. The Hub reads `plan/<id>/delivery`; a release-authorized Handoff emits no final delivery relay before deployment verification. If its controlled release adapter is missing or mismatched, the Plan stays `release-blocked` rather than appearing ready for publication. Details are in `017-plan-integration.md`.
 
+A missing release credential uses a separate `human-action` relay, `plan-release-credential:<planId>`, with the exact release target, configured credential identifier and provider link, and the Plan delivery resource. It does not create a Ticket credential action or call the test-account verification endpoint.
+
 The Hub instructions in `prompts/handoff-orchestrator.md` tell it to show the operator the Ticket, affected work, status and controlled configuration reference in Harness, rather than asking for a secret or announcing an unchanged or failed check again. S21 supplies API resources and a relay, not a credential entry form or panel UI.
 
 A Plan Worker's `human_action` returns `question_proposal` and an internal `plan-question-review` relay. It creates neither user attention nor a pause. Before asking, the Hub checks that it is a missing product decision, not a request to fix tests or resolve a technical conflict, and calls `orchestrator_plan_question` with `{ticket_id, question_id, criterion}`. The criterion must belong to the active Ticket, and the ID must identify the current Assignment's proposal. Approval records attention and queues one `human-action` relay; repeating it while pending reuses the receipt.

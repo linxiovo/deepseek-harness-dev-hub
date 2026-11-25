@@ -72,7 +72,7 @@ export class PlanIntegration {
     if (required.waitingFor.length) return { planId, status: 'awaiting-tickets', waitingFor: required.waitingFor }
     const prior = this.host.store.get(KV.plans.integration(planId))
     if (integrated(prior)) {
-      if (this.host.artifactExists(planId, prior)) return prior
+      if (prior.status === 'released-artifact-unavailable' || this.retainedArtifactExists(prior)) return prior
       if (prior.status === 'released') return missingReleaseArtifact(prior)
       if ('releaseId' in prior) return { ...prior, artifactAvailable: false }
       return { planId, status: 'blocked', reason: 'artifact_unavailable', version: prior.version, run: prior.run }
@@ -97,7 +97,7 @@ export class PlanIntegration {
     const planId = requestId.slice(deliveryRelayPrefix.length)
     const prior = this.host.store.get(KV.plans.integration(planId))
     if (prior?.status !== 'delivered' && prior?.status !== 'released') return false
-    if (this.host.artifactExists(planId, prior)) return true
+    if (this.retainedArtifactExists(prior)) return true
     this.invalidateArtifact(prior)
     return false
   }
@@ -107,7 +107,11 @@ export class PlanIntegration {
     for (const { id } of this.host.plans.list()) {
       const prior = this.host.store.get(KV.plans.integration(id))
       if (integrated(prior)) {
-        if (!await this.host.artifactAvailable(id, prior)) this.invalidateArtifact(prior)
+        if (this.host.store.get(KV.plans.releaseIntent(id)) && !terminal(prior)) {
+          this.rearm(id)
+          continue
+        }
+        if (!await this.retainedArtifactAvailable(prior)) this.invalidateArtifact(prior)
         else if (!terminal(prior)) this.rearm(id)
       } else this.rearm(id)
     }
@@ -130,11 +134,24 @@ export class PlanIntegration {
     })
   }
 
+  private retainedArtifactExists(view: IntegratedView): boolean {
+    try { return this.host.artifactExists(view.planId, view) }
+    catch (error) {
+      if (view.status === 'delivered') throw error
+      return false
+    }
+  }
+
+  private async retainedArtifactAvailable(view: IntegratedView): Promise<boolean> {
+    try { return await this.host.artifactAvailable(view.planId, view) }
+    catch (error) {
+      if (view.status === 'delivered') throw error
+      return false
+    }
+  }
+
   private completeRelease(view: ReleasedView): boolean {
-    let available: boolean
-    try { available = this.host.artifactExists(view.planId, view) }
-    catch { available = false }
-    if (!available) {
+    if (!this.retainedArtifactExists(view)) {
       this.save(missingReleaseArtifact(view))
       return false
     }
@@ -145,7 +162,7 @@ export class PlanIntegration {
 
   private async restoreReleaseArtifact(prior: MissingReleaseArtifact, verification: PlanVerificationConfig): Promise<void> {
     const { host } = this, { planId, artifact, version, run } = prior
-    if (!await host.artifactAvailable(planId, prior)) {
+    if (!await this.retainedArtifactAvailable(prior)) {
       const draft = await host.downloadArtifact(planId, { ...version, verification }, run, artifact)
       try {
         if (!isDeepStrictEqual(draft.artifact, artifact)) throw new Later('Downloaded artifact differs from the released package')

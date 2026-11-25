@@ -241,31 +241,41 @@ it('leaves a deployment unverified when its reported checksum differs from the r
   }
 })
 
-it('reconciles a published request after restart without publishing the target twice', async () => {
+it.each(['available', 'unreadable'] as const)('reconciles an external deployment after restart with an %s package', async availability => {
   const publication = releaseRun({ status: 'passed', at: '2026-11-25T10:01:00.000Z', deploymentId: deployment.id, sha, sha256: artifactSha })
   const app = fixture({ credentialAvailable: true, publication, publishAcceptedThenLoseResponse: true })
   try {
     await app.getHandler()({}, planId)
     await expect(app.getHandler()({}, planId)).rejects.toThrow()
     expect(app.integration.view(planId)).toMatchObject({ status: 'releasing' })
-    app.host.readTarget.mockResolvedValue({ sha: 'e'.repeat(40), includesIntegrations: true })
+    if (availability === 'unreadable') {
+      const failure = Object.assign(new Error('retained file cannot be read'), { code: 'EACCES' })
+      app.host.artifactAvailable.mockRejectedValue(failure)
+      app.host.artifactExists.mockImplementation(() => { throw failure })
+    }
 
     const recovered = new PlanIntegration(app.host as unknown as ConstructorParameters<typeof PlanIntegration>[0])
     await recovered.resume()
+    app.host.release.observe.mockImplementationOnce(async request => ({ requestId: request.id, target: request.target, status: 'missing' }))
+    await integrate(app)
+    expect(recovered.view(planId)).toMatchObject({ status: 'releasing', reason: 'release_dispatch_unconfirmed' })
+    expect(app.host.release.publish).toHaveBeenCalledOnce()
+
+    app.host.readTarget.mockResolvedValue({ sha: 'e'.repeat(40), includesIntegrations: true })
     await app.getHandler()({}, planId)
 
-    expect(recovered.view(planId)).toMatchObject({ status: 'released', releaseId: expect.any(String), deployment })
+    expect(recovered.view(planId)).toMatchObject({ status: availability === 'available' ? 'released' : 'released-artifact-unavailable',
+      releaseId: expect.any(String), deployment, verification: { status: 'passed' } })
     expect(app.host.release.publish).toHaveBeenCalledOnce()
-    expect(app.host.release.observe).toHaveBeenCalledOnce()
-    expect(app.host.relay).toHaveBeenCalledOnce()
-    expect(app.host.release.publish.mock.calls[0]?.[0].id).toBe(app.host.release.observe.mock.calls[0]?.[0].id)
+    expect(app.host.relay).toHaveBeenCalledTimes(availability === 'available' ? 1 : 0)
+    expect(app.host.release.observe.mock.calls.at(-1)?.[0].id).toBe(app.host.release.publish.mock.calls[0]?.[0].id)
   } finally {
     app.store.close()
     rmSync(app.root, { recursive: true, force: true })
   }
 })
 it('rechecks credentials before retrying an absent publication after restart', async () => {
-  const app = fixture({ credentialSequence: [true, false], publication: { requestId: 'set-by-test', target: release, status: 'missing' },
+  const app = fixture({ credentialSequence: [true, false], publication: { requestId: 'set-by-test', target: release, status: 'not-started' },
     publishAcceptedThenLoseResponse: true })
   try {
     await integrate(app)
@@ -292,7 +302,7 @@ it.each(['request', 'target'] as const)('does not retry publication on an absenc
   const app = fixture({ credentialAvailable: true, publishAcceptedThenLoseResponse: true })
   try {
     await integrate(app)
-    app.host.release.observe.mockImplementationOnce(async request => ({ status: 'missing',
+    app.host.release.observe.mockImplementationOnce(async request => ({ status: 'not-started',
       requestId: mismatch === 'request' ? 'another-request' : request.id,
       target: mismatch === 'target' ? { ...request.target, environment: 'staging' } : request.target }))
 
@@ -312,7 +322,7 @@ it('preserves an observed deployment when a later observation incorrectly report
   try {
     await integrate(app)
     expect(app.integration.view(planId)).toMatchObject({ status: 'released-unverified', deployment })
-    app.host.release.observe.mockImplementationOnce(async request => ({ status: 'missing', requestId: request.id, target: request.target }))
+    app.host.release.observe.mockImplementationOnce(async request => ({ status: 'not-started', requestId: request.id, target: request.target }))
 
     await integrate(app)
 
@@ -337,7 +347,7 @@ it('records a deployment whose receipt arrives while processing is paused', asyn
     expect(app.integration.view(planId)).toMatchObject({ status: 'released-unverified', deployment })
 
     app.host.paused = () => false
-    app.host.release.observe.mockImplementationOnce(async request => ({ status: 'missing', requestId: request.id, target: request.target }))
+    app.host.release.observe.mockImplementationOnce(async request => ({ status: 'not-started', requestId: request.id, target: request.target }))
     const recovered = new PlanIntegration(app.host as unknown as ConstructorParameters<typeof PlanIntegration>[0])
     await recovered.resume()
     await integrate(app)
@@ -372,7 +382,7 @@ it.each(['branch', 'profile', 'run'] as const)('does not release an old artifact
 })
 
 it('rechecks the regression before retrying a publication proved absent', async () => {
-  const app = fixture({ credentialAvailable: true, publication: { requestId: 'set-by-test', target: release, status: 'missing' },
+  const app = fixture({ credentialAvailable: true, publication: { requestId: 'set-by-test', target: release, status: 'not-started' },
     publishAcceptedThenLoseResponse: true })
   try {
     await integrate(app)

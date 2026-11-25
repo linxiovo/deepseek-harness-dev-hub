@@ -64,7 +64,7 @@ export type PlanEnvironmentVerification = { status: 'pending' } | { status: 'fai
   | { status: 'passed'; at: string; deploymentId: string; sha: string; sha256: string }
 
 export type PlanReleaseObservation = { requestId: string; target: ReleaseTarget } & (
-  | { status: 'missing' | 'publishing' | 'not-published' }
+  | { status: 'missing' | 'not-started' | 'publishing' | 'not-published' }
   | { status: 'published'; deployment: PlanDeployment; verification: PlanEnvironmentVerification }
 )
 

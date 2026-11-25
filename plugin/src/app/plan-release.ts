@@ -111,7 +111,7 @@ export class PlanRelease {
     let observation: PlanReleaseObservation
     try { observation = await adapter.observe(request) }
     catch { return this.unavailable(prior, request, 'release_unavailable') }
-    if (observation.status === 'missing' && prior.status !== 'released-unverified') {
+    if (observation.status === 'not-started' && prior.status !== 'released-unverified') {
       if (!matchesRequest(request, observation)) return this.unavailable(prior, request, 'release_unavailable')
       active()
       let credentialsAvailable: boolean
@@ -202,7 +202,7 @@ export class PlanRelease {
     if (result.status !== 'published') {
       if (prior.status === 'released-unverified') return this.unavailable(prior, request, 'release_unavailable')
       if (result.status === 'not-published') { finish({ ...base, status: 'release-failed' }); return Park }
-      this.host.save({ ...base, status: 'releasing', ...(result.status === 'missing' ? { reason: 'release_dispatch_unconfirmed' } : {}) })
+      this.host.save({ ...base, status: 'releasing', ...(result.status === 'publishing' ? {} : { reason: 'release_dispatch_unconfirmed' }) })
       throw new Later()
     }
     const { deployment, verification } = result

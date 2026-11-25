@@ -661,6 +661,16 @@ describe('managed project plan pause', () => {
   expect(workerDeliveries()).toEqual([])
   expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['accounts'] })
 
+  const control = (action: 'pause' | 'resume', wording: string) => {
+    h.sendUserMessage(h.runtime.masterId, wording)
+    return h.runTool(h.runtime.masterId, 'orchestrator_plan_control', { action, planId: id, scope: { kind: 'ticket', ticketId: b.ticketId } })
+  }
+  await control('pause', `Pause Ticket ${b.ticketId}`)
+  expect(await control('resume', `Resume Ticket ${b.ticketId}`)).toMatchObject({ status: 'resumed',
+    waiting: [{ nodeId: 'accounts', reason: 'Awaiting credential verification' }] })
+  await expect(h.runTool(b.session, 'orchestrator_report', { state: 'ready', summary: 'Cannot bypass credential verification.' })).rejects.toThrow()
+  expect(workerDeliveries()).toEqual([])
+
   h.hooks.credentialCheck = () => true
   const verify = () => h.api('POST', `${path}/verify`, {}, project.id)
   expect(await verify()).toMatchObject({ status: 200, body: { status: 'verified', verification: 'passed' } })
@@ -979,6 +989,105 @@ it('does not deliver a failed, stopped or dropped predecessor', async () => {
   expect(await read(`ticket/${accountsClaim.ticketId}`)).toMatchObject({ state: 'dropped', ended: { by: 'executor' } })
   await blocked()
 })
+
+it('pauses one Plan Ticket without blocking unrelated frontier work and exposes the active scope', async () => {
+  const { id } = await registeredFanIn()
+  const claim = (await dispatchPlan(id, 'catalog')).claim!
+  await h.runtime.idle()
+  const { ticketId, assignmentId, session } = claim
+  const scope = { kind: 'ticket', ticketId }
+  const control = (action: 'pause' | 'resume') => h.runTool(h.runtime.masterId, 'orchestrator_plan_control', { action, planId: id, scope })
+  const status = () => read(`plan/${id}/control`)
+
+  h.sendUserMessage(h.runtime.masterId, '暂停一下')
+  await expect(control('pause')).rejects.toThrow(/exact scope/)
+  await expect(h.runTool(session, 'orchestrator_plan_control', { action: 'pause', planId: id, scope })).rejects.toThrow(/not registered/i)
+  expect(await status()).toMatchObject({ activeScopes: [] })
+
+  const hub = h.runtime.masterId
+  h.sendUserMessage(hub, `暂停工单 ${ticketId}`)
+  h.record(hub, [{ type: 'turn/end', data: { turn: 1, reason: 'completed' } },
+    { type: 'user/message', data: { role: 'user', source: { kind: 'plugin', plugin: 'dsh-superagent' },
+      content: [{ type: 'text', text: `转述：暂停工单 ${ticketId}` }] } }])
+  await expect(control('pause')).rejects.toThrow(/direct Harness operator/)
+  expect(await status()).toMatchObject({ activeScopes: [] })
+
+  const job = h.jobs.run(session), stopping = Promise.withResolvers<void>()
+  h.jobs.service.kill.mockImplementationOnce(() => { stopping.resolve(); return 'requested' })
+  try {
+    h.sendUserMessage(h.runtime.masterId, `暂停工单 ${ticketId}`)
+    expect(await control('pause')).toMatchObject({ status: 'paused', activeScopes: [scope], actions: expect.arrayContaining([
+      { kind: 'dispatch', nodeId: 'catalog', ticketId, status: 'already-happened' },
+      expect.objectContaining({ kind: 'worker', ticketId, operationId: assignmentId, status: 'stop-requested' }),
+    ]) })
+    await stopping.promise
+    expect(await dispatchPlan(id, 'catalog')).toMatchObject({ status: 'blocked', reused: true, claim: { ticketId, assignmentId, session } })
+    expect(await dispatchPlan(id, 'accounts')).toMatchObject({ status: 'claimed', reused: false })
+    expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'] })
+  } finally { h.jobs.end(job, 'killed') }
+  await vi.waitFor(async () => expect(await status()).toMatchObject({ actions: expect.arrayContaining([
+    expect.objectContaining({ kind: 'worker', ticketId, operationId: assignmentId, status: 'stopped' }),
+  ]) }))
+  await h.restart()
+  expect(await status()).toMatchObject({ activeScopes: [scope] })
+  await expect(h.runTool(session, 'orchestrator_report', { state: 'ready', summary: 'Paused writer cannot report.' })).rejects.toThrow()
+  h.sendUserMessage(h.runtime.masterId, `恢复工单 ${ticketId}`)
+  expect(await control('resume')).toMatchObject({ status: 'resumed', activeScopes: [] })
+  await h.runtime.idle()
+  expect(await dispatchPlan(id, 'catalog')).toMatchObject({ status: 'running', reused: true, claim: { ticketId, assignmentId, session } })
+  await expect(h.runTool(session, 'orchestrator_report', { state: 'ready', summary: 'Resumed writer can report.' })).resolves.toBeDefined()
+})
+
+it('records a dispatched Worker while paused even when its local start receipt was interrupted', async () => {
+  const { id } = await registeredFanIn(), hub = h.runtime.masterId
+  const pause = Promise.withResolvers<Record<string, unknown>>()
+  const interrupted = vi.spyOn(h.runtime.engine, 'assignmentStarted').mockImplementationOnce(ticketId => {
+    h.sendUserMessage(hub, `Pause Ticket ${ticketId}`)
+    pause.resolve(h.runTool(hub, 'orchestrator_plan_control', { action: 'pause', planId: id, scope: { kind: 'ticket', ticketId } }))
+    throw new Error('Interrupted before recording the start receipt')
+  })
+  const { claim } = await dispatchPlan(id, 'catalog')
+  expect(claim).toBeDefined()
+  const { assignmentId, session, ticketId } = claim!
+  await h.runtime.idle()
+  expect(interrupted).toHaveBeenCalledWith(ticketId, assignmentId)
+  expect(await pause.promise).toMatchObject({ status: 'paused' })
+  await vi.waitFor(async () => expect(await read(`plan/${id}/control`)).toMatchObject({ actions: expect.arrayContaining([
+    { kind: 'dispatch', nodeId: 'catalog', ticketId, status: 'already-happened' },
+    expect.objectContaining({ kind: 'worker', ticketId, operationId: assignmentId, status: 'stopped' }),
+  ]) }))
+  h.sendUserMessage(hub, `Resume Ticket ${ticketId}`)
+  await h.runTool(hub, 'orchestrator_plan_control', { action: 'resume', planId: id, scope: { kind: 'ticket', ticketId } })
+  await h.runtime.idle()
+  expect(h.deliveries.mock.calls.filter(([input]) => input.sessionId === session && input.text.startsWith('{'))).toHaveLength(1)
+})
+
+it('clears only the named Plan hold and keeps quota and predecessor waits', async () => {
+  const { id } = await registeredFanIn()
+  const branch = { kind: 'branch', nodeId: 'catalog' }, plan = { kind: 'plan' }
+  const control = (text: string, action: 'pause' | 'resume', scope: typeof plan) => {
+    h.sendUserMessage(h.runtime.masterId, text)
+    return h.runTool(h.runtime.masterId, 'orchestrator_plan_control', { action, planId: id, scope })
+  }
+  expect(await control(`暂停计划 ${id} 的分支 catalog`, 'pause', branch)).toMatchObject({ actions: expect.arrayContaining([
+    { kind: 'dispatch', nodeId: 'catalog', status: 'stopped' }, { kind: 'dispatch', nodeId: 'dashboard', status: 'stopped' },
+  ]) })
+  expect(await control(`暂停整个计划 ${id}`, 'pause', plan)).toMatchObject({ activeScopes: [branch, plan] })
+  expect(await dispatchPlan(id, 'accounts')).toMatchObject({ status: 'blocked', reason: expect.stringMatching(/pause/i) })
+  expect(await control(`恢复整个计划 ${id}`, 'resume', plan)).toMatchObject({ activeScopes: [branch],
+    waiting: expect.arrayContaining([{ nodeId: 'catalog', reason: 'Paused by Plan control' }]) })
+  expect(await dispatchPlan(id, 'accounts')).toMatchObject({ status: 'claimed' })
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, runLimits: {
+    ticketOverrides: [{ planId: id, nodeId: 'catalog', tokens: 0 }],
+  } } })
+  expect(await control(`恢复计划 ${id} 的分支 catalog`, 'resume', branch)).toMatchObject({ status: 'resumed', activeScopes: [],
+    waiting: [{ nodeId: 'catalog', reason: 'ticket budget: exhausted' },
+      { nodeId: 'dashboard', reason: 'Awaiting formal delivery of catalog, accounts' }] })
+  expect(await dispatchPlan(id, 'catalog')).toMatchObject({ status: 'quota-paused', reused: false })
+  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'] })
+})
+
 
 it('replays a durable claim after restart without creating a second Worker delivery', async () => {
   const published = await publish()

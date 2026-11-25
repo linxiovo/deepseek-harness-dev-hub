@@ -774,10 +774,14 @@ const withdrawnRelay = Symbol('withdrawn relay')
     if (!this.host.workerAuthorized(ticketId, sessionId)) throw new Error(`No verified writer for retry of ${sessionId}`)
     await this.prompt(sessionId, requestId, text, 'queue', undefined, () => this.bindWorker(ticketId, sessionId, true))
   }
-  /** Returns whether `sessionId` already holds the message delivered under `requestId`, or `false` if the session does not exist. */
-  async holds(sessionId: string, requestId: string): Promise<boolean> {
+  /** Reads a delivered message by its stable request ID. Reconciliation requires the original Session to be readable. */
+  async holds(sessionId: string, requestId: string, required = false): Promise<boolean> {
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
-    return !('error' in result) && await this.agentDelivery.holds(result.agent, key(requestId))
+    if ('error' in result) {
+      if (required) throw new Error(`Cannot verify delivery to Session ${sessionId}: ${result.error.code}`)
+      return false
+    }
+    return this.agentDelivery.holds(result.agent, key(requestId))
   }
   /** Deliver a message once per request id: to the next turn, the current one, or `inject`ed with its label without waking the agent. */
   async prompt(sessionId: string, requestId: string, text: string, mode: 'queue' | 'steer' | { inject: string }, authorize?: () => void,

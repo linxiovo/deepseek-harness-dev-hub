@@ -135,6 +135,8 @@ After interruption, a queued intent can continue at the original base if the exa
 
 A current Plan credential blocker prevents a new mainline write or a new repair dispatch for that Ticket. It does not erase an integration already observed on the target.
 
+A Plan control hold blocks new merge, repair and formal closure for the affected Ticket. The queue checks the actual target for an admitted Git intent and preserves verified writes. An exact lease rejection confirms that the first attempt stopped. If the outcome remains unknown, it stays pending while unrelated Tickets can proceed under their own exact leases. See `009-handoff.md`.
+
 ## Formal Plan closure
 
 The host records the verified merge and enqueues closure in the same transaction. The closing check uses the same Ticket, Assignment, writer generation, base, candidate and target as the verified intent. The host rechecks acceptance, both reviews, tests, required repairs, Doc Tree and required CI (see `plugin/docs/013-development-verification.md`). It fetches the target and requires the intent's integration commit, which has the exact candidate tree. A later tip must preserve the reviewed changes and scoped Doc Tree, including its local links; changes to that scope or broken links report `mainline_docs`, and changes to the other reviewed paths report `mainline_candidate_changed`. After reading the target, the host samples the worktree branch, candidate and cleanliness together. An unrelated write that only puts the candidate on the branch does not qualify.

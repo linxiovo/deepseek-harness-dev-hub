@@ -17,6 +17,11 @@ export class CliError extends Error {
   constructor(message: string, readonly code?: number, readonly exitCode?: number) { super(message) }
 }
 
+/** Git's porcelain output confirmed that the single requested ref update failed its expected-base lease. */
+export class GitLeaseRejected extends CliError {
+  constructor() { super('Cannot advance mainline with the expected base: Git rejected the lease', undefined, 1) }
+}
+
 /** cmd.exe requires a shell to start .cmd/.bat files. Keep the fixed executable path and each argument quoted separately. */
 export function batchInvocation(program: string, args: readonly string[]): string {
   if (/["&|<>^%!\r\n]/.test(program) || args.some(arg => /[\r\n\0]/.test(arg))) throw new CliError('Unsafe batch CLI path or argument')
@@ -178,7 +183,14 @@ export class Commands {
       const { stdout } = await running
       if (!await fed) throw new CliError('Could not deliver CLI input')
       return stdout
-    } catch (error) { throw error instanceof CliError ? error : commandError(error, program) }
+    } catch (error) {
+      if (program === 'git' && args.includes('push') && args.includes('--porcelain') && args.some(arg => arg.startsWith('--force-with-lease=')) &&
+          error && typeof error === 'object' && 'code' in error && error.code === 1 && 'stdout' in error && typeof error.stdout === 'string') {
+        const updates = error.stdout.split(/\r?\n/).filter(line => line.includes('\t'))
+        if (updates.length === 1 && updates[0] === `!\t${args.at(-1)}\t[rejected] (stale info)`) throw new GitLeaseRejected()
+      }
+      throw error instanceof CliError ? error : commandError(error, program)
+    }
   }
   /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
   async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.githubOutput(args)) as T }

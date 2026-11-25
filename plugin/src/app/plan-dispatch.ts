@@ -2,11 +2,12 @@
 import { UserError } from '../core/errors.ts'
 import { latestAssignment, waitsForPerson } from '../core/model.ts'
 import { key } from '../core/ids.ts'
-import { PLAN_ROLES, type PlanNodeClaim, type PlanNodeState, type PlanRole } from '../core/plan.ts'
+import { PLAN_ROLES, type PlanNode, type PlanNodeClaim, type PlanNodeState, type PlanRole } from '../core/plan.ts'
 import type { Engine } from '../core/engine.ts'
 import type { DshExecutor } from '../executor/dsh.ts'
 import type { Store } from './store.ts'
 import type { Plans } from './plans.ts'
+import type { PlanControl } from './plan-control.ts'
 import type { CredentialAction, ScopedAttention } from './scoped-attention.ts'
 import type { DispatchLimits, RunLimits } from './run-limits.ts'
 
@@ -29,7 +30,9 @@ interface PlanDispatcherHost {
   readonly engine: Pick<Engine, 'createPlanTicket'>
   readonly executor: Pick<DshExecutor, 'reserveLaunch' | 'releaseLaunch' | 'start'>
   readonly attention: Pick<ScopedAttention, 'forTicket' | 'blocked'>
-  readonly limits: Pick<RunLimits, 'forDispatch' | 'blocked'>
+  readonly limits: Pick<RunLimits, 'forDispatch'>
+  readonly control: Pick<PlanControl, 'blocksNode' | 'dispatchBlocked'>
+  paused(): boolean
   bindWorker(ticketId: string, sessionId: string): void
   readonly now?: () => string
 }
@@ -51,6 +54,9 @@ export class PlanDispatcher {
     if (current) {
       this.bindClaim(current, node.role)
       const replay = this.result(request, current, true)
+      if (this.host.control.blocksNode(planId, nodeId) && (current.status === 'claimed' || current.status === 'running' || current.status === 'awaiting-delivery')) {
+        return { ...replay, status: 'blocked', reason: 'Paused by Plan control' }
+      }
       if (block && block.state !== 'reserved' && (current.status === 'claimed' || current.status === 'running' || current.status === 'awaiting-delivery')) {
         return { ...replay, status: 'quota-paused', reason: `${block.scope} budget: ${block.state}` }
       }
@@ -59,6 +65,9 @@ export class PlanDispatcher {
     const waitingOn = this.host.plans.waitingOn(planId, node)
     if (waitingOn.length) return { ...request, status: 'blocked', reused: false, waitingOn,
       reason: `Waiting for formal delivery of ${waitingOn.join(', ')}` }
+    if (this.host.control.dispatchBlocked(plan, nodeId)) {
+      return { ...request, status: 'blocked', reused: false, reason: 'Paused by Plan control' }
+    }
     const draining = this.host.plans.waitingForWriters(planId, nodeId)
     if (draining.length) return { ...request, status: 'blocked', reused: false, waitingOn: draining,
       reason: `Waiting for superseded writers to drain: ${draining.join(', ')}` }
@@ -113,17 +122,35 @@ export class PlanDispatcher {
       for (const node of plan.nodes) {
         if (!PLAN_ROLES.includes(node.role)) continue
         const state = this.host.plans.state(plan.id, node.id)
-        if (!state || ['delivered', 'failed', 'stopped'].includes(state.status)) continue
-        if (this.host.attention.blocked(state.claim.ticketId)) continue
-        if (this.host.limits.blocked(state.claim.ticketId)) continue
-        const ticket = this.host.store.tickets.get(state.claim.ticketId)
-        const assignment = ticket && latestAssignment(ticket)
-        if (!ticket || ticket.ended || !assignment || assignment.state !== 'pending' || waitsForPerson(ticket)) continue
-        const action = ticket.execution?.active_writer || assignment.writer?.state === 'active' ? 'resume' : 'launch'
-        this.host.plans.rearm(plan.id, node.id, action)
-        this.host.executor.start(ticket, assignment)
+        if (state) this.resumeNode(plan.id, node, state)
       }
     }
+  }
+
+  /** Explain the first current gate for a scoped resume without creating a claim. */
+  resumeBlock(planId: string, nodeId: string): string | undefined {
+    const { host } = this, plan = host.plans.get(planId), node = plan?.nodes.find(item => item.id === nodeId)
+    if (!plan || !node) return 'Plan node is no longer current'
+    const claim = host.plans.state(planId, nodeId)?.claim
+    const ticketId = claim?.ticketId ?? key('plan-ticket', planId, nodeId)
+    if (claim && host.store.tickets.get(ticketId)?.ended) return undefined
+    if (claim ? host.control.blocksNode(planId, nodeId) : host.control.dispatchBlocked(plan, nodeId)) return 'Paused by Plan control'
+    if (host.paused()) return 'Project processing is paused or unavailable'
+    if (host.attention.blocked(ticketId)) return 'Awaiting credential verification'
+    const predecessors = host.plans.waitingOn(planId, node)
+    if (predecessors.length) return `Awaiting formal delivery of ${predecessors.join(', ')}`
+    if (host.plans.waitingForWriters(planId, nodeId).length) return 'Awaiting superseded writers'
+    const { block } = host.limits.forDispatch(ticketId, { planId, nodeId, role: node.role })
+    if (block) return `${block.scope} budget: ${block.state}`
+  }
+
+  private resumeNode(planId: string, node: PlanNode, state: PlanNodeState): void {
+    if (state.status === 'delivered' || state.status === 'failed' || state.status === 'stopped' || this.resumeBlock(planId, node.id)) return
+    const ticket = this.host.store.tickets.get(state.claim.ticketId), assignment = ticket && latestAssignment(ticket)
+    if (!ticket || ticket.ended || !assignment || assignment.state !== 'pending' || waitsForPerson(ticket)) return
+    const action = ticket.execution?.active_writer || assignment.writer?.state === 'active' ? 'resume' : 'launch'
+    this.host.plans.rearm(planId, node.id, action)
+    this.host.executor.start(ticket, assignment)
   }
 
   private result(request: Pick<PlanDispatchResult, 'planId' | 'nodeId' | 'role' | 'limits'>, state: PlanNodeState, reused: boolean): PlanDispatchResult {

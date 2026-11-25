@@ -9,7 +9,8 @@ import type { Handoff } from '../src/core/handoff.ts'
 import type { Plan } from '../src/core/plan.ts'
 import type { PlanActionsObservation, PlanEnvironmentVerification, PlanReleaseConfig, PlanReleaseObservation, PlanReleaseRequest,
   PlanVerificationConfig, PlanVerificationRequest } from '../src/core/plan-integration.ts'
-import { Later } from '../src/app/effects.ts'
+import { Later, Park } from '../src/app/effects.ts'
+import { KV } from '../src/kv.ts'
 
 const planId = 'plan-release'
 const projectId = 'a'.repeat(32)
@@ -24,7 +25,8 @@ const releaseRun = (environmentCheck: PlanEnvironmentVerification): PlanReleaseO
   ({ requestId: 'set-by-test', target: release, status: 'published', deployment, verification: environmentCheck })
 
 type Options = { authorized?: boolean; authorizationScope?: string; authorizationTarget?: 'default' | 'missing'; authorizedTarget?: PlanReleaseConfig;
-  credentialAvailable?: boolean; credentialSequence?: boolean[]; publication?: PlanReleaseObservation; publishAcceptedThenLoseResponse?: boolean }
+  credentialAvailable?: boolean; credentialSequence?: boolean[]; publication?: PlanReleaseObservation; publishAcceptedThenLoseResponse?: boolean;
+  controlBlocked?: boolean }
 function fixture(options: Options = {}) {
   const root = mkdtempSync(join(tmpdir(), 'plan-release-'))
   const store = new Store(join(root, 'state.sqlite'))
@@ -59,18 +61,20 @@ function fixture(options: Options = {}) {
   const adapter = { config: options.authorizedTarget ?? release, credentialAvailable, publish, observe }
   const host = {
     store, effects,
-    plans: { list: () => [plan], get: () => plan, state: () => undefined, requiredDelivery: () => ({ waitingFor: [], integrations: [sha] }) },
+    plans: { list: () => [plan], get: (_id: string) => plan, state: () => undefined,
+      requiredDelivery: (): { waitingFor: string[]; integrations: string[] } => ({ waitingFor: [], integrations: [sha] }) },
     handoffs: { get: () => handoff }, lifetime: new AbortController().signal, verification, release: adapter,
-    paused: () => false, target: () => ({ repository: root, slug: 'acme/widgets', ref: 'refs/heads/main' }),
+    paused: () => false, controlBlocked: (_id: string) => options.controlBlocked === true,
+    target: () => ({ repository: root, slug: 'acme/widgets', ref: 'refs/heads/main' }),
     readTarget: vi.fn(async () => ({ sha, includesIntegrations: true })),
-    observe: vi.fn(async () => integrationObservation), isLatestRun: vi.fn(async () => true),
+    observe: vi.fn(async (): Promise<PlanActionsObservation> => integrationObservation), isLatestRun: vi.fn(async () => true),
     downloadArtifact: vi.fn(async (_id: string, _request: PlanVerificationRequest) => draft),
     commitArtifact: vi.fn(), discardArtifact: vi.fn(), artifactAvailable: vi.fn(async () => true), artifactExists: vi.fn(() => true),
     dispatch: vi.fn(async () => {}), releaseArtifact: vi.fn(async () => join(root, artifact.fileName)),
     deliveryLink: () => 'http://127.0.0.1:3082/project', relay, cancelRelay: vi.fn(),
   }
-  const integration = new PlanIntegration(host as unknown as ConstructorParameters<typeof PlanIntegration>[0])
-  return { root, store, draft, integration, host, getHandler: () => handler! }
+  const restart = () => new PlanIntegration(host as unknown as ConstructorParameters<typeof PlanIntegration>[0])
+  return { root, store, draft, integration: restart(), restart, host, getHandler: () => handler! }
 }
 
 async function integrate(app: ReturnType<typeof fixture>) {
@@ -176,10 +180,16 @@ it('refuses a different configured target and scope before probing credentials',
   }
 })
 
-it.each(['not-published', 'not-started'] as const)('shows a definitive %s publish result as not released', async status => {
+it.each(['not-published', 'not-started'] as const)('records a definitive %s publish result even when a hold arrives during publication', async status => {
   const publication: PlanReleaseObservation = { requestId: 'set-by-test', target: release, status }
-  const app = fixture({ credentialAvailable: true, publication })
+  const options = { credentialAvailable: true, publication, controlBlocked: false }
+  const app = fixture(options)
   try {
+    const publish = app.host.release.publish.getMockImplementation()!
+    app.host.release.publish.mockImplementationOnce(async request => {
+      options.controlBlocked = true
+      return publish(request)
+    })
     await integrate(app)
 
     expect(app.integration.view(planId)).toMatchObject({ status: 'release-failed',
@@ -275,6 +285,167 @@ it.each(['available', 'unreadable'] as const)('reconciles an external deployment
     rmSync(app.root, { recursive: true, force: true })
   }
 })
+
+it('adopts the exact deployment after a restart under a scope hold without publishing again', async () => {
+  const publication = releaseRun({ status: 'passed', at: '2026-11-25T10:01:00.000Z', deploymentId: deployment.id, sha, sha256: artifactSha })
+  const options = { credentialAvailable: true, publication, publishAcceptedThenLoseResponse: true, controlBlocked: false }
+  const app = fixture(options)
+  try {
+    await integrate(app)
+    options.controlBlocked = true
+    app.host.plans.requiredDelivery = () => ({ waitingFor: ['new-ticket'], integrations: [] })
+    const recovered = app.restart()
+    await recovered.resume()
+    await app.getHandler()({}, planId)
+
+    const request = app.host.release.publish.mock.calls[0]![0]
+    expect(app.host.release.observe).toHaveBeenCalledExactlyOnceWith(request)
+    expect(app.host.release.credentialAvailable).toHaveBeenCalledOnce()
+    expect(app.host.release.publish).toHaveBeenCalledOnce()
+    expect(recovered.view(planId)).toMatchObject({ status: 'released', releaseId: request.id, deployment })
+    expect(app.store.get(KV.plans.releaseActive(projectId, release.environment, release.target))).toBeUndefined()
+  } finally {
+    app.store.close()
+    rmSync(app.root, { recursive: true, force: true })
+  }
+})
+
+it('keeps an unresolved release and its target lock until exact stop proof arrives', async () => {
+  const options = { credentialAvailable: true, controlBlocked: false }
+  const app = fixture(options)
+  const lock = KV.plans.releaseActive(projectId, release.environment, release.target)
+  try {
+    app.host.release.publish.mockRejectedValueOnce(new Error('Publication response was interrupted'))
+    await integrate(app)
+    const request = app.host.release.publish.mock.calls[0]![0]
+    options.controlBlocked = true
+    const inconclusive: PlanReleaseObservation[] = [
+      { status: 'missing', requestId: request.id, target: request.target },
+      { status: 'not-started', requestId: 'other-request', target: request.target },
+      { status: 'not-started', requestId: request.id, target: { ...request.target, scope: 'other scope' } },
+      { status: 'publishing', requestId: request.id, target: request.target },
+    ]
+    for (const observation of inconclusive) {
+      app.host.release.observe.mockResolvedValueOnce(observation)
+      await expect(app.getHandler()({}, planId)).rejects.toBeInstanceOf(Later)
+      expect(app.integration.view(planId)).toMatchObject({ status: 'releasing', releaseId: request.id })
+      expect(app.store.get(lock)).toBe(request.id)
+    }
+    app.host.release.observe.mockResolvedValue({ status: 'not-started', requestId: request.id, target: request.target })
+    await expect(app.getHandler()({}, planId)).resolves.toBe(Park)
+    expect(app.integration.view(planId)).toMatchObject({ status: 'awaiting-release-verification' })
+    expect(app.store.get(lock)).toBeUndefined()
+    expect(app.store.get(KV.plans.releaseIntent(planId))?.request).toEqual(request)
+    expect(app.host.release.credentialAvailable).toHaveBeenCalledOnce()
+    expect(app.host.release.publish).toHaveBeenCalledOnce()
+
+    const recovered = app.restart()
+    await recovered.resume()
+    app.host.release.observe.mockClear()
+    await expect(app.getHandler()({}, planId)).resolves.toBe(Park)
+    expect(app.host.release.observe).not.toHaveBeenCalled()
+    app.host.effects.enqueue.mockClear()
+    recovered.resumePlan(planId)
+    expect(app.host.effects.enqueue).not.toHaveBeenCalled()
+    options.controlBlocked = false
+    recovered.resumePlan(planId)
+    expect(app.host.effects.enqueue).toHaveBeenCalledExactlyOnceWith('planIntegration', planId, {})
+
+    const authorization = app.host.handoffs.get().authorization
+    app.host.handoffs.get().authorization = { scope: 'implement only', release: 'not-authorized' }
+    await expect(app.getHandler()({}, planId)).resolves.toBe(Park)
+    expect(recovered.view(planId)).toMatchObject({ status: 'release-blocked', reason: 'authorization_missing' })
+    expect(app.host.release.credentialAvailable).toHaveBeenCalledOnce()
+    expect(app.host.release.publish).toHaveBeenCalledOnce()
+    expect(app.store.get(lock)).toBeUndefined()
+
+    app.host.handoffs.get().authorization = authorization
+    app.host.release.credentialAvailable.mockImplementationOnce(async () => {
+      app.host.handoffs.get().authorization = { scope: 'release another scope', release: 'authorized',
+        releaseTarget: { ...release, scope: 'different scope' } }
+      return true
+    })
+    await expect(app.getHandler()({}, planId)).resolves.toBe(Park)
+    expect(recovered.view(planId)).toMatchObject({ status: 'release-blocked', reason: 'target_scope_mismatch' })
+    expect(app.host.release.publish).toHaveBeenCalledOnce()
+    app.host.handoffs.get().authorization = authorization
+    recovered.resumePlan(planId)
+    app.host.isLatestRun.mockImplementationOnce(async () => {
+      app.store.set(lock, 'other-request')
+      return true
+    })
+    await expect(app.getHandler()({}, planId)).rejects.toBeInstanceOf(Later)
+    expect(app.store.get(lock)).toBe('other-request')
+    expect(recovered.view(planId)).toMatchObject({ status: 'release-blocked', reason: 'release_busy' })
+    expect(app.host.release.publish).toHaveBeenCalledOnce()
+    app.store.delete(lock)
+    app.host.release.publish.mockImplementationOnce(async current => {
+      expect(app.store.get(lock)).toBe(request.id)
+      expect(current).toEqual(request)
+      return { status: 'published', requestId: current.id, target: current.target, deployment,
+        verification: { status: 'passed', at: '2026-11-25T10:01:00.000Z', deploymentId: deployment.id, sha, sha256: artifactSha } }
+    })
+    await app.getHandler()({}, planId)
+    expect(recovered.view(planId)).toMatchObject({ status: 'released', releaseId: request.id, deployment })
+    expect(app.host.release.credentialAvailable.mock.lastCall?.[0]).toEqual(request)
+    expect(app.host.releaseArtifact).toHaveBeenCalledTimes(3)
+    expect(app.host.release.publish).toHaveBeenCalledTimes(2)
+  } finally {
+    app.store.close()
+    rmSync(app.root, { recursive: true, force: true })
+  }
+})
+
+it.each(['credentials', 'artifact', 'regression'] as const)('parks a proven absent release when scope is paused during %s checks', async stage => {
+  const options = { credentialAvailable: true, controlBlocked: false }
+  const app = fixture(options)
+  const lock = KV.plans.releaseActive(projectId, release.environment, release.target)
+  try {
+    app.host.release.publish.mockRejectedValueOnce(new Error('Publication response was interrupted'))
+    await integrate(app)
+    const request = app.host.release.publish.mock.calls[0]![0]
+    app.host.release.observe.mockResolvedValue({ status: 'not-started', requestId: request.id, target: request.target })
+    if (stage === 'credentials') app.host.release.credentialAvailable.mockImplementationOnce(async () => {
+      options.controlBlocked = true
+      throw new Error('Credential provider is unavailable')
+    })
+    else if (stage === 'artifact') app.host.releaseArtifact.mockImplementationOnce(async () => {
+      options.controlBlocked = true
+      throw new Error('Retained package cannot be opened')
+    })
+    else app.host.isLatestRun.mockImplementationOnce(async () => {
+      options.controlBlocked = true
+      return false
+    })
+
+    await expect(app.getHandler()({}, planId)).resolves.toBe(Park)
+    expect(app.integration.view(planId)).toMatchObject({ status: 'awaiting-release-verification' })
+    expect(app.store.get(KV.plans.releaseIntent(planId))?.request).toEqual(request)
+    expect(app.store.get(lock)).toBeUndefined()
+    expect(app.host.release.publish).toHaveBeenCalledOnce()
+  } finally {
+    app.store.close()
+    rmSync(app.root, { recursive: true, force: true })
+  }
+})
+
+it('continues regression on a held Plan and parks publication before probing credentials', async () => {
+  const app = fixture({ controlBlocked: true })
+  try {
+    app.host.observe.mockResolvedValueOnce({ status: 'missing' })
+    await app.getHandler()({}, planId)
+    expect(app.host.dispatch).toHaveBeenCalledOnce()
+    await app.getHandler()({}, planId)
+    expect(app.integration.view(planId)).toMatchObject({ status: 'awaiting-release-verification' })
+    await expect(app.getHandler()({}, planId)).resolves.toBe(Park)
+    expect(app.host.release.credentialAvailable).not.toHaveBeenCalled()
+    expect(app.host.release.publish).not.toHaveBeenCalled()
+  } finally {
+    app.store.close()
+    rmSync(app.root, { recursive: true, force: true })
+  }
+})
+
 it('rechecks credentials and retries the same release after restart when the target proves no write', async () => {
   const publication = releaseRun({ status: 'passed', at: '2026-11-25T10:01:00.000Z', deploymentId: deployment.id, sha, sha256: artifactSha })
   const app = fixture({ credentialSequence: [true, false, true], publication })

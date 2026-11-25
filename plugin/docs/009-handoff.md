@@ -124,6 +124,22 @@ Budget admission can also pause or defer dispatch without issuing a formal deliv
 
 An active Plan can publish a revised graph and acceptance view without overwriting its original registration; see `018-plan-replanning.md`. Only the current graph contributes required work and Frontier nodes. A superseded claim and its evidence stay readable.
 
+## Pause and resume execution
+
+The confirming project's current Hub accepts an explicit direct Harness operator message. A Ticket ID names one claim. A branch request names a Plan and its node, then includes the node's dependency descendants. Explicitly naming the whole Plan holds all its nodes. A descendant still waits for formal delivery of its predecessors. Independent nodes remain eligible.
+
+| Scope | Example pause command | Example resume command |
+| --- | --- | --- |
+| Ticket | `暂停工单 <ticketId>` | `恢复工单 <ticketId>` |
+| Branch | `暂停计划 <planId> 的分支 <nodeId>` | `恢复计划 <planId> 的分支 <nodeId>` |
+| Plan | `暂停整个计划 <planId>` | `恢复整个计划 <planId>` |
+
+The Hub can also ask for the exact JSON `orchestrator_plan_control` arguments in a direct reply. It asks only for the missing target when a scope is ambiguous. A direct control event authorizes one action with the same exact scope. Active holds survive restart and overlap independently. A requirement revision carries the hold to the replacement nodes. Requirement changes follow the preview and approval flow in `018-plan-replanning.md`.
+
+Read `plan/<id>/control` or call `orchestrator_plan_control` with `{action: 'status', planId}`. `stop-requested` means an in-flight action still needs confirmation, `stopped` means the action was prevented or the Worker drained, and `already-happened` identifies a completed dispatch, observed Git write or actual deployment. Deployment remains visible after pause. Clear the same named hold to resume. The runtime checks the remaining scope, credentials, predecessors and run limits before rearming the same Assignment. Read the Plan Frontier for newly eligible dispatches and `plan/<id>/delivery` for release prerequisites. The simulated Harness scenarios are in `tests/plans.spec.ts`.
+
+The read resource pages `actions` with `offset`, `limit` and `next_offset`. Keep the returned Plan ID and operation IDs when reporting a stop.
+
 ## Optional Feishu entry
 
 A selected, registered project can use one Feishu private chat or group topic as a second entrance. This does not create a second Hub or change a Worker's tools. Harness confirmation, questions, and specification reads do not require a binding.

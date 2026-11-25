@@ -23,6 +23,7 @@ interface IntegrationHost {
   release?: ReleaseAdapter
   releaseArtifact?: (planId: string, view: PlanIntegratedArtifact) => Promise<string | undefined>
   paused(): boolean
+  controlBlocked(planId: string): boolean
   target(): MainlineTarget | undefined
   readTarget(target: MainlineTarget, integrations: readonly string[]): Promise<{ sha: string; includesIntegrations: boolean }>
   observe(request: PlanVerificationRequest): Promise<PlanActionsObservation>
@@ -62,6 +63,8 @@ export class PlanIntegration {
       complete: view => { if (!this.completeRelease(view)) this.rearm(view.planId) },
       save: view => this.save(view), verifyEvidence: view => this.verifyReleaseEvidence(view),
       restartVerification: (view, reason) => this.restartVerification(view, reason),
+      controlBlocked: host.controlBlocked,
+      ready: planId => host.plans.requiredDelivery(planId)?.waitingFor.length === 0,
     })
     host.effects.handle('planIntegration', (_, id) => this.verify(id), { limit: () => host.paused() ? 0 : 4, retry: [15_000, 60_000] })
   }
@@ -69,8 +72,9 @@ export class PlanIntegration {
   view(planId: string): PlanIntegrationView | undefined {
     const required = this.host.plans.requiredDelivery(planId)
     if (!required) return undefined
-    if (required.waitingFor.length) return { planId, status: 'awaiting-tickets', waitingFor: required.waitingFor }
     const prior = this.host.store.get(KV.plans.integration(planId))
+    if (required.waitingFor.length && !(prior && 'releaseId' in prior))
+      return { planId, status: 'awaiting-tickets', waitingFor: required.waitingFor }
     if (integrated(prior)) {
       if (prior.status === 'released-artifact-unavailable' || this.retainedArtifactExists(prior)) return prior
       if (prior.status === 'released') return missingReleaseArtifact(prior)
@@ -174,6 +178,8 @@ export class PlanIntegration {
     if (!host.store.atomic(() => this.completeRelease({ ...receipt, status: 'released' }))) throw new Later()
   }
 
+  /** Rearm one durable verification/release intent after a matching scope resumes. */
+  resumePlan(planId: string): void { if (!this.host.controlBlocked(planId)) this.rearm(planId) }
   private restartVerification({ planId, version, run }: IntegratedView, reason: 'artifact_unavailable' | 'regression_evidence_changed'): void {
     this.host.store.atomic(() => {
       this.save({ planId, status: 'blocked', reason, version, run })
@@ -181,29 +187,32 @@ export class PlanIntegration {
       this.host.cancelRelay(credentialRelayPrefix + planId)
       this.rearm(planId)
     })
+
   }
 
   private async verifyReleaseEvidence(prior: IntegratedView): Promise<PlanVerificationConfig | undefined> {
     const { host } = this, { verification } = host, target = host.target()
     if (!verification) return undefined
     if (!target) throw new Error('The integrated branch is unavailable')
+    const required = host.plans.requiredDelivery(prior.planId)
+    if (!required || required.waitingFor.length) return undefined
     const { repository, ref, sha, context } = prior.version
     if (target.slug.toLowerCase() !== repository || target.ref !== ref || integrationContext(verification, repository, ref, sha) !== context)
       return undefined
     const request: PlanVerificationRequest = { repository, ref, sha, context, verification }
     if (!await host.isLatestRun(request, prior.run)) return undefined
     this.active(target)
-    const actual = await host.readTarget(target, [])
+    const actual = await host.readTarget(target, required.integrations)
     this.active(target)
-    if (actual.sha !== sha) return undefined
+    if (actual.sha !== sha || !actual.includesIntegrations) return undefined
     const latest = await host.isLatestRun(request, prior.run)
     this.active(target)
-    return latest ? verification : undefined
+    return latest && isDeepStrictEqual(host.plans.requiredDelivery(prior.planId), required) ? verification : undefined
   }
 
   private rearm(planId: string): void {
     const { verification, plans, effects } = this.host
-    if ((verification || this.host.store.get(KV.plans.releaseIntent(planId))) && plans.requiredDelivery(planId)?.waitingFor.length === 0)
+    if (this.host.store.get(KV.plans.releaseIntent(planId)) || (verification && plans.requiredDelivery(planId)?.waitingFor.length === 0))
       effects.enqueue('planIntegration', planId, {})
   }
 
@@ -217,20 +226,24 @@ export class PlanIntegration {
     const { host } = this, { store, verification } = host, slot = KV.plans.integration(planId)
     const prior = store.get(slot), intent = store.get(KV.plans.releaseIntent(planId))
     if (terminal(prior)) return
-    const required = host.plans.requiredDelivery(planId), plan = host.plans.get(planId)
-    if (!required || required.waitingFor.length || !plan) return
+    const getHandoff = () => {
+      const plan = host.plans.get(planId)
+      return plan && host.handoffs.get(plan.handoffId)
+    }
     if (intent && prior?.status === 'released-artifact-unavailable') return this.restoreReleaseArtifact(prior, intent.verification)
-    if (intent && integrated(prior)) return this.releases.reconcile(prior, intent, () => {
+    if (intent && integrated(prior)) return this.releases.reconcile(prior, intent, getHandoff, () => {
       host.lifetime.throwIfAborted()
       if (host.paused()) throw new Later()
     })
     if (intent) throw new Error('Plan release intent has no integrated artifact record')
-    const handoff = host.handoffs.get(plan.handoffId)
-    if (!handoff) return
-    if (integrated(prior)) return this.releases.start(prior, handoff, () => {
+    const required = host.plans.requiredDelivery(planId)
+    if (!required || required.waitingFor.length) return
+    if (integrated(prior)) return this.releases.start(prior, getHandoff, () => {
       host.lifetime.throwIfAborted()
       if (host.paused()) throw new Later()
     })
+    const handoff = getHandoff()
+    if (!handoff) return
     if (!verification || handoff.project.id !== verification.projectId) return
     const retry = (view: PlanIntegrationView): never => { this.save(view); throw new Later() }
     const target = host.target()

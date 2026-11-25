@@ -20,6 +20,7 @@ import type { MeterSessionBinding } from './app/project-meter.ts'
 import type { BudgetLedger, PendingUsage } from './app/run-limits.ts'
 import type { TopicBindingRecord } from './app/topic-binding.ts'
 import type { CredentialBlocker } from './app/scoped-attention.ts'
+import type { PlanControlState } from './app/plan-control.ts'
 import type { SettingsSave } from './policy.ts'
 import type { GithubConfig, Retry } from './sources/github.ts'
 
@@ -120,7 +121,10 @@ export const KV = {
     instructions: family<PlanMessage[], [id: string, nodeId: string]>('plan-instructions:',
       (id, nodeId) => JSON.stringify([id, nodeId])),
     receipt: family<string, [id: string, sessionId: string, messageId: string]>('plan-message-receipt:',
-      (id, sessionId, messageId) => JSON.stringify([id, sessionId, messageId])) },
+      (id, sessionId, messageId) => JSON.stringify([id, sessionId, messageId])),
+    control: family<PlanControlState>('plan-control:'),
+    controlRequest: family<string, [sessionId: string, messageId: string]>('plan-control-request:',
+      (sessionId, messageId) => JSON.stringify([sessionId, messageId])) },
   /** Only the product change flow writes previews and consumes direct operator approval events. */
   planRequirements: { preview: family<RequirementPreview>('plan-requirement-preview:'),
     reviewer: family<{ sessionId: string; createdAt: number }>('plan-requirement-reviewer:'),

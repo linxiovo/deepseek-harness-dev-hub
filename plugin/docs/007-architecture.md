@@ -193,6 +193,7 @@ Failures retry with exponential backoff. Throwing `Later` defers work without co
 | `planning` | Planning | Sends the confirmed brief or recorded answer to the planner Session | 1 | 2 s doubling to 60 s; defers while paused |
 | `splitting` | Planning | Gives a published spec to its splitter; the durable intent is retired with Plan registration | 1 | 2 s doubling to 60 s for delivery failures; resumes unfinished work on restart |
 | `delivery` | DshExecutor | Hands a Ticket's waiting Inputs to its running Assignment, in order | 4, none while paused | 2 s doubling to 60 s; one that waits for a worker slot tries again after 2 s |
+| `planControlResume` | DshExecutor | Rearms the existing Assignment after its Plan hold has been cleared and its Worker is confirmed idle | 4, none while paused | Defers while any scope or prerequisite still blocks the Ticket. The resume intent survives restart. |
 | `mainlineDelivery` | MainlineQueue | Rechecks one verified intent for [formal Plan closure](003-execution.md#formal-plan-closure) | 8, only when configured | Resumes pending work on restart; evidence gaps stay on the Ticket until rechecked |
 | `planIntegration` | PlanIntegration, using PlanRelease for publication | Verifies the target and attempt-matched package after all formal Ticket receipts; then, only for an authorized release, rechecks prerequisites, publishes and reconciles environment evidence | 4, none while paused | Persists each intent before its write, resumes by observing the exact Actions context or release request; preserves a verified deployment when restoring its specific package |
 | `requirementScopeReview` | Runtime | Dispatches the sealed requirement scope comparison to its read-only reviewer | 1, when configured and unpaused | Reconciles the same Session and dispatch on restart |
@@ -339,6 +340,7 @@ Validation: `tests/session-meter.spec.ts` covers the read seam (absent vs corrup
   | A Ticket's worktree ownership and write access (`execution.ownership`, `execution.active_writer`) | `Tickets`; the Executor inspects Git and confirms the previous writer idle. `pinMainlineRepair` changes the base only with the idle fenced writer and the durable repair Input in the same transaction. |
   | Confirmed handoffs and immutable specifications | `Handoffs` |
   | Plan DAGs, root background, and addressed node instructions | `Plans` |
+  | Plan control holds and direct operator command receipts | `PlanControl` |
   | Mainline merge FIFOs and actual Git observations | `MainlineQueue` |
   | Plan integration view, Actions dispatch intent and final delivery relay | `PlanIntegration` |
   | External release intent and target lock | `PlanRelease`; its state transitions ask `PlanIntegration` to update the delivery view |
@@ -417,6 +419,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/planning.ts` | `Planning`: durable `planning` and `splitting` effects for the specification planner and the Plan DAG splitter |
 | `src/app/plans.ts` | `Plans`: validates and publishes immutable Plan revisions, retains old node definitions and claims, and gates Frontier and delivery |
 | `src/app/plan-dispatch.ts` | `PlanDispatcher`: validates Frontier predecessors, reserves a launch slot, atomically claims a node into a stable Ticket/Assignment, and rearms the same claim on restart |
+| `src/app/plan-control.ts` | `PlanControl`: authorizes direct Hub controls, persists scope holds and tracks the stop of each affected Worker. See `009-handoff.md`. |
 | `src/app/plan-replan.ts` | Binds a technical replan to the current failure, effective authorization and graph revision |
 | `src/app/plan-stagnation.ts` | `PlanStagnation`: durable technical failure and recovery state, diagnosis and reassignment policy, and failed-check gating |
 | `src/app/plan-requirements.ts` | `PlanRequirements`: computes impact, records an independent scope verdict, consumes exact direct approval and applies one revision |

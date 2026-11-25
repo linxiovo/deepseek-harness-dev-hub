@@ -49,6 +49,7 @@ const TEXT = {
   'health.mainlineRepair': ['主干修复派工', 'Mainline repair dispatch'],
   'health.mainlineDelivery': ['正式交付核验', 'Formal delivery verification'],
   'health.planIntegration': ['计划集成验证', 'Plan integration verification'],
+  'health.planControlResume': ['计划暂停恢复', 'Plan pause recovery'],
   'health.replanReview': ['停滞重排协调', 'Stalled Plan coordination'],
   'health.requirementScopeReview': ['需求变更范围审查', 'Requirement scope review'],
   'health.relay': ['转达给主 Session 的消息', 'Relays to the main Session'],

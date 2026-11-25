@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { access, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, posix } from 'node:path'
-import { CliError, type Commands } from '../infra/commands.ts'
+import { CliError, GitLeaseRejected, type Commands } from '../infra/commands.ts'
 import { credentialHelper, sameDirectory } from '../infra/environment.ts'
 import { validateRepositoryIdentity } from './repository-identity.ts'
 import { inspectDocuments, type DocTreeScope } from './doc-tree.ts'
@@ -26,6 +26,7 @@ async function git(commands: Pick<Commands, 'git'>, cwd: string, label: string, 
 function gitFailure(label: string, error: unknown): Error {
   // Never surface external stderr/argv. A helper, Git, or the remote can emit sensitive diagnostics.
   if (error instanceof Error && error.name === 'AbortError') return new DOMException('The operation was aborted', 'AbortError')
+  if (error instanceof GitLeaseRejected) return error
   const exit = error instanceof CliError ? error.exitCode : undefined
   return new CliError(`Cannot ${label}${exit === undefined ? '' : ` (Git exit ${exit})`}`, undefined, exit)
 }
@@ -267,14 +268,15 @@ export function prepareMainline(commands: Commands, target: MainlineTarget, cand
 
 /** Make one exact-lease fast-forward push after the final authorization; never retry here. */
 export function advanceMainline(commands: Commands, target: MainlineTarget, base: string, candidate: string,
-  authorize?: () => void | Promise<void>): Promise<'advanced' | 'unchanged'> {
+  authorize?: () => void | (() => void) | Promise<void | (() => void)>): Promise<'advanced' | 'unchanged'> {
   return inScratch(commands, target, async scratch => {
     if (base.toLowerCase() === candidate.toLowerCase() || !await contains(scratch, base, candidate)) {
       throw new Error('Mainline candidate must strictly descend from the expected base.')
     }
     const args = [...scratch.transport, 'push', '--porcelain', `--force-with-lease=${target.ref}:${base}`,
       '--', scratch.url, `${candidate}:${target.ref}`]
-    await authorize?.()
+    const beforeWrite = await authorize?.()
+    beforeWrite?.()
     const result = await scratch.git('advance mainline with the expected base; re-read its tip before retrying', args)
     // Git's up-to-date response skips its lease check. Do not report a CAS in that case.
     const updates = result.split(/\r?\n/).filter(line => line.includes('\t')).map(line => line.split('\t'))

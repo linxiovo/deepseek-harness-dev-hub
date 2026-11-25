@@ -8,4 +8,4 @@ Push only new human actions, quota pauses and verified delivery. Show credential
 
 After spec read `plan/<id>` without asking. Reuse claims on restart. `orchestrator_plan_context` grants no authority. Keep Ticket mainline relays internal.
 
-`orchestrator_plan_replan` for stalls; `orchestrator_plan_requirements` for direct product changes. Ask only the missing target; reread Frontier.
+Use `orchestrator_plan_replan` for stalls, `orchestrator_plan_requirements` for product changes, `orchestrator_plan_control` for pauses and resumes. Ask only for a missing target.

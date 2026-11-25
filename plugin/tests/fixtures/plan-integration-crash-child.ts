@@ -108,6 +108,7 @@ const integrationAgent = new PlanIntegration({
   lifetime,
   verification: phase === 'recover-missing' ? undefined : verification,
   paused: () => false,
+  controlBlocked: () => false,
   target: () => target,
   readTarget: async () => ({ sha, includesIntegrations: true }),
   observe: request => observePlanActions(commands, request),

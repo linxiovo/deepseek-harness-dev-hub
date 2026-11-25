@@ -105,6 +105,7 @@ export type RequirementScopeTask = {
  type Host = {
   store: Pick<Store, 'atomic' | 'get' | 'set' | 'tickets'>
   plans: Pick<Plans, 'current' | 'state' | 'requiredDelivery' | 'revision' | 'revise'>
+  migrateHolds(planId: string, replacements: Record<string, string[]>): void
   handoffs: Pick<Handoffs, 'get'>
   limits: Pick<RunLimits, 'forDispatch'>
   stop: (ticketId: string, reason: string) => void
@@ -360,6 +361,7 @@ export class PlanRequirements {
       const { revision } = plans.revise(preview.planId, preview.expectedRevision,
         { draft: { features: active.plan.features, nodes }, replacements },
         { kind: 'requirements', proposalId, approval: message, goal: preview.goal, acceptance })
+      this.host.migrateHolds(planId, replacements)
       const stopped = new Set<string>()
       for (const node of affected) for (const ticket of node.tickets) if (ticket.open && !stopped.has(ticket.ticketId)) {
         stopped.add(ticket.ticketId)

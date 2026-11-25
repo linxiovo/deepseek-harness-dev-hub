@@ -68,7 +68,7 @@ export type PlanReleaseObservation = { requestId: string; target: ReleaseTarget 
   | { status: 'published'; deployment: PlanDeployment; verification: PlanEnvironmentVerification }
 )
 
-export interface PlanReleaseIntent { request: PlanReleaseRequest; adapter: string }
+export interface PlanReleaseIntent { request: PlanReleaseRequest; adapter: string; verification: PlanVerificationConfig }
 
 export type PlanActionsFailure = 'regression_failed' | 'full_regression_missing' | 'artifact_unavailable'
 export type PlanActionsObservation =
@@ -82,7 +82,7 @@ export interface PlanIntegrationVersion extends PlanIntegrationIdentity {
   environment: string
 }
 type PlanIntegrationBlock = PlanActionsFailure | 'verification_unconfigured' | 'integration_unavailable' | 'integration_not_on_target'
-  | 'target_changed' | 'actions_unavailable' | 'dispatch_unconfirmed'
+  | 'target_changed' | 'actions_unavailable' | 'dispatch_unconfirmed' | 'regression_evidence_changed'
 
 export interface PlanIntegratedArtifact {
   version: PlanIntegrationVersion
@@ -93,12 +93,13 @@ export interface PlanIntegratedArtifact {
 type PlanReleaseProgress =
   | { status: 'release-blocked'; reason: 'release_unconfigured' | 'authorization_missing' | 'target_scope_mismatch' | 'release_unavailable' | 'release_busy'; release?: ReleaseTarget }
   | { status: 'awaiting-release-credentials'; release: ReleaseTarget; credential: { id: string; providerUrl: string } }
-  | { status: 'releasing'; release: ReleaseTarget; releaseId: string; reason?: 'dispatch_unconfirmed' | 'release_unavailable' | 'release_configuration_changed' }
+  | { status: 'releasing'; release: ReleaseTarget; releaseId: string; reason?: 'release_dispatch_unconfirmed' | 'release_unavailable' | 'release_configuration_changed' }
   | { status: 'release-failed'; release: ReleaseTarget; releaseId: string }
   | { status: 'released-unverified'; release: ReleaseTarget; releaseId: string; deployment: PlanDeployment;
       verification: PlanEnvironmentVerification; reason?: 'release_evidence_mismatch' | 'release_unavailable' | 'release_configuration_changed' }
-  | { status: 'released'; release: ReleaseTarget; releaseId: string; deployment: PlanDeployment;
-      verification: Extract<PlanEnvironmentVerification, { status: 'passed' }> }
+  | ({ release: ReleaseTarget; releaseId: string; deployment: PlanDeployment;
+      verification: Extract<PlanEnvironmentVerification, { status: 'passed' }> } & (
+    { status: 'released' } | { status: 'released-artifact-unavailable'; reason: 'artifact_unavailable'; artifactAvailable: false }))
 
 /** Plan-level delivery, distinct from the status of an individual Ticket or the registered graph. */
 export type PlanIntegrationView = { planId: string } & (

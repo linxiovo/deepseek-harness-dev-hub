@@ -178,13 +178,15 @@ it('shows a failed publication as integrated but not live', async () => {
 })
 
 it.each([
-  { verification: { status: 'failed', at: '2026-11-24T00:01:00Z' }, label: '未通过' },
-  { verification: { status: 'passed', at: '2026-11-24T00:01:00Z', deploymentId: 'another-deployment',
-    sha: 'a'.repeat(40), sha256: 'c'.repeat(64) }, reason: 'release_evidence_mismatch', label: '未核实' },
-] as const)('distinguishes actual deployment from an unverified environment result: $label', async ({ verification, reason, label }) => {
+  { result: { status: 'released-unverified', verification: { status: 'failed', at: '2026-11-24T00:01:00Z' } }, label: '未通过' },
+  { result: { status: 'released-unverified', reason: 'release_evidence_mismatch', verification: { status: 'passed',
+    at: '2026-11-24T00:01:00Z', deploymentId: 'another-deployment', sha: 'a'.repeat(40), sha256: 'c'.repeat(64) } }, label: '未核实' },
+  { result: { status: 'released-artifact-unavailable', reason: 'artifact_unavailable', artifactAvailable: false, verification: { status: 'passed',
+    at: '2026-11-24T00:01:00Z', deploymentId: 'deployment-1', sha: 'a'.repeat(40), sha256: 'c'.repeat(64) } }, label: '通过' },
+] as const)('distinguishes actual deployment from verification and package availability: $label', async ({ result, label }) => {
   server.projectId = 'a'.repeat(32)
   server.ticketDetails.t1 = { ...server.ticketDetails.t1!, planId: 'plan-a' }
-  const view: PlanIntegrationView = { planId: 'plan-a', status: 'released-unverified', releaseId: 'release-1',
+  const view: PlanIntegrationView = { planId: 'plan-a', releaseId: 'release-1',
     release: { environment: 'production', target: 'storefront', scope: 'catalog service' },
     version: { repository: 'acme/widgets', ref: 'refs/heads/main', sha: 'a'.repeat(40), context: 'b'.repeat(64), workflowId: '44',
       configuration: 'plugin-check-v1', environment: 'hosted-v1' },
@@ -192,15 +194,16 @@ it.each([
     artifact: { id: 19, name: 'plugin-bundle', url: 'https://github.com/acme/widgets/actions/runs/12/artifacts/19',
       fileName: 'dsh-superagent-0.1.0.tgz', contentType: 'application/gzip', size: 128, sha256: 'c'.repeat(64) }, verifiedAt: '2026-11-23T00:00:00Z',
     deployment: { id: 'deployment-1', sha: 'a'.repeat(40), sha256: 'c'.repeat(64), at: '2026-11-24T00:00:00Z' },
-    verification, ...(reason ? { reason } : {}) }
+    ...result }
   server.planDeliveries['plan-a'] = view
   at({ page: 'execution', id: 't1' })
   await mount()
-  expect(text()).toContain(zh['planDelivery.status.released-unverified'])
+  expect(text()).toContain(zh[`planDelivery.status.${result.status}`])
   expect(text()).toContain('deployment-1')
   const field = all('dt').find(item => item.textContent === '环境验证')
   expect(field?.nextElementSibling?.textContent).toBe(label)
-  expect(text()).toContain(zh['planDelivery.deployedAt'].split('{time}')[0]!)
+  if (result.status === 'released-unverified') expect(text()).toContain(zh['planDelivery.deployedAt'].split('{time}')[0]!)
+  else expect(find(zh['planDelivery.download'])).toHaveProperty('disabled', true)
 })
 
 it('displays verified worktree identity and actual writer, then names a rejected preparation without inventing Git facts', async () => {

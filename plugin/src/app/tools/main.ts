@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
-import { releaseNamePattern, releaseScopePattern } from '../../core/handoff.ts'
+import { releaseNamePattern, releaseScopePattern, sameReleaseTarget, type ReleaseTarget } from '../../core/handoff.ts'
 import { UserError, followupOwners, reasonText, type Decision, type DecisionKind, type Engine, type EngineForMainSession, type EngineForPeople }
   from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
@@ -34,7 +34,7 @@ const HandoffAuthorizationSchema = z.object({
   releaseTarget: z.object({ environment: z.string(), target: z.string(), scope: z.string() }).strict().optional(),
 }).strict()
 type DirectHandoffAuthorization = { scope: string; release: 'not-authorized' }
-  | { scope: string; release: 'authorized'; releaseTarget: { environment: string; target: string; scope: string } }
+  | { scope: string; release: 'authorized'; releaseTarget: ReleaseTarget }
 const isDirectHandoffAuthorization = (authorization: z.infer<typeof HandoffAuthorizationSchema>): authorization is DirectHandoffAuthorization => {
   if (authorization.release === 'not-authorized') return authorization.releaseTarget === undefined
   const target = authorization.releaseTarget
@@ -283,10 +283,8 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
           || brief.acceptanceScope.some((value, index) => value !== approvedBrief.acceptanceScope[index])
           || brief.authorization.scope !== approvedBrief.authorization.scope
           || brief.authorization.release !== approvedBrief.authorization.release
-          || (brief.authorization.release === 'authorized' && approvedBrief.authorization.release === 'authorized' && (
-            brief.authorization.releaseTarget.environment !== approvedBrief.authorization.releaseTarget.environment
-            || brief.authorization.releaseTarget.target !== approvedBrief.authorization.releaseTarget.target
-            || brief.authorization.releaseTarget.scope !== approvedBrief.authorization.releaseTarget.scope))) {
+          || (brief.authorization.release === 'authorized' && approvedBrief.authorization.release === 'authorized' &&
+            !sameReleaseTarget(brief.authorization.releaseTarget, approvedBrief.authorization.releaseTarget))) {
           throw new Error(handoffErrors.mismatchedBrief)
         }
         await host.verifyProjectBinding?.()

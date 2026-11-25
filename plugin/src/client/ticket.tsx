@@ -147,7 +147,8 @@ function PlanDelivery({ planId }: { planId: string }) {
   }
   const statusLabel = (status: PlanIntegrationView['status']) => t(`planDelivery.status.${status}`)
   const statusTone: TagTone = data?.status === 'delivered' || data?.status === 'released' ? 'success'
-    : data?.status === 'blocked' || data?.status === 'release-blocked' || data?.status === 'release-failed' || data?.status === 'released-unverified' ? 'danger'
+    : data?.status === 'blocked' || data?.status === 'release-blocked' || data?.status === 'release-failed'
+      || data?.status === 'released-unverified' || data?.status === 'released-artifact-unavailable' ? 'danger'
       : data?.status === 'verifying' || data?.status === 'releasing' ? 'info' : 'neutral'
   const version = data && 'version' in data ? data.version : undefined
   const run = data && 'run' in data ? data.run : undefined
@@ -206,7 +207,8 @@ function PlanDelivery({ planId }: { planId: string }) {
           onClick={() => { void download() }}>{downloading ? t('loading') : t('planDelivery.download')}</Button></div>
       </>}
       {data.status === 'delivered' && <Hint>{t('planDelivery.deliveredAt', { time: when(data.verifiedAt, t('lang')) })}</Hint>}
-      {data.status === 'released' && <Hint>{t('planDelivery.environmentVerifiedAt', { time: when(data.verification.at, t('lang')) })}</Hint>}
+      {(data.status === 'released' || data.status === 'released-artifact-unavailable') && <Hint>{t('planDelivery.environmentVerifiedAt',
+        { time: when(data.verification.at, t('lang')) })}</Hint>}
       {data.status === 'released-unverified' && <Hint>{t('planDelivery.deployedAt', { time: when(data.deployment.at, t('lang')) })}</Hint>}
     </>}
   </Section>

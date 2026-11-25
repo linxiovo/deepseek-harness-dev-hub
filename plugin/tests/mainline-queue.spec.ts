@@ -637,7 +637,7 @@ it.each([
     await h.runtime.idle()
   }
   if (controlledRelease) {
-    expect(initial).toMatchObject({ status: 'releasing', reason: 'dispatch_unconfirmed', release: sandboxTarget })
+    expect(initial).toMatchObject({ status: 'releasing', reason: 'release_dispatch_unconfirmed', release: sandboxTarget })
     expect(readFileSync(join(h.runtime.machine.stateDir, 'deployed-label-service.tgz'), 'utf8')).toBe(`${integration}-1`)
     expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toEqual([])
     await h.restart()

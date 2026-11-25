@@ -49,8 +49,10 @@ export function releaseAdapter(config: PlanReleaseConfig, cwd: string, subproces
   return {
     config,
     credentialAvailable: async request => {
-      try { return await execute(subprocess, inputs, 'credential-check', request, 30_000) === 'ready' }
-      catch { return false }
+      const result = await execute(subprocess, inputs, 'credential-check', request, 30_000)
+      if (result === 'ready') return true
+      if (result === 'missing') return false
+      throw new Error('Release credential check returned neither ready nor missing')
     },
     publish: (request, artifactPath) => run('publish', request, artifactPath),
     observe: request => run('observe', request),

@@ -194,7 +194,7 @@ Failures retry with exponential backoff. Throwing `Later` defers work without co
 | `splitting` | Planning | Gives a published spec to its splitter; the durable intent is retired with Plan registration | 1 | 2 s doubling to 60 s for delivery failures; resumes unfinished work on restart |
 | `delivery` | DshExecutor | Hands a Ticket's waiting Inputs to its running Assignment, in order | 4, none while paused | 2 s doubling to 60 s; one that waits for a worker slot tries again after 2 s |
 | `mainlineDelivery` | MainlineQueue | Rechecks one verified intent for [formal Plan closure](003-execution.md#formal-plan-closure) | 8, only when configured | Resumes pending work on restart; evidence gaps stay on the Ticket until rechecked |
-| `planIntegration` | PlanIntegration | Verifies the actual target, full regression jobs and the attempt-matched package after all formal Plan receipts exist | 4, only when configured and unpaused | Persists the exact revision/configuration before dispatch; resumes by observing that context |
+| `planIntegration` | PlanIntegration, using PlanRelease for publication | Verifies the target and attempt-matched package after all formal Ticket receipts; then, only for an authorized release, rechecks prerequisites, publishes and reconciles environment evidence | 4, none while paused | Persists each intent before its write, resumes by observing the exact Actions context or release request; preserves a verified deployment when restoring its specific package |
 | `requirementScopeReview` | Runtime | Dispatches the sealed requirement scope comparison to its read-only reviewer | 1, when configured and unpaused | Reconciles the same Session and dispatch on restart |
 | `hubInbox` | Sessions | Moves a message claimed by a retired physical Hub generation into the current Hub through a durable per-source inbox queue, marking transferred user input as a relay rather than a new direct approval | 1 per current target | 2 s doubling to 60 s; resumes from the persisted queue after restart |
 | `relay` | Sessions | Steers a worker's report or question, or a person's follow-up, into the main Session's turn | 1, in queue order | 2 s doubling to 60 s |
@@ -340,7 +340,8 @@ Validation: `tests/session-meter.spec.ts` covers the read seam (absent vs corrup
   | Confirmed handoffs and immutable specifications | `Handoffs` |
   | Plan DAGs, root background, and addressed node instructions | `Plans` |
   | Mainline merge FIFOs and actual Git observations | `MainlineQueue` |
-  | Plan integration views, regression/release intents and final delivery relays | `PlanIntegration` and `PlanRelease` |
+  | Plan integration view, Actions dispatch intent and final delivery relay | `PlanIntegration` |
+  | External release intent and target lock | `PlanRelease`; its state transitions ask `PlanIntegration` to update the delivery view |
   | Project Session attribution and business parentage | `ProjectMeter`, through `bind` at a trusted delegation seam |
   | A Source's read positions, and the meta it keeps on its Threads (`label`, `url`, `facts` and its own keys) | That Source, through `SourceContext` |
   | Settings and their history | Settings |

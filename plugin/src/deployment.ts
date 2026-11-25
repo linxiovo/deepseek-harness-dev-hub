@@ -6,7 +6,8 @@ import type { Volatile } from '@deepseek-ai/cordis'
 import s from '@deepseek-ai/schemastery'
 import { z } from 'zod'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import type { PlanVerificationConfig } from './core/plan-integration.ts'
+import { releaseNamePattern, releaseScopePattern } from './core/handoff.ts'
+import type { PlanReleaseConfig, PlanVerificationConfig } from './core/plan-integration.ts'
 import { runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra/environment.ts'
 import { SetupError } from './setup.ts'
 
@@ -31,6 +32,17 @@ const PlanVerificationConfigSchema: s<PlanVerificationConfigInput> = s.object({
   configuration: s.string().pattern(/^[a-zA-Z0-9_.-]{1,120}$/).required(),
   environment: s.string().pattern(/^[a-zA-Z0-9_.-]{1,120}$/).required(),
 })
+
+const PlanReleaseConfigSchema: s<Partial<PlanReleaseConfig>, PlanReleaseConfig> = s.object({
+  projectId: s.string().pattern(/^[a-f0-9]{32}$/).required(),
+  executable: absolute('Trusted release adapter executable.').required(),
+  args: s.array(s.string()).default([]),
+  environment: s.string().pattern(releaseNamePattern).required(),
+  target: s.string().pattern(releaseNamePattern).required(),
+  scope: s.string().pattern(releaseScopePattern).required(),
+  credentialId: s.string().pattern(credentialIdPattern).required(),
+  credentialProviderUrl: s.string().required().description('Controlled HTTPS credential configuration page; never include credentials, queries or fragments.'),
+})
 /** Plugin configuration of the dsh-superagent entry. Volatile fields apply without a restart because dsh-superagent reads them on each use; changing `stateDir` remounts the plugin. */
 export const Config = s.object({
   stateDir: absolute('Directory for the database, locks, worker shims, the agent\'s git configuration and, by default, the ticket directories.').required(),
@@ -43,6 +55,7 @@ export const Config = s.object({
     .default(15000).description('Time limit of one context read during an assessment, in milliseconds.').volatile(),
   credentialChecks: s.array(CredentialCheckConfig).default([]).description('Project test-account checks. Credentials must not appear in arguments.'),
   planVerification: s.array(PlanVerificationConfigSchema).default([]).description('Trusted non-production full regression workflows by project.'),
+  planRelease: s.array(PlanReleaseConfigSchema).default([]).description('Trusted release adapters and exact deployment targets by project.'),
 })
 export type DeploymentConfig = ReturnType<typeof Config>
 export type RuntimeMode = 'desktop' | 'headless'
@@ -54,6 +67,7 @@ export interface Machine {
   runtimeMode?: RuntimeMode
   credentialChecks?: readonly CredentialCheck[]
   planVerification?: readonly PlanVerificationConfig[]
+  planRelease?: readonly PlanReleaseConfig[]
   promptMaxChars: Volatile<number>
   admissionContextMaxPages: Volatile<number>
   admissionContextTimeoutMs: Volatile<number>
@@ -68,7 +82,7 @@ const MOVED: Record<string, string> = {
 export function machineOf(config: DeploymentConfig): Machine {
   const unknown = Object.keys(config).filter(key => !(key in (Config.dict ?? {})))
   if (unknown.length) throw new Error(`dsh-superagent configuration has keys it does not use: ${unknown.map(key => MOVED[key] ? `${key} (now ${MOVED[key]})` : key).join(', ')}; docs/006-deployment.md lists the keys`)
-  const { stateDir, runtimeMode, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, credentialChecks, planVerification } = config
+  const { stateDir, runtimeMode, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, credentialChecks, planVerification, planRelease } = config
   if (new Set(credentialChecks.map(check => `${check.projectId}:${check.id}`)).size !== credentialChecks.length) {
     throw new Error('Duplicate credential check for the same project and credential ID')
   }
@@ -84,8 +98,18 @@ export function machineOf(config: DeploymentConfig): Machine {
     throw new Error('Plan verification workflow ID must be a safe positive integer')
   for (const { identityJob, jobs } of planVerification) if (!jobs.includes(identityJob) || new Set(jobs).size !== jobs.length || jobs.some(job => !job.trim()))
     throw new Error('Plan verification requires a listed identity job and unique, non-blank full regression job names')
+  if (new Set(planRelease.map(release => release.projectId)).size !== planRelease.length)
+    throw new Error('Duplicate Plan release adapter for the same project')
+  for (const release of planRelease) {
+    if (!planVerification.some(check => check.projectId === release.projectId))
+      throw new Error('Plan release requires a matching full-regression workflow for the same project')
+    const url = URL.parse(release.credentialProviderUrl)
+    if (!url || url.protocol !== 'https:' || url.username || url.password || url.search || url.hash)
+      throw new Error('Plan release credential provider URL must be HTTPS without credentials, a query or a fragment')
+  }
   return { stateDir, runtimeMode: runtimeMode ?? 'desktop', promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs,
-    ...(credentialChecks.length ? { credentialChecks } : {}), ...(planVerification.length ? { planVerification } : {}) }
+    ...(credentialChecks.length ? { credentialChecks } : {}), ...(planVerification.length ? { planVerification } : {}),
+    ...(planRelease.length ? { planRelease } : {}) }
 }
 
 const RepositoryName = z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, 'owner/name')

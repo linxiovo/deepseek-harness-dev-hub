@@ -28,9 +28,13 @@ export class Handoffs {
 
   /** Confirm and persist the original brief once; identical confirmations reuse it without re-enqueuing planning. */
   confirm(input: HandoffInput): { handoff: Handoff; reused: boolean } {
+    const authorization = input.authorization.release === 'authorized'
+      ? { scope: input.authorization.scope.trim(), release: input.authorization.release,
+        ...(input.authorization.releaseTarget ? { releaseTarget: { environment: input.authorization.releaseTarget.environment,
+          target: input.authorization.releaseTarget.target, scope: input.authorization.releaseTarget.scope } } : {}) }
+      : { scope: input.authorization.scope.trim(), release: input.authorization.release }
     const brief = { goal: input.goal.trim(),
-      constraints: input.constraints.map(item => item.trim()), acceptanceScope: input.acceptanceScope.map(item => item.trim()),
-      authorization: { scope: input.authorization.scope.trim(), release: input.authorization.release } }
+      constraints: input.constraints.map(item => item.trim()), acceptanceScope: input.acceptanceScope.map(item => item.trim()), authorization }
     const idFor = ({ id, repository, workspace }: ProjectRef) => key('handoff', id, JSON.stringify({ project: { repository, workspace }, ...brief }))
     const repository = input.project.repository.trim()
     const workspace = resolve(input.project.workspace.trim())

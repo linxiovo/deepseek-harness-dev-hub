@@ -2,6 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
+import { releaseNamePattern, releaseScopePattern } from '../../core/handoff.ts'
 import { UserError, followupOwners, reasonText, type Decision, type DecisionKind, type Engine, type EngineForMainSession, type EngineForPeople }
   from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
@@ -28,13 +29,25 @@ import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 const RoutingNoteSchema = z.string().trim()
   .refine(text => wordCount(text) <= NOTE_WORDS, `Routing note must not exceed ${NOTE_WORDS} words (Chinese uses word segmentation). Shorten it; do not split it across deliveries.`)
   .describe(`Optional routing background or explicit human constraint, at most ${NOTE_WORDS} words. Never add implementation instructions or replace the original source.`)
+const HandoffAuthorizationSchema = z.object({
+  scope: z.string().trim().min(1), release: z.enum(['authorized', 'not-authorized']),
+  releaseTarget: z.object({ environment: z.string(), target: z.string(), scope: z.string() }).strict().optional(),
+}).strict()
+type DirectHandoffAuthorization = { scope: string; release: 'not-authorized' }
+  | { scope: string; release: 'authorized'; releaseTarget: { environment: string; target: string; scope: string } }
+const isDirectHandoffAuthorization = (authorization: z.infer<typeof HandoffAuthorizationSchema>): authorization is DirectHandoffAuthorization => {
+  if (authorization.release === 'not-authorized') return authorization.releaseTarget === undefined
+  const target = authorization.releaseTarget
+  return !!target && releaseNamePattern.test(target.environment) && releaseNamePattern.test(target.target)
+    && releaseScopePattern.test(target.scope)
+}
 /** A handoff is a single product intent the user confirmed, not a bundle of unrelated goals. */
 const HandoffConfirmationSchema = z.object({
   project: z.object({ repository: z.string().trim().min(1), workspace: z.string().trim().min(1) }).strict(),
   goal: z.string().trim().min(1),
   constraints: z.array(z.string().trim().min(1)),
   acceptanceScope: z.array(z.string().trim().min(1)).min(1),
-  authorization: z.object({ scope: z.string().trim().min(1), release: z.enum(['authorized', 'not-authorized']) }).strict(),
+  authorization: HandoffAuthorizationSchema,
   confirmation: z.string().min(1).refine(text => !!text.trim(), 'Confirmation cannot be blank')
     .describe('Verbatim latest direct Hub user confirmation; never relay.'),
 }).strict()
@@ -247,7 +260,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
     tool({
       name: 'orchestrator_handoff_confirm',
-      description: 'Direct Hub approval only: persist one project goal, acceptance scope, and authorization; planner writes the spec.',
+      description: 'Direct Hub approval only; release requires the exact environment, target and scope in that confirmation.',
       schema: HandoffConfirmationSchema,
       execute: async ({ confirmation, ...brief }) => {
         if (agent.id !== host.resources.masterId) throw new Error(handoffErrors.confirmationSession)
@@ -259,6 +272,9 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         const approval = ApprovalSchema.safeParse(parsed)
         if (!approval.success) throw new Error(handoffErrors.invalidConfirmation)
         const approvedBrief = approval.data.brief
+        if (!isDirectHandoffAuthorization(brief.authorization) || !isDirectHandoffAuthorization(approvedBrief.authorization)) {
+          throw new Error(handoffErrors.invalidConfirmation)
+        }
         if (brief.project.repository !== approvedBrief.project.repository || brief.project.workspace !== approvedBrief.project.workspace
           || brief.goal !== approvedBrief.goal
           || brief.constraints.length !== approvedBrief.constraints.length
@@ -266,7 +282,11 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
           || brief.acceptanceScope.length !== approvedBrief.acceptanceScope.length
           || brief.acceptanceScope.some((value, index) => value !== approvedBrief.acceptanceScope[index])
           || brief.authorization.scope !== approvedBrief.authorization.scope
-          || brief.authorization.release !== approvedBrief.authorization.release) {
+          || brief.authorization.release !== approvedBrief.authorization.release
+          || (brief.authorization.release === 'authorized' && approvedBrief.authorization.release === 'authorized' && (
+            brief.authorization.releaseTarget.environment !== approvedBrief.authorization.releaseTarget.environment
+            || brief.authorization.releaseTarget.target !== approvedBrief.authorization.releaseTarget.target
+            || brief.authorization.releaseTarget.scope !== approvedBrief.authorization.releaseTarget.scope))) {
           throw new Error(handoffErrors.mismatchedBrief)
         }
         await host.verifyProjectBinding?.()

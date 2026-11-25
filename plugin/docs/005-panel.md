@@ -33,6 +33,8 @@ Ticket details show the originating Trigger, Decision and reason, scope and Poli
 
 The Ticket, Plan and project usage query contract is in `plugin/docs/014-project-metering.md`.
 
+For a Plan Ticket, **Plan delivery** keeps the regression package, exact release target, actual deployment and verified environment result separate. See `plugin/docs/017-plan-integration.md`.
+
 ## Settings groups
 
 - **Sources:** one card per Source with its switch, fields and verified account facts. GitHub also offers receive-all switches for new Issues, pull requests, comments and default-branch CI. Polling and read limits are under Advanced.

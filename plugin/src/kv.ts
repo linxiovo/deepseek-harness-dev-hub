@@ -8,7 +8,7 @@ import type { Plan, PlanMessage, PlanNodeState } from './core/plan.ts'
 import type { HubAuthorityState } from './app/hub-authority.ts'
 export type HubDeliveryReceipt = { hash: string; sessionId: string; at: string }
 import type { TestHistory } from './core/delivery-check.ts'
-import type { PlanIntegrationView } from './core/plan-integration.ts'
+import type { PlanIntegrationView, PlanReleaseIntent } from './core/plan-integration.ts'
 import type { PromptVersion } from './app/prompts.ts'
 import type { MainlineIntent } from './app/mainline-queue.ts'
 import type { PlanRepairSource, PlanRevision } from './app/plans.ts'
@@ -113,6 +113,9 @@ export const KV = {
     node: family<PlanNodeState, [id: string, nodeId: string]>('plan-node:', (id, nodeId) => JSON.stringify([id, nodeId])),
     integration: family<PlanIntegrationView>('plan-integration:'),
     integrationDispatch: family<true>('plan-integration-dispatch:'),
+    releaseIntent: family<PlanReleaseIntent>('plan-release-intent:'),
+    releaseActive: family<string, [projectId: string, environment: string, target: string]>('plan-release-active:',
+      (projectId, environment, target) => JSON.stringify([projectId, environment, target])),
     background: family<PlanMessage[], [id: string]>('plan-background:'),
     instructions: family<PlanMessage[], [id: string, nodeId: string]>('plan-instructions:',
       (id, nodeId) => JSON.stringify([id, nodeId])),

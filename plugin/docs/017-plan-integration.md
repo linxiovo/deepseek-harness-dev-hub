@@ -1,6 +1,6 @@
 # 017 Plan integration delivery
 
-The Plan closes its delivery gate only after every registered node has a matching formal Ticket receipt. `PlanIntegration` then verifies one fresh snapshot of the configured GitHub branch, dispatches the full regression workflow for that exact commit and accepts only that run's configured successful jobs and downloadable artifact. The returned artifact and full commit are the Plan's delivery; no production deployment is part of this workflow.
+The Plan closes its delivery gate only after every registered node has a matching formal Ticket receipt. `PlanIntegration` verifies a fresh configured-branch snapshot, the full regression for that exact commit and its attempt-matched artifact. Without release authorization, the verified package is the Plan delivery. With release authorization, the package remains pending until a separate controlled release adapter proves the exact target deployment and environment verification. A missing or mismatched adapter blocks release instead of falling back to package-only completion.
 
 ## Configure a full regression workflow
 
@@ -24,7 +24,34 @@ These settings select and version a regression workflow; they do not select or a
 
 The registered workflow is trusted operator configuration: the plugin dispatches it but does not inspect its source or restrict its GitHub permissions. Register only a full-regression workflow that cannot publish or deploy, and do not expose production secrets to it. The configured `gh` identity needs Actions write permission to dispatch and read permission to inspect and download artifacts. Before reporting delivery, the host downloads the run's artifact with this identity and checks the strict manifest, repository, ref, commit, workflow run, attempt, context, configuration, environment, safe filename, declared media type and SHA-256; it then retains the verified file in the project's state directory. The Harness download route is project-scoped and uses this retained copy, so the requester does not need GitHub Actions access. The separate GitHub run/artifact links still require the requester's browser account to have repository Actions read access. Missing host permission or an unavailable GitHub API leaves the Plan blocked; the Hub does not claim a successful run or substitute a local test.
 
+## Authorized release
+
+The original direct Handoff confirmation must set `authorization.release` to `authorized` and include the exact `releaseTarget { environment, target, scope }`. An authorized legacy record without that target, an execution quota change, or repair-only scope cannot release anything. The configured adapter must match all three target fields and the registered project before the host checks credentials or invokes it.
+
+Add one `planRelease` entry for a project that also has `planVerification`:
+
+```yaml
+    planRelease:
+      - projectId: '0123456789abcdef0123456789abcdef'
+        executable: /opt/dsh-release/bin/adapter
+        args: []
+        environment: production
+        target: storefront
+        scope: catalog service
+        credentialId: production-deploy
+        credentialProviderUrl: https://vault.example.test/projects/storefront
+```
+
+The executable and anything it loads must be trusted operator code outside the project's control, not a repository workflow. It runs from the mounted project's state directory through the Harness subprocess service. Keep credentials in their provider, never in the profile, arguments, request or chat. `credential-check --request-stdin` receives `{request}` and must exit successfully with stdout exactly `ready`. Otherwise the Ticket's Plan delivery panel and one credential relay expose only the controlled provider URL and identifier. The host checks availability again before publishing.
+
+`publish --request-stdin` receives `{request, artifactPath}`. The request binds the project, exact approved target, integration SHA/context, regression run and artifact filename/size/SHA-256. Immediately before transfer, the adapter must verify the file checksum and deploy only the requested scope. The stable `request.id` is its idempotency key: repeats must return the same deployment rather than create another release. `observe --request-stdin` receives the same request and is read-only. Each successful command writes one JSON `PlanReleaseObservation` to stdout; stderr is private and never relayed.
+
+An observation is `missing`, `publishing`, `not-published`, or `published`. `not-published` is definitive and means no target write occurred. If any deployment occurred, return `published` with its deployment ID, SHA, artifact SHA-256 and timestamp, plus environment verification (`pending`, `failed`, or `passed`). A passed verification names that same deployment ID, SHA and checksum and has a timestamp no earlier than deployment. Process failures and malformed or foreign receipts do not prove absence. Recovery repeats the write only after `observe` proves absence for the same request and exact target, no deployment has already been observed, and credentials are available again. Never map a partial deployment to `not-published`.
+
+The host records release intent before calling the adapter and serializes releases to each project/environment/target. `release-failed` means the adapter proved publication did not occur: the panel says 已合入，未上线. `released-unverified` records an actual deployment but not a matching successful environment verification; it is not complete and is never reported as rolled back. Only `released` closes the Plan delivery state and emits the final relay with artifact, deployment and verification evidence.
+
 ## Durable verification
+
 
 Formal Ticket closure stores the integration commit with the node receipt. The Plan gate re-reads the authoritative configured `refs/heads/...` target and proves each recorded integration is an ancestor of the exact observed SHA. It binds repository, project, ref, commit, workflow, identity job, sorted jobs, artifact name, configuration and environment into a context digest. A changed tip or verification profile produces a different context and requires a new run. Change the configured profile identifiers when the tests or a relevant runner/toolchain environment changes.
 
@@ -34,7 +61,7 @@ To recover a `dispatch_unconfirmed` with no run, an operator with Actions access
 
 The host polls pending runs. Before accepting a package, it samples the target, downloads and checks the exact attempt, then checks Actions, the target and Actions again. These observations reject a target move during the first Actions check or a superseded attempt during the target recheck. Git and Actions are separate services; evidence covers the observed revision and attempt, not later branch movement or reruns. The identity and every full-regression job must report `completed / success`; the manifest must match the repository, commit, attempt, profile and file checksum.
 
-On restart, a terminal record with a missing or invalid retained package is demoted to `blocked` and its queued success relay is cancelled before the effect queue starts. The host also checks the retained file immediately before a success relay reaches the Hub inbox; if the file or its run directory is unavailable, it withdraws the relay and rearms verification. A successful re-download can replace an invalid run directory. If interrupted after removing that directory, startup clears the unfinished download and recovers from Actions. The relay keeps the same request ID after repair, so an already received notification is not sent twice.
+If a retained package is missing or invalid before a release intent exists, restart demotes the record to `blocked`, cancels the success relay and rearms verification. A successful re-download can replace an invalid run directory; startup clears unfinished downloads. Once a release intent exists, package loss never erases the release record or authorizes a different release. The host preserves any deployment and verification facts, marks its package unavailable and withholds the success relay. A delivered relay keeps the same request ID so it is not sent twice.
 
 The Hub reads `plan/<id>/delivery`; its response carries the state, repository/ref/SHA/context, Actions run and job URLs, artifact filename, media type, size, checksum and verification time. A successful `plan-delivered` relay includes a Harness deep link to one of the Plan's Tickets, where the person can open the retained artifact without GitHub Actions permission. `GET /orchestrator/api/plans/:id/delivery` exposes the stored view and `GET /orchestrator/api/plans/:id/artifact` streams the retained file under the selected project's normal loopback, same-origin and project-scope checks. Both routes are read-only; neither GET nor resource reads dispatch or retry work.
 
@@ -52,9 +79,15 @@ The routes require the normal loopback Host, `x-orchestrator-request: 1`, same-o
 | `blocked` | Evidence is unconfigured, failed/incomplete, stale, unavailable, or an external dispatch could not be confirmed. The response includes a reason and available version/run evidence. |
 | `delivered` | All formal Ticket receipts, full regression jobs and a matching available package passed. One stable `plan-delivered:<planId>` relay points to the version, run, artifact and resource. |
 | `awaiting-release-verification` | The handoff explicitly promised release. Integration and regression passed, but production is not deployed and no final-delivery relay is emitted. |
+| `release-blocked` | Release is blocked by missing authorization, an absent or mismatched adapter, contention with another release or unavailable release prerequisites. Read `reason` for the specific hold. |
+| `awaiting-release-credentials` | The authorized target matched, but the credential check failed. The panel links to the controlled provider and shows its credential identifier, not a credential value. |
+| `releasing` | A durable release request is being reconciled by the same request ID after dispatch or restart. |
+| `release-failed` | The adapter proved publication did not occur; the Plan remains incomplete and no rollback is implied. |
+| `released-unverified` | Deployment occurred, but artifact identity or environment verification has not passed. The deployment and the adapter's reported check remain visible; a `passed` check with `release_evidence_mismatch` is not accepted. |
+| `released` | The environment reports the regression SHA and artifact checksum, and verification names that deployment; the final relay reports package, deployment and verification separately. |
 
-Pure optional retro follow-ups are not Plan nodes and do not delay verification. Configuration and implementation entry points are `src/deployment.ts`, `src/app/plan-integration.ts`, `src/executor/mainline-git.ts`, and `src/sources/actions-evidence.ts`. The GitHub workflow is `.github/workflows/plugin-ci.yml`.
+Pure optional retro follow-ups are not Plan nodes and do not delay verification. Configuration and implementation entry points are `src/deployment.ts`, `src/app/plan-integration.ts`, `src/app/plan-release.ts`, `src/app/release-adapter.ts`, `src/app/plan-artifacts.ts`, `src/executor/mainline-git.ts`, and `src/sources/actions-evidence.ts`. The repository regression workflow is `.github/workflows/plugin-ci.yml`.
 
 ## Code and verification
 
-From `plugin/`, run `pnpm test tests/actions-evidence.spec.ts tests/plan-artifacts.spec.ts tests/plan-integration-crash.spec.ts tests/mainline-queue.spec.ts tests/http.spec.ts tests/panel-execution.spec.tsx tests/navigation.spec.ts tests/deployment.spec.ts tests/locales.spec.ts tests/class-docs.spec.ts tests/docs.spec.ts`. These checks cover interruption before and after dispatch, pause during a refusal, target and attempt movement, missing or damaged packages before notification and on restart, retained downloads, Harness deep links, release holds and the documented configuration. `pnpm check` runs the complete import gate, typecheck, tests, and build; CI's Windows and Ubuntu required jobs use this same full check before the package job.
+From `plugin/`, run `pnpm test tests/plan-release.spec.ts tests/actions-evidence.spec.ts tests/plan-artifacts.spec.ts tests/plan-integration-crash.spec.ts tests/mainline-queue.spec.ts tests/http.spec.ts tests/panel-execution.spec.tsx tests/navigation.spec.ts tests/deployment.spec.ts tests/locales.spec.ts tests/class-docs.spec.ts tests/docs.spec.ts`. These checks cover release authorization, target/scope rejection, missing credentials, interrupted release recovery, exact artifact and environment receipts, integration dispatch recovery, package loss, Harness downloads, and the release panel. `pnpm check` runs the complete import gate, typecheck, tests, and build; CI's Windows and Ubuntu required jobs use this same full check before the package job.

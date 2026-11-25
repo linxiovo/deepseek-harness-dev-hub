@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { closeSync, createReadStream, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, type Stats } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { z } from 'zod'
-import type { PlanArtifact, PlanArtifactReference, PlanIntegrationView, PlanVerificationRequest, PlanVerificationRun } from '../core/plan-integration.ts'
+import type { PlanArtifact, PlanArtifactReference, PlanIntegratedArtifact, PlanVerificationRequest, PlanVerificationRun } from '../core/plan-integration.ts'
 import type { Commands } from '../infra/commands.ts'
 const fileNameSchema = z.string().max(255).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/).refine(value => !value.endsWith('.') &&
   !/^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(value))
@@ -67,9 +67,8 @@ function rememberChecksum(path: string, { size, mtimeMs, ctimeMs, ino }: Stats, 
   verifiedArtifacts.set(path, { size, mtimeMs, ctimeMs, ino, sha256 })
 }
 /** Cheap synchronous check for the project panel; the actual download verifies the checksum again. */
-export function planArtifactExists(stateDir: string, planId: string, view: PlanIntegrationView): boolean {
-  if (view.status !== 'delivered' && view.status !== 'awaiting-release-verification' || !fileNameSchema.safeParse(view.artifact.fileName).success ||
-      !contentTypeSchema.safeParse(view.artifact.contentType).success) return false
+export function planArtifactExists(stateDir: string, planId: string, view: PlanIntegratedArtifact): boolean {
+  if (!fileNameSchema.safeParse(view.artifact.fileName).success || !contentTypeSchema.safeParse(view.artifact.contentType).success) return false
   const directory = join(planDirectory(stateDir, planId), view.version.context, `${view.run.id}-${view.run.attempt}`)
   if (!runSlot(directory)?.isDirectory()) return false
   return verifyRetainedFileSync(join(directory, view.artifact.fileName), view.artifact, true)
@@ -158,8 +157,7 @@ export function discardPlanArtifact(draft: PlanArtifactDraft): void {
 }
 
 /** Rechecks the stored file checksum before opening it to a project-scoped Harness download. */
-export async function openPlanArtifact(stateDir: string, planId: string, view: PlanIntegrationView): Promise<PlanArtifactFile | undefined> {
-  if (view.status !== 'delivered' && view.status !== 'awaiting-release-verification') return undefined
+export async function openPlanArtifact(stateDir: string, planId: string, view: PlanIntegratedArtifact): Promise<PlanArtifactFile | undefined> {
   const { artifact, version, run } = view
   if (!fileNameSchema.safeParse(artifact.fileName).success || !contentTypeSchema.safeParse(artifact.contentType).success) return undefined
   const directory = join(planDirectory(stateDir, planId), version.context, `${run.id}-${run.attempt}`)

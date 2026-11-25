@@ -1,0 +1,1 @@
+Configure the release credential only in its configured provider. The host checks availability before publishing; do not enter, request, or show credentials in conversation. The integration remains pending until the exact authorized target and environment receipt are verified.

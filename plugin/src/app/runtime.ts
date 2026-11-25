@@ -42,6 +42,7 @@ import { PlanRequirements } from './plan-requirements.ts'
 import { hubResumeText } from './hub-resume.ts'
 import { PlanStagnation } from './plan-stagnation.ts'
 import { PlanIntegration } from './plan-integration.ts'
+import { releaseAdapter } from './release-adapter.ts'
 import { ScopedAttention } from './scoped-attention.ts'
 import { PlanDispatcher } from './plan-dispatch.ts'
 import { MainlineQueue, mainlineIntent } from './mainline-queue.ts'
@@ -281,8 +282,11 @@ export class Runtime extends Service implements SourceHost {
         tools: (agent, ticket, role) => role === 'planner' ? plannerTools(this.toolHost, agent)
           : role === 'splitter' ? splitterTools(this.toolHost, agent)
           : ticket ? executorTools(this.toolHost, ticket, agent.id, role === 'review') : mainTools(this.toolHost, agent) })
+      const releaseConfig = projectMachine.planRelease?.find(check => check.projectId === project?.id)
       const planIntegration = this.planIntegration = new PlanIntegration({ store, effects, plans, handoffs, lifetime: this.lifetime,
         verification: project && machine.planVerification?.find(check => check.projectId === project.id),
+        release: releaseConfig ? releaseAdapter(releaseConfig, projectMachine.stateDir, ctx.subprocess, this.lifetime) : undefined,
+        releaseArtifact: async (planId, view) => (await openPlanArtifact(projectMachine.stateDir, planId, view))?.path,
         paused: () => this.paused(), target: () => {
           if (!project || !setup.configured()) return undefined
           const ref = store.settings().executor.baseRef?.trim()
@@ -764,7 +768,8 @@ export class Runtime extends Service implements SourceHost {
       attention: this.attention, runLimits: this.runLimits, planIntegration: this.planIntegration,
       planArtifact: async id => {
         const view = this.planIntegration.view(id)
-        return view && await openPlanArtifact(machine.stateDir, id, view)
+        return view && 'artifact' in view && (!('artifactAvailable' in view) || view.artifactAvailable !== false)
+          ? await openPlanArtifact(machine.stateDir, id, view) : undefined
       },
       meter: { read: (id, signal) => this.readScopedMeter(id, signal) },
       topicBinding: this.topicBinding, verifyTopicBinding: () => this.verifyTopicBinding(),

@@ -66,7 +66,9 @@ Assignment and Session IDs, verifier executable and arguments, credential values
 
 For Plan execution push, the allowlist is `human-action`, `quota-paused` and `plan-delivered`. The stable credential relay ID is `credential-action:<id>`; the payload includes `kind`, the Plan `AttentionSummary` fields, the triggering `action`, and a request for controlled configuration and verification. The quota producer is described in `016-run-limits.md`. Plan progress, readiness, technical blockers, failures, closure and review stay internal. Legacy non-Plan behavior is unchanged. None of these relays is a Channel send from the Worker.
 
-The `plan-delivered` relay comes from the Plan-level delivery result, not Ticket closure. The Hub reads `plan/<id>/delivery`; a release-committed Handoff remains `awaiting-release-verification` without a final delivery relay. Details are in `017-plan-integration.md`.
+The `plan-delivered` relay comes from the Plan-level delivery result, not Ticket closure. The Hub reads `plan/<id>/delivery`; a release-authorized Handoff emits no final delivery relay before deployment verification. If its controlled release adapter is missing or mismatched, the Plan stays `release-blocked` rather than appearing ready for publication. Details are in `017-plan-integration.md`.
+
+A missing release credential uses a separate `human-action` relay, `plan-release-credential:<planId>`, with the exact release target, configured credential identifier and provider link, and the Plan delivery resource. It does not create a Ticket credential action or call the test-account verification endpoint.
 
 The Hub instructions in `prompts/handoff-orchestrator.md` tell it to show the operator the Ticket, affected work, status and controlled configuration reference in Harness, rather than asking for a secret or announcing an unchanged or failed check again. S21 supplies API resources and a relay, not a credential entry form or panel UI.
 

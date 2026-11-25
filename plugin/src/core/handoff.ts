@@ -1,12 +1,17 @@
 import type { PLAN_FEATURE_KINDS } from './plan.ts'
 
 export interface ProjectRef { id: string; repository: string; workspace: string }
+export interface ReleaseTarget { environment: string; target: string; scope: string }
+export const sameReleaseTarget = (a: ReleaseTarget, b: ReleaseTarget): boolean =>
+  a.environment === b.environment && a.target === b.target && a.scope === b.scope
+export const releaseNamePattern = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$/
+export const releaseScopePattern = /^[^\s\p{Cc}\p{Cf}](?:[^\p{Cc}\p{Cf}]{0,254}[^\s\p{Cc}\p{Cf}])?$/u
 export interface HandoffInput {
   project: { repository: string; workspace: string }
   goal: string
   constraints: string[]
   acceptanceScope: string[]
-  authorization: { scope: string; release: 'authorized' | 'not-authorized' }
+  authorization: { scope: string; release: 'not-authorized' } | { scope: string; release: 'authorized'; releaseTarget?: ReleaseTarget }
   confirmedBy: { sessionId: string; messageId: string; text: string }
 }
 export interface HandoffQuestion {
@@ -39,7 +44,7 @@ export interface Handoff {
   goal: string
   constraints: string[]
   acceptanceScope: string[]
-  authorization: HandoffInput['authorization']
+  authorization: { scope: string; release: 'not-authorized' } | { scope: string; release: 'authorized'; releaseTarget?: ReleaseTarget }
   confirmedBy: HandoffInput['confirmedBy']
   status: 'confirmed' | 'planning' | 'awaiting' | 'specified'
   question?: HandoffQuestion

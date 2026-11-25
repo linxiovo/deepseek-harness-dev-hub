@@ -146,8 +146,9 @@ Copy [examples/profile.cordis.patch.yml](../examples/profile.cordis.patch.yml) t
 | `promptMaxChars`, `admissionContextMaxPages`, `admissionContextTimeoutMs` | no | The largest saved prompt configuration, and how many Thread pages one assessment reads within what time |
 | `credentialChecks` | no | Project-scoped trusted test-account verifiers, empty by default; see `015-scoped-attention.md` for the entry schema and deployment example |
 | `planVerification` | no | Full regression workflow and artifact identity for a registered project; see `017-plan-integration.md` for its dispatch, job and artifact contract |
+| `planRelease` | no | Separate operator-managed release adapter, exact authorized environment/target/scope and controlled credential-provider URL; see `017-plan-integration.md`. It is not the full-regression workflow and receives no credentials in arguments |
 
-After the first start, edit volatile machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Limits apply without restart. Set `stateDir`, `runtimeMode`, `credentialChecks` and `planVerification` in the profile configuration; they are not volatile. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
+After the first start, edit volatile machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Limits apply without restart. Set `stateDir`, `runtimeMode`, `credentialChecks`, `planVerification` and `planRelease` in the profile configuration; they are not volatile. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
 
 ## Start and stop
 

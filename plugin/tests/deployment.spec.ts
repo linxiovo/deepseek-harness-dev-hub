@@ -110,6 +110,19 @@ describe('configuration schema', () => {
       .toThrow('safe positive integer')
   })
 
+  it('requires a scoped release adapter and a controlled credential-provider URL', () => {
+    const projectId = 'a'.repeat(32)
+    const verification = { projectId, workflowId: '44', identityJob: 'full-regression', jobs: ['full-regression'],
+      artifactName: 'package', configuration: 'checks-v1', environment: 'ci-v1' }
+    const release = { projectId, executable: cliPath(join(dir, 'bin', 'release-adapter')), environment: 'production', target: 'widgets-production',
+      scope: 'catalog service', credentialId: 'production-deploy', credentialProviderUrl: 'https://vault.example.test/projects/widgets' }
+    expect(machineOf(Config(minimal({ planVerification: [verification], planRelease: [release] }))).planRelease).toEqual([{ ...release, args: [] }])
+    expect(() => machineOf(Config(minimal({ planRelease: [release] })))).toThrow('matching full-regression workflow')
+    expect(() => machineOf(Config(minimal({ planVerification: [verification], planRelease: [release, release] }))))
+    expect(() => machineOf(Config(minimal({ planVerification: [verification], planRelease: [{ ...release, credentialProviderUrl: 'http://vault.example.test' }] }))))
+      .toThrow('credential provider URL must be HTTPS')
+  })
+
   it('names keys the configuration does not define, and where the values of older keys live now', () => {
     const raw = minimal({ repository: 'acme/widgets', repositoryPath: '/srv/widgets', blockedCommands: [], author: { name: 'Alice' }, extra: 1 })
     expect(() => machineOf(Config(raw))).toThrow('keys it does not use: repository (now on the GitHub Source), repositoryPath (now executor.repository in the Execution settings), blockedCommands (now in the Execution settings), author (now prompt text), extra;')

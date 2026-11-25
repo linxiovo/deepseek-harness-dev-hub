@@ -146,8 +146,10 @@ function PlanDelivery({ planId }: { planId: string }) {
     }
   }
   const statusLabel = (status: PlanIntegrationView['status']) => t(`planDelivery.status.${status}`)
-  const statusTone: TagTone = data?.status === 'delivered' ? 'success' : data?.status === 'blocked' ? 'danger'
-    : data?.status === 'verifying' ? 'info' : 'neutral'
+  const statusTone: TagTone = data?.status === 'delivered' || data?.status === 'released' ? 'success'
+    : data?.status === 'blocked' || data?.status === 'release-blocked' || data?.status === 'release-failed'
+      || data?.status === 'released-unverified' || data?.status === 'released-artifact-unavailable' ? 'danger'
+      : data?.status === 'verifying' || data?.status === 'releasing' ? 'info' : 'neutral'
   const version = data && 'version' in data ? data.version : undefined
   const run = data && 'run' in data ? data.run : undefined
   const artifact = data && 'artifact' in data ? data.artifact : undefined
@@ -156,9 +158,23 @@ function PlanDelivery({ planId }: { planId: string }) {
     {!data && !error && <LoadState loading />}
     {data && <>
       <div className="dt-row-meta"><Tag tone={statusTone}>{statusLabel(data.status)}</Tag>
-        {data.status === 'blocked' && <span>{t(`planDelivery.reason.${data.reason}`)}</span>}
+        {'reason' in data && typeof data.reason === 'string' && <span>{t(`planDelivery.reason.${data.reason}`)}</span>}
         {data.status === 'awaiting-tickets' && <span>{t('planDelivery.waitingFor', { nodes: data.waitingFor.join(', ') })}</span>}
       </div>
+      {'release' in data && data.release && <KeyValues rows={[
+        [t('planDelivery.release'), <span>{data.release.environment} · {data.release.target} · {data.release.scope}</span>],
+        ...('releaseId' in data ? [[t('planDelivery.releaseId'), <span className="dt-mono">{data.releaseId}</span>] as [string, ReactNode]] : []),
+      ]} />}
+      {data.status === 'awaiting-release-credentials' && <div className="dt-row-meta dt-actions">
+        <span>{t('planDelivery.credentialId')}: <span className="dt-mono">{data.credential.id}</span></span>
+        <ExternalLink href={data.credential.providerUrl}>{t('planDelivery.credentialProvider')}</ExternalLink>
+      </div>}
+      {'deployment' in data && <KeyValues rows={[
+        [t('planDelivery.deployment'), <span className="dt-mono">{data.deployment.id} · {data.deployment.sha}</span>],
+        [t('planDelivery.sha256'), <span className="dt-mono">{data.deployment.sha256}</span>],
+        [t('planDelivery.environmentCheck'), t(`planDelivery.environmentCheck.${data.status === 'released-unverified' &&
+          data.verification.status === 'passed' ? 'unverified' : data.verification.status}`)],
+      ]} />}
       {version && <KeyValues rows={[
         [t('planDelivery.repository'), <span className="dt-mono">{version.repository}</span>],
         [t('planDelivery.ref'), <span className="dt-mono">{version.ref}</span>],
@@ -186,10 +202,14 @@ function PlanDelivery({ planId }: { planId: string }) {
           [t('planDelivery.contentType'), <span className="dt-mono">{artifact.contentType}</span>],
           [t('planDelivery.size'), <span>{artifact.size.toLocaleString()} {t('planDelivery.bytes')}</span>],
         ]} />
-        <div className="dt-row-meta dt-actions"><Button variant="outline" size="sm" disabled={downloading || !selectedProject}
+        <div className="dt-row-meta dt-actions"><Button variant="outline" size="sm"
+          disabled={downloading || !selectedProject || 'artifactAvailable' in data && data.artifactAvailable === false}
           onClick={() => { void download() }}>{downloading ? t('loading') : t('planDelivery.download')}</Button></div>
       </>}
       {data.status === 'delivered' && <Hint>{t('planDelivery.deliveredAt', { time: when(data.verifiedAt, t('lang')) })}</Hint>}
+      {(data.status === 'released' || data.status === 'released-artifact-unavailable') && <Hint>{t('planDelivery.environmentVerifiedAt',
+        { time: when(data.verification.at, t('lang')) })}</Hint>}
+      {data.status === 'released-unverified' && <Hint>{t('planDelivery.deployedAt', { time: when(data.deployment.at, t('lang')) })}</Hint>}
     </>}
   </Section>
 }

@@ -194,7 +194,7 @@ Failures retry with exponential backoff. Throwing `Later` defers work without co
 | `splitting` | Planning | Gives a published spec to its splitter; the durable intent is retired with Plan registration | 1 | 2 s doubling to 60 s for delivery failures; resumes unfinished work on restart |
 | `delivery` | DshExecutor | Hands a Ticket's waiting Inputs to its running Assignment, in order | 4, none while paused | 2 s doubling to 60 s; one that waits for a worker slot tries again after 2 s |
 | `mainlineDelivery` | MainlineQueue | Rechecks one verified intent for [formal Plan closure](003-execution.md#formal-plan-closure) | 8, only when configured | Resumes pending work on restart; evidence gaps stay on the Ticket until rechecked |
-| `planIntegration` | PlanIntegration | Verifies the actual target, full regression jobs and the attempt-matched package after all formal Plan receipts exist | 4, only when configured and unpaused | Persists the exact revision/configuration before dispatch; resumes by observing that context |
+| `planIntegration` | PlanIntegration, using PlanRelease for publication | Verifies the target and attempt-matched package after all formal Ticket receipts; then, only for an authorized release, rechecks prerequisites, publishes and reconciles environment evidence | 4, none while paused | Persists each intent before its write, resumes by observing the exact Actions context or release request; preserves a verified deployment when restoring its specific package |
 | `requirementScopeReview` | Runtime | Dispatches the sealed requirement scope comparison to its read-only reviewer | 1, when configured and unpaused | Reconciles the same Session and dispatch on restart |
 | `hubInbox` | Sessions | Moves a message claimed by a retired physical Hub generation into the current Hub through a durable per-source inbox queue, marking transferred user input as a relay rather than a new direct approval | 1 per current target | 2 s doubling to 60 s; resumes from the persisted queue after restart |
 | `relay` | Sessions | Steers a worker's report or question, or a person's follow-up, into the main Session's turn | 1, in queue order | 2 s doubling to 60 s |
@@ -340,7 +340,8 @@ Validation: `tests/session-meter.spec.ts` covers the read seam (absent vs corrup
   | Confirmed handoffs and immutable specifications | `Handoffs` |
   | Plan DAGs, root background, and addressed node instructions | `Plans` |
   | Mainline merge FIFOs and actual Git observations | `MainlineQueue` |
-  | Plan integration views, workflow dispatch intents and final delivery relays | `PlanIntegration` |
+  | Plan integration view, Actions dispatch intent and final delivery relay | `PlanIntegration` |
+  | External release intent and target lock | `PlanRelease`; its state transitions ask `PlanIntegration` to update the delivery view |
   | Project Session attribution and business parentage | `ProjectMeter`, through `bind` at a trusted delegation seam |
   | A Source's read positions, and the meta it keeps on its Threads (`label`, `url`, `facts` and its own keys) | That Source, through `SourceContext` |
   | Settings and their history | Settings |
@@ -393,10 +394,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/errors.ts` | `UserError` and `USER_ERRORS` |
 | `src/core/reasons.ts` | `Reason`, `REASONS` and `reasonText`: why the core recorded a Decision or set a Trigger aside, by code |
 | `src/core/ids.ts` | `key`: ids derived from their inputs, equal for equal inputs |
-| `src/core/handoff.ts` | The handoff records: `ProjectRef`, `HandoffInput`, `HandoffQuestion`, `SpecInput`, `Spec` and `Handoff`, with the fields and statuses 009 Handoff describes |
+| `src/core/handoff.ts` | The handoff records: `ProjectRef`, `ReleaseTarget`, `HandoffInput`, `HandoffQuestion`, `SpecInput`, `Spec` and `Handoff`; a release grant binds an exact environment, target and scope as described in 009 Handoff |
 | `src/core/plan.ts` | Plan DAG records and domain validation: role separation, acceptance coverage and explicit dependencies |
 | `src/core/plan-topology.ts` | Technical graph transformations for unclaimed nodes; retain acceptance, dependency and interface commitments |
-| `src/core/plan-integration.ts` | Plan full-regression configuration, Actions run evidence, artifact reference and validated retained-file metadata |
+| `src/core/plan-integration.ts` | Plan regression and release configuration, exact run/artifact evidence, durable release intent, deployment receipt and environment-verification contracts |
 | `src/core/memory.ts` | `MemoryRepositories`: the Store's repositories in memory, in the Store's order and with its nested rollback, for domain tests |
 | `src/core/index.ts` | The core's exports, including `TakeUp` and the Plan integration evidence contract |
 | `src/app/runtime.ts` | The Runtime, the composition root, with its start and stop |
@@ -421,6 +422,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/plan-requirements.ts` | `PlanRequirements`: computes impact, records an independent scope verdict, consumes exact direct approval and applies one revision |
 | `src/app/mainline-queue.ts` | Durable per-target FIFO, Ticket attempts, Worker repair, actual Git verification and formal closure coordination |
 | `src/app/plan-integration.ts` | Durable Plan verification after formal Ticket receipts, exact Actions run/attempt checks, checksummed artifact acceptance, exactly-once relay and release hold |
+| `src/app/plan-release.ts` | `PlanRelease`: exact-target credential gating, durable idempotent request IDs, release-target serialization, restart observation and deployment/verification reconciliation |
+| `src/app/release-adapter.ts` | Runs the trusted operator release executable with bounded subprocess I/O and strictly validates its deployment/verification receipt |
 | `src/app/plan-artifacts.ts` | Downloads one exact Actions artifact into private staging, validates its identity manifest, safe filename, media type and file SHA-256, retains it by Plan/context/run/attempt, and serves only a checksum-matching file |
 | `src/app/scoped-attention.ts` | `ScopedAttention`: durable Plan Ticket credential blockers, deduplicated Hub relays, shared management and Hub projections, and verified continuation; contract in `plugin/docs/015-scoped-attention.md` |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
@@ -561,8 +564,9 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
 | `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |
 | `tests/plan-integration-crash.spec.ts` | SIGKILL after GitHub accepts workflow dispatch but before the effect records a result; SQLite recovery observes the existing run without another dispatch |
-| `tests/mainline-queue.spec.ts` | Queue admission, versioned candidate CI, same-target serialization, code and Doc Tree conflicts, formal closure, shared-rule publication, restart, Frontier claims, Plan regression and generic artifact delivery, including a pause during 403 and a rerun during download |
+| `tests/mainline-queue.spec.ts` | Queue admission, versioned CI, same-target serialization, conflicts, formal closure and Frontier; Plan regression, artifact delivery and a local subprocess release that changes an isolated target before its lost response is reconciled |
 | `tests/plan-artifacts.spec.ts` | Exact workflow attempt/profile binding, safe filenames and media types, package SHA-256, strict archive contents, restart staging cleanup and retained-file tamper rejection |
+| `tests/plan-release.spec.ts` | Public PlanIntegration effect seam: no release without exact authorization, credentials or target match; exact artifact verification, controlled credential relay and lost-response restart reconciliation |
 | `tests/panel-execution.spec.tsx` | Ticket delivery status in Harness, release-verification hold and project-scoped artifact download |
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
 | `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, review evidence and child-only review submission, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
@@ -777,7 +781,7 @@ Built-in instructions live in `prompts/*.md`, with one sentence per line joined 
 
 ## Configuration reload
 
-The host writes `cordis.patch.yml` and updates the volatile machine limits in place. dsh-superagent reads each limit when it uses it, so a limit change applies without a restart. Set `stateDir`, `runtimeMode` and `credentialChecks` in the profile configuration. See [006 Deployment](006-deployment.md#machine-configuration).
+The host writes `cordis.patch.yml` and updates volatile machine limits in place. dsh-superagent reads each limit when used, so limit changes apply without a restart. Set `stateDir`, `runtimeMode`, `credentialChecks`, `planVerification` and `planRelease` in the profile configuration. See [006 Deployment](006-deployment.md#machine-configuration).
 
 A settings save that changes a Source field setup reads, such as an account's CLI, and any save while setup waits, restarts dsh-superagent. DeepSeek Harness's settings service does not serve the entry during that restart, so after its own restart dsh-superagent asks it to read the entry again, and an open form becomes editable again.
 

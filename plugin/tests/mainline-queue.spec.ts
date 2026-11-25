@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { CliError, Commands } from '../src/infra/commands.ts'
@@ -21,6 +22,9 @@ afterEach(async () => { await h.stop() })
 const runCommand = Commands.prototype.run
 const slug = 'acme/widgets'
 const targetRef = 'refs/heads/main'
+const productionTarget = { environment: 'production', target: 'widgets-production', scope: 'label service' }
+const sandboxTarget = { environment: 'sandbox', target: 'widgets-local', scope: 'label service' }
+const releaseFixture = fileURLToPath(new URL('./fixtures/plan-release-adapter.mjs', import.meta.url))
 const canonicalUrl = `https://github.com/${slug}.git`
 const hub = (tool: string, input: object) => h.runTool(h.runtime.masterId, tool, input)
 const read = (resource: string) => hub('orchestrator_read', { resource })
@@ -128,10 +132,12 @@ async function registerPlan<Node extends LabelNode>({ start, checkDependsOn = la
   return { id, workers: Object.fromEntries(workers) as Record<Node, Worker>, dispatch }
 }
 
-async function registerSingleIntegrationPlan(release: 'authorized' | 'not-authorized' = 'not-authorized') {
+async function registerSingleIntegrationPlan(release: 'authorized' | 'not-authorized' = 'not-authorized', releaseTarget = productionTarget) {
   const acceptance = [{ statement: 'Trim display labels', observable: 'A padded label has no surrounding spaces', delivery: 'backend' }]
   const brief = { project: { repository: slug, workspace: h.localGit!.repository }, goal: 'Trim display labels.', constraints: [],
-    acceptanceScope: [acceptance[0]!.statement], authorization: { scope: 'Trim display labels', release } }
+    acceptanceScope: [acceptance[0]!.statement], authorization: release === 'authorized'
+      ? { scope: 'Trim display labels', release, releaseTarget }
+      : { scope: 'Trim display labels', release } }
   const confirmation = JSON.stringify({ confirmed: true, brief })
   h.sendUserMessage(h.runtime.masterId, confirmation)
   const { id } = await hub('orchestrator_handoff_confirm', { ...brief, confirmation }) as { id: string }
@@ -453,19 +459,38 @@ function actionsHost(beforeRuns?: (sha: string) => Promise<void>) {
 it.each([
   { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const },
   { release: 'authorized' as const, dispatchFailure: 'lost-response' as const },
+  { release: 'authorized' as const, dispatchFailure: 'lost-response' as const, controlledRelease: true },
   { release: 'not-authorized' as const, dispatchFailure: 'forbidden' as const, pauseOnRefusal: true },
   { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, rerunDuringDownload: true },
   { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, advanceTargetDuringFinalRunLookup: true },
   { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, rerunDuringFinalTargetRead: true },
   { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, loseArtifactBeforeRelay: true },
  ] as const)('verifies the integrated package: %j',
-  async ({ release, dispatchFailure, pauseOnRefusal, rerunDuringDownload, advanceTargetDuringFinalRunLookup, rerunDuringFinalTargetRead, loseArtifactBeforeRelay }) => {
+  async ({ release, dispatchFailure, controlledRelease, pauseOnRefusal, rerunDuringDownload, advanceTargetDuringFinalRunLookup,
+    rerunDuringFinalTargetRead, loseArtifactBeforeRelay }) => {
   await h.stop()
   const verification = { workflowId: '44', identityJob: 'integration-identity',
     jobs: ['integration-identity', 'windows', 'check', 'integration-bundle'], artifactName: 'plugin-bundle',
     configuration: 'plugin-check-v1', environment: 'github-hosted-node22-pnpm11-v1' }
-  const mounted = await startManagedProject({ withFeishu: false, machine: project => ({ planVerification: [{ projectId: project.id, ...verification }] }) })
+  const mounted = await startManagedProject({ withFeishu: false, machine: project => ({ planVerification: [{ projectId: project.id, ...verification }],
+    ...(controlledRelease ? { planRelease: [{ projectId: project.id, ...sandboxTarget, executable: process.execPath, args: [releaseFixture],
+      credentialId: 'sandbox-deploy', credentialProviderUrl: 'https://vault.example.test/sandbox' }] } : {}) }) })
   h = mounted.host
+  if (controlledRelease) {
+    const spawn = h.subprocess.spawn.getMockImplementation()!
+    h.subprocess.spawn.mockImplementation(spec => {
+      const [executable, entry, ...args] = spec.argv
+      if (entry !== releaseFixture) return spawn(spec)
+      const stdin = spec.stdio?.stdin
+      if (executable !== process.execPath || typeof stdin !== 'object') throw new Error('Invalid release fixture invocation')
+      const result = spawnSync(executable, [entry, ...args], { cwd: spec.cwd, input: stdin.data, encoding: 'utf8', timeout: 10_000,
+        env: { SystemRoot: process.env.SystemRoot }, windowsHide: true })
+      if (result.error || result.status === null) throw result.error ?? new Error('Release fixture did not exit')
+      return { done: Promise.resolve({ exitCode: result.status, signal: null }), waitForExit: async () => true,
+        collected: { stdout: { readFrom: () => ({ text: result.stdout, nextOffset: Buffer.byteLength(result.stdout), lossy: false }) },
+          stderr: { readFrom: () => ({ text: result.stderr, nextOffset: Buffer.byteLength(result.stderr), lossy: false }) } } }
+    })
+  }
   const { repository, git, base, remote, tip, runGit } = mainlineRepository()
   const ci = actionsHost()
   await configureCI()
@@ -551,7 +576,7 @@ it.each([
     return runGit(this, args, cwd)
   })
 
-  const { id, worker } = await registerSingleIntegrationPlan(release)
+  const { id, worker } = await registerSingleIntegrationPlan(release, controlledRelease ? sandboxTarget : productionTarget)
   formatLabel(worker.directory, 'value.trim()', 'Trim surrounding whitespace')
   const candidate = commit(worker.directory, 'Trim display labels')
   const branch = git('-C', worker.directory, 'branch', '--show-current')
@@ -611,25 +636,42 @@ it.each([
     await h.restart()
     await h.runtime.idle()
   }
+  if (controlledRelease) {
+    expect(initial).toMatchObject({ status: 'releasing', reason: 'release_dispatch_unconfirmed', release: sandboxTarget })
+    expect(readFileSync(join(h.runtime.machine.stateDir, 'deployed-label-service.tgz'), 'utf8')).toBe(`${integration}-1`)
+    expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toEqual([])
+    await h.restart()
+    await h.runtime.idle()
+  }
   const attempts = rerunDuringDownload || rerunDuringFinalTargetRead ? 2 : 1
   const resource = await read(`plan/${id}/delivery`), packageBytes = Buffer.from(`${integration}-${attempts}`)
-  expect(resource).toMatchObject({ planId: id, status: release === 'authorized' ? 'awaiting-release-verification' : 'delivered',
+  const artifactSha = createHash('sha256').update(packageBytes).digest('hex')
+  expect(resource).toMatchObject({ planId: id, status: controlledRelease ? 'released' : release === 'authorized' ? 'release-blocked' : 'delivered',
+    ...(controlledRelease ? { release: sandboxTarget, deployment: { id: expect.any(String), sha: integration, sha256: artifactSha },
+      verification: { status: 'passed', sha: integration, sha256: artifactSha } }
+      : release === 'authorized' ? { reason: 'release_unconfigured', release: productionTarget } : {}),
     version: { repository: slug, ref: targetRef, sha: integration, context: expect.stringMatching(/^[a-f0-9]{64}$/),
       configuration: verification.configuration, environment: verification.environment },
     run: { id: expect.any(Number), attempt: attempts },
     artifact: { id: expect.any(Number), name: `plugin-bundle-${integration}-${attempts}`, url: expect.stringContaining('/actions/runs/'),
       fileName: 'dsh-superagent-0.1.0.tgz', contentType: 'application/gzip', size: packageBytes.length,
-      sha256: createHash('sha256').update(packageBytes).digest('hex') },
+      sha256: artifactSha },
     verifiedAt: expect.any(String) })
   expect(dispatches).toBe(dispatchFailure === 'forbidden' ? 2 : 1)
   const relays = h.jsonRelays(h.runtime.masterId, 'plan-delivered')
-  if (release === 'authorized') expect(relays).toEqual([])
+  if (release === 'authorized' && !controlledRelease) expect(relays).toEqual([])
   else expect(relays).toEqual([expect.objectContaining({ planId: id, version: expect.objectContaining({ sha: integration }),
     verification: expect.stringContaining('/actions/runs/'), artifact: expect.objectContaining({ url: expect.stringContaining('/artifacts/') }),
     harness: expect.stringContaining(`superagentTicket=${worker.ticketId}`), read: `plan/${id}/delivery` })])
+  if (controlledRelease) {
+    const receipt = z.object({ deployment: z.object({ id: z.string() }), verification: z.object({ deploymentId: z.string() }) }).parse(resource)
+    expect(receipt.verification.deploymentId).toBe(receipt.deployment.id)
+    expect(relays[0]).toMatchObject({ release: sandboxTarget, deployment: resource.deployment, environmentVerification: resource.verification })
+  }
   expect(await h.api('GET', `plans/${id}/delivery`, undefined, mounted.project.id)).toMatchObject({ status: 200, body: resource })
   if (loseArtifactBeforeRelay) {
     const view = h.runtime.store.get(KV.plans.integration(id))!
+    if (!('artifact' in view)) throw new Error('The Plan integration artifact was not retained')
     const file = await openPlanArtifact(h.runtime.machine.stateDir, id, view)
     if (!file) throw new Error('The fixture had no repaired artifact')
     h.step(h.runtime.masterId)
@@ -647,7 +689,7 @@ it.each([
   await h.runtime.idle()
   expect(await read(`plan/${id}/delivery`)).toEqual(resource)
   expect(dispatches).toBe(dispatchFailure === 'forbidden' ? 2 : 1)
-  expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toHaveLength(release === 'authorized' ? 0 : 1)
+  expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toHaveLength(release === 'authorized' && !controlledRelease ? 0 : 1)
 }, 180_000)
 async function interruptedByRestart(lifetime: AbortSignal): Promise<never> {
   if (!lifetime.aborted) {

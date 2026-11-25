@@ -12,6 +12,7 @@ import { vi, type Mock } from 'vitest'
 import { markAgentLoopRequest, type GenerateOptions, type StreamChunk, type UserMessage } from '@deepseek-ai/dsh-llm'
 import type { SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import { SessionAlreadyExistsError, SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
+import type { SubprocessStdio } from '@deepseek-ai/dsh-subprocess'
 import { Runtime } from '../../src/app/runtime.ts'
 import type { Machine } from '../../src/deployment.ts'
 import { Store } from '../../src/app/store.ts'
@@ -174,7 +175,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   /** A prepare command (`sh -c`) waits for this while it is set. */
   const hooks: { prepare?: Promise<void>; openingLog?: (sessionId: string) => Promise<void> | undefined;
     credentialCheck?: () => boolean | Promise<boolean>; flushSessionLog?: () => void; deferStep?: (delivery: Delivery) => boolean } = {}
-  const subprocess = { spawn: vi.fn((spec: { argv: readonly string[]; cwd?: string; env?: Record<string, string> }) => {
+  const subprocess = { spawn: vi.fn((spec: { argv: readonly string[]; cwd?: string; env?: Record<string, string>; stdio?: SubprocessStdio }) => {
     const argv = [...spec.argv]
     while (argv[0] === 'env' || /^[A-Z_]+=/.test(argv[0] ?? '')) argv.shift()
     const reader = (text: () => string) => ({ readFrom: () => { const value = text(); return { text: value, nextOffset: value.length, lossy: false } } })

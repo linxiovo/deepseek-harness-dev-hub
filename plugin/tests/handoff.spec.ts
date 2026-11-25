@@ -11,7 +11,8 @@ const sourceBrief = {
   goal: 'Let a shopper save a product and find it again later.',
   constraints: ['Saved products are private to the shopper.'],
   acceptanceScope: ['A signed-in shopper can save and unsave a product.', 'The saved-products page shows saved products.'],
-  authorization: { scope: 'Implement this feature and verify it before reporting completion.', release: 'authorized' as const }
+  authorization: { scope: 'Implement this feature and verify it before reporting completion.', release: 'authorized' as const,
+    releaseTarget: { environment: 'production', target: 'shopper-catalog', scope: 'saved-products service' } }
 }
 const approvalFor = ({ project, goal, constraints, acceptanceScope, authorization }: typeof sourceBrief) =>
   JSON.stringify({ confirmed: true, brief: { project, goal, constraints, acceptanceScope, authorization } })
@@ -53,9 +54,8 @@ describe.each([
       handoff_id: first.id,
       project,
       goal: handoff.goal,
-      constraints: handoff.constraints,
       acceptanceScope: handoff.acceptanceScope,
-      authorization: { scope: handoff.authorization.scope, release: 'authorized' },
+      authorization: { scope: handoff.authorization.scope, release: 'authorized', releaseTarget: handoff.authorization.releaseTarget },
       confirmedBy: { sessionId: h.runtime.masterId, messageId: expect.any(String), text: handoff.confirmation },
       task: expect.any(String)
     })
@@ -70,15 +70,42 @@ describe.each([
       id: first.id,
       project,
       goal: handoff.goal,
-      constraints: handoff.constraints,
       acceptanceScope: handoff.acceptanceScope,
-      authorization: { scope: handoff.authorization.scope, release: 'authorized' },
+      authorization: { scope: handoff.authorization.scope, release: 'authorized', releaseTarget: handoff.authorization.releaseTarget },
       confirmedBy: { sessionId: h.runtime.masterId, messageId: expect.any(String), text: handoff.confirmation }
     })
     expect([...h.agents.keys()].filter(id => id.startsWith('planner-'))).toEqual([plannerId])
     expect(await read(`handoff/${first.id}`)).not.toHaveProperty('feishu')
   })
 
+  it('requires the exact environment, target and scope in direct release approval', async () => {
+    const mismatch = { ...handoff, authorization: { ...sourceBrief.authorization,
+      releaseTarget: { ...sourceBrief.authorization.releaseTarget, environment: 'staging', scope: 'all services' } } }
+    const directApproval = approvalFor(sourceBrief)
+    h.sendUserMessage(h.runtime.masterId, directApproval)
+
+    await expect(h.runTool(h.runtime.masterId, 'orchestrator_handoff_confirm', { ...mismatch, confirmation: directApproval }))
+      .rejects.toThrow()
+    expect(h.runtime.handoffs.list()).toEqual([])
+  })
+
+  it('rejects an authorized release target that differs from the direct confirmation', async () => {
+    const mismatch = { ...handoff, authorization: { ...sourceBrief.authorization,
+      releaseTarget: { ...sourceBrief.authorization.releaseTarget, target: 'another-target' } } }
+    const directApproval = approvalFor(sourceBrief)
+    h.sendUserMessage(h.runtime.masterId, directApproval)
+    await expect(h.runTool(h.runtime.masterId, 'orchestrator_handoff_confirm', { ...mismatch, confirmation: directApproval })).rejects.toThrow()
+    expect(h.runtime.handoffs.list()).toEqual([])
+  })
+
+
+  it('refuses a release promise without an explicitly approved target', async () => {
+    const brief = { ...sourceBrief, authorization: { scope: sourceBrief.authorization.scope, release: 'authorized' as const } }
+    const confirmation = JSON.stringify({ confirmed: true, brief })
+    h.sendUserMessage(h.runtime.masterId, confirmation)
+    await expect(h.runTool(h.runtime.masterId, 'orchestrator_handoff_confirm', { ...brief, confirmation })).rejects.toThrow()
+    expect(h.runtime.handoffs.list()).toEqual([])
+  })
   it('lets the planner publish a complete observable specification without another technical confirmation', async () => {
     const { id: handoffId } = await confirm() as { id: string }
     const plannerId = plannerFor(handoffId)

@@ -176,14 +176,15 @@ it('refuses a different configured target and scope before probing credentials',
   }
 })
 
-it('does not deliver a failed publication as if it had been rolled back', async () => {
-  const publication: PlanReleaseObservation = { requestId: 'set-by-test', target: release, status: 'not-published' }
+it.each(['not-published', 'not-started'] as const)('shows a definitive %s publish result as not released', async status => {
+  const publication: PlanReleaseObservation = { requestId: 'set-by-test', target: release, status }
   const app = fixture({ credentialAvailable: true, publication })
   try {
     await integrate(app)
 
     expect(app.integration.view(planId)).toMatchObject({ status: 'release-failed',
       release: { environment: release.environment, target: release.target, scope: release.scope } })
+    await integrate(app)
     expect(app.host.release.publish).toHaveBeenCalledOnce()
     expect(app.host.relay).not.toHaveBeenCalled()
   } finally {
@@ -274,10 +275,12 @@ it.each(['available', 'unreadable'] as const)('reconciles an external deployment
     rmSync(app.root, { recursive: true, force: true })
   }
 })
-it('rechecks credentials before retrying an absent publication after restart', async () => {
-  const app = fixture({ credentialSequence: [true, false], publication: { requestId: 'set-by-test', target: release, status: 'not-started' },
-    publishAcceptedThenLoseResponse: true })
+it('rechecks credentials and retries the same release after restart when the target proves no write', async () => {
+  const publication = releaseRun({ status: 'passed', at: '2026-11-25T10:01:00.000Z', deploymentId: deployment.id, sha, sha256: artifactSha })
+  const app = fixture({ credentialSequence: [true, false, true], publication })
   try {
+    app.host.release.publish.mockRejectedValueOnce(new Error('Publication was interrupted before it reached the target'))
+    app.host.release.observe.mockImplementation(async ({ id, target }) => ({ requestId: id, target, status: 'not-started' }))
     await integrate(app)
     expect(app.integration.view(planId)).toMatchObject({ status: 'releasing' })
 
@@ -292,6 +295,13 @@ it('rechecks credentials before retrying an absent publication after restart', a
     expect(app.host.release.publish).toHaveBeenCalledOnce()
     expect(app.host.release.observe).toHaveBeenCalledOnce()
     expect(app.host.relay).toHaveBeenCalledOnce()
+
+    await integrate(app)
+
+    expect(app.host.release.publish).toHaveBeenCalledTimes(2)
+    expect(app.host.release.publish.mock.calls[1]).toEqual(app.host.release.publish.mock.calls[0])
+    expect(recovered.view(planId)).toMatchObject({ status: 'released', deployment, verification: { status: 'passed' } })
+    expect(app.host.relay.mock.calls.map(([message]) => JSON.parse(message.text).kind)).toEqual(['human-action', 'plan-delivered'])
   } finally {
     app.store.close()
     rmSync(app.root, { recursive: true, force: true })

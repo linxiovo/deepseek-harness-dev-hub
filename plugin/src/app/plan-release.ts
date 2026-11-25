@@ -201,7 +201,10 @@ export class PlanRelease {
     })
     if (result.status !== 'published') {
       if (prior.status === 'released-unverified') return this.unavailable(prior, request, 'release_unavailable')
-      if (result.status === 'not-published') { finish({ ...base, status: 'release-failed' }); return Park }
+      if (result.status === 'not-published' || result.status === 'not-started') {
+        finish({ ...base, status: 'release-failed' })
+        return Park
+      }
       this.host.save({ ...base, status: 'releasing', ...(result.status === 'publishing' ? {} : { reason: 'release_dispatch_unconfirmed' }) })
       throw new Later()
     }

@@ -17,6 +17,8 @@ Use the existing `PUT /orchestrator/api/settings/executor` with the mounted proj
 
 For example, with no aggregate project cap, `runLimits: {"ticketTokens":1000000,"ticketOverrides":[{"planId":"…","nodeId":"accounts","tokens":2000000}]}` gives independent Ticket pools. Omitted values use the preset; omitting `runLimits` removes all its saved overrides. `maxWorkers` remains the same Executor value used to allocate slots, with the existing priority for human follow-ups. A stale write returns `409`; malformed configuration returns `400`. `orchestrator_settings_save` cannot change `maxWorkers` or any `runLimits` setting, including by omission; it refuses with `panelOnlyRunLimits`. A scope header prevents mistakes across mounts; the [operator-only loopback transport](006-deployment.md#management-api) is not an OS-level sandbox.
 
+For a reviewed cap increase, use the durable confirmation flow in `019-confirmed-settings.md`. It accepts only a strict increase and applies the same `executor` block revision as the ordinary settings API; the existing admission and query contracts above do not change.
+
 ## Read contract
 
 | HTTP GET path | Hub `orchestrator_read` resource | HTTP 200 JSON |

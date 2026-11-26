@@ -30,6 +30,32 @@ async function expectNoDispatch() {
   expect(host.deliveries.mock.calls.map(([delivery]) => delivery.sessionId).filter(id => id.startsWith('worker-'))).toEqual([])
 }
 
+it('offers the next unmentioned maintenance request only after the bound group gains all-message intake', async () => {
+  const source = host.runtime.context(feishuKind)
+  const anchor = feishu('71', 'Selected group')
+  await source.receive(anchor)
+  expect(await host.api('POST', 'topic-binding', { triggerId: anchor.id, allowedActors: [MEMBER] }, project)).toMatchObject({ status: 200 })
+  const { config } = host.runtime.sources.instance('feishu')!
+  const saved = await host.api('PUT', 'settings/source:feishu', { revision: host.runtime.settings.block('source:feishu').revision,
+    value: { enabled: true, config: { ...config, chats: [{ chatId: 'oc_team', listen: 'mentions' }] } } }, project)
+  expect(saved.status).toBe(200)
+  const revision = Number(saved.body.revision)
+  startStageTwo()
+  const meta = { root_id: 'om_71', mentions: [], message_type: 'text', create_time: String(Date.now()) }
+  const path = 'settings-confirmations'
+  const proposal = await host.api('POST', path, { revision, change: { object: 'feishuChat', chatId: 'oc_team', value: 'all' } }, project)
+  expect(proposal).toMatchObject({ status: 200, body: { status: 'pending', effectiveValue: 'mentions' } })
+  await source.receive(feishu('72', 'Correct the typo in the catalogue.', meta))
+  expect(await read('maintenance')).toEqual({ items: [], next_offset: null })
+  expect(await host.api('POST', `${path}/${proposal.body.id}/approve`, { revision }, project)).toMatchObject({ status: 200, body: { effectiveValue: 'all' } })
+  const next = feishu('73', 'Fix the missing invoice label.', meta)
+  await source.receive(next)
+  await source.receive(feishu('74', 'Wrong topic', { ...meta, root_id: 'om_elsewhere' }))
+  expect(await read('maintenance')).toEqual({ items: [{ event_id: next.id, read: `maintenance/${next.id}` }], next_offset: null })
+  expect(await read(`maintenance/${next.id}`)).toMatchObject({ text: 'Fix the missing invoice label.', status: 'pending' })
+  await expectNoDispatch()
+})
+
 it('keeps the original maintenance wake-up when the durable inbox has not entered the turn', async () => {
   startStageTwo()
   const hub = host.runtime.masterId

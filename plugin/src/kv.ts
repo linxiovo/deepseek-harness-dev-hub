@@ -19,6 +19,7 @@ import type { SessionMeterState } from './app/session-meter.ts'
 import type { MeterSessionBinding } from './app/project-meter.ts'
 import type { BudgetLedger, PendingUsage } from './app/run-limits.ts'
 import type { TopicBindingRecord } from './app/topic-binding.ts'
+import type { SettingsConfirmationRecord } from './app/settings-confirmations.ts'
 import type { CredentialBlocker } from './app/scoped-attention.ts'
 import type { PlanControlState } from './app/plan-control.ts'
 import type { MaintenanceEvent, MaintenanceTarget } from './app/maintenance.ts'
@@ -95,6 +96,8 @@ export const KV = {
     maintenanceLookup: family<{ epoch: string; at: string; actorId: string; sourceRevision: number; policyVersion: string }>('feishu-maintenance-lookup:') },
   /** Mounted project: one active binding and text-free consumption receipts that survive unbind/rebind. */
   topicBinding: { active: record<TopicBindingRecord>('topic-binding'), received: family<true>('topic-binding-received:') },
+  /** One immutable proposal per ID and the current proposal for each confirmable object in this mount. */
+  settingsConfirmations: { request: family<SettingsConfirmationRecord>('settings-confirmation:'), latest: family<string>('settings-confirmation-latest:') },
   /** Maintenance: immutable source observations, pending review and durable associations. */
   maintenance: { event: family<MaintenanceEvent>('maintenance-event:'), pending: family<true>('maintenance-pending:'),
     feedback: family<MaintenanceTarget>('maintenance-feedback:'), recovery: record<string>('maintenance-recovery-relay') },

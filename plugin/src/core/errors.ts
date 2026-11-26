@@ -22,6 +22,7 @@ export const USER_ERRORS = {
   credentialBlocked: ['refused', 'This ticket waits for its credential check to pass.'],
   quotaPaused: ['refused', 'This ticket is paused by its run limits.'],
   panelOnlyRunLimits: ['refused', 'Only the operator can change worker concurrency or run limits in management settings.'],
+  panelOnlyListenScope: ['refused', 'Feishu listening scope requires operator authorization.'],
   panelOnlyPolicy: ['refused', 'Only the operator can change the admission Policy in management settings.'],
   panelOnlyRequiredChecks: ['refused', 'Only the operator can change required CI checks in management settings.'],
   ruleMaintenanceRequired: ['refused', 'Stage admission rule changes in Prompts with an independent maintenance Ticket.'],

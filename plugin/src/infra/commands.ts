@@ -239,9 +239,10 @@ export class Commands {
     const bot = this.deployment.feishu
     if (!bot) throw new Error('The Feishu Source has no working bot CLI')
     const argv = [...args, '--as', 'bot', '--format', 'json']
-    const markdown = args[0] === 'im' && (args[1] === '+messages-send' || args[1] === '+messages-reply') ? args.indexOf('--markdown') : -1
-    const input = markdown < 0 ? undefined : args[markdown + 1]
-    if (input !== undefined) argv[markdown + 1] = '-'
+    const body = args[0] === 'im' && (args[1] === '+messages-send' || args[1] === '+messages-reply')
+      ? args.findIndex(arg => arg === '--markdown' || arg === '--content') : -1
+    const input = body < 0 ? undefined : args[body + 1]
+    if (input !== undefined) argv[body + 1] = '-'
     const output = await this.run(bot.cli, argv, cwd, input)
       .catch((error: unknown) => { throw membership(error) })
     const result = JSON.parse(output) as { ok: boolean; data: T; error?: { code?: number; message?: string } }

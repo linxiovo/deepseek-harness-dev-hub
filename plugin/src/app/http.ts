@@ -31,6 +31,8 @@ import type { PlanIntegrationView } from '../core/plan-integration.ts'
 import { PlanArtifactFileSchema, type PlanArtifactFile } from './plan-artifacts.ts'
 import { actorIdPattern, TopicBindingError, type TopicBinding } from './topic-binding.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
+import { SettingsApprovalSchema, SettingsProposalSchema } from '../confirmed-settings.ts'
+import { SettingsConfirmationError, type SettingsConfirmations } from './settings-confirmations.ts'
 import type { Variable } from './execution-environment.ts'
 import { policyHistory } from './settings-history.ts'
 import { overview } from './views/overview.ts'
@@ -42,6 +44,7 @@ import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
 export interface HttpHost {
   readonly installation?: InstallationApi
   readonly topicBinding?: Pick<TopicBinding, 'view' | 'bind' | 'unbind'> | undefined
+  readonly settingsConfirmations?: Pick<SettingsConfirmations, 'propose' | 'read' | 'approve'> | undefined
   /** Verify the workspace under the write lock, before the final scope check and bind. */
   readonly verifyTopicBinding?: (() => Promise<void>) | undefined
   assertNewWork?(): void
@@ -250,6 +253,13 @@ function attentionFailure(error: unknown): [number, Record<string, unknown>] {
   return [500, { error: 'Attention operation failed.' }]
 }
 
+function confirmationFailure(error: unknown): [number, Record<string, unknown>] {
+  if (error instanceof RouteError) return failure(error)
+  if (error instanceof InstallationError) return failure(new InstallationError(error.status, error.code))
+  if (error instanceof SettingsConfirmationError) return [error.status, { error: error.message }]
+  return [500, { error: 'Settings confirmation operation failed.' }]
+}
+
 function runtimeView({ mode, status, reason, projectId, resumedFrom }: RuntimeView): RuntimeView {
   if (!resumedFrom) return { mode, status, reason, projectId, resumedFrom: null }
   const { reason: via, at, recoverable: { assignments, handoffs, effects } } = resumedFrom
@@ -278,6 +288,10 @@ const runLimitRoutes: Partial<Record<keyof Api, true>> = {
 const attentionRoutes: Partial<Record<keyof Api, true>> = {
   'GET attention/summary': true, 'GET attention/credentials/:id': true, 'POST attention/credentials/:id/verify': true,
 }
+const confirmationRoutes: Partial<Record<keyof Api, true>> = {
+  'GET settings-confirmations/:id': true, 'POST settings-confirmations': true,
+  'POST settings-confirmations/:id/approve': true,
+}
 
 function assertProjectScope(active: string | null, requested: string | string[] | undefined,
   requirement: 'optional' | 'when-active' | 'required'): void {
@@ -302,12 +316,29 @@ function routes(runtime: HttpHost): Routes {
     if (!view) throw new RouteError(404, id === undefined ? 'Project not found' : 'Ticket not found')
     return view
   }
+  const settingsConfirmations = () => {
+    if (!runtime.settingsConfirmations) throw new RouteError(404, 'Settings confirmations are not available')
+    return runtime.settingsConfirmations
+  }
   return {
     'GET runtime': () => runtimeView(installationOf(runtime).runtime()),
     'GET onboarding': () => onboardingView(installationOf(runtime).onboarding()),
     'POST onboarding/github/verify': async ({ body, write }) => {
       const request = installationInput(VerifyRequest, await body())
       return write(async () => onboardingView(await installationOf(runtime).verifyGithub(request)))
+    },
+    'POST settings-confirmations': async input => {
+      const confirmations = settingsConfirmations()
+      const result = SettingsProposalSchema.safeParse(await input.body())
+      if (!result.success) throw new RouteError(400, 'Invalid settings confirmation request')
+      return input.write(() => confirmations.propose(result.data))
+    },
+    'GET settings-confirmations/:id': ({ params }) => settingsConfirmations().read(params.id),
+    'POST settings-confirmations/:id/approve': async input => {
+      const confirmations = settingsConfirmations()
+      const result = SettingsApprovalSchema.safeParse(await input.body())
+      if (!result.success) throw new RouteError(400, 'Invalid settings confirmation request')
+      return input.write(() => confirmations.approve(input.params.id, result.data.revision))
     },
     'GET projects': () => {
       const { activeProjectId, projects } = installationOf(runtime).projects()
@@ -493,7 +524,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
     verify?: () => Promise<void>): Promise<T> {
     if (retiring) throw new InstallationError(409, 'switching')
     const installationRoute = installationRoutes.has(route)
-    const requirement = topicBindingRoutes[route] || attentionRoutes[route] ? 'required' : 'when-active'
+    const requirement = topicBindingRoutes[route] || attentionRoutes[route] || confirmationRoutes[route] ? 'required' : 'when-active'
     const { installation } = runtime
     const mount = installation?.runtime()
     if (!installationRoute || scope !== undefined) {
@@ -529,6 +560,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
       if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
       let installationRoute = false
       let attentionRoute = false
+      let confirmationRoute = false
       let mounted: string | null = null
       let artifactLease = false
       try {
@@ -536,10 +568,12 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         if (!route) throw new RouteError(404, 'Unknown operation')
         installationRoute = installationRoutes.has(route.key)
         attentionRoute = attentionRoutes[route.key] === true
+        confirmationRoute = confirmationRoutes[route.key] === true
         if (!installationRoute) await runtime.ready
         const scope = req.headers[PROJECT_SCOPE_HEADER]
         const runLimitRoute = runLimitRoutes[route.key] === true
-        const requiredProject = attentionRoute || runLimitRoute || topicBindingRoutes[route.key] === true || requiredProjectRoutes[route.key] === true
+        const requiredProject = attentionRoute || runLimitRoute || confirmationRoute
+          || topicBindingRoutes[route.key] === true || requiredProjectRoutes[route.key] === true
         const mountedRoute = requiredProject || route.key === 'GET settings' || projectMeterRoutes[route.key]
         const requirement = requiredProject ? 'required' : 'optional'
         if (mountedRoute) mounted = readableMount(scope, requirement)
@@ -550,6 +584,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         if (attentionRoute && (route.key === 'GET attention/summary'
           ? [...url.searchParams.keys()].some(key => key !== 'planId') || url.searchParams.getAll('planId').length > 1
           : url.searchParams.size !== 0)) throw new RouteError(400, 'Invalid attention query')
+        if (confirmationRoute && url.searchParams.size !== 0) throw new RouteError(400, 'Invalid settings confirmations query')
         if (runLimitRoute && url.searchParams.size !== 0) throw new RouteError(400, 'Invalid run limits query')
         if (route.key === 'GET plans/:id/delivery' && url.searchParams.size !== 0) {
           throw new RouteError(400, 'Invalid plan delivery query')
@@ -585,7 +620,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         } else json(res, 200, result)
       } catch (error) {
         if (res.headersSent) { res.destroy(error instanceof Error ? error : undefined); return }
-        const respond = attentionRoute ? attentionFailure : installationRoute ? installationFailure : failure
+        const respond = confirmationRoute ? confirmationFailure : attentionRoute ? attentionFailure : installationRoute ? installationFailure : failure
         json(res, ...respond(error))
       } finally {
         if (artifactLease) writing = undefined

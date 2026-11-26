@@ -6,6 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
 import { threadKey, type Thread, type Trigger } from '../core/index.ts'
 import { feishuChatLink } from './feishu-channel.ts'
+import { cardEventKey, settingsCardAction } from './feishu-card.ts'
 import type { FeishuBot } from '../deployment.ts'
 import { batchInvocation, validItems, type Tally } from '../infra/commands.ts'
 import { feishuBoundThread, readFeishu, type FeishuRef } from './feishu-read.ts'
@@ -20,7 +21,8 @@ const TimedHistoricalMessageSchema = HistoricalMessageSchema.extend({ create_tim
 }) })
 
 export const runFeishu = (ctx: SourceContext, signal: AbortSignal): Promise<unknown> =>
-  Promise.allSettled([watch, backfillLoop, chatNamesLoop, ...(ctx.feishuTopic ? [boundTopicLoop] : [])].map(loop => loop(ctx, signal)))
+  Promise.allSettled([watch(ctx, signal), backfillLoop(ctx, signal), chatNamesLoop(ctx, signal),
+    ...(ctx.feishuTopic ? [boundTopicLoop(ctx, signal)] : []), ...(ctx.feishuTopic?.cardAction ? [watch(ctx, signal, true)] : [])])
 const enabled = (ctx: SourceContext): FeishuConfig | undefined => ctx.config<FeishuConfig>(SOURCE)
 const bot = (ctx: SourceContext): FeishuBot => {
   const resolved = ctx.deployment.feishu
@@ -44,14 +46,14 @@ function available(ctx: SourceContext): boolean {
 }
 
 /** Runs the live event consumer only while the Source is enabled; disabling it stops the consumer within five seconds. */
-async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
+async function watch(ctx: SourceContext, signal: AbortSignal, cards = false): Promise<void> {
   await ctx.ready
   // Setup restarts dsh-superagent once it resolves the bot; until then nothing runs.
   if (!available(ctx)) return
   let retry: number | undefined
   while (!signal.aborted) {
     if (!enabled(ctx)) {
-      ctx.report('feishu', health('paused', 'sourceOff'))
+      if (!cards) ctx.report('feishu', health('paused', 'sourceOff'))
       await delay(5000, undefined, { signal }).catch(() => {})
       continue
     }
@@ -60,8 +62,8 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
     const stop = () => running.abort()
     signal.addEventListener('abort', stop, { once: true })
     const began = Date.now()
-    try { await consume(ctx, running.signal) }
-    catch (error) { if (!running.signal.aborted) ctx.report('feishu', { state: 'error', detail: String(error) }) }
+    try { await consume(ctx, running.signal, cards) }
+    catch (error) { if (!cards && !running.signal.aborted) ctx.report('feishu', { state: 'error', detail: String(error) }) }
     finally { clearInterval(check); signal.removeEventListener('abort', stop) }
     if (running.signal.aborted) continue
     retry = consumerRetry(retry, Date.now() - began)
@@ -71,10 +73,14 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
 /** Wait before restarting the event consumer: 1s after a run that stayed up for a minute, otherwise exponential backoff up to 60s. */
 export const consumerRetry = (previous: number | undefined, ranMs: number): number =>
   previous === undefined || ranMs >= 60_000 ? 1000 : Math.min(previous * 2, 60_000)
-async function consume(ctx: SourceContext, signal: AbortSignal): Promise<void> {
+async function consume(ctx: SourceContext, signal: AbortSignal, cards: boolean): Promise<void> {
   if (signal.aborted) return
-  const cli = bot(ctx).cli
-  const args = ['event', 'consume', 'im.message.receive_v1', '--as', 'bot']
+  const { cli, botId, appId } = bot(ctx), identity = `${appId}:${botId}`
+  const connection = cards ? ctx.feishuTopic : undefined
+  connection?.cardReady?.(identity, false)
+  const args = ['event', 'consume', cards ? cardEventKey : 'im.message.receive_v1', '--as', 'bot']
+  // Discard the update token and fetched card body at the CLI boundary, before they enter the host's queue.
+  if (cards) args.push('--jq', 'select((.form_value | length) == 0) | {type,host,action_tag,action_value,operator_id,message_id,chat_id,timestamp,event_id}')
   const batch = process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(cli)
   const child = spawn(batch ? process.env.ComSpec ?? 'cmd.exe' : cli,
     batch ? ['/d', '/e:on', '/v:off', '/s', '/c', batchInvocation(cli, args)] : args,
@@ -82,10 +88,17 @@ async function consume(ctx: SourceContext, signal: AbortSignal): Promise<void> {
       env: { ...process.env, LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
   const stdout = createInterface({ input: child.stdout }); const stderr = createInterface({ input: child.stderr })
   let chain = Promise.resolve(); let diagnostic = ''; let ready = false; let eventFailed = false
+  const handshake = cards ? Promise.withResolvers<void>() : undefined
+  const active = () => !!enabled(ctx) && ctx.deployment.feishu?.appId === appId && ctx.deployment.feishu?.botId === botId
+  const down = () => {
+    if (cards && ready) { ready = false; connection?.cardReady?.(identity, false) }
+    handshake?.resolve()
+  }
   let stopping = false
   const stop = (): void => {
     if (stopping) return
     stopping = true
+    down()
     child.stdin.end()
     if (batch && child.pid !== undefined) {
       // Killing cmd.exe alone leaves the CLI it launched running; terminate both processes.
@@ -100,25 +113,43 @@ async function consume(ctx: SourceContext, signal: AbortSignal): Promise<void> {
   const timeout = setTimeout(() => { diagnostic = 'Feishu event consumer did not become ready within 45 seconds'; stop() }, 45_000)
   stderr.on('line', (line: string) => {
     if (stopping) return
-    diagnostic = line.slice(0, 4000)
-    if (line.startsWith('[event] ready')) {
+    if (!cards) diagnostic = line.slice(0, 4000)
+    if (cards ? line === `[event] ready event_key=${cardEventKey}` : line.startsWith('[event] ready')) {
+      if (!active()) { stop(); return }
       ready = true; clearTimeout(timeout)
+      if (cards) { connection?.cardReady?.(identity, true); handshake?.resolve() }
       // stdout and stderr are independent: late readiness must not erase an event-processing failure.
-      if (!eventFailed) ctx.report('feishu', { state: 'ready', detail: 'Listening for bot events', at: new Date().toISOString() })
-    } else if (/WARN|drop|error/.test(line)) ctx.report('feishu', { state: 'error', detail: diagnostic })
+      else if (!eventFailed) ctx.report('feishu', { state: 'ready', detail: 'Listening for bot events', at: new Date().toISOString() })
+    } else if (/WARN|drop|error/.test(line)) {
+      if (cards) stop()
+      else ctx.report('feishu', { state: 'error', detail: diagnostic })
+    }
   })
   stdout.on('line', (line: string) => {
     chain = chain.then(async () => {
       // Events queued before cancellation or a Source toggle must not be read after it.
-      if (stopping || !enabled(ctx)) return
+      if (handshake && !ready) await handshake.promise
+      if (stopping) return
+      if (!active()) { stop(); return }
       if (line.length > 1_048_576) throw new Error('Feishu event exceeds 1 MiB')
-      const trigger = feishuTrigger(JSON.parse(line), bot(ctx).botId, bot(ctx).appId)
+      if (cards) {
+        if (!ready) return
+        const action = settingsCardAction(line, identity)
+        if (action && action.actorId !== botId) await connection?.cardAction?.(action)
+        return
+      }
+      const input = JSON.parse(line)
+      if (input?.type === cardEventKey) return
+      const trigger = feishuTrigger(input, botId, appId)
       if (!trigger) return
       const chats = ctx.state.get(KV.feishu.chats) ?? {}
       chats[String(trigger.meta.chatId)] = trigger.meta.direct === true
       ctx.state.set(KV.feishu.chats, chats)
       await receive(ctx, trigger)
-    }).catch(error => { eventFailed = true; ctx.report('feishu', { state: 'error', detail: String(error) }) })
+    }).catch(error => {
+      if (cards) { stop(); return } // Neither raw callback data nor a handler's diagnostic may leave this stream.
+      eventFailed = true; ctx.report('feishu', { state: 'error', detail: String(error) })
+    })
   })
   try {
     await new Promise<void>((resolve, reject) => {
@@ -126,7 +157,9 @@ async function consume(ctx: SourceContext, signal: AbortSignal): Promise<void> {
       const exited = (code: number | null) => new Error(`Feishu event consumer exited (${code}, ready=${ready}): ${diagnostic}`)
       child.once('close', (code) => signal.aborted ? resolve() : reject(exited(code)))
     })
-  } finally { clearTimeout(timeout); signal.removeEventListener('abort', stop); stdout.close(); stderr.close(); await chain }
+  } finally {
+    down(); clearTimeout(timeout); signal.removeEventListener('abort', stop); stdout.close(); stderr.close(); await chain
+  }
 }
 
 /** Refreshes the map of joined chats (`chat_id -> name`); throws on failure so the previously stored list remains intact. */

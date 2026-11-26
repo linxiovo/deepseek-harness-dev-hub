@@ -2,6 +2,7 @@
 import type { ReceiveResult, OutboundMessage, Thread, ThreadFact, ThreadRef, Ticket, Trigger } from '../core/index.ts'
 import type { Commands } from '../infra/commands.ts'
 import type { Deployment } from '../deployment.ts'
+import type { SettingsCardAction } from '../confirmed-settings.ts'
 import type { SourceRegistry } from './registry.ts'
 import type { SetupProblem } from '../setup.ts'
 import type { Family, Key } from '../kv.ts'
@@ -52,6 +53,8 @@ export interface SourceContext {
   /** Exact-epoch ingress for handoff protocol and authorized maintenance, never ordinary Ticket follow-up. */
   feishuTopic?: {
     target(): FeishuTopic | undefined
+    cardReady?(botIdentity: string, ready: boolean): void
+    cardAction?(event: SettingsCardAction): Promise<void>
     /** Unresolved native messages pin the history read to their earliest arrival, independent of its ordinary cursor. */
     maintenanceSince?(topic: FeishuTopic): string | undefined
     resolvedMaintenance?(topic: FeishuTopic, messageId: string): void

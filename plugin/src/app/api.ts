@@ -16,6 +16,7 @@ import type { CreateProjectInput, CreateProjectResult, OnboardingView, ProjectsV
 import type { TopicBindingView } from './topic-binding.ts'
 import type { ScopedAttention } from './scoped-attention.ts'
 import type { PlanIntegrationView } from '../core/plan-integration.ts'
+import type { SettingsProposal, SettingsConfirmationView } from '../confirmed-settings.ts'
 
 export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
 export const THREAD_FILTERS = ['subscribed', 'evaluating', 'recent', 'all'] as const
@@ -47,6 +48,9 @@ export interface Api {
   'GET overview': { response: OverviewView }
   'GET search': { query: { q: string }; response: SearchView }
   'GET sources': { response: SourceStatusView[] }
+  'POST settings-confirmations': { body: SettingsProposal; response: SettingsConfirmationView }
+  'GET settings-confirmations/:id': { response: SettingsConfirmationView }
+  'POST settings-confirmations/:id/approve': { body: { revision: number }; response: SettingsConfirmationView }
   'GET settings': { response: SettingsView }
   'POST sources/:id/labels': { response: { added: string[] } }
   'GET threads': { query?: Paged & { filter?: ThreadFilter }; response: ThreadListView }

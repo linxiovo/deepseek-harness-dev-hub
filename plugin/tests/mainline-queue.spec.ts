@@ -491,32 +491,6 @@ async function exerciseGithubAndHarnessMaintenance(projectId: string, deliveredP
   const transferredPlan = await decideMaintenance(maintenanceVerdict(transferred), transferId)
   expect(transferredPlan).toMatchObject({ status: 'registered' })
   expect(await decideMaintenance(maintenanceVerdict(transferred), transferId)).toEqual(transferredPlan)
-  const setMode = async (mode: 'off' | 'auto') => {
-    const { revision, value } = JSON.parse(String((await read('settings/eval')).text))
-    expect(await h.api('PUT', 'settings/eval', { revision, value: { ...value, mode } }, projectId)).toMatchObject({ status: 200 })
-  }
-  const receivedWhileOff = 'Correct the label “Teh” to “The”.'
-  await setMode('off')
-  h.sendUserMessage(h.runtime.masterId, receivedWhileOff)
-  await setMode('auto')
-  await expect(decideMaintenance(maintenanceVerdict(receivedWhileOff))).rejects.toThrow(/authorization/i)
-  const interrupted = 'Correct the label “Toosl” to “Tools”.'
-  const settingsSavedAt = h.runtime.store.settingsHistory(1)[0]!.savedAt
-  h.record(h.runtime.masterId, [{ type: 'user/message', time: Date.parse(settingsSavedAt) + 1, data: freezeMessage({
-    id: MessageId('maintenance-restart-native'), role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: interrupted }],
-  }) }])
-  // Cut after the native Session entry, before its maintenance receipt.
-  const remembered = z.object({ items: z.array(z.object({ event_id: z.string() })).length(1) }).parse(await read('maintenance'))
-  h.runtime.store.atomic(() => {
-    const id = remembered.items[0]!.event_id
-    h.runtime.store.delete(KV.maintenance.event(id))
-    h.runtime.store.delete(KV.maintenance.pending(id))
-  })
-  await h.restart()
-  const pending = z.object({ items: z.array(z.object({ event_id: z.string() })).length(1) }).parse(await read('maintenance'))
-  const recoveryId = pending.items[0]!.event_id
-  expect(await read(`maintenance/${recoveryId}`)).toMatchObject({ status: 'pending', text: interrupted })
-  expect(await decideMaintenance(maintenanceVerdict(interrupted), recoveryId)).toMatchObject({ status: 'registered' })
   const coordinated = 'Restore the label “Widgets” in the API and the page.'
   h.sendUserMessage(h.runtime.masterId, coordinated)
   const cross = maintenanceVerdict(coordinated), provider = cross.draft.nodes[0]!
@@ -652,17 +626,21 @@ function actionsHost(beforeRuns?: (sha: string) => Promise<void>) {
     setPull: (value: Pull) => { pull = value; return pullResponse(value) } }
 }
 
-it.each([
-  { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const },
-  { release: 'authorized' as const, dispatchFailure: 'lost-response' as const },
-  { release: 'authorized' as const, dispatchFailure: 'lost-response' as const, controlledRelease: true },
-  { release: 'not-authorized' as const, dispatchFailure: 'forbidden' as const, pauseOnRefusal: true },
-  { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, rerunDuringDownload: true },
-  { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, advanceTargetDuringFinalRunLookup: true },
-  { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, rerunDuringFinalTargetRead: true },
-  { release: 'not-authorized' as const, dispatchFailure: 'lost-response' as const, loseArtifactBeforeRelay: true },
- ] as const)('verifies the integrated package: %j',
-  async ({ release, dispatchFailure, controlledRelease, pauseOnRefusal, rerunDuringDownload, advanceTargetDuringFinalRunLookup,
+it.each<[name: string, scenario: {
+  release: 'not-authorized' | 'authorized'; dispatchFailure: 'lost-response' | 'forbidden'
+  controlledRelease?: boolean; pauseOnRefusal?: boolean; rerunDuringDownload?: boolean
+  advanceTargetDuringFinalRunLookup?: boolean; rerunDuringFinalTargetRead?: boolean; loseArtifactBeforeRelay?: boolean
+}]>([
+  ['artifact-only', { release: 'not-authorized', dispatchFailure: 'lost-response' }],
+  ['authorized-release-unverified', { release: 'authorized', dispatchFailure: 'lost-response' }],
+  ['verified-release', { release: 'authorized', dispatchFailure: 'lost-response', controlledRelease: true }],
+  ['dispatch-refused', { release: 'not-authorized', dispatchFailure: 'forbidden', pauseOnRefusal: true }],
+  ['rerun-during-download', { release: 'not-authorized', dispatchFailure: 'lost-response', rerunDuringDownload: true }],
+  ['target-advanced-during-run-lookup', { release: 'not-authorized', dispatchFailure: 'lost-response', advanceTargetDuringFinalRunLookup: true }],
+  ['rerun-during-target-read', { release: 'not-authorized', dispatchFailure: 'lost-response', rerunDuringFinalTargetRead: true }],
+  ['artifact-lost-before-relay', { release: 'not-authorized', dispatchFailure: 'lost-response', loseArtifactBeforeRelay: true }],
+])('verifies the integrated package: %s',
+  async (_scenario, { release, dispatchFailure, controlledRelease, pauseOnRefusal, rerunDuringDownload, advanceTargetDuringFinalRunLookup,
     rerunDuringFinalTargetRead, loseArtifactBeforeRelay }) => {
   await h.stop()
   const verification = { workflowId: '44', identityJob: 'integration-identity',

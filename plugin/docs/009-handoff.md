@@ -182,6 +182,12 @@ Run `pnpm test tests/handoff.spec.ts tests/topic-binding.spec.ts tests/http.spec
 
 `pnpm test tests/mainline-queue.spec.ts -t 'verifies the integrated package'` drives delivery and Stage 2 through real temporary Git worktrees, simulated GitHub and Feishu sources, direct Harness messages and the controlled local release adapter.
 
+`pnpm test tests/maintenance-recovery.spec.ts` isolates the interruption points at the Runtime boundary. It seeds the saved project milestone; the Git integration cases above establish when that milestone is written.
+
+The [lark-cli 1.0.100 private-chat fixture](../tests/fixtures/feishu-bound-private-lark-cli-1.0.100.json) retains the actual event and history shapes with anonymized values. A standalone text has no parent or root field. A reply to the binding anchor has `reply_to` in the event and `parent_id` in history; both also have `root_id` equal to the anchor. The Runtime check simulates delayed visibility of these history items: the standalone message enters maintenance once, and the reply does not. These samples cover a bot private chat, not a live group topic.
+
+To verify the live Feishu protocol, use a bot authorized for a dedicated test chat. For both an unmentioned standalone text in the bound conversation and a direct reply to its root, capture the `im.message.receive_v1` event and the matching item from the exact-bound history query (`GET /open-apis/im/v1/messages`, using the resolved thread ID for a group or the chat ID for a private chat). Record the CLI version. Before saving a fixture, replace identifiers consistently across the pair and redact text and unrelated data without changing field presence or types. Check native `message_id`, chat/thread identity, live `reply_to` versus history `parent_id`, and the original text message type. A delayed history read must recover the standalone message once and must not put the root reply in the maintenance inbox. Constructed history responses do not verify the live protocol.
+
 ## Limitations
 
 - The Feishu entry answers product questions; it does not accept configuration approvals. Other IM connectors and interactive confirmation cards are not part of this contract.

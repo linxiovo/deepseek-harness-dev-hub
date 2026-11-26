@@ -3,12 +3,16 @@ import { spawnSync } from 'node:child_process'
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { freezeMessage, MessageId } from '@deepseek-ai/dsh-llm'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { CliError, Commands } from '../src/infra/commands.ts'
 import { githubKind } from '../src/sources/github.ts'
+import { commentTrigger } from '../src/sources/github-trigger.ts'
+import { feishuKind } from '../src/sources/feishu.ts'
+import { pollBoundTopic } from '../src/sources/feishu-loops.ts'
 import { observePull } from '../src/sources/github-pull.ts'
-import { feishu, startManagedProject, startRuntime, type Host } from './fixtures/host.ts'
+import { feishu, MEMBER, startManagedProject, startRuntime, type Host } from './fixtures/host.ts'
 import { KV } from '../src/kv.ts'
 import type { MainlineRepair } from '../src/core/model.ts'
 import type { MainlineIntent } from '../src/app/mainline-queue.ts'
@@ -392,6 +396,198 @@ async function configureCI() {
   typeof active === 'string' ? active : undefined)).toMatchObject({ status: 200 })
 }
 
+const maintenanceText = 'Correct the label “Widgtes” to “Widgets”.'
+const maintenanceVerdict = (text = maintenanceText) => ({ kind: 'plan', scope: text, intentEvidence: text,
+  direction: { implementation_requested: true, target_basis: 'specified', requires_design_decision: false, evidence: text },
+  ruleAssessments: [{ rule_id: 'copy', matched: true, reason: 'Correct an exact spelling.' }, { rule_id: 'visual', matched: false, reason: 'No styling.' }],
+  spec: { body: text, acceptance: [{ statement: text, observable: 'The formatter returns “Widgets”.', delivery: 'backend' }],
+    testInterfaces: [{ seam: 'label()', kind: 'existing', note: 'Call the formatter with the title label.' }], outOfScope: [] },
+  draft: { features: [{ id: 'label', kind: 'backend' }], nodes: [{ id: 'label', featureId: 'label', title: 'Correct the label',
+    role: 'backend', acceptance: [1], blockedBy: [], demonstration: 'Read the corrected label.' }] } })
+const decideMaintenance = (verdict: object, event_id?: string) => hub('orchestrator_maintenance', { event_id, verdict })
+const maintenanceCandidates = () => h.jsonRelays(h.runtime.masterId, 'maintenance-candidate')
+
+async function exerciseGithubAndHarnessMaintenance(projectId: string, deliveredPlan: string, original: Worker) {
+  const { revision, value } = JSON.parse(String((await read('settings/source:github')).text))
+  expect(await h.api('PUT', 'settings/source:github', { revision, value: { ...value, config: { ...value.config, observeComments: true } } }, projectId))
+    .toMatchObject({ status: 200 })
+  const source = () => h.runtime.context(githubKind)
+  const comment = (id: number, text: string, repository = slug, number = 31) => commentTrigger({ id, body: text, user: { login: 'alice' },
+    html_url: `https://github.com/${repository}/issues/${number}#issuecomment-${id}`, created_at: new Date().toISOString() },
+  { number, isPr: false }, 'conversation', 'agent-bot')
+  const foreign = comment(501, maintenanceText, 'other/widgets'), quoted = comment(502, `> ${maintenanceText}`)
+  const chat = comment(503, 'Thanks for the update!'), request = comment(504, maintenanceText)
+  for (const trigger of [foreign, quoted, chat, request]) await source().receive(trigger)
+  await h.idleRelay()
+  expect(await read('tickets')).toMatchObject({ items: [expect.objectContaining({ ticket_id: original.ticketId })] })
+  expect(maintenanceCandidates()).toEqual([chat, request].map(trigger => expect.objectContaining({ event_id: trigger.id })))
+  for (const trigger of [foreign, quoted]) await expect(decideMaintenance(maintenanceVerdict(), trigger.id)).rejects.toThrow()
+  await expect(h.route({ kind: 'attach', ticket_id: original.ticketId, trigger_id: request.id })).rejects.toThrow(/read.only|maintenance/i)
+  expect(await decideMaintenance({ kind: 'ignore', reason: 'Not a work request.' }, chat.id)).toMatchObject({ status: 'ignored' })
+  await expect(hub('orchestrator_settings_save', { block: 'pause', value: { paused: false }, revision: 0 }))
+    .rejects.toThrow(/operator/i)
+  // The project retains the pending event even after its Hub relay was sent and the process restarted.
+  await h.restart()
+  await h.idleRelay()
+  expect(h.jsonRelays(h.runtime.masterId, 'maintenance-pending')).toEqual([expect.objectContaining({ read: 'maintenance' })])
+  expect(await read('maintenance')).toMatchObject({ items: [expect.objectContaining({ event_id: request.id })] })
+  const verdict = maintenanceVerdict()
+  await expect(decideMaintenance({ ...verdict, ruleAssessments: verdict.ruleAssessments.map(rule => ({ ...rule, matched: false })) }, request.id))
+    .rejects.toThrow(/rule/i)
+  const result = await decideMaintenance(verdict, request.id)
+  const planId = z.string().parse(result.planId)
+  expect(planId).not.toBe(deliveredPlan)
+  expect(await read(`plan/${planId}`)).toMatchObject({ nodes: [{ id: 'label', blockedBy: [], status: 'waiting-for-slot' }] })
+  const { claim } = await hub('orchestrator_plan_dispatch', { planId, nodeId: 'label' })
+  const { ticketId } = claimIdentity.parse(claim)
+  await h.runtime.idle()
+  const details = await read(`ticket/${ticketId}`)
+  expect(details).toMatchObject({ directory: expect.any(String), plan: { plan_id: planId, node_id: 'label' } })
+  expect(details.directory).not.toBe(original.directory)
+  const pull = { source: 'github', id: '41' }
+  source().tickets.bindThread(ticketId, pull, true)
+  const review = commentTrigger({ id: 401, state: 'CHANGES_REQUESTED', body: 'Keep the spacing stable.', user: { login: 'alice' },
+    html_url: `https://github.com/${slug}/pull/41#pullrequestreview-401`, submitted_at: new Date().toISOString() },
+  { number: 41, isPr: true }, 'review', 'agent-bot')
+  await source().receive(review)
+  expect(h.runtime.store.tickets.get(ticketId)?.inputs).toContainEqual(expect.objectContaining({ triggerId: review.id, context: true }))
+  await expect(decideMaintenance(verdict, review.id)).rejects.toThrow(/authorization/i)
+  expect(await source().receive(request)).toBe('duplicate')
+  const repeated = comment(505, maintenanceText)
+  await source().receive(repeated)
+  expect(await read(`maintenance/${repeated.id}`)).toMatchObject({ status: 'associated', planId, ticketIds: [ticketId] })
+  const paraphrased = 'The heading needs the same spelling correction.'
+  const paraphrase = comment(506, paraphrased)
+  await source().receive(paraphrase)
+  const existing = { kind: 'existing', ticketId, intentEvidence: paraphrased, ruleAssessments: verdict.ruleAssessments }
+  expect(await decideMaintenance(existing, paraphrase.id)).toMatchObject({ status: 'associated', ticketIds: [ticketId] })
+  const otherIssue = comment(507, maintenanceText, slug, 32)
+  await source().receive(otherIssue)
+  expect(await read(`maintenance/${otherIssue.id}`)).toMatchObject({ status: 'pending' })
+  expect(await decideMaintenance(verdict, otherIssue.id)).toMatchObject({ status: 'registered', planId: expect.not.stringMatching(planId) })
+  expect(await read(`ticket/${original.ticketId}`)).toMatchObject({ ended: { by: 'delivery' } })
+  h.sendUserMessage(h.runtime.masterId, maintenanceText)
+  expect(await decideMaintenance({ ...existing, intentEvidence: maintenanceText })).toMatchObject({ status: 'associated', ticketIds: [ticketId] })
+  const direct = 'Correct the label “Accoutns” to “Accounts”.'
+  h.sendUserMessage(h.runtime.masterId, direct)
+  const harnessPlan = await decideMaintenance(maintenanceVerdict(direct))
+  expect(harnessPlan).toMatchObject({ status: 'registered' })
+  expect(harnessPlan.planId).not.toBe(planId)
+  expect(await read(`plan/${harnessPlan.planId}`)).toMatchObject({ nodes: [{ id: 'label', status: 'waiting-for-slot' }] })
+  const oldId = h.runtime.masterId, old = h.agents.get(oldId)!
+  old.status = 'running'
+  const rotating = h.runtime.rotateHub()
+  const transferred = 'Correct the label “Setings” to “Settings”.'
+  try {
+    old.followup(freezeMessage({ id: MessageId('maintenance-during-rotation'), role: 'user',
+      source: { kind: 'user', rpcId: 'maintenance-rpc' }, content: [{ type: 'text', text: transferred }] }))
+  } finally { old.status = 'idle' }
+  await rotating
+  const { items } = z.object({ items: z.array(z.object({ event_id: z.string() })) }).parse(await read('maintenance'))
+  expect(items).toHaveLength(1)
+  const transferId = items[0]!.event_id
+  expect(await read(`maintenance/${transferId}`)).toMatchObject({ actor: { source: 'harness', id: oldId }, text: transferred })
+  await expect(decideMaintenance(maintenanceVerdict(transferred))).rejects.toThrow(/direct Harness/i)
+  const transferredPlan = await decideMaintenance(maintenanceVerdict(transferred), transferId)
+  expect(transferredPlan).toMatchObject({ status: 'registered' })
+  expect(await decideMaintenance(maintenanceVerdict(transferred), transferId)).toEqual(transferredPlan)
+  const setMode = async (mode: 'off' | 'auto') => {
+    const { revision, value } = JSON.parse(String((await read('settings/eval')).text))
+    expect(await h.api('PUT', 'settings/eval', { revision, value: { ...value, mode } }, projectId)).toMatchObject({ status: 200 })
+  }
+  const receivedWhileOff = 'Correct the label “Teh” to “The”.'
+  await setMode('off')
+  h.sendUserMessage(h.runtime.masterId, receivedWhileOff)
+  await setMode('auto')
+  await expect(decideMaintenance(maintenanceVerdict(receivedWhileOff))).rejects.toThrow(/authorization/i)
+  const interrupted = 'Correct the label “Toosl” to “Tools”.'
+  const settingsSavedAt = h.runtime.store.settingsHistory(1)[0]!.savedAt
+  h.record(h.runtime.masterId, [{ type: 'user/message', time: Date.parse(settingsSavedAt) + 1, data: freezeMessage({
+    id: MessageId('maintenance-restart-native'), role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: interrupted }],
+  }) }])
+  // Cut after the native Session entry, before its maintenance receipt.
+  const remembered = z.object({ items: z.array(z.object({ event_id: z.string() })).length(1) }).parse(await read('maintenance'))
+  h.runtime.store.atomic(() => {
+    const id = remembered.items[0]!.event_id
+    h.runtime.store.delete(KV.maintenance.event(id))
+    h.runtime.store.delete(KV.maintenance.pending(id))
+  })
+  await h.restart()
+  const pending = z.object({ items: z.array(z.object({ event_id: z.string() })).length(1) }).parse(await read('maintenance'))
+  const recoveryId = pending.items[0]!.event_id
+  expect(await read(`maintenance/${recoveryId}`)).toMatchObject({ status: 'pending', text: interrupted })
+  expect(await decideMaintenance(maintenanceVerdict(interrupted), recoveryId)).toMatchObject({ status: 'registered' })
+  const coordinated = 'Restore the label “Widgets” in the API and the page.'
+  h.sendUserMessage(h.runtime.masterId, coordinated)
+  const cross = maintenanceVerdict(coordinated), provider = cross.draft.nodes[0]!
+  const frontend = { ...provider, id: 'page', role: 'frontend', blockedBy: [provider.id] }
+  const draft = { features: [{ id: 'label', kind: 'cross-end' }], nodes: [provider, frontend] }
+  const spec = { ...cross.spec, acceptance: cross.spec.acceptance.map(item => ({ ...item, delivery: 'cross-end' })) }
+  await expect(decideMaintenance({ ...cross, spec, draft })).rejects.toThrow(/interfaceContract/i)
+  const paired = await decideMaintenance({ ...cross, spec, draft: { ...draft, nodes: [{ ...provider,
+    interfaceContract: { path: contractDoc, requirements: 'Document the API label and its public check.' } }, frontend] } })
+  expect(await read(`plan/${paired.planId}`)).toMatchObject({ nodes: [{ id: 'label', status: 'waiting-for-slot' },
+    { id: 'page', status: 'blocked', waiting_on: ['label'] }] })
+}
+
+async function exerciseBoundMaintenance(projectId: string) {
+  const source = () => h.runtime.context(feishuKind)
+  const native = (id: string, text: string, overrides = {}) => feishu(id, text,
+    { create_time: String(Date.now()), mentions: [], message_type: 'text', ...overrides })
+  const root = native('600', 'Independent project discussion')
+  await source().receive(root)
+  const bound = await h.api('POST', 'topic-binding', { triggerId: root.id, allowedActors: [MEMBER, 'ou_guest'] }, projectId)
+  expect(bound).toMatchObject({ status: 200 })
+  const event = (id: string, text: string, overrides = {}) => native(id, text, { root_id: 'om_600', ...overrides })
+  const at = String(Date.now())
+  const feedback = event('601', maintenanceText, { create_time: at }), otherTopic = event('602', maintenanceText, { root_id: 'om_900' }),
+    forwarded = event('603', maintenanceText, { message_type: 'merge_forward' }),
+    quoted = event('604', `> ${maintenanceText}`), guest = event('605', maintenanceText, { sender_id: 'ou_guest' }),
+    joined = event('606', maintenanceText, { message_type: 'system' }), nestedQuote = event('608', maintenanceText, { parent_id: 'om_599' }),
+    rootQuote = event('609', maintenanceText, { reply_to: 'om_600' })
+  for (const denied of [otherTopic, forwarded, quoted, guest, joined, nestedQuote, rootQuote]) {
+    await source().receive(denied)
+    await expect(decideMaintenance(maintenanceVerdict(), denied.id)).rejects.toThrow()
+  }
+  const topic = source().feishuTopic!
+  const target = topic.target()!
+  // On a later loop the normal cursor no longer covers this incomplete real-time message.
+  const partial = native('601', maintenanceText, { create_time: at, message_type: undefined, thread_id: 'omt_bound' })
+  expect(await source().receive(partial)).toBe('filtered')
+  const lark = vi.spyOn(Commands.prototype, 'lark')
+    .mockResolvedValueOnce({ items: [{ message_id: 'om_600', chat_id: target.chatId, thread_id: 'omt_bound' }] })
+    .mockResolvedValueOnce({ items: [{ message_id: 'om_601', chat_id: target.chatId, thread_id: 'omt_bound', create_time: at,
+      msg_type: 'text', sender: { id: MEMBER, sender_type: 'user' }, body: { content: JSON.stringify({ text: maintenanceText }) } }] })
+  const laterCursor = new Date(Number(at) + 60_000).toISOString()
+  await expect(pollBoundTopic(source(), target, new AbortController().signal, laterCursor, laterCursor)).resolves.toBe(true)
+  lark.mockRestore()
+  expect(await source().receive(feedback)).toBe('duplicate')
+  await h.idleRelay()
+  expect(maintenanceCandidates()).toEqual([expect.objectContaining({ event_id: feedback.id })])
+  const { intentEvidence, ruleAssessments } = maintenanceVerdict()
+  const checked = { kind: 'checked', reason: 'Label checked read-only; no write requested.', intentEvidence, ruleAssessments }
+  await expect(decideMaintenance({ ...checked, ruleAssessments: ruleAssessments.map(rule => ({ ...rule, matched: false })) }, feedback.id))
+    .rejects.toThrow(/matched rule/i)
+  expect(await decideMaintenance(checked, feedback.id)).toMatchObject({ status: 'checked' })
+  expect(await read('tickets')).toMatchObject({ items: [expect.objectContaining({ state: 'merged' })] })
+  const revoked = event('607', maintenanceText)
+  await source().receive(revoked)
+  expect(await h.api('POST', 'topic-binding/unbind', undefined, projectId)).toMatchObject({ status: 200 })
+  await expect(decideMaintenance(maintenanceVerdict(), revoked.id)).rejects.toThrow(/authority|authoriz/i)
+  expect(await read(`maintenance/${revoked.id}`)).toMatchObject({ status: 'withdrawn' })
+  expect(await read('maintenance')).toMatchObject({ items: [] })
+  const dm = (id: string, text: string, overrides = {}) => native(id, text, { chat_id: 'oc_private', chat_type: 'p2p', ...overrides })
+  const dmRoot = dm('610', 'Private coordination')
+  await source().receive(dmRoot)
+  expect(await h.api('POST', 'topic-binding', { triggerId: dmRoot.id, allowedActors: [MEMBER] }, projectId)).toMatchObject({ status: 200 })
+  const nativeQuote = dm('611', maintenanceText, { root_id: 'om_610', reply_to: 'om_610' })
+  await source().receive(nativeQuote)
+  await expect(decideMaintenance(maintenanceVerdict(), nativeQuote.id)).rejects.toThrow(/authorization/i)
+  const freshPrivate = dm('612', maintenanceText)
+  await source().receive(freshPrivate)
+  expect(await decideMaintenance(checked, freshPrivate.id)).toMatchObject({ status: 'checked' })
+}
+
 /** Keep hosting responses tied to the specific revisions explicitly published by the test. */
 function actionsHost(beforeRuns?: (sha: string) => Promise<void>) {
   const runs = new Map<string, { id: number; sha: string; base?: string; branch?: string; detachPull?: boolean; conclusion?: 'success' | 'failure' }>()
@@ -472,10 +668,11 @@ it.each([
   const verification = { workflowId: '44', identityJob: 'integration-identity',
     jobs: ['integration-identity', 'windows', 'check', 'integration-bundle'], artifactName: 'plugin-bundle',
     configuration: 'plugin-check-v1', environment: 'github-hosted-node22-pnpm11-v1' }
-  const mounted = await startManagedProject({ withFeishu: false, machine: project => ({ planVerification: [{ projectId: project.id, ...verification }],
+  const mounted = await startManagedProject({ withFeishu: !!controlledRelease, machine: project => ({ planVerification: [{ projectId: project.id, ...verification }],
     ...(controlledRelease ? { planRelease: [{ projectId: project.id, ...sandboxTarget, executable: process.execPath, args: [releaseFixture],
       credentialId: 'sandbox-deploy', credentialProviderUrl: 'https://vault.example.test/sandbox' }] } : {}) }) })
   h = mounted.host
+  expect(await read('project/stage')).toEqual({ stage: 1 })
   if (controlledRelease) {
     const spawn = h.subprocess.spawn.getMockImplementation()!
     h.subprocess.spawn.mockImplementation(spec => {
@@ -599,6 +796,8 @@ it.each([
   const beforeRecovery = await read(`plan/${id}/delivery`)
   expect(beforeRecovery).toMatchObject({ status: 'blocked',
     reason: dispatchFailure === 'forbidden' ? 'actions_unavailable' : 'dispatch_unconfirmed', version: { sha: integration } })
+  expect(await read('project/stage')).toEqual({ stage: 1 })
+  if (!pauseOnRefusal) await expect(decideMaintenance(maintenanceVerdict(), '0'.repeat(32))).rejects.toThrow(/fully delivered/i)
   expect(dispatches).toBe(1)
   if (dispatchFailure === 'forbidden') {
     const refusedContext = z.object({ version: z.object({ context: z.string() }) }).parse(beforeRecovery).version.context
@@ -640,6 +839,7 @@ it.each([
     expect(initial).toMatchObject({ status: 'releasing', reason: 'release_dispatch_unconfirmed', release: sandboxTarget })
     expect(readFileSync(join(h.runtime.machine.stateDir, 'deployed-label-service.tgz'), 'utf8')).toBe(`${integration}-1`)
     expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toEqual([])
+    expect(await read('project/stage')).toEqual({ stage: 1 })
     await h.restart()
     await h.runtime.idle()
   }
@@ -690,6 +890,13 @@ it.each([
   expect(await read(`plan/${id}/delivery`)).toEqual(resource)
   expect(dispatches).toBe(dispatchFailure === 'forbidden' ? 2 : 1)
   expect(h.jsonRelays(h.runtime.masterId, 'plan-delivered')).toHaveLength(release === 'authorized' && !controlledRelease ? 0 : 1)
+  const stageTwo = release === 'not-authorized' || controlledRelease
+  expect(await read('project/stage')).toMatchObject(stageTwo ? { stage: 2, deliveredPlan: id } : { stage: 1 })
+  await h.runtime.pump()
+  expect(maintenanceCandidates()).toEqual([])
+  if (controlledRelease) await exerciseBoundMaintenance(mounted.project.id)
+  else if (release === 'not-authorized' && !pauseOnRefusal && !rerunDuringDownload && !rerunDuringFinalTargetRead)
+    await exerciseGithubAndHarnessMaintenance(mounted.project.id, id, worker)
 }, 180_000)
 async function interruptedByRestart(lifetime: AbortSignal): Promise<never> {
   if (!lifetime.aborted) {

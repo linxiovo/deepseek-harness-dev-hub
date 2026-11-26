@@ -9,7 +9,7 @@ import type { EngineOptions } from './part.ts'
 import { Assignments, type ReviewSubmission, type WorkerReport } from './assignments.ts'
 import type { DeliveryEvent, DeliveryRevision } from './delivery-check.ts'
 import { Evals, type Outcome } from './evals.ts'
-import { Intake, type ReceiveResult } from './intake.ts'
+import { Intake, type IntakeMode, type ReceiveResult } from './intake.ts'
 import { Replies, type Reply, type ReplyRequest, type TakeUp } from './replies.ts'
 import { Tickets } from './tickets.ts'
 
@@ -47,8 +47,17 @@ export class Engine {
    * ended one only a person's message, which resumes it at once unless processing is paused, and to none a person stopped),
    * and queue it for Eval on its primary Thread unless a ticket's worker decides it (see `followupOwners`).
    * Triggers that arrive while an Eval of that Thread runs wait together for the next one.
+   * Observation and context modes retain evidence without starting a new Eval; context reaches only existing active Tickets.
    */
-  receive(trigger: Trigger): ReceiveResult { return this.repo.atomic(() => this.intake.receive(trigger)) }
+  receive(trigger: Trigger, mode: IntakeMode = 'default'): ReceiveResult {
+    return this.repo.atomic(() => this.intake.receive(trigger, mode))
+  }
+
+  private assertRoutable(triggerId: string): void {
+    if (this.repo.triggers.disposition(triggerId)?.observationOnly) {
+      throw new UserError('notAdmissible', { reason: 'Read-only observation; use the maintenance intake for new work' })
+    }
+  }
   /**
    * A Source's request to make an open ticket follow one of its Threads, such as a pull request's, `own` when the ticket
    * opened it: the ticket subscribes to it, and a ready report ends it only once `followsDone` holds (see `Tickets.followsDone`).
@@ -100,7 +109,12 @@ export class Engine {
    * ticket's worker still decides the Trigger and the outcome is not a stop, or an inferred candidate is accepted outside `auto`
    * mode or without enabled matching rules.
    */
-  decide(triggerId: string, outcome: Outcome): Decision { return this.repo.atomic(() => this.evals.decide(triggerId, outcome)) }
+  decide(triggerId: string, outcome: Outcome): Decision {
+    return this.repo.atomic(() => {
+      this.assertRoutable(triggerId)
+      return this.evals.decide(triggerId, outcome)
+    })
+  }
   /** Create one authorized Plan Ticket with a stable identity; it has no Source Trigger or human acknowledgement. */
   createPlanTicket(planId: string, node: PlanNode, at = new Date().toISOString()): Ticket {
     const id = key('plan-ticket', planId, node.id)
@@ -146,6 +160,7 @@ export class Engine {
    */
   attach(ticketId: string, triggerId: string, note?: string): Ticket {
     return this.repo.atomic(() => {
+      this.assertRoutable(triggerId)
       // A message this ticket's worker handed back is not its work: attached here, no worker would decide it, and it could not be handed back again.
       const handedBack = this.repo.triggers.disposition(triggerId)?.handbacks?.some(item => item.ticketId === ticketId)
       if (handedBack) throw new UserError('handedBackHere')
@@ -180,7 +195,12 @@ export class Engine {
    * Queue a stored Trigger for a fresh Eval, such as a person's replay; returns false while an Eval holds it.
    * @throws UserError when the trigger is unknown.
    */
-  reevaluate(triggerId: string): boolean { return this.repo.atomic(() => this.evals.reevaluate(triggerId)) }
+  reevaluate(triggerId: string): boolean {
+    return this.repo.atomic(() => {
+      this.assertRoutable(triggerId)
+      return this.evals.reevaluate(triggerId)
+    })
+  }
   /**
    * A person dismisses the problem an unavailable Decision shows: the overview lists it no more.
    * @throws UserError for a Decision that is unknown or not unavailable.

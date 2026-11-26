@@ -6,6 +6,8 @@ The host enforces allowed lists, rules and Mandates. Messages, comments and quot
 
 ## Two paths for a Trigger
 
+The following paths describe ordinary intake. After a mounted project's first complete delivery, `009-handoff.md#stage-2-maintenance` governs new Source work. The only automatic Ticket delivery from Stage 2 intake is existing pull-request review and CI context; it neither adds a new request nor reopens or launches a Ticket.
+
 ### Eval: deciding whether to start work
 
 The Source records whether a message addresses the agent: `mention` for a mention of the bot or agent account, and `direct` for a direct message. The gate checks the sender and the Source's Policy:

@@ -9,12 +9,14 @@ import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
 import type { Handoffs } from '../handoffs.ts'
 import { InstallationError } from '../installation-api.ts'
-import { PlanTargetSchema, type Plans } from '../plans.ts'
+import { PlanDraftSchema, PlanTargetSchema, type Plans } from '../plans.ts'
 import type { PlanDispatcher } from '../plan-dispatch.ts'
 import { replanTechnical, TechnicalReplanSchema } from '../plan-replan.ts'
 import type { PlanRequirements } from '../plan-requirements.ts'
 import { PlanControlCommandSchema, type PlanControl } from '../plan-control.ts'
 import type { MainlineQueue } from '../mainline-queue.ts'
+import type { Maintenance } from '../maintenance.ts'
+import { AdmissionDirectionSchema, RuleAssessmentSchema } from '../../policy.ts'
 import type { ProjectMeter } from '../project-meter.ts'
 import { ticketCard } from '../cards.ts'
 import { planQuestionRelay } from '../notices.ts'
@@ -26,6 +28,7 @@ import type { Settings } from '../settings.ts'
 import { promptFile } from '../skill-files.ts'
 import type { Store } from '../store.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
+import { SpecInputSchema } from './planner.ts'
 
 const RoutingNoteSchema = z.string().trim()
   .refine(text => wordCount(text) <= NOTE_WORDS, `Routing note must not exceed ${NOTE_WORDS} words (Chinese uses word segmentation). Shorten it; do not split it across deliveries.`)
@@ -66,6 +69,15 @@ const PlanAnswerSchema = z.object({
   question_id: z.string().min(1).refine(id => !!id.trim()),
   answer: z.string().min(1).refine(text => !!text.trim(), 'Answer cannot be blank'),
 }).strict()
+const MaintenanceText = z.string().trim().min(1).max(1500)
+const maintenanceEvidence = { intentEvidence: MaintenanceText, ruleAssessments: z.array(RuleAssessmentSchema) }
+const MaintenanceVerdictSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('ignore'), reason: MaintenanceText }),
+  z.strictObject({ kind: z.literal('checked'), reason: MaintenanceText, ...maintenanceEvidence }),
+  z.strictObject({ kind: z.literal('existing'), ticketId: z.string().min(1).max(200), ...maintenanceEvidence }),
+  z.strictObject({ kind: z.literal('plan'), scope: MaintenanceText, direction: AdmissionDirectionSchema,
+    ...maintenanceEvidence, spec: SpecInputSchema, draft: PlanDraftSchema }),
+])
 const handoffErrors = z.object({
   latestConfirmation: z.string().min(1),
   latestAnswer: z.string().min(1),
@@ -122,6 +134,7 @@ export interface MainToolsHost {
   readonly runLimits: Pick<RunLimits, 'forDispatch' | 'view'>
   readonly attention: Pick<ScopedAttention, 'summary' | 'forTicket'>
   readonly planIntegration?: MainResourceHost['planIntegration']
+  readonly maintenance?: Maintenance
   readonly handoffs: Pick<Handoffs, 'confirm' | 'answer' | 'get' | 'spec'>
   readonly plans: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'testHistory' | 'view' | 'node' | 'append' | 'at' | 'revision' | 'current' | 'state' | 'requiredDelivery' | 'revise'>
   readonly stagnation: MainResourceHost['stagnation']
@@ -262,10 +275,28 @@ function routeTool(host: MainToolsHost): Tool {
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings,
     handoffs: host.handoffs, plans: host.plans, projectMeter: host.projectMeter, runLimits: host.runLimits, attention: host.attention,
-    planIntegration: host.planIntegration, stagnation: host.stagnation, requirements: host.requirements, planControl: host.planControl }
+    planIntegration: host.planIntegration, maintenance: host.maintenance, stagnation: host.stagnation,
+    requirements: host.requirements, planControl: host.planControl }
+  const maintenance = host.maintenance
   return [
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
+    ...maintenance ? [tool({
+      name: 'orchestrator_maintenance', description: promptFile('maintenance-tool'),
+      schema: z.strictObject({ event_id: z.string().regex(/^[0-9a-f]{32}$/).optional(), verdict: MaintenanceVerdictSchema }),
+      execute: async ({ event_id, verdict }, signal) => {
+        if (agent.id !== host.resources.masterId) throw new Error('Only the current Hub may decide maintenance events')
+        host.assertNewWork?.()
+        const input = event_id ?? latestOperatorMessage(agent, true)
+        if (verdict.kind === 'plan') await host.verifyProjectBinding?.()
+        signal.throwIfAborted()
+        host.assertNewWork?.()
+        if (typeof input !== 'string' && input.messageId !== latestOperatorMessage(agent, true).messageId) {
+          throw new Error('The direct Harness message changed during maintenance admission')
+        }
+        return maintenance.decide(input, agent.id, verdict)
+      },
+    })] : [],
     tool({
       name: 'orchestrator_handoff_confirm',
       description: 'Direct Hub approval only; release requires the exact environment, target and scope in that confirmation.',
@@ -535,6 +566,9 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       }).strict()
         .refine(args => (args.block === 'source') === (args.source !== undefined), 'source names the Source instance, with block source only'),
       execute: async args => {
+        if (host.planIntegration?.stage().stage === 2) {
+          throw new Error('Only the operator can change Stage 2 settings in management settings')
+        }
         if (args.block === 'pause') return host.settings.pause(z.object({ paused: z.boolean() }).parse(args.value).paused, 'tool')
         // Strip context_delivery since the main Session initiated the save itself.
         const { context_delivery: _delivery, ...saved } = await host.settings.save(args.block === 'source' ? `source:${args.source!}` : args.block,
@@ -547,6 +581,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       description: 'Refresh one Source\'s part of the Policy from where that Source keeps it, such as the Feishu users of its sync chat. Same operation as the Web button.',
       schema: z.object({ source: z.string() }).strict(),
       execute: async args => {
+        if (host.planIntegration?.stage().stage === 2) throw new Error('Sync Source authorization in management settings')
         const before = host.store.settings().policy.sources[args.source]?.allowed ?? []
         const after = (await host.settings.sync(args.source)).allowed
         const names = (from: typeof after, without: typeof after) => from.filter(item => !without.some(other => other.id === item.id))

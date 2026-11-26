@@ -416,6 +416,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/effects.ts` | Effects |
 | `src/app/handoffs.ts` | `Handoffs`: the durable project and handoff records, their single question, answer and immutable specification |
 | `src/app/topic-binding.ts` | Binds one observed Feishu destination to the selected project and accepts correlated answers from explicitly authorized senders; see `009-handoff.md` |
+| `src/app/maintenance.ts` | `Maintenance`: Stage 2 event intake, rule-based registration, recovery relays and durable feedback associations; see `009-handoff.md#stage-2-maintenance` |
 | `src/app/planning.ts` | `Planning`: durable `planning` and `splitting` effects for the specification planner and the Plan DAG splitter |
 | `src/app/plans.ts` | `Plans`: validates and publishes immutable Plan revisions, retains old node definitions and claims, and gates Frontier and delivery |
 | `src/app/plan-dispatch.ts` | `PlanDispatcher`: validates Frontier predecessors, reserves a launch slot, atomically claims a node into a stable Ticket/Assignment, and rearms the same claim on restart |
@@ -567,7 +568,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
 | `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |
 | `tests/plan-integration-crash.spec.ts` | SIGKILL after GitHub accepts workflow dispatch but before the effect records a result; SQLite recovery observes the existing run without another dispatch |
-| `tests/mainline-queue.spec.ts` | Queue admission, versioned CI, same-target serialization, conflicts, formal closure and Frontier; Plan regression, artifact delivery and a local subprocess release that changes an isolated target before its lost response is reconciled |
+| `tests/mainline-queue.spec.ts` | Queue admission, CI, conflicts, formal closure and Frontier; artifact and controlled release delivery; Stage 2 through Harness, GitHub and bound Feishu events |
 | `tests/plan-artifacts.spec.ts` | Exact workflow attempt/profile binding, safe filenames and media types, package SHA-256, strict archive contents, restart staging cleanup and retained-file tamper rejection |
 | `tests/plan-release.spec.ts` | Public PlanIntegration effect seam: no release without exact authorization, credentials or target match; exact artifact verification, controlled credential relay and lost-response restart reconciliation |
 | `tests/panel-execution.spec.tsx` | Ticket delivery status in Harness, release-verification hold and project-scoped artifact download |

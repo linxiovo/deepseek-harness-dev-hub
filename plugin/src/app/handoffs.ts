@@ -1,7 +1,7 @@
 import { realpathSync, statSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { key } from '../core/ids.ts'
-import type { Handoff, HandoffInput, HandoffQuestion, ProjectRef, Spec, SpecInput } from '../core/handoff.ts'
+import type { Handoff, HandoffInput, HandoffQuestion, MaintenanceOrigin, ProjectRef, Spec, SpecInput } from '../core/handoff.ts'
 import { PLAN_FEATURE_KINDS } from '../core/plan.ts'
 import { KV } from '../kv.ts'
 import type { Effects } from './effects.ts'
@@ -153,23 +153,24 @@ export class Handoffs {
     })
   }
 
+  /** Persist rule-authorized maintenance without claiming a human confirmation, changing the current brief, or sending IM. */
+  recordMaintenance(maintenance: MaintenanceOrigin, scope: string, constraints: string[], input: SpecInput): Spec {
+    const project = this.binding
+    if (!project) throw new Error('Maintenance requires a registered project')
+    return this.store.atomic(() => {
+      const id = key('maintenance-plan', project.id, maintenance.eventId)
+      if (this.get(id)) throw new Error(`Maintenance brief ${id} already exists`)
+      return this.saveSpec({ id, project, goal: scope, constraints, acceptanceScope: input.acceptance.map(item => item.statement),
+        authorization: { scope, release: 'not-authorized' }, maintenance, status: 'specified' }, input).spec
+    })
+  }
+
   /** Publish a complete immutable three-block specification exactly once. */
   publish(id: string, input: SpecInput): Handoff {
     return this.store.atomic(() => {
       const handoff = this.require(id)
       if (handoff.status !== 'planning') throw new Error(`Handoff ${id} is not planning`)
-      if (!input.body.trim() || input.acceptance.length === 0 || input.acceptance.some(item => !item.statement.trim() || !item.observable.trim() ||
-          !PLAN_FEATURE_KINDS.includes(item.delivery)) ||
-          input.testInterfaces.length === 0 || input.testInterfaces.some(item => !item.seam.trim() || !item.note.trim() ||
-            (item.kind !== 'existing' && item.kind !== 'proposed')) ||
-          input.outOfScope.some(item => !item.trim())) {
-        throw new Error('A specification requires complete body, acceptance, and test-interface blocks')
-      }
-      const spec: Spec = { id: key(id, 'spec', '1'), handoffId: id, revision: 1, body: input.body, acceptance: input.acceptance.map(item => ({ ...item })),
-        testInterfaces: input.testInterfaces.map(item => ({ ...item })), outOfScope: [...input.outOfScope] }
-      const specified: Handoff = { ...handoff, status: 'specified', spec }
-      this.store.set(KV.handoffs.spec(id), spec)
-      this.store.set(KV.handoffs.record(id), specified)
+      const specified = this.saveSpec(handoff, input), { spec } = specified
       this.effects.enqueue('relay', `handoff:${id}:spec`, {
         text: this.relay(handoff, 'published specification', `Goal: ${handoff.goal}`, `spec/${id} (revision ${spec.revision})`),
       })
@@ -177,6 +178,22 @@ export class Handoffs {
       this.changed?.(specified)
       return specified
     })
+  }
+
+  private saveSpec(handoff: Handoff, input: SpecInput): Handoff & { spec: Spec } {
+    if (!input.body.trim() || input.acceptance.length === 0 || input.acceptance.some(item => !item.statement.trim() || !item.observable.trim() ||
+        !PLAN_FEATURE_KINDS.includes(item.delivery)) ||
+        input.testInterfaces.length === 0 || input.testInterfaces.some(item => !item.seam.trim() || !item.note.trim() ||
+          (item.kind !== 'existing' && item.kind !== 'proposed')) || input.outOfScope.some(item => !item.trim())) {
+      throw new Error('A specification requires complete body, acceptance, and test-interface blocks')
+    }
+    const { id } = handoff
+    const spec: Spec = { id: key(id, 'spec', '1'), handoffId: id, revision: 1, body: input.body, acceptance: input.acceptance.map(item => ({ ...item })),
+      testInterfaces: input.testInterfaces.map(item => ({ ...item })), outOfScope: [...input.outOfScope] }
+    const specified = { ...handoff, status: 'specified' as const, spec }
+    this.store.set(KV.handoffs.spec(id), spec)
+    this.store.set(KV.handoffs.record(id), specified)
+    return specified
   }
 
   spec(id: string): Spec | undefined { return this.store.get(KV.handoffs.spec(id)) }

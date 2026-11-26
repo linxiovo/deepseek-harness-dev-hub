@@ -44,6 +44,8 @@ export interface Trigger {
 export interface TriggerDisposition {
   /** Rejected by the source scope filter before entering the domain, for the Source's reason. */
   filtered?: Reason
+  /** Retained for inspection, not eligible for the legacy routing, follow-up or requeue paths. */
+  observationOnly?: true
   evalId?: string
   decisionId?: string
   /**

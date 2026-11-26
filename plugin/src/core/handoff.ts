@@ -1,4 +1,5 @@
 import type { PLAN_FEATURE_KINDS } from './plan.ts'
+import type { ActorRef } from './model.ts'
 
 export interface ProjectRef { id: string; repository: string; workspace: string }
 export interface ReleaseTarget { environment: string; target: string; scope: string }
@@ -38,15 +39,29 @@ export interface Spec extends Omit<SpecInput, 'acceptance'> {
   revision: 1
   acceptance: (Omit<SpecAcceptance, 'delivery'> & Partial<Pick<SpecAcceptance, 'delivery'>>)[]
 }
-export interface Handoff {
+export interface MaintenanceOrigin {
+  eventId: string
+  actor: ActorRef
+  hubSessionId: string
+  policyVersion: string
+  rules: string[]
+  intentEvidence: string
+}
+
+export type Handoff = {
   id: string
   project: ProjectRef
   goal: string
   constraints: string[]
   acceptanceScope: string[]
   authorization: { scope: string; release: 'not-authorized' } | { scope: string; release: 'authorized'; releaseTarget?: ReleaseTarget }
-  confirmedBy: HandoffInput['confirmedBy']
   status: 'confirmed' | 'planning' | 'awaiting' | 'specified'
   question?: HandoffQuestion
   spec?: Spec
-}
+} & ({ confirmedBy: HandoffInput['confirmedBy']; maintenance?: never } | {
+  confirmedBy?: never; maintenance: MaintenanceOrigin
+  authorization: { scope: string; release: 'not-authorized' }
+})
+
+export const handoffHubSession = (handoff: Handoff): string =>
+  handoff.confirmedBy ? handoff.confirmedBy.sessionId : handoff.maintenance.hubSessionId

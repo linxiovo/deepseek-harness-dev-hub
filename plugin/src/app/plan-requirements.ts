@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 import { UserError } from '../core/errors.ts'
-import type { Handoff, Spec } from '../core/handoff.ts'
+import { handoffHubSession, type Handoff, type Spec } from '../core/handoff.ts'
 import { key } from '../core/ids.ts'
 import type { Ticket } from '../core/model.ts'
 import type { Plan, PlanMessage, PlanNode, PlanNodeState } from '../core/plan.ts'
@@ -390,15 +390,15 @@ export class PlanRequirements {
     const active = plans.current(preview.planId)
     if (!active || active.revision !== preview.expectedRevision || active.plan.handoffId !== preview.handoffId) return undefined
     const handoff = handoffs.get(preview.handoffId)
-    if (handoff?.status !== 'specified' || !this.sameHub(handoff.confirmedBy.sessionId, preview.ownerSession) || !handoff.spec ||
+    if (handoff?.status !== 'specified' || !this.sameHub(handoffHubSession(handoff), preview.ownerSession) || !handoff.spec ||
         !plans.requiredDelivery(preview.planId)?.waitingFor.length) return undefined
     return handoff
   }
 
   private requireOwner(handoffId: string, sessionId: string): Handoff {
     const handoff = this.host.handoffs.get(handoffId)
-    if (!this.host.isCurrentHub(sessionId) || !handoff || handoff.status !== 'specified' || !this.sameHub(handoff.confirmedBy.sessionId, sessionId)) {
-      refuse('Only the current Hub Session that confirmed the original Handoff can change its product requirements')
+    if (!this.host.isCurrentHub(sessionId) || !handoff || handoff.status !== 'specified' || !this.sameHub(handoffHubSession(handoff), sessionId)) {
+      refuse('Only the current Hub Session of the original project can change its product requirements')
     }
     return handoff
   }

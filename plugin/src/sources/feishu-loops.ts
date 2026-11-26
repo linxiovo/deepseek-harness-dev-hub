@@ -259,7 +259,7 @@ async function boundTopicLoop(ctx: SourceContext, signal: AbortSignal): Promise<
   }
 }
 
-/** The fetched messages are pinned to this epoch; they can never be rerouted to a Ticket. */
+/** Exact-topic fetches stay pinned to their epoch and never become ordinary Ticket follow-ups. */
 export async function pollBoundTopic(ctx: Pick<SourceContext, 'commands' | 'deployment' | 'feishuTopic'>, topic: FeishuTopic,
   signal: AbortSignal, since = topic.since, until = new Date().toISOString()): Promise<boolean> {
   const connection = ctx.feishuTopic
@@ -284,7 +284,8 @@ export async function pollBoundTopic(ctx: Pick<SourceContext, 'commands' | 'depl
   // Keep the initial cursor while the group root has no thread, so the first reply cannot be lost.
   const tally = { skipped: 0 }
   if (!topic.direct && !threadId) return false
-  const from = Date.parse(since), to = Date.parse(until)
+  const neededSince = connection.maintenanceSince?.(topic)
+  const from = Date.parse(neededSince !== undefined && neededSince < since ? neededSince : since), to = Date.parse(until)
   const pages = new Set<string>()
   // Chats stream oldest-first. For threads, scan newest-first to stop at the cursor, but decide answers in creation order.
   const backlog: Trigger[] | undefined = threadId ? [] : undefined
@@ -302,16 +303,17 @@ export async function pollBoundTopic(ctx: Pick<SourceContext, 'commands' | 'depl
       if (!active()) return false
       if (message.chat_id !== topic.chatId || (threadId && ((message.thread_id && message.thread_id !== threadId)
         || (message.root_id && message.root_id !== rootId)))) throw new Error('Feishu returned a message outside the bound conversation')
-      if (message.deleted || message.message_id === rootId) continue
+      if (message.deleted) { connection.resolvedMaintenance?.(topic, message.message_id); continue }
+      if (message.message_id === rootId) continue
       const at = Date.parse(feishuTime(message.create_time))
       if (at < from) { older = true; continue }
       if (at > to) continue
       // The exact thread endpoint may omit the root on replies. It is safe to supply the verified ID here only.
-      const event = historyEvent(rootId ? { ...message, root_id: rootId } : message, topic.chatId, topic.direct)
-      const trigger = feishuTrigger(event, botId, appId)
-      if (trigger) {
-        if (backlog) backlog.push(trigger)
-        else await connection.receive(trigger, topic.epoch)
+      const trigger = feishuTrigger(historyEvent(rootId ? { ...message, root_id: rootId } : message, topic.chatId, topic.direct), botId, appId)
+      if (trigger && backlog) backlog.push(trigger)
+      else {
+        if (trigger) await connection.receive(trigger, topic.epoch)
+        if (active() && (!trigger || message.msg_type !== undefined)) connection.resolvedMaintenance?.(topic, message.message_id)
       }
     }
     if (threadId && older) break
@@ -321,7 +323,10 @@ export async function pollBoundTopic(ctx: Pick<SourceContext, 'commands' | 'depl
   } while (page)
   while (backlog?.length) {
     if (!active()) return false
-    await connection.receive(backlog.pop()!, topic.epoch)
+    const trigger = backlog.pop()!
+    await connection.receive(trigger, topic.epoch)
+    if (active() && trigger.meta.messageType !== undefined && typeof trigger.meta.messageId === 'string')
+      connection.resolvedMaintenance?.(topic, trigger.meta.messageId)
   }
   connection.report(tally.skipped ? { state: 'error', detail: `${tally.skipped} unreadable bound-topic messages skipped` }
     : { state: 'ready', detail: 'Bound Feishu conversation recovered', at: new Date().toISOString() })

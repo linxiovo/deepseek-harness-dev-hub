@@ -9,8 +9,9 @@ export const githubChannel = (number: number, url?: string): ChannelRef =>
   ({ source: SOURCE, thread: `github:${number}`, address: { number: String(number), ...(url ? { url } : {}) } })
 export const githubPage = (repository: string, number: number, pr = false): string =>
   `https://github.com/${repository}/${pr ? 'pull' : 'issues'}/${number}`
+export interface GithubAddress { number: number; pr: boolean; discussion?: number }
 /** Parses a web or API URL for an Issue, PR, or review comment in `repository`; returns undefined for other URLs or repositories. */
-export function githubAddress(url: string, repository: string): { number: number; pr: boolean; discussion?: number } | undefined {
+export function githubAddress(url: string, repository: string): GithubAddress | undefined {
   const address = /^https:\/\/(?:api\.github\.com\/repos|github\.com)\/([^/]+\/[^/]+)\/(issues|pulls?)\/(\d+)\/?(?:#discussion_r(\d+)|#[\w-]*)?$/i
   const match = address.exec(url)
   if (!match || !sameName(match[1]!, repository)) return undefined
@@ -72,6 +73,7 @@ export function commentTrigger(comment: GithubComment, ref: PullRef, kind: 'conv
     channel: githubChannel(ref.number, comment.html_url ?? undefined),
     ...(comment.html_url ?? ref.url ? { url: comment.html_url ?? ref.url } : {}),
     meta: { number: ref.number, isPr: ref.isPr, ...(ref.prAuthor ? { prAuthor: ref.prAuthor } : {}), commentId: comment.id, kind,
+      ...(comment.created_at ? { createdAt: comment.created_at } : {}),
       ...comment.path ? { path: comment.path, line: comment.line ?? comment.original_line ?? null } : {},
       ...comment.in_reply_to_id ? { inReplyTo: comment.in_reply_to_id } : {} } }
 }

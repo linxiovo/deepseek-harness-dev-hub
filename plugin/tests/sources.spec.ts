@@ -211,7 +211,7 @@ describe('feishu source', () => {
     })
     await pollFeishuThreads(h)
     const live = feishuTrigger({ message_id: 'om_reply', chat_id: 'oc_dm', chat_type: 'p2p', sender_id: MEMBER, sender_type: 'user',
-      content: 'and the header',
+      content: 'and the header', message_type: 'text',
       create_time: String(Date.parse('2026-09-11 12:00')), root_id: 'om_root', thread_id: 'omt_dm' }, 'ou_bot', 'cli_bot')
     expect(h.receive.mock.calls.map(([trigger]) => trigger)).toEqual([live])
     expect(live).toMatchObject({ addressed: 'direct', threads: [{ source: 'feishu', id: 'oc_dm:om_root' }] })

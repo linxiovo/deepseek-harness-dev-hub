@@ -47,13 +47,13 @@ const TECHNICAL_QUESTIONS = [
 const ProductQuestionSchema = z.string().trim().min(1)
   .refine(text => !TECHNICAL_QUESTIONS.some(pattern => pattern.test(text)), 'Ask only about product behavior or acceptance, not API protocols, technical boundaries, testing tools, or file organization')
   .describe('One unanswered product behavior or acceptance decision for the user; never ask them to choose API protocols, files, modules, architecture, test frameworks, assertion libraries, or other implementation details.')
-const SpecInputSchema = z.object({
-  body: z.string().trim().min(1).describe('One implementable product specification for this handoff’s confirmed goal, not a bundle of unrelated intents.'),
+export const SpecInputSchema = z.object({
+  body: z.string().trim().min(1).describe('One implementable product specification for the authorized goal, not a bundle of unrelated intents.'),
   acceptance: z.array(z.object({ statement: z.string().trim().min(1), observable: z.string().trim().min(1),
     delivery: z.enum(PLAN_FEATURE_KINDS) }).strict()).min(1)
     .describe('Observable acceptance criteria, each classified by the implementation roles it requires: backend, frontend, or cross-end (both).'),
   testInterfaces: z.array(z.object({ seam: z.string().trim().min(1), kind: z.enum(['existing', 'proposed']),
-    note: z.string().trim().min(1) }).strict()).min(1).describe('At least one existing or proposed public test interface for the confirmed product intent.'),
+    note: z.string().trim().min(1) }).strict()).min(1).describe('At least one existing or proposed public test interface for the authorized product intent.'),
   outOfScope: z.array(z.string().trim().min(1)).describe('Explicit exclusions, not additional product goals.'),
 }).strict()
 

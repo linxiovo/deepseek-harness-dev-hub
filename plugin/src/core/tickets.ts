@@ -423,7 +423,7 @@ export class Tickets extends EnginePart {
    * Add an Input once (idempotently) and ask the Executor to deliver it, or to launch again a pending Assignment whose launch
    * failed once no person is waited for: a Policy change alone does not launch it again.
    */
-  addInput(ticket: Ticket, input: TicketInput): void {
+  addInput(ticket: Ticket, input: TicketInput, startPending = true): void {
     if (ticket.inputs.some(existing => existing.id === input.id)) return
     ticket.inputs.push(input); ticket.updatedAt = this.now()
     // Hold back automated inputs while the worker is waiting on a person.
@@ -434,7 +434,7 @@ export class Tickets extends EnginePart {
     if (!liveTicket(ticket) || held || this.options.credentialBlocked?.(ticket.id)) return
     const running = runningAssignment(ticket), latest = latestAssignment(ticket)
     if (running) this.options.executor.deliver(ticket, running)
-    else if (latest?.state === 'pending' && !waitsForPerson(ticket)) this.options.executor.start(ticket, latest)
+    else if (startPending && latest?.state === 'pending' && !waitsForPerson(ticket)) this.options.executor.start(ticket, latest)
   }
   /**
    * Resume an ended ticket under its unchanged Mandate when a person's message on one of its Threads waits for it: no Eval

@@ -129,7 +129,8 @@ export function hubResumeText({ store, handoffs, plans: planReader, effects, pro
     plans: plannedHandoffs.length > plans.length, pending_events: pendingEventCount > pendingEvents.length, actions: actionCount > actionRows.length,
     pending_effects: effects.count() > pendingEffects.length, text: textTruncated, handoff_lists: handoffListsTruncated }
   const result = { hub_id: hubId, epoch, project: projectView, tickets: ticketRows, handoffs: activeHandoffs, plans,
-    pending_events: pendingEvents, actions: actionRows, pending_effects: pendingEffects, counts, truncated }
+    pending_events: pendingEvents, actions: actionRows, pending_effects: pendingEffects,
+    ...store.get(KV.plans.maintenanceStarted) ? { maintenance: 'maintenance' } : {}, counts, truncated }
   const maxJson = Math.max(0, LIMIT - prompt.length - 1)
   let json = JSON.stringify(result)
   while (json.length > maxJson) {

@@ -49,9 +49,12 @@ export interface SourceContext {
   config<C extends Record<string, unknown>>(kind: string): C | undefined
   /** Ingests a trigger into the Engine and schedules the next evaluation pass; callers should await completion before advancing read cursors. */
   receive(trigger: Trigger): ReceiveResult | Promise<ReceiveResult>
-  /** Independent of generic chat subscriptions. A fetch pinned to an epoch must never fall through to Engine intake. */
+  /** Exact-epoch ingress for handoff protocol and authorized maintenance, never ordinary Ticket follow-up. */
   feishuTopic?: {
     target(): FeishuTopic | undefined
+    /** Unresolved native messages pin the history read to their earliest arrival, independent of its ordinary cursor. */
+    maintenanceSince?(topic: FeishuTopic): string | undefined
+    resolvedMaintenance?(topic: FeishuTopic, messageId: string): void
     /** Historical protocol messages belong to the ordered binding poll, not a subscribed Ticket's paged reader. */
     claims(trigger: Trigger): boolean
     receive(trigger: Trigger, epoch: string): Promise<ReceiveResult>

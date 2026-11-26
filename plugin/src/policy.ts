@@ -32,6 +32,16 @@ export interface Assessment {
   decision: 'accept' | 'ignore' | 'unavailable'; rule_assessments: RuleAssessment[]; direction: unknown
   title: string; scope: string; reason: string; intent_evidence?: string | null; acknowledgement?: string | null; worktree_name?: string
 }
+/** Verify full rule coverage before using the matched rules for any verdict. */
+export function matchedRules(judged: RuleAssessment[], rules: readonly Rule[]): RuleMatch[] {
+  const enabled = rules.filter(rule => rule.enabled)
+  const ids = new Set(judged.map(item => item.rule_id))
+  if (judged.length !== enabled.length || ids.size !== judged.length || enabled.some(rule => !ids.has(rule.id))) {
+    throw new Error('Exactly one assessment for every enabled rule is required; disabled, unknown or missing rule IDs are not allowed')
+  }
+  return judged.filter(item => item.matched).map(({ rule_id, reason }) => ({ rule_id, reason }))
+}
+
 /**
  * Validate an assessment against enabled rules and convert it into an engine `AssessmentOutcome`.
  * Acceptance requires a settled direction, at least one matched enabled rule, and `intent_evidence`, and accepts an
@@ -39,13 +49,7 @@ export interface Assessment {
  * @throws when `rule_assessments` does not cover every enabled rule exactly once, or an accept omits `intent_evidence`.
  */
 export function assessmentOutcome(assessment: Assessment, settings: Pick<Settings, 'policy' | 'eval'>, strength: Strength): AssessmentOutcome {
-  const enabled = settings.policy.rules.filter(rule => rule.enabled)
-  const judged = assessment.rule_assessments
-  const ids = new Set(judged.map(item => item.rule_id))
-  if (judged.length !== enabled.length || ids.size !== judged.length || enabled.some(rule => !ids.has(rule.id))) {
-    throw new Error('Exactly one assessment for every enabled rule is required; disabled, unknown or missing rule IDs are not allowed')
-  }
-  const matches = judged.filter(item => item.matched).map(({ rule_id, reason }) => ({ rule_id, reason }))
+  const judged = assessment.rule_assessments, matches = matchedRules(judged, settings.policy.rules)
   const evidence = assessment.intent_evidence ? { intent_evidence: assessment.intent_evidence } : {}
   const audit = { matches, rule_assessments: judged, direction: assessment.direction, ...evidence }
   if (assessment.decision !== 'accept') return { kind: assessment.decision, reason: assessment.reason, audit }

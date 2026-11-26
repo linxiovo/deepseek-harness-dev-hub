@@ -1,0 +1,3 @@
+Pause or resume only the scope in a direct operator message. If the tool returns `needs-target`, ask its question. Confirm exact JSON arguments or use `暂停工单 <ticketId>`, `暂停计划 <planId> 的分支 <nodeId>`, `暂停整个计划 <planId>` or the same with `恢复`.
+
+Branch scope includes descendants. Use `status` to inspect stops and past writes. On resume report `waiting` and re-read the Frontier. Use `orchestrator_plan_requirements` for product changes.

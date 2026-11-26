@@ -9,6 +9,7 @@ import { KV } from '../kv.ts'
 import type { Plans } from './plans.ts'
 import type { PlanStagnation } from './plan-stagnation.ts'
 import type { RunLimits } from './run-limits.ts'
+import type { PlanControl } from './plan-control.ts'
 import type { Store } from './store.ts'
 
 const id = z.string().min(1).max(200)
@@ -29,10 +30,11 @@ interface ReplanHost {
   engine: Pick<Engine, 'supersedePlanTicket'>
   stagnation: Pick<PlanStagnation, 'view'>
   runLimits: Pick<RunLimits, 'forDispatch'>
+  planControl: Pick<PlanControl, 'dispatchBlocked'>
 }
 
 /** Validate the actual failure and applicable scope before publishing one new graph version. */
-export function replanTechnical({ store, plans, stagnation, engine, runLimits }: ReplanHost, input: TechnicalReplan) {
+export function replanTechnical({ store, plans, stagnation, engine, runLimits, planControl }: ReplanHost, input: TechnicalReplan) {
   const { planId, nodeId: stalled, revision, failureId, reason, change } = input
   const repair = change.kind === 'repair'
   return store.atomic(() => {
@@ -75,6 +77,10 @@ export function replanTechnical({ store, plans, stagnation, engine, runLimits }:
     const scope: string[] = []
     for (const node of current.plan.nodes) {
       if (isDeepStrictEqual(node, next.get(node.id))) continue
+      // Repair only redirects surviving edges from the failed node to its replacement.
+      if (planControl.dispatchBlocked(current.plan, node.id) && !(repair && next.has(node.id))) {
+        throw new UserError('invalidPlan', { detail: `Cannot replan paused node "${node.id}"` })
+      }
       const { block } = runLimits.forDispatch(key('plan-ticket', planId, node.id), { planId, nodeId: node.id, role: node.role })
       if (block) throw new UserError('invalidPlan', { detail: `Cannot replan node "${node.id}": ${block.scope} budget: ${block.state}` })
       scope.push(node.id)

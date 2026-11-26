@@ -32,6 +32,8 @@ export interface EffectPayloads {
   mainlineDelivery: { ticketId: string }
   /** Verify the actual integrated commit and its artifact once every required Ticket closes; the key is the Plan ID. */
   planIntegration: Record<string, never>
+  /** Resume a paused Ticket only after its Worker drains and current prerequisites pass; key is the Ticket ID. */
+  planControlResume: Record<string, never>
   /** Steer a report or a candidate into the main Session; the key is the request ID. */
   relay: { text: string }
   /** Move a retired Hub's saved pending input; the key is the originating physical Session. */

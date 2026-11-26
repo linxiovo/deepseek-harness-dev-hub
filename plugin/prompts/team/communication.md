@@ -17,7 +17,7 @@ The host sends the acknowledgement an accept carries, and a worker's take-up is 
 For an IM-origin ticket, send the ready outcome and actual PR link in the original thread without waiting for merge.
 Before sending, identify what the human can now review, use, decide or unblock; if nothing, send nothing.
 Ready example: [PR #123](<actual link>) is ready for review.
-Pending checks with no human action: send nothing.
+When nobody needs to act on a pending check, send nothing.
 
 Human attention is limited.
 Respond to each new human request, not each new ticket.

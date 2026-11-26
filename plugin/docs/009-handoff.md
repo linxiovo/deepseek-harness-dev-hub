@@ -124,6 +124,24 @@ Budget admission can also pause or defer dispatch without issuing a formal deliv
 
 An active Plan can publish a revised graph and acceptance view without overwriting its original registration; see `018-plan-replanning.md`. Only the current graph contributes required work and Frontier nodes. A superseded claim and its evidence stay readable.
 
+## Pause and resume execution
+
+The confirming project's current Hub accepts an explicit direct Harness operator message. A Ticket hold pauses the named claim and blocks the first Assignment message for any descendant that has yet to start. A branch hold also pauses descendants that have already started. A whole-Plan hold covers all nodes. Descendants still require formal predecessor delivery. Independent nodes remain eligible.
+
+| Scope | Example pause command | Example resume command |
+| --- | --- | --- |
+| Ticket | `暂停工单 <ticketId>` | `恢复工单 <ticketId>` |
+| Branch | `暂停计划 <planId> 的分支 <nodeId>` | `恢复计划 <planId> 的分支 <nodeId>` |
+| Plan | `暂停整个计划 <planId>` | `恢复整个计划 <planId>` |
+
+An ambiguous direct command returns `needs-target` without creating a hold or a receipt. The Hub asks for the exact scope using the examples above or the JSON `orchestrator_plan_control` arguments. A direct event authorizes one exact command. Holds survive restart, overlap independently and carry over to replacement nodes in a requirement revision. See `018-plan-replanning.md`.
+
+Read `plan/<id>/control` or call `orchestrator_plan_control` with `{action: 'status', planId}`. `stop-requested` means an in-flight action still needs confirmation, `stopped` means the action was prevented or the Worker drained, and `already-happened` identifies a completed dispatch, observed Git write or actual deployment. Deployment remains visible after pause. Clear the same named hold to resume. The runtime checks the remaining scope, credentials, predecessors and run limits before rearming the same Assignment. Read the Plan Frontier for newly eligible dispatches and `plan/<id>/delivery` for release prerequisites. The simulated Harness scenarios are in `tests/plans.spec.ts`.
+
+A failed Worker drain keeps its writer fenced. The durable resume task retries the drain against the current Worker and its descendants. Repeating the exact resume command can rearm a pending retry without clearing another hold.
+
+The read resource pages `actions` with `offset`, `limit` and `next_offset`. Keep the returned Plan ID and operation IDs when reporting a stop.
+
 ## Optional Feishu entry
 
 A selected, registered project can use one Feishu private chat or group topic as a second entrance. This does not create a second Hub or change a Worker's tools. Harness confirmation, questions, and specification reads do not require a binding.

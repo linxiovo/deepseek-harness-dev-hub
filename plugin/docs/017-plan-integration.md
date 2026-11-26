@@ -52,6 +52,8 @@ Before each `publish`, the host rechecks the local package, current target commi
 
 The host records release intent before calling the adapter and serializes releases to each project/environment/target. `release-failed` means the adapter proved publication did not occur: the panel says 已合入，未上线. `released-unverified` records an actual deployment but not a matching successful environment verification; it is not complete and is never reported as rolled back. Only `released` closes the Plan delivery state and emits the final relay with artifact, deployment and verification evidence.
 
+An active [Plan control](009-handoff.md#pause-and-resume-execution) holds new publication of the combined Plan artifact. The release adapter still reconciles an admitted request. An exact `not-started` observation allows parking that same request and releasing its lock. A missing or mismatched observation keeps the outcome unresolved, and a matching deployment remains recorded. Resuming the Plan first rechecks release authorization, prerequisites and the target lock.
+
 ## Durable verification
 
 

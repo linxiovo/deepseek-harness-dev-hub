@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { advanceMainline, inspectRulesChange, precedes, readMainline, RULES_MANIFEST, type MainlineTarget } from '../src/executor/mainline-git.ts'
-import { Commands } from '../src/infra/commands.ts'
+import { Commands, GitLeaseRejected } from '../src/infra/commands.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 import { gitEnv, gitRepository, type GitRepository } from './fixtures/git.ts'
 
@@ -104,11 +104,16 @@ describe('mainline Git', () => {
     const candidate = clone.git('rev-parse', 'HEAD')
     clone.git('tag', '-a', 'candidate-tag', '-m', 'do not push')
     const refs = clone.git('show-ref')
-    const authorize = vi.fn(() => expect(transfers).toEqual([]))
+    let transfersAtNextMicrotask: string[] | undefined
+    const authorize = vi.fn(async () => () => {
+      expect(transfers).toEqual([])
+      queueMicrotask(() => { transfersAtNextMicrotask = [...transfers] })
+    })
 
     await expect(advanceMainline(commands(), target, clone.base.sha, candidate, authorize)).resolves.toBe('advanced')
     expect(authorize).toHaveBeenCalledOnce()
     expect(transfers).toEqual(['push'])
+    expect(transfersAtNextMicrotask).toEqual(['push'])
     expect(gitFor(remote, 'for-each-ref', '--format=%(objectname) %(refname)')).toBe(`${candidate} ${main}`)
     expect(gitFor(wrong, 'for-each-ref')).toBe('')
     expect(clone.git('show-ref')).toBe(refs)
@@ -124,7 +129,7 @@ describe('mainline Git', () => {
     clone.git('commit', '-qm', 'candidate above moved tip', '--allow-empty')
     const candidate = clone.git('rev-parse', 'HEAD')
 
-    await expect(advanceMainline(commands(), target, clone.base.sha, candidate)).rejects.toThrow(/expected base/)
+    await expect(advanceMainline(commands(), target, clone.base.sha, candidate)).rejects.toThrow(GitLeaseRejected)
     expect(gitFor(remote, 'rev-parse', main)).toBe(moved)
     expect(transfers).toEqual(['fetch', 'fetch', 'push'])
   })

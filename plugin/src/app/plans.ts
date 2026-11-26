@@ -80,8 +80,9 @@ export interface PlanRepairSource { nodeId: string; ticketId: string; failureId:
 
 type PlanNodeView = PlanNode & {
   status: PlanNodeState['status'] | 'blocked' | 'waiting-for-slot' | 'superseded'
-  waiting_for?: 'predecessors' | 'superseded-writers'
+  waiting_for?: 'predecessors' | 'superseded-writers' | 'plan-control'
   waiting_on?: string[]
+  paused?: true
   claim?: PlanNodeState['claim']
   delivery?: PlanNodeState['delivery']
   superseded?: { revision: number; replacements: string[] }
@@ -90,7 +91,8 @@ type PlanNodeView = PlanNode & {
 /** Owns immutable Plan versions, node claims, formal delivery gates and targeted context. */
 export class Plans {
   constructor(private readonly store: Pick<Store, 'atomic' | 'get' | 'set' | 'keys' | 'tickets'>, private readonly handoffs: Pick<Handoffs, 'get'>,
-    private readonly effects: Pick<Effects, 'cancel'>) {}
+    private readonly effects: Pick<Effects, 'cancel'>, private readonly dispatchPaused?: (plan: Plan, nodeId: string) => boolean,
+    private readonly nodePaused?: (planId: string, nodeId: string) => boolean) {}
 
   get(id: string): Plan | undefined { return this.current(id)?.plan }
 
@@ -304,7 +306,8 @@ export class Plans {
   frontier(id: string): string[] {
     const plan = this.get(id)
     if (!plan) return []
-    return plan.nodes.filter(node => !this.state(id, node.id) && this.waitingOn(id, node).length === 0 && !this.waitingForWriters(id, node.id).length).map(node => node.id)
+    return plan.nodes.filter(node => !this.state(id, node.id) && !this.dispatchPaused?.(plan, node.id)
+      && this.waitingOn(id, node).length === 0 && !this.waitingForWriters(id, node.id).length).map(node => node.id)
   }
 
   /** Register against the exact published specification. Only an identical replay may reuse an existing Plan. */
@@ -342,9 +345,10 @@ export class Plans {
   /** Atomically run the ticket creation callback and persist the node's claim before any queued launch can run. */
   claim(id: string, nodeId: string, claim: PlanNodeClaim, prepare: () => void): PlanNodeState {
     return this.store.atomic(() => {
-      const { node } = this.requireNode(id, nodeId)
+      const { plan, node } = this.requireNode(id, nodeId)
       const prior = this.state(id, nodeId)
       if (prior) return prior
+      if (this.dispatchPaused?.(plan, nodeId)) throw new UserError('invalidPlan', { detail: `Node ${nodeId} is paused by Plan control` })
       const waiting = this.waitingOn(id, node)
       if (waiting.length) throw new UserError('invalidPlan', { detail: `Node ${nodeId} waits for formal delivery of ${waiting.join(', ')}` })
       if (this.waitingForWriters(id, nodeId).length) throw new UserError('invalidPlan', { detail: `Node ${nodeId} waits for superseded writers to drain` })
@@ -424,11 +428,14 @@ export class Plans {
     })
   }
 
-  private nodeView(id: string, node: PlanNode): PlanNodeView {
+  private nodeView(id: string, node: PlanNode, plan?: Plan): PlanNodeView {
     const state = this.state(id, node.id)
-    if (state) return { ...node, status: state.status, claim: state.claim, ...(state.delivery ? { delivery: state.delivery } : {}) }
+    if (state) return { ...node, status: state.status, claim: state.claim, ...(state.delivery ? { delivery: state.delivery } : {}),
+      ...(this.nodePaused?.(id, node.id) ? { paused: true } : {}) }
     const waiting = this.waitingOn(id, node)
     if (waiting.length) return { ...node, status: 'blocked', waiting_for: 'predecessors', waiting_on: waiting }
+    const current = plan ?? this.get(id)
+    if (current && this.dispatchPaused?.(current, node.id)) return { ...node, status: 'blocked', waiting_for: 'plan-control', paused: true }
     const writers = this.waitingForWriters(id, node.id)
     return writers.length ? { ...node, status: 'blocked', waiting_for: 'superseded-writers', waiting_on: writers }
       : { ...node, status: 'waiting-for-slot' }
@@ -443,7 +450,7 @@ export class Plans {
     const nodes = plan.nodes.map(node => {
       stats[node.role].total++
       if (this.state(id, node.id)?.status === 'delivered') stats[node.role].delivered++
-      return this.nodeView(id, node)
+      return this.nodeView(id, node, plan)
     })
     return { ...plan, revision, goal, nodes, frontier: this.frontier(id), stats, context: this.store.get(KV.plans.background(id)) ?? [] }
   }

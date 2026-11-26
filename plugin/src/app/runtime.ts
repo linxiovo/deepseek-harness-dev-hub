@@ -39,6 +39,7 @@ import { InstallationError } from './installation-api.ts'
 import { Planning } from './planning.ts'
 import { Plans, planDeliveryWriter } from './plans.ts'
 import { PlanRequirements } from './plan-requirements.ts'
+import { PlanControl } from './plan-control.ts'
 import { hubResumeText } from './hub-resume.ts'
 import { PlanStagnation } from './plan-stagnation.ts'
 import { PlanIntegration } from './plan-integration.ts'
@@ -183,7 +184,8 @@ export class Runtime extends Service implements SourceHost {
       const effects = this.effects = new Effects(store, board)
       const handoffs = this.handoffs = new Handoffs(store, effects, project, () => installation.assertNewWork(),
         handoff => this.topicBinding?.changed(handoff))
-      const plans = this.plans = new Plans(store, handoffs, effects)
+      const plans = this.plans = new Plans(store, handoffs, effects,
+        (plan, node) => planControl.dispatchBlocked(plan, node), (id, node) => planControl.blocksNode(id, node))
       const prompts = this.prompts = new Prompts(store, () => machine.promptMaxChars.get(), deployed, feishu, plans)
       const credentialChecks = new Map(projectMachine.credentialChecks?.filter(check => check.projectId === project?.id)
         .map(check => [check.id, check]))
@@ -287,7 +289,9 @@ export class Runtime extends Service implements SourceHost {
         verification: project && machine.planVerification?.find(check => check.projectId === project.id),
         release: releaseConfig ? releaseAdapter(releaseConfig, projectMachine.stateDir, ctx.subprocess, this.lifetime) : undefined,
         releaseArtifact: async (planId, view) => (await openPlanArtifact(projectMachine.stateDir, planId, view))?.path,
-        paused: () => this.paused(), target: () => {
+        paused: () => this.paused(),
+        controlBlocked: id => planControl.blocksRelease(id),
+        target: () => {
           if (!project || !setup.configured()) return undefined
           const ref = store.settings().executor.baseRef?.trim()
           return ref?.startsWith('refs/heads/') ? { repository: project.workspace, slug: project.repository, ref } : undefined
@@ -333,6 +337,9 @@ export class Runtime extends Service implements SourceHost {
       this.executor = new DshExecutor({ context: ctx, commands, get engine() { return runtime.engine }, store, effects,
         health: board.claim('worker'), machine: projectMachine, lifetime: this.lifetime, sessions, closing: () => this.closing(),
         credentialBlocked: ticketId => attention.blocked(ticketId),
+        planControlBlocked: ticketId => planControl.blocksWorker(ticketId),
+        controlDrained: (ticketId, assignmentId) => planControl.stopped(ticketId, assignmentId),
+        controlResumeBlocked: ({ plan }) => !plan || !!this.planDispatcher.resumeBlock(plan.planId, plan.nodeId),
         diagnosisAllowed: (ticket, inputId) => runtime.stagnation.allowed(ticket, inputId),
         reassignmentAllowed: ticket => runtime.stagnation.allowed(ticket),
         quota: runLimits,
@@ -409,11 +416,14 @@ export class Runtime extends Service implements SourceHost {
           }
         } })
       this.planDispatcher = new PlanDispatcher({ store, plans, engine, executor, attention, limits: runLimits,
+        get control() { return planControl },
+        paused: () => this.paused(),
         bindWorker: (ticket, id) => sessions.bindWorker(ticket, id) })
       const stagnation = this.stagnation = new PlanStagnation({ store, plans, limits: runLimits, engine,
         paused: () => this.paused(), eligible: ticket => {
           const binding = ticket.plan
-          if (!binding || store.get(KV.plans.retired(binding.planId, binding.nodeId)) || attention.blocked(ticket.id)) return false
+          if (!binding || store.get(KV.plans.retired(binding.planId, binding.nodeId)) || attention.blocked(ticket.id)
+            || planControl.blocksTicket(ticket.id)) return false
           const merge = mainlineIntent(store, ticket.id)
           return !merge || merge.status === 'waiting' || (merge.status === 'repair' && merge.repair_requested === true)
         }, replaceReview: (ticketId, previous, current) => {
@@ -437,6 +447,8 @@ export class Runtime extends Service implements SourceHost {
       }, { limit: () => this.configured() && !this.closing() ? 1 : 0 })
       const requirements = new PlanRequirements({ store, plans, handoffs, limits: runLimits,
         stop: (ticketId, reason) => { engine.stopTicket(ticketId, reason) }, authorize: () => installation.assertNewWork(),
+        migrateHolds: (planId, replacements) => planControl.replaceNodes(planId, replacements),
+        mainlineHeld: ticketId => planControl.blocksTicket(ticketId), cancelQueuedMerge: ticketId => mainline.cancelQueued(ticketId),
         requestScopeReview: id => effects.enqueue('requirementScopeReview', id, {}), isHubGeneration: id => authority.isGeneration(id), isCurrentHub: id => authority.isCurrent(id) })
       const scopeDispatchOpen = () => {
         if (this.paused()) return false
@@ -451,6 +463,7 @@ export class Runtime extends Service implements SourceHost {
       const planDelivery = planDeliveryWriter(plans, id => engine.closePlanTicket(id))
       const mainline = new MainlineQueue({ store, effects, lifetime: this.lifetime,
         available: () => this.configured() && !this.closing(), paused: () => this.paused(),
+        controlBlocked: ticketId => planControl.blocksTicket(ticketId),
         approve: async (id, candidate, signal, replay) => {
           if (replay) await executor.settleMainlineWriter(id)
           return approveMainline(resources, id, candidate, signal, replay)
@@ -510,6 +523,21 @@ export class Runtime extends Service implements SourceHost {
           }))
         },
       })
+      const planControl: PlanControl = new PlanControl({ store, plans, handoffs, isCurrentHub: id => authority.isCurrent(id),
+        isHubGeneration: id => authority.isGeneration(id), authorize: () => {
+          if (this.closing()) throw new InstallationError(409, 'switching')
+        },
+        suspend: ticketId => executor.pauseForControl(ticketId), waiting: (id, node) => this.planDispatcher.resumeBlock(id, node),
+        rearm: (planId, ticketIds, retryOnly) => {
+          for (const ticketId of ticketIds) {
+            const ticket = store.tickets.get(ticketId)
+            if (ticket && !ticket.ended && latestAssignment(ticket)?.state !== 'ended' && !planControl.blocksWorker(ticketId) &&
+                (!retryOnly || effects.pending('planControlResume', ticketId))) effects.enqueue('planControlResume', ticketId, {})
+            if (!retryOnly) mainline.resumeTicket(ticketId)
+          }
+          if (!retryOnly) planIntegration.resumePlan(planId)
+        } })
+
       // Reconcile historical dispatch receipts before serving even paused/setup-pending reads. This grants no tools or writer lease.
       this.planDispatcher.restoreBindings()
       const { requiredChecks } = githubKind.schema.parse(store.settings().sources.github?.config ?? {})
@@ -544,6 +572,7 @@ export class Runtime extends Service implements SourceHost {
           return passes.receive(trigger)
         } }
       this.toolHost = { context: ctx, engine, store, sessions, executor, mainline, planDispatcher: this.planDispatcher, settings: this.settings,
+        planControl,
         assessor, resources, projectMeter, runLimits, attention, handoffs, plans, planIntegration, stagnation, requirements, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,
@@ -677,7 +706,7 @@ export class Runtime extends Service implements SourceHost {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposeHttp = registerHttp(this.ctx, this.httpHost())
     this.runLimits.recover()
-    this.executor.recoverCredentialPauses()
+    this.executor.recoverPauses()
     this.disposeAdmission = installModelAdmission(this.ctx, {
       owns: id => scopeProposalId(id) !== undefined || this.projectMeter.owns(id) || this.sessions.hasManagedAncestry(id),
       acquire: (id, maximum, signal) => {

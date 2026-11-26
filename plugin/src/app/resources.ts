@@ -28,6 +28,7 @@ import { KV } from '../kv.ts'
 import type { Handoffs } from './handoffs.ts'
 import { PlanDeliveryReceiptSchema, type Plans } from './plans.ts'
 import type { PlanStagnation } from './plan-stagnation.ts'
+import type { PlanControl } from './plan-control.ts'
 import type { PlanRequirements } from './plan-requirements.ts'
 import { mainlineAttempts, mainlineIntent, type CheckDeliveryTarget, type DeliveryTargetObservation,
   type MainlineCiBinding, type MainlineIntent, type MergeApproval } from './mainline-queue.ts'
@@ -56,6 +57,7 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'plan/<id>/revision/<n>', holds: 'historical Plan graph, acceptance and reason for revision' },
   { name: 'plan-requirement/<id>', holds: 'impact and approval status of a product-change preview' },
   { name: 'plan/<id>/delivery', holds: 'integrated commit, regression result and artifact' },
+  { name: 'plan/<id>/control', holds: 'active Plan holds and observed stop, merge and publication outcomes' },
   { name: 'plan/<id>/node/<node-id>', holds: 'node claim or waiting reason, delivery and instructions' },
   { name: 'plan/<id>/node/<node-id>/recovery/<failure-id>', holds: 'one retained technical failure observation' },
   { name: 'plan/<id>/attention', holds: 'Plan status counts and credential actions' },
@@ -127,6 +129,7 @@ export interface MainResourceHost extends ResourceHost {
   readonly settings: Pick<Settings, 'view' | 'block'>
   readonly handoffs: Pick<Handoffs, 'get' | 'spec'>
   readonly planIntegration?: { view(id: string): PlanIntegrationView | undefined }
+  readonly planControl: Pick<PlanControl, 'view'>
   readonly plans: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'testHistory' | 'view' | 'node' | 'at' | 'revision'>
   readonly stagnation: Pick<PlanStagnation, 'view' | 'failure'>
   readonly requirements: Pick<PlanRequirements, 'get'>
@@ -676,7 +679,7 @@ const ROUTES: readonly Route[] = [
     return preview
   }],
   ['plan/', read => {
-    const { plans, handoffs, attention, stagnation } = main(read)
+    const { plans, handoffs, attention, stagnation, planControl } = main(read)
     const [id, section, nodeId, ...extra] = read.rest.split('/')
     if (id && section === 'meter' && nodeId === undefined) return projectMeter(read, 'plan', id)
     if (id && section === 'attention' && nodeId === undefined) return attention.summary(id)
@@ -697,6 +700,11 @@ const ROUTES: readonly Route[] = [
       const result = extra.length === 1 ? stagnation.view(claim.ticketId) : stagnation.failure(claim.ticketId, extra[1]!)
       if (!result) throw new Error('Unknown Plan recovery observation')
       return result
+    }
+    if (id && section === 'control' && nodeId === undefined && !extra.length) {
+      const { actions, ...control } = planControl.view(id)
+      const page = list(read, (offset, count) => actions.slice(offset, offset + count))
+      return { ...control, actions: page.items, next_offset: page.next_offset }
     }
     if (!id || extra.length || (section !== undefined && section !== 'delivery' && (section !== 'node' || !nodeId))
       || (section === 'delivery' && nodeId !== undefined)) throw new Error('Unknown plan resource')
@@ -728,7 +736,7 @@ const ROUTES: readonly Route[] = [
             read: `plan/${id}/node/${node.id}` } } : {}) }
       }))
       const contextPage = list(read, (offset, count) => context.slice(offset, offset + count))
-      return { ...header, delivery: `plan/${id}/delivery`, nodes: nodePage.items, context: contextPage.items,
+      return { ...header, delivery: `plan/${id}/delivery`, control: `plan/${id}/control`, nodes: nodePage.items, context: contextPage.items,
         revision_read: `plan/${id}/revision/${header.revision}`, next_offset: nodePage.next_offset ?? contextPage.next_offset }
     }
     if (!handoff.spec) return { id, handoffId: id, status: 'awaiting-spec' }

@@ -5,9 +5,10 @@ import { UserError } from '../core/errors.ts'
 import { KV } from '../kv.ts'
 import type { DeliveryTargetResult, MainlineTarget } from '../executor/mainline-git.ts'
 import type { DocTreeScope } from '../executor/doc-tree.ts'
+import { GitLeaseRejected } from '../infra/commands.ts'
 import type { MainlineRepair } from '../core/model.ts'
 import type { PlanDeliveryReceipt } from '../core/plan.ts'
-import { Later, type Effects } from './effects.ts'
+import { Later, Park, type Effects } from './effects.ts'
 import type { Store } from './store.ts'
 
 /** Exact Actions lookup authorized before the Git write, independent of later PR state. */
@@ -49,6 +50,7 @@ interface QueueHost {
   lifetime: AbortSignal
   available(): boolean
   paused(): boolean
+  controlBlocked(ticketId: string): boolean
   approve(id: string, candidate: string, signal?: AbortSignal, replay?: MainlineIntent): Promise<MergeApproval>
   authorize(id: string, approval: MergeApproval): void
   inspectDelivery(intent: MainlineIntent, verify: CheckDeliveryTarget): Promise<{
@@ -59,7 +61,7 @@ interface QueueHost {
   precedes(target: MainlineTarget, ancestor: string, descendant: string): Promise<boolean>
   verifyDelivery(target: MainlineTarget, base: string, integration: string, actual: string, scope: DocTreeScope): Promise<DeliveryTargetResult>
   prepare(target: MainlineTarget, candidate: string, intent: string, queuedAt: string): Promise<string>
-  advance(target: MainlineTarget, base: string, candidate: string, authorize: () => Promise<void>): Promise<'advanced' | 'unchanged'>
+  advance(target: MainlineTarget, base: string, candidate: string, prepareWrite: () => Promise<() => void>): Promise<'advanced' | 'unchanged'>
   repair(id: string, repair: MainlineRepair): Promise<void>
   changed(intent: MainlineIntent, delivered?: boolean): void
 }
@@ -92,7 +94,8 @@ export class MainlineQueue {
   /** Replaying an already verified intent can retry closure, but never queues another Git write. */
   private replay(intent: MainlineIntent): MainlineIntent {
     const { store, effects } = this.host
-    if (intent.status === 'verified' && store.tickets.get(intent.ticket_id)?.ended?.by !== 'delivery' && !effects.pending('mainlineDelivery', intent.id)) {
+    if (intent.status === 'verified' && !this.host.controlBlocked(intent.ticket_id)
+      && store.tickets.get(intent.ticket_id)?.ended?.by !== 'delivery' && !effects.pending('mainlineDelivery', intent.id)) {
       effects.enqueue('mainlineDelivery', intent.id, { ticketId: intent.ticket_id })
     }
     return intent
@@ -103,8 +106,10 @@ export class MainlineQueue {
     signal?.throwIfAborted()
     const existing = this.existing(ticketId, candidate)
     if (existing) return this.replay(existing)
+    if (this.host.controlBlocked(ticketId)) throw new UserError('mainlineRefused', { reason: 'Ticket is paused by Plan control' })
     const approval = await this.host.approve(ticketId, candidate, signal)
     signal?.throwIfAborted()
+    if (this.host.controlBlocked(ticketId)) throw new UserError('mainlineRefused', { reason: 'Ticket is paused by Plan control' })
     this.host.authorize(ticketId, approval)
     return store.atomic(() => {
       const latest = this.existing(ticketId, candidate)
@@ -121,15 +126,47 @@ export class MainlineQueue {
       store.set(KV.mainline.ticket(ticketId), [...mainlineAttempts(store, ticketId), intent])
       const queue = store.get(pending) ?? []
       store.set(pending, [...queue, ticketId])
-      if (!queue.length) effects.enqueue('mainline', key, {})
+      effects.enqueue('mainline', key, {})
       return intent
     })
+  }
+
+  /** Rearm only the durable work of one resumed Ticket. */
+  resumeTicket(ticketId: string): void {
+    if (this.host.controlBlocked(ticketId)) return
+    const intent = mainlineIntent(this.host.store, ticketId)
+    if (!intent) return
+    if (intent.status === 'verified') {
+      if (this.host.store.tickets.get(ticketId)?.ended?.by !== 'delivery') {
+        this.host.effects.enqueue('mainlineDelivery', intent.id, { ticketId })
+      }
+    } else if (intent.status === 'repair' && !intent.repair_requested) {
+      this.host.effects.enqueue('mainlineRepair', intent.id, { ticketId })
+    } else if (intent.status === 'queued' || intent.status === 'applying') {
+      this.host.effects.enqueue('mainline', targetKey(intent.target), {})
+    }
+  }
+
+  /** Retire an unadmitted candidate in the same transaction that supersedes its Ticket. */
+  cancelQueued(ticketId: string): void {
+    const intent = mainlineIntent(this.host.store, ticketId)
+    if (intent?.status !== 'queued') return
+    if (!this.host.controlBlocked(ticketId)) throw new Error('Cannot retire an unpaused mainline candidate')
+    this.finish(intent, 'waiting', { reason: 'The approved requirement revision superseded the queued candidate before Git authorization' })
+  }
+
+  private current(intent: MainlineIntent): boolean {
+    const latest = mainlineIntent(this.host.store, intent.ticket_id)
+    return latest?.id === intent.id && latest.status === intent.status
   }
 
   private update(intent: MainlineIntent, status: MainlineIntent['status'], fields: Partial<MainlineIntent> = {}): void {
     const { store } = this.host
     const attempts = mainlineAttempts(store, intent.ticket_id)
-    if (attempts.at(-1)?.id !== intent.id) throw new Error('Mainline intent changed during processing')
+    const current = attempts.at(-1)
+    if (current?.id !== intent.id || (current.status === 'verified' && intent.status !== 'verified')) {
+      throw new Error('Mainline intent changed during processing')
+    }
     attempts[attempts.length - 1] = { ...intent, ...fields, status }
     store.set(KV.mainline.ticket(intent.ticket_id), attempts)
   }
@@ -137,10 +174,12 @@ export class MainlineQueue {
   private finish(intent: MainlineIntent, status: 'verified' | 'waiting' | 'repair', fields: Partial<MainlineIntent>): void {
     const { store, effects } = this.host
     store.atomic(() => {
-      const pending = KV.mainline.pending(targetKey(intent.target)), queue = store.get(pending)
-      if (queue?.[0] !== intent.ticket_id) throw new Error('Mainline intent is not at the head of its queue')
+      const pending = KV.mainline.pending(targetKey(intent.target)), queue = store.get(pending) ?? []
+      const index = queue.indexOf(intent.ticket_id)
+      if (index < 0) throw new Error('Mainline intent is not in its target queue')
       this.update(intent, status, fields)
-      if (queue.length > 1) store.set(pending, queue.slice(1))
+      const remaining = [...queue.slice(0, index), ...queue.slice(index + 1)]
+      if (remaining.length) store.set(pending, remaining)
       else store.delete(pending)
       if (status === 'repair') effects.enqueue('mainlineRepair', intent.id, { ticketId: intent.ticket_id })
       if (status === 'verified') effects.enqueue('mainlineDelivery', intent.id, { ticketId: intent.ticket_id })
@@ -168,13 +207,15 @@ export class MainlineQueue {
   }
 
   /** Close only after rechecking the exact approved evidence and reacquiring proof from the actual target. */
-  private async deliver(ticketId: string, id: string): Promise<void> {
+  private async deliver(ticketId: string, id: string): Promise<void | typeof Park> {
     const { host } = this, { store } = host
     const intent = mainlineIntent(store, ticketId)
     if (intent?.id !== id || intent.status !== 'verified' || store.tickets.get(ticketId)?.ended?.by === 'delivery') return
+    if (host.controlBlocked(ticketId)) return Park
     const { missing, approval, observation } = await host.inspectDelivery(intent, scope => this.verifyDeliveryTarget(intent, scope))
     const integration = intent.integration
     host.lifetime.throwIfAborted()
+    if (host.controlBlocked(ticketId)) return Park
     store.atomic(() => {
       const current = mainlineIntent(store, ticketId)
       if (current?.id !== id || current.status !== 'verified' || store.tickets.get(ticketId)?.ended?.by === 'delivery') return
@@ -196,9 +237,10 @@ export class MainlineQueue {
     })
   }
 
-  private async repair(ticketId: string, id: string): Promise<void> {
+  private async repair(ticketId: string, id: string): Promise<void | typeof Park> {
     const intent = mainlineIntent(this.host.store, ticketId)
     if (!intent?.actual || intent.id !== id || intent.status !== 'repair' || intent.repair_requested) return
+    if (this.host.controlBlocked(ticketId)) return Park
     try {
       await this.host.repair(ticketId, { id, assignment: intent.assignment, previousBase: intent.base, base: intent.actual,
         candidate: intent.candidate, ref: intent.target.ref })
@@ -213,53 +255,90 @@ export class MainlineQueue {
   }
 
   private async drain(key: string): Promise<void> {
+    const deferred = new Set<string>()
     for (;;) {
       this.host.lifetime.throwIfAborted()
-      const ticketId = this.host.store.get(KV.mainline.pending(key))?.[0]
-      if (ticketId === undefined) return
-      const intent = mainlineIntent(this.host.store, ticketId)
-      if (!intent || targetKey(intent.target) !== key || (intent.status !== 'queued' && intent.status !== 'applying')) {
-        throw new Error('Inconsistent durable mainline queue')
+      let next: MainlineIntent | undefined
+      for (const id of this.host.store.get(KV.mainline.pending(key)) ?? []) {
+        const intent = mainlineIntent(this.host.store, id)
+        if (!intent || targetKey(intent.target) !== key || (intent.status !== 'queued' && intent.status !== 'applying')) {
+          throw new Error('Inconsistent durable mainline queue')
+        }
+        // Reconcile admitted writes first. An unconfirmed paused write cannot start again, and each later write still needs an exact lease.
+        if (intent.status === 'applying') {
+          if (deferred.has(intent.id)) continue
+          next = intent
+          break
+        }
+        if (!next && !this.host.controlBlocked(id)) next = intent
       }
-      await this.process(intent)
+      if (!next) {
+        if (deferred.size) throw new Later()
+        return
+      }
+      if (await this.process(next)) deferred.add(next.id)
     }
   }
 
-  private async observe(intent: MainlineIntent): Promise<MainlineIntent | undefined> {
+  private async observe(intent: MainlineIntent, readOnly = false): Promise<MainlineIntent | undefined> {
     const { host } = this
-    let actual: string
-    try { actual = await host.read(intent.target) }
-    catch (error) {
+    const reconcileOnly = () => intent.status === 'applying' && (readOnly || host.controlBlocked(intent.ticket_id))
+    let live = intent
+    let observedAt: string
+    let outcome: { status: 'verified' | 'waiting' | 'repair'; reason: string } | undefined
+    try {
+      const actual = await host.read(intent.target)
+      observedAt = now()
+      live = { ...intent, actual, observed_at: observedAt }
+      if (actual !== intent.base) {
+        if (intent.integration !== undefined && (actual === intent.integration || await host.precedes(intent.target, intent.integration, actual))) {
+          outcome = { status: 'verified', reason: 'Observed the intent-specific integration commit on the actual target' }
+        } else if (!reconcileOnly()) {
+          if (actual === intent.candidate || await host.precedes(intent.target, intent.candidate, actual)) {
+            outcome = { status: 'waiting', reason: 'The target contains the candidate but not the queued integration commit' }
+          } else if (await host.precedes(intent.target, intent.base, actual)) {
+            outcome = { status: 'repair', reason: 'The target advanced; refresh the candidate and all required evidence on the actual base' }
+          } else {
+            outcome = { status: 'waiting', reason: 'Target history moved away from the reviewed baseline; no queued write is safe' }
+          }
+        }
+      }
+    } catch (error) {
       host.lifetime.throwIfAborted()
-      this.update(intent, intent.status, { reason: 'Cannot verify the actual Git target; will check again' })
+      if (!this.current(intent)) return undefined
+      this.update(live, intent.status, { reason: 'Cannot verify the actual Git target; will check again' })
+      if (reconcileOnly()) return live
       throw error
     }
     host.lifetime.throwIfAborted()
-    const observed = { actual, observed_at: now() }
-    const live = { ...intent, ...observed }
-    if (actual === intent.base) return live
-    const integrated = intent.integration !== undefined && (actual === intent.integration ||
-      await host.precedes(intent.target, intent.integration, actual))
-    host.lifetime.throwIfAborted()
-    if (integrated) {
-      this.finish(live, 'verified', { reason: 'Observed the intent-specific integration commit on the actual target',
-        verification: { status: 'passed', at: observed.observed_at, method: 'integration_on_target' } })
-    } else if (actual === intent.candidate || await host.precedes(intent.target, intent.candidate, actual)) {
-      this.finish(live, 'waiting', { reason: 'The target contains the candidate but not the queued integration commit' })
-    } else if (await host.precedes(intent.target, intent.base, actual)) {
-      host.lifetime.throwIfAborted()
-      this.finish(live, 'repair', { reason: 'The target advanced; refresh the candidate and all required evidence on the actual base' })
+    if (!this.current(intent)) return undefined
+    if (outcome?.status === 'verified') {
+      this.finish(live, 'verified', { reason: outcome.reason,
+        verification: { status: 'passed', at: observedAt, method: 'integration_on_target' } })
+    } else if (reconcileOnly()) {
+      this.update(live, 'applying', { reason: 'Git write result is unconfirmed; the actual target does not prove the queued integration' })
+      return live
+    } else if (outcome) {
+      this.finish(live, outcome.status, { reason: outcome.reason })
     } else {
-      this.finish(live, 'waiting', { reason: 'Target history moved away from the reviewed baseline; no queued write is safe' })
+      return live
     }
     return undefined
   }
 
-  private async process(intent: MainlineIntent): Promise<void> {
+  /** Return true when an admitted write remains unconfirmed and must be observed again. */
+  private async process(intent: MainlineIntent): Promise<boolean> {
     const { host } = this
-    if (host.paused() && intent.status === 'queued') throw new Later()
-    const observed = await this.observe(intent)
-    if (!observed) return
+    const blocked = host.controlBlocked(intent.ticket_id)
+    if (intent.status === 'queued') {
+      if (blocked) return false
+      if (host.paused()) throw new Later()
+    }
+    const observed = await this.observe(intent, blocked)
+    if (!observed) return false
+    // The old base does not prove an admitted receive-pack has stopped, even before any pause.
+    if (intent.status === 'applying') return true
+    if (blocked || host.controlBlocked(intent.ticket_id)) return false
     if (host.paused()) throw new Later()
     let applying = observed
     try {
@@ -271,23 +350,40 @@ export class MainlineQueue {
             approval.assignment !== intent.assignment || approval.generation !== intent.generation || approval.rulesRevision !== intent.rulesRevision) {
           throw new UserError('mainlineRefused', { reason: 'Queued candidate no longer has matching delivery evidence' })
         }
-        host.lifetime.throwIfAborted()
-        if (host.paused()) throw new Later()
-        host.authorize(intent.ticket_id, approval)
-        applying = { ...observed, status: 'applying', applying_at: observed.applying_at ?? now(), integration, ci: approval.ci }
-        // Commit the intent before starting the mutating subprocess, including on its first attempt.
-        this.update(applying, 'applying', { reason: 'Git write may be in flight; compare the actual target before retrying' })
+        return () => {
+          host.lifetime.throwIfAborted()
+          if (!this.current(intent)) throw new Later()
+          if (host.controlBlocked(intent.ticket_id) || host.paused()) throw new Later()
+          host.authorize(intent.ticket_id, approval)
+          const admitted: MainlineIntent = { ...observed, status: 'applying', applying_at: observed.applying_at ?? now(), integration, ci: approval.ci }
+          // The synchronous fence is the last step before starting the mutating subprocess.
+          this.update(admitted, 'applying', { reason: 'Git write may be in flight; compare the actual target before retrying' })
+          applying = admitted
+        }
       })
       host.lifetime.throwIfAborted()
     } catch (error) {
       host.lifetime.throwIfAborted()
-      if (error instanceof Later) throw error
+      if (!this.current(applying)) return false
+      const rejected = error instanceof GitLeaseRejected
+      if (host.controlBlocked(intent.ticket_id) && rejected) {
+        this.finish(applying, 'waiting', { reason: error.message })
+        return false
+      }
+      if (error instanceof Later) {
+        if (host.controlBlocked(intent.ticket_id)) return false
+        throw error
+      }
       const live = await this.observe(applying)
-      if (live) this.finish(live, 'waiting', { reason: message(error) })
-      return
+      if (!live) return false
+      if (applying.status === 'applying' && !rejected) {
+        this.update(live, 'applying', { reason: 'Git write result is unconfirmed; the actual target does not prove the queued integration' })
+        return true
+      }
+      if (rejected || !host.controlBlocked(intent.ticket_id)) this.finish(live, 'waiting', { reason: message(error) })
+      return false
     }
-    const live = await this.observe(applying)
-    if (live) this.finish(live, 'waiting', { reason: 'The target did not retain the candidate; no merge verification issued' })
+    return !!await this.observe(applying, true)
   }
 }
 

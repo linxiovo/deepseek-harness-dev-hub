@@ -1381,3 +1381,156 @@ it.each(['intent stored', 'Git advanced', 'candidate already present', 'external
     expect(writes).toBe(1)
   }
 }, 120_000)
+
+it.each(['before final authorization', 'with an ambiguous reply', 'when Git rejects the lease', 'before the remote moves and the host restarts', 'after Git advanced'] as const)(
+  'reconciles a Ticket paused %s without holding unrelated work on the same target', async point => {
+    const { git, repository, remote, base, tip, runGit } = mainlineRepository()
+    const ci = actionsHost()
+    await configureCI()
+    const { id, workers: { trim: a, lowercase: b }, dispatch } = await registerPlan({ start: labelNodes })
+    formatLabel(a.directory, 'value.trim()', 'Trim leading and trailing whitespace')
+    const shaA = commit(a.directory, 'Trim display labels')
+    formatLabel(b.directory, 'value.toLowerCase()', 'Convert letters to lowercase')
+    const shaB = commit(b.directory, 'Lowercase display labels')
+    for (const [worker, sha, criterion, expected] of [[a, shaA, '1', 'ALERT'], [b, shaB, '2', '  alert  ']] as const) {
+      await recordEvidence(worker, id, base, sha, criterion, expected)
+      ci.publish(sha, undefined, git('-C', worker.directory, 'branch', '--show-current'))
+      await h.runTool(worker.session, 'orchestrator_report', { state: 'ready', summary: 'Delivery evidence is ready.' })
+    }
+    await h.runtime.idle()
+
+    const reached = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(), pushed = Promise.withResolvers<void>()
+    const lifetime = h.runtime.lifetime, pushes: string[][] = []
+    let integrationA: string | undefined
+    vi.spyOn(Commands.prototype, 'git').mockImplementation(async function (this: Commands, args, cwd) {
+      if (args.includes('commit-tree') && args.includes(shaA)) {
+        const result = await runGit(this, args, cwd)
+        integrationA = result.trim()
+        if (point === 'before final authorization') { reached.resolve(); await release.promise }
+        return result
+      }
+      if (args.includes('push') && args.includes(canonicalUrl)) {
+        pushes.push(args)
+        if (args.includes(`${integrationA}:${targetRef}`)) {
+          reached.resolve()
+          await release.promise
+          if (point === 'with an ambiguous reply') throw new CliError('Lost Git receive-pack reply')
+          if (point === 'after Git advanced') {
+            try { await runGit(this, args, cwd) }
+            catch (error) { pushed.reject(error); throw error }
+            pushed.resolve()
+            return interruptedByRestart(lifetime)
+          }
+          if (point === 'before the remote moves and the host restarts') return interruptedByRestart(lifetime)
+        }
+      }
+      return runGit(this, args, cwd)
+    })
+
+    const queuedA = await queue(a.ticketId, shaA)
+    let queuedB: Record<string, unknown>
+    try {
+      await Promise.race([reached.promise, h.runtime.idle().then(() => { throw new Error('A never reached the interruption point') })])
+      queuedB = await queue(b.ticketId, shaB)
+      expect(queuedB).toMatchObject({ status: 'queued', base, candidate: shaB })
+      if (point === 'after Git advanced') {
+        release.resolve()
+        await pushed.promise
+        expect(tip()).toBe(integrationA)
+      }
+      h.sendUserMessage(h.runtime.masterId, `Pause Ticket ${a.ticketId}`)
+      expect(await hub('orchestrator_plan_control', { action: 'pause', planId: id, scope: { kind: 'ticket', ticketId: a.ticketId } }))
+        .toMatchObject({ status: 'paused', actions: expect.arrayContaining([{ kind: 'mainline', nodeId: 'trim',
+          ticketId: a.ticketId, operationId: queuedA.id, status: point === 'before final authorization' ? 'stopped' : 'stop-requested' }]) })
+      if (point === 'when Git rejects the lease') {
+        git('-C', repository, 'commit', '-qm', 'Advance the test target', '--allow-empty')
+        git('-C', repository, 'push', remote, `HEAD:${targetRef}`)
+      }
+    } finally {
+      release.resolve()
+    }
+    if (point === 'after Git advanced' || point === 'before the remote moves and the host restarts') await h.restart()
+    await h.runtime.idle()
+
+    const aResult = (await read(`ticket/${a.ticketId}`)).mainline
+    const bResult = (await read(`ticket/${b.ticketId}`)).mainline
+    const aPushes = pushes.filter(args => args.includes(`${integrationA}:${targetRef}`))
+    if (point === 'after Git advanced') {
+      expect(aResult).toMatchObject({ id: queuedA.id, status: 'verified', integration: integrationA,
+        actual: integrationA, verification: { status: 'passed' } })
+      expect(tip()).toBe(integrationA)
+      expect(aPushes).toHaveLength(1)
+      expect(pushes).toHaveLength(1)
+      expect(bResult).toMatchObject({ id: queuedB.id, status: 'repair', actual: integrationA })
+    } else if (point === 'when Git rejects the lease') {
+      expect(aResult).toMatchObject({ id: queuedA.id, status: 'waiting', reason: expect.stringContaining('rejected the lease') })
+      expect(tip()).toBe(git('-C', repository, 'rev-parse', 'HEAD'))
+      expect(aPushes).toHaveLength(1)
+      expect(bResult).toMatchObject({ id: queuedB.id, status: 'repair', actual: tip() })
+    } else {
+      expect(aResult).toMatchObject({ id: queuedA.id, status: point === 'before final authorization' ? 'queued' : 'applying',
+        ...(point === 'before final authorization' ? {} : { integration: integrationA }) })
+      expect(aResult).not.toHaveProperty('verification')
+      expect(aPushes).toHaveLength(point === 'before final authorization' ? 0 : 1)
+      expect(pushes.filter(args => args.includes(`${tip()}:${targetRef}`))).toEqual([
+        expect.arrayContaining([`--force-with-lease=${targetRef}:${base}`]),
+      ])
+      expect(git('rev-parse', `${tip()}^`)).toBe(shaB)
+      expect(bResult).toMatchObject({ id: queuedB.id, status: 'verified', integration: tip(), verification: { status: 'passed' } })
+      await delivered(id, 'lowercase', b, queuedB, base, shaB, tip())
+    }
+    expect(await read(`plan/${id}/control`)).toMatchObject({ actions: expect.arrayContaining([{ kind: 'mainline', nodeId: 'trim',
+      ticketId: a.ticketId, operationId: queuedA.id,
+      status: point === 'after Git advanced' ? 'already-happened'
+        : point === 'before final authorization' || point === 'when Git rejects the lease' ? 'stopped' : 'stop-requested' }]) })
+    expect(await read(`plan/${id}/node/trim`)).not.toHaveProperty('delivery')
+    expect(await dispatch('combined-check')).toMatchObject({ status: 'blocked', waitingOn: point === 'after Git advanced' || point === 'when Git rejects the lease'
+      ? ['trim', 'lowercase'] : ['trim'] })
+  }, 180_000)
+
+it('records a late Git write after pause and restart without sending it twice', async () => {
+  const { git, base, remote, tip, runGit } = mainlineRepository()
+  const ci = actionsHost()
+  await configureCI()
+  const { id, workers: { trim } } = await registerPlan({ start: ['trim'] })
+  formatLabel(trim.directory, 'value.trim()', 'Trim leading and trailing whitespace')
+  const candidate = commit(trim.directory, 'Trim display labels')
+  await recordEvidence(trim, id, base, candidate, '1', 'ALERT')
+  ci.publish(candidate, undefined, git('-C', trim.directory, 'branch', '--show-current'))
+  await h.runTool(trim.session, 'orchestrator_report', { state: 'ready', summary: 'Delivery evidence is ready.' })
+  await h.runtime.idle()
+
+  let requests = 0, integration = '', readOldAfterFailure = false
+  vi.spyOn(Commands.prototype, 'git').mockImplementation(async function (this: Commands, args, cwd) {
+    if (args.includes(canonicalUrl) && args.includes('push')) {
+      requests++
+      integration = args.at(-1)!.split(':')[0]!
+      throw new CliError('Lost Git receive-pack reply')
+    }
+    const output = await runGit(this, args, cwd)
+    if (requests && args.includes(canonicalUrl) && args.includes('fetch') && tip() === base) readOldAfterFailure = true
+    return output
+  })
+  const queued = await queue(trim.ticketId, candidate)
+  await h.runtime.idle()
+  expect(readOldAfterFailure).toBe(true)
+  expect(await read(`ticket/${trim.ticketId}`)).toMatchObject({ mainline: { id: queued.id, status: 'applying' } })
+  const control = (action: 'pause' | 'resume') => {
+    h.sendUserMessage(h.runtime.masterId, `${action === 'pause' ? 'Pause' : 'Resume'} Ticket ${trim.ticketId}`)
+    return hub('orchestrator_plan_control', { action, planId: id, scope: { kind: 'ticket', ticketId: trim.ticketId } })
+  }
+  expect(await control('pause')).toMatchObject({ actions: expect.arrayContaining([
+    expect.objectContaining({ kind: 'mainline', operationId: queued.id, status: 'stop-requested' }),
+  ]) })
+  git('-C', trim.directory, 'push', `--force-with-lease=${targetRef}:${base}`, remote, `${integration}:${targetRef}`)
+  await h.restart()
+  await vi.waitFor(async () => {
+    await h.runtime.idle()
+    expect(await read(`plan/${id}/control`)).toMatchObject({ actions: expect.arrayContaining([
+      expect.objectContaining({ kind: 'mainline', operationId: queued.id, status: 'already-happened' }),
+    ]) })
+  }, { timeout: 15_000 })
+  expect(tip()).toBe(integration)
+  expect(requests).toBe(1)
+  expect(await read(`plan/${id}/node/trim`)).not.toHaveProperty('delivery')
+}, 120_000)

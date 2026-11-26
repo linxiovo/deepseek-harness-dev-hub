@@ -275,6 +275,17 @@
         "created_by": "aoci-init",
         "order": 119,
         "enabled": true
+      },
+      {
+        "rule_id": "meta-local-reference-exclude",
+        "action": "exclude",
+        "pattern": "meta",
+        "pattern_kind": "directory",
+        "reason": "meta/ 是本地历史参考资料，已整体 gitignore，不参与代码索引与认知维护（AGENTS.md）",
+        "source": "user",
+        "created_by": "omp-agent",
+        "order": 200,
+        "enabled": true
       }
     ]
   },

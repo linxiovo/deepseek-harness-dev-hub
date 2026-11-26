@@ -13,6 +13,7 @@ import { PlanTargetSchema, type Plans } from '../plans.ts'
 import type { PlanDispatcher } from '../plan-dispatch.ts'
 import { replanTechnical, TechnicalReplanSchema } from '../plan-replan.ts'
 import type { PlanRequirements } from '../plan-requirements.ts'
+import { PlanControlCommandSchema, type PlanControl } from '../plan-control.ts'
 import type { MainlineQueue } from '../mainline-queue.ts'
 import type { ProjectMeter } from '../project-meter.ts'
 import { ticketCard } from '../cards.ts'
@@ -88,18 +89,24 @@ function latestDirectUserMessageId(agent: Agent, expected: string | ((text: stri
 }
 
 /** DSH identifies the local operator channel, not individuals. Inherited events and relay text confer no authority. */
-function latestRequirementMessage(agent: Agent) {
+function latestOperatorMessage(agent: Agent, currentTurn = false) {
   const events = agent.session.snapshotEvents()
   for (let i = events.length - 1; i >= agent.session.inheritedEventCount; i--) {
     const event = events[i]
-    if (event?.type !== 'user/message' || event.data.source.kind !== 'user') continue
+    if (currentTurn && event?.type === 'turn/end') break
+    if (event?.type !== 'user/message') continue
+    if (event.data.source.kind !== 'user') {
+      if (currentTurn) break
+      continue
+    }
     const [block] = event.data.content
     if (event.data.content.length === 1 && block?.type === 'text' && event.data.id) {
       return { sessionId: agent.id, messageId: event.data.id, seq: event.seq, at: event.time, text: block.text }
     }
     break
   }
-  throw new Error('A product change needs a single text message from the direct Harness operator')
+  throw new Error(currentTurn ? 'Plan control requires a direct Harness operator message in the current turn'
+    : 'A product change needs a single text message from the direct Harness operator')
 }
 
 export interface MainToolsHost {
@@ -119,6 +126,7 @@ export interface MainToolsHost {
   readonly plans: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'testHistory' | 'view' | 'node' | 'append' | 'at' | 'revision' | 'current' | 'state' | 'requiredDelivery' | 'revise'>
   readonly stagnation: MainResourceHost['stagnation']
   readonly requirements: Pick<PlanRequirements, 'preview' | 'apply' | 'get'>
+  readonly planControl: Pick<PlanControl, 'change' | 'view' | 'dispatchBlocked'>
   readonly planDispatcher: Pick<PlanDispatcher, 'dispatch'>
   readonly mainline: Pick<MainlineQueue, 'enqueue'>
   assertNewWork?(): void
@@ -254,7 +262,7 @@ function routeTool(host: MainToolsHost): Tool {
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings,
     handoffs: host.handoffs, plans: host.plans, projectMeter: host.projectMeter, runLimits: host.runLimits, attention: host.attention,
-    planIntegration: host.planIntegration, stagnation: host.stagnation, requirements: host.requirements }
+    planIntegration: host.planIntegration, stagnation: host.stagnation, requirements: host.requirements, planControl: host.planControl }
   return [
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
@@ -388,15 +396,25 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       ]),
       execute: async args => {
         if (agent.id !== host.resources.masterId) throw new Error('Only the Hub may handle Plan requirement changes')
-        if (args.mode === 'preview') return host.requirements.preview(latestRequirementMessage(agent))
+        if (args.mode === 'preview') return host.requirements.preview(latestOperatorMessage(agent))
         const replay = host.requirements.get(args.proposalId)?.status === 'applied'
         if (!replay) {
           host.assertNewWork?.()
           await host.verifyProjectBinding?.()
         }
-        const result = host.requirements.apply(args.proposalId, latestRequirementMessage(agent))
+        const result = host.requirements.apply(args.proposalId, latestOperatorMessage(agent))
         if (!replay) host.requestPass()
         return result
+      },
+    }),
+    tool({
+      name: 'orchestrator_plan_control',
+      description: promptFile('plan-control-tool'),
+      schema: PlanControlCommandSchema,
+      execute: async args => {
+        if (agent.id !== host.resources.masterId) throw new UserError('invalidPlan', { detail: 'Only the Hub may control Plan execution' })
+        if (args.action === 'status') return host.planControl.view(args.planId)
+        return host.planControl.change(args, latestOperatorMessage(agent, true))
       },
     }),
     tool({

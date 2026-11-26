@@ -19,6 +19,8 @@ type IntegratedView = Extract<PlanIntegrationView, PlanIntegratedArtifact>
 type ReleasedView = Extract<PlanIntegrationView, { status: 'released' }>
 interface ReleaseHost {
   store: Pick<Store, 'get' | 'set' | 'delete' | 'atomic'>
+  controlBlocked(planId: string): boolean
+  ready(planId: string): boolean
   adapter?: ReleaseAdapter
   artifact?(planId: string, view: PlanIntegratedArtifact): Promise<string | undefined>
   save(view: PlanIntegrationView): void
@@ -35,17 +37,25 @@ const credentialPrompt = promptFile('plan-release-credential')
 const matchesRequest = (request: PlanReleaseRequest, observation: PlanReleaseObservation): boolean =>
   observation.requestId === request.id && sameReleaseTarget(observation.target, request.target)
 const adapterId = (config: PlanReleaseConfig): string => key('release-adapter', config.executable, JSON.stringify(config.args), config.credentialId)
+const releaseLock = ({ projectId, target }: PlanReleaseRequest) => KV.plans.releaseActive(projectId, target.environment, target.target)
+const authorizationFailure = (handoff: Handoff | undefined, { projectId, version, target }: PlanReleaseRequest):
+  'authorization_missing' | 'target_scope_mismatch' | undefined => {
+  if (handoff?.authorization.release !== 'authorized' || !handoff.authorization.releaseTarget) return 'authorization_missing'
+  if (handoff.project.id !== projectId || handoff.project.repository.toLowerCase() !== version.repository ||
+    !sameReleaseTarget(handoff.authorization.releaseTarget, target)) return 'target_scope_mismatch'
+}
 
 /** Publishes verified packages under durable intents and reconciles the exact deployment before completion. */
 export class PlanRelease {
   constructor(private readonly host: ReleaseHost) {}
 
-  async start(prior: IntegratedView, handoff: Handoff, active: () => void): Promise<void | typeof Park> {
+  async start(prior: IntegratedView, getHandoff: () => Handoff | undefined, active: () => void): Promise<void | typeof Park> {
     const { host } = this, { store, adapter } = host, { planId, version, run, artifact, verifiedAt } = prior
+    const handoff = getHandoff()
     const intentKey = KV.plans.releaseIntent(planId)
     const base = { planId, version, run, artifact, verifiedAt }
-    const release = handoff.authorization.release === 'authorized' ? handoff.authorization.releaseTarget : undefined
-    if (!release) {
+    const release = handoff?.authorization.release === 'authorized' ? handoff.authorization.releaseTarget : undefined
+    if (!handoff || !release) {
       host.save({ ...base, status: 'release-blocked', reason: 'authorization_missing' })
       return Park
     }
@@ -58,13 +68,25 @@ export class PlanRelease {
       return Park
     }
     active()
+    if (host.controlBlocked(planId)) return Park
     const request: PlanReleaseRequest = {
       id: key('plan-release', handoff.project.id, planId, version.context, String(run.id), String(run.attempt), String(artifact.id), artifact.sha256,
         release.environment, release.target, release.scope), planId, projectId: handoff.project.id, target: release, version,
       run: { id: run.id, attempt: run.attempt }, artifact: { id: artifact.id, name: artifact.name, sha256: artifact.sha256,
         size: artifact.size, fileName: artifact.fileName, contentType: artifact.contentType },
     }
-    const lock = KV.plans.releaseActive(request.projectId, release.environment, release.target)
+    const lock = releaseLock(request)
+    const check = () => {
+      active()
+      if (store.get(intentKey)) throw new Later()
+      if (host.controlBlocked(planId)) return Park
+      if (!host.ready(planId)) throw new Later()
+      const reason = authorizationFailure(getHandoff(), request)
+      if (reason) {
+        host.save({ ...base, status: 'release-blocked', release, reason })
+        return Park
+      }
+    }
     if (store.get(lock)) {
       host.save({ ...base, status: 'release-blocked', release, reason: 'release_busy' })
       throw new Later()
@@ -72,30 +94,38 @@ export class PlanRelease {
     let available: boolean
     try { available = await adapter.credentialAvailable(request) }
     catch {
-      active()
+      if (check() === Park) return Park
       host.save({ ...base, status: 'release-blocked', release, reason: 'release_unavailable' })
       throw new Later()
     }
-    active()
+    if (check() === Park) return Park
     const credentialRelay = credentialRelayPrefix + planId
     if (!available) return this.awaitCredentials(prior, request, adapter.config)
-    const verified = await this.verifiedPackage(prior, request, active)
-    if (!verified) return
-    active()
+    const verified = await this.verifiedPackage(prior)
+    if (check() === Park) return Park
+    if (verified === 'release_unavailable') {
+      host.save({ ...base, status: 'release-blocked', release, reason: verified })
+      throw new Later()
+    }
+    if (typeof verified === 'string') return host.restartVerification(prior, verified)
     const intent: PlanReleaseIntent = { request, adapter: adapterId(adapter.config), verification: verified.verification }
     const publishing = { ...base, status: 'releasing' as const, release, releaseId: request.id }
     const acquired = store.atomic(() => {
-      if (store.get(intentKey) || store.get(lock)) return false
+      if (store.get(intentKey) || store.get(lock) || host.controlBlocked(planId)) return false
       store.set(intentKey, intent)
       store.set(lock, request.id)
       host.save(publishing)
       host.cancelRelay(credentialRelay)
       return true
     })
-    if (!acquired) throw new Later()
+    if (!acquired) {
+      if (host.controlBlocked(planId)) return Park
+      throw new Later()
+    }
     let observation: PlanReleaseObservation
     try { observation = await adapter.publish(request, verified.path) }
     catch {
+      this.requireIntent(request)
       host.save({ ...publishing, reason: 'release_dispatch_unconfirmed' })
       throw new Later()
     }
@@ -103,34 +133,74 @@ export class PlanRelease {
     return this.record(publishing, request, observation)
   }
 
-  async reconcile(prior: IntegratedView, intent: PlanReleaseIntent, active: () => void): Promise<void | typeof Park> {
-    const { adapter } = this.host, { request } = intent
+  async reconcile(prior: IntegratedView, intent: PlanReleaseIntent, getHandoff: () => Handoff | undefined,
+    active: () => void): Promise<void | typeof Park> {
+    const { host } = this, { adapter, store } = host, { request } = intent
+    if (prior.status === 'awaiting-release-verification' && host.controlBlocked(request.planId)) return Park
     if (!adapter || adapter.config.projectId !== request.projectId || !sameReleaseTarget(adapter.config, request.target) || adapterId(adapter.config) !== intent.adapter)
       return this.unavailable(prior, request, 'release_configuration_changed')
     active()
     let observation: PlanReleaseObservation
     try { observation = await adapter.observe(request) }
     catch { return this.unavailable(prior, request, 'release_unavailable') }
-    if (observation.status === 'not-started' && prior.status !== 'released-unverified') {
-      if (!matchesRequest(request, observation)) return this.unavailable(prior, request, 'release_unavailable')
-      active()
-      let credentialsAvailable: boolean
-      try { credentialsAvailable = await adapter.credentialAvailable(request) }
-      catch { return this.unavailable(prior, request, 'release_unavailable') }
-      active()
-      if (!credentialsAvailable) return this.awaitCredentials(prior, request, adapter.config)
-      const verified = await this.verifiedPackage(prior, request, active, true)
-      if (!verified) return
-      active()
-      const { store } = this.host, { planId, target: release, id: releaseId } = request
-      const { version, run, artifact, verifiedAt } = prior
-      store.atomic(() => {
-        this.host.save({ planId, version, run, artifact, verifiedAt, status: 'releasing', release, releaseId })
-        this.host.cancelRelay(credentialRelayPrefix + planId)
+    if (observation.status !== 'not-started' || prior.status === 'released-unverified') return this.record(prior, request, observation)
+    if (!matchesRequest(request, observation)) return this.unavailable(prior, request, 'release_unavailable')
+
+    const { planId, target: release, id: releaseId } = request
+    const { version, run, artifact, verifiedAt } = prior
+    const base = { planId, version, run, artifact, verifiedAt, release }
+    const lock = releaseLock(request)
+    const check = () => {
+      this.requireIntent(request)
+      const held = host.controlBlocked(planId)
+      if (!held) {
+        active()
+        if (!host.ready(planId)) throw new Later()
+      }
+      const reason = held ? undefined : authorizationFailure(getHandoff(), request)
+      if (!held && !reason) return
+      return store.atomic(() => {
+        // Authoritative absence permits releasing the lock while keeping this request for resume.
+        if (store.get(lock) === releaseId) store.delete(lock)
+        host.save(reason ? { ...base, status: 'release-blocked', reason } : { ...base, status: 'awaiting-release-verification' })
+        host.cancelRelay(credentialRelayPrefix + planId)
+        return Park
       })
-      try { observation = await adapter.publish(request, verified.path) }
-      catch { return this.unavailable(prior, request, 'release_unavailable') }
     }
+    const busy = (): never => {
+      host.save({ ...base, status: 'release-blocked', reason: 'release_busy' })
+      throw new Later()
+    }
+    if (check() === Park) return Park
+    const owner = store.get(lock)
+    if (owner !== undefined && owner !== releaseId) return busy()
+    let credentialsAvailable: boolean
+    try { credentialsAvailable = await adapter.credentialAvailable(request) }
+    catch {
+      if (check() === Park) return Park
+      return this.unavailable(prior, request, 'release_unavailable')
+    }
+    if (check() === Park) return Park
+    if (!credentialsAvailable) return this.awaitCredentials(prior, request, adapter.config)
+    const verified = await this.verifiedPackage(prior)
+    if (check() === Park) return Park
+    if (verified === 'release_unavailable') return this.unavailable(prior, request, verified)
+    if (typeof verified === 'string') return store.atomic(() => {
+      if (store.get(lock) === releaseId) store.delete(lock)
+      store.delete(KV.plans.releaseIntent(planId))
+      host.restartVerification(prior, verified)
+    })
+    const acquired = store.atomic(() => {
+      const owner = store.get(lock)
+      if (owner !== undefined && owner !== releaseId) return false
+      store.set(lock, releaseId)
+      host.save({ ...base, status: 'releasing', releaseId })
+      host.cancelRelay(credentialRelayPrefix + planId)
+      return true
+    })
+    if (!acquired) return busy()
+    try { observation = await adapter.publish(request, verified.path) }
+    catch { return this.unavailable(prior, request, 'release_unavailable') }
     return this.record(prior, request, observation)
   }
 
@@ -150,38 +220,25 @@ export class PlanRelease {
     throw new Later()
   }
 
-  private async verifiedPackage(prior: IntegratedView, request: PlanReleaseRequest, active: () => void, retry = false):
-    Promise<{ path: string; verification: PlanVerificationConfig } | undefined> {
-    const { host } = this, { store } = host, { planId, target: release } = request
-    let path: string | undefined, verification: PlanVerificationConfig | undefined
+  private requireIntent(request: PlanReleaseRequest): void {
+    if (this.host.store.get(KV.plans.releaseIntent(request.planId))?.request.id !== request.id) throw new Later()
+  }
+
+  private async verifiedPackage(prior: IntegratedView): Promise<{ path: string; verification: PlanVerificationConfig } |
+    'artifact_unavailable' | 'regression_evidence_changed' | 'release_unavailable'> {
+    const { host } = this
     try {
-      path = await host.artifact?.(planId, prior)
-      if (path) verification = await host.verifyEvidence(prior)
+      const path = await host.artifact?.(prior.planId, prior)
+      if (!path) return 'artifact_unavailable'
+      const verification = await host.verifyEvidence(prior)
+      return verification ? { path, verification } : 'regression_evidence_changed'
     } catch {
-      active()
-      if (retry) {
-        this.unavailable(prior, request, 'release_unavailable')
-      } else {
-        const { version, run, artifact, verifiedAt } = prior
-        host.save({ planId, version, run, artifact, verifiedAt, status: 'release-blocked', release, reason: 'release_unavailable' })
-      }
-      throw new Later()
+      return 'release_unavailable'
     }
-    active()
-    if (path && verification) return { path, verification }
-    store.atomic(() => {
-      // Only a matching absence observation allows retiring an already-persisted intent.
-      if (retry) {
-        const lock = KV.plans.releaseActive(request.projectId, release.environment, release.target)
-        if (store.get(lock) !== request.id) throw new Error('Release intent does not own its target')
-        store.delete(lock)
-        store.delete(KV.plans.releaseIntent(planId))
-      }
-      host.restartVerification(prior, path ? 'regression_evidence_changed' : 'artifact_unavailable')
-    })
   }
 
   private unavailable(prior: IntegratedView, request: PlanReleaseRequest, reason: 'release_unavailable' | 'release_configuration_changed'): typeof Park {
+    this.requireIntent(request)
     const view: PlanIntegrationView = prior.status === 'released-unverified' ? { ...prior, reason }
       : { ...prior, status: 'releasing', release: request.target, releaseId: request.id, reason }
     this.host.save(view)
@@ -191,8 +248,9 @@ export class PlanRelease {
 
   private record(prior: IntegratedView, request: PlanReleaseRequest, result: PlanReleaseObservation): void | typeof Park {
     if (!matchesRequest(request, result)) return this.unavailable(prior, request, 'release_unavailable')
+    this.requireIntent(request)
     const { store } = this.host, { planId, target: release, id: releaseId } = request
-    const lock = KV.plans.releaseActive(request.projectId, release.environment, release.target)
+    const lock = releaseLock(request)
     const base = { planId, version: prior.version, run: prior.run, artifact: prior.artifact, verifiedAt: prior.verifiedAt, release, releaseId }
     const finish = (view: PlanIntegrationView) => store.atomic(() => {
       if (store.get(lock) === releaseId) store.delete(lock)

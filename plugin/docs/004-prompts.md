@@ -39,6 +39,7 @@ The mainline queue uses `prompts/queue-merge-tool.md` for its Hub tool, `prompts
 
 `prompts/plan-release-credential.md` supplies the controlled-provider instruction sent while an explicitly authorized Plan release awaits credential availability. It contains no credential value and is not an editable system-prompt part.
 `prompts/plan-stagnation.md` supplies the Worker diagnosis; `prompts/plan-replan-relay.md` wakes the Hub for internal coordination. `prompts/plan-replan-tool.md`, `prompts/plan-requirements-tool.md` and `prompts/plan-question-tool.md` describe Hub tools. The product change flow uses `prompts/plan-requirements-target.md` for an ambiguous target and `prompts/plan-requirements-revalidate.md` for replacement verification. These packaged templates are not editable prompt parts.
+`prompts/plan-control-tool.md` describes direct Harness commands and stop statuses. `prompts/plan-control-target.md` supplies the tool's clarification when a direct command does not identify its scope. See `009-handoff.md`.
 
 The independent scope reviewer receives `prompts/plan-requirement-scope-review.md` with its sealed request. `prompts/plan-requirement-scope-tool.md` describes its only tool.
 The Hub's rotation recovery loads `prompts/hub-resume.md` as a fixed continuation preface; the following JSON is assembled from durable project state and resource references, not copied Session history.

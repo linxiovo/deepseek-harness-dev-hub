@@ -33,43 +33,37 @@ const historicalMessage = z.object({ message_id: messageId, chat_id: chatId, roo
 const botIdentitySchema = z.string().regex(/^cli_[A-Za-z0-9]+:ou_[A-Za-z0-9]+$/)
 const MAX_HISTORY_PAGES = 20
 
-function cardContent(view: SettingsConfirmationView) {
-  const plain = (content: string) => ({ tag: 'plain_text', content })
-  const description = [`Project: ${view.repository} (${view.projectId})`, `Setting: ${view.object}${view.chatId ? ` (${view.chatId})` : ''}`,
+const buttons = { approve: 'Approve change', status: 'Check current status' } as const
+const plainText = z.strictObject({ tag: z.literal('plain_text'), content: z.string() })
+const cardButton = z.strictObject({ tag: z.literal('button'), text: plainText, type: z.string(),
+  behaviors: z.tuple([z.strictObject({ type: z.literal('callback'), value: payload })]) })
+const storedCard = z.strictObject({ schema: z.literal('2.0'), config: z.strictObject({ enable_forward: z.literal(false) }),
+  header: z.strictObject({ title: plainText, template: z.string() }), body: z.strictObject({
+    elements: z.tuple([z.strictObject({ tag: z.literal('div'), text: plainText }), cardButton, cardButton]),
+  }) })
+
+function cardDescription(view: SettingsConfirmationView): string {
+  return [`Project: ${view.repository} (${view.projectId})`, `Setting: ${view.object}${view.chatId ? ` (${view.chatId})` : ''}`,
     `Current: ${view.currentValue ?? 'unlimited'} → Proposed: ${view.proposedValue ?? 'unlimited'}`,
     `Effective: ${view.effectiveValue ?? 'unlimited'} (revision ${view.effectiveRevision})`,
     `Impact: ${view.impact}`, `Status: ${view.status}. Approval expires: ${view.expiresAt}`, `Request: ${view.id}`].join('\n')
+}
+
+function cardContent(view: SettingsConfirmationView) {
+  const plain = (content: string) => ({ tag: 'plain_text', content })
   const base = { projectId: view.projectId, requestId: view.id, revision: view.revision }
   return { schema: '2.0', config: { enable_forward: false }, header: { title: plain('Project settings approval'), template: 'blue' },
-    body: { elements: [{ tag: 'div', text: plain(description) }, ...(['approve', 'status'] as const).map(action => ({ tag: 'button',
-      text: plain(action === 'approve' ? 'Approve change' : 'Check current status'), type: action === 'approve' ? 'primary_filled' : 'default',
+    body: { elements: [{ tag: 'div', text: plain(cardDescription(view)) }, ...(['approve', 'status'] as const).map(action => ({ tag: 'button',
+      text: plain(buttons[action]), type: action === 'approve' ? 'primary_filled' : 'default',
       behaviors: [{ type: 'callback', value: { ...base, action } }] }))] } }
 }
-function cardMatches(content: string, view: SettingsConfirmationView): boolean {
-  try {
-    const parsed = JSON.parse(content)
-    const shape = z.strictObject({ schema: z.literal('2.0'), config: z.strictObject({ enable_forward: z.literal(false) }),
-      header: z.strictObject({ title: z.strictObject({ tag: z.literal('plain_text'), content: z.string() }), template: z.string() }),
-      body: z.strictObject({ elements: z.array(z.unknown()).length(3) }) }).safeParse(parsed)
-    if (!shape.success) return false
-    const elements = parsed.body.elements
-    const description = z.strictObject({ tag: z.literal('div'), text: z.strictObject({ tag: z.literal('plain_text'), content: z.string() }) }).safeParse(elements[0])
-    if (!description.success || description.data.text.content.split('\n').filter(line => line === `Request: ${view.id}`).length !== 1) return false
-    const button = z.strictObject({ tag: z.literal('button'), text: z.strictObject({ tag: z.literal('plain_text'), content: z.string() }),
-      type: z.string(), behaviors: z.array(z.strictObject({ type: z.literal('callback'), value: payload })).length(1) })
-    const actions = new Map<string, z.infer<typeof payload>>()
-    for (const raw of elements.slice(1)) {
-      const result = button.safeParse(raw)
-      if (!result.success) return false
-      const value = result.data.behaviors[0]!.value
-      if (actions.has(value.action)) return false
-      actions.set(value.action, value)
-    }
-    return actions.size === 2 && ['approve', 'status'].every(action => {
-      const value = actions.get(action)
-      return value?.action === action && value.projectId === view.projectId && value.requestId === view.id && value.revision === view.revision
-    })
-  } catch { return false }
+function cardMatches(content: unknown, view: SettingsConfirmationView): boolean {
+  const result = storedCard.safeParse(content)
+  if (!result.success) return false
+  const [description, first, second] = result.data.body.elements
+  return description.text.content === cardDescription(view) && first.behaviors[0].value.action !== second.behaviors[0].value.action &&
+    [first, second].every(({ text, behaviors: [{ value }] }) => text.content === buttons[value.action] && value.projectId === view.projectId &&
+      value.requestId === view.id && value.revision === view.revision)
 }
 
 /** Find exactly one still-present original card sent by this bot in the exact DM or bound group topic. */
@@ -121,10 +115,12 @@ export async function findSettingsCard(commands: Commands, target: { chatId: str
       if (message.msg_type !== 'interactive' || message.sender.sender_type !== 'app' ||
         !((message.sender.id_type === 'app_id' && message.sender.id === appId) || (message.sender.id_type === 'open_id' && message.sender.id === botId))) continue
       if (!message.body) throw new Error('Feishu settings card history contains an incomplete app card')
-      try { JSON.parse(message.body.content) } catch { throw new Error('Feishu settings card history contains an undecodable app card') }
-      const marker = message.body.content.includes(`Request: ${view.id}`)
-      if (marker && cardMatches(message.body.content, view)) matches.add(message.message_id)
-      else if (marker) throw new Error('Feishu settings card history contains an ambiguous request marker')
+      let content: unknown
+      try { content = JSON.parse(message.body.content) }
+      catch { throw new Error('Feishu settings card history contains an undecodable app card') }
+      if (!message.body.content.includes(view.id)) continue
+      if (!cardMatches(content, view)) throw new Error('Feishu settings card history contains a mismatched proposal')
+      matches.add(message.message_id)
     }
     if (!page.has_more) break
     if (!page.page_token || cursors.has(page.page_token)) throw new Error('Feishu settings card history pagination is incomplete')

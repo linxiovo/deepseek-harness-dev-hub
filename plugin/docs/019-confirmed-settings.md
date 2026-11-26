@@ -57,7 +57,7 @@ Keep `projectId` and `id` to query or approve this proposal. The same view inclu
 
 A proposal is valid for up to 15 minutes. An approval is `approved` only after the atomic setting write succeeds. Repeated approval, an expired or superseded proposal, or a revision mismatch returns `409`; no second write occurs. After restart, the same `GET` still reads the durable decision and current effective state. The original trusted card's status action re-queries that same result, including after restart, as long as the same binding, bot, and granted participant are still authorized. If the card is no longer authorized, query through the operator API.
 
-If a card send is interrupted, the host first reads the original bound conversation and looks for that proposal's card from the verified bot. A unique match restores the original message ID. The host retries the same provider idempotency key only if the read completes with no match and the proposal remains current. An incomplete or ambiguous read leaves approval available through the API.
+After an interrupted send, the host searches the original bound conversation for the verified bot's card. The proposal details and both button actions must match. A unique match restores the original message ID. The host retries with the same idempotency key after a complete search finds no match and the proposal is still current. Use the API if the search cannot establish a result.
 
 The response does not contain credentials, access tokens, bot secrets, the original request body, or the approver list. The approval body accepts neither actor identity nor a replacement value.
 

@@ -46,7 +46,6 @@ describe('findSettingsCard', () => {
     const content = sendArgs[sendArgs.indexOf('--content') + 1]!
     expect(content).toContain(`Request: ${view.id}`)
     const original = JSON.parse(content)
-    original.body.elements[0].text.content = `Reworded proposal details\nRequest: ${view.id}`
     for (const button of original.body.elements.slice(1)) {
       const behavior = button.behaviors[0]
       behavior.value = Object.fromEntries(Object.entries(behavior.value).reverse())
@@ -54,6 +53,14 @@ describe('findSettingsCard', () => {
     original.body.elements.splice(1, 2, ...original.body.elements.slice(1).reverse())
     responses.push(page([message({ body: { content: JSON.stringify(original) } })]))
     await expect(findSettingsCard(commandsMock, target, view, identity, () => true)).resolves.toBe('om_original')
+  })
+
+  it('refuses to recover a card whose visible limit differs from its approval payload', async () => {
+    const original = card()
+    const description = original.body.elements[0]!.text
+    description.content = description.content.replace('Proposed: all', 'Proposed: mentions')
+    await expect(findSettingsCard(commands([page([message({ body: { content: JSON.stringify(original) } })])]),
+      target, view, identity, () => true)).rejects.toThrow('mismatched proposal')
   })
 
   it('recovers only this app card in the bounded DM history after a lost send receipt', async () => {

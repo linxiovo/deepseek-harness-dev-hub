@@ -6,7 +6,7 @@ The local management API creates durable, project-scoped proposals for a narrow 
 
 All routes use the loopback management transport described in [012 Project runtime](012-project-runtime.md#project-scope): send `x-orchestrator-request: 1`, `x-orchestrator-project-id: <mounted project ID>`, a loopback `Host`, and, when present, a same-origin `Origin`. Reads and writes both require a registered managed mount and its current ID. These are local operator routes, not Hub tools or remote Feishu callbacks.
 
-Use `Content-Type: application/json` for the two POST bodies. Both bodies are limited to 131,072 bytes. Proposal and approval objects and nested changes reject unknown fields; none of the routes takes query parameters. Successful requests return HTTP 200 with JSON and `Cache-Control: no-store`.
+Both POST routes require `Content-Type: application/json` and limit bodies to 131,072 bytes. Proposal and approval objects and nested changes reject unknown fields. The routes take no query parameters. Successful requests return HTTP 200 with JSON and `Cache-Control: no-store`.
 
 | Method and path | Request | Response |
 | --- | --- | --- |
@@ -24,7 +24,7 @@ The supported `change` variants are strict objects:
 
 For an explicit Feishu grant, the interactive card is delivered to the original bound conversation. Only its verified action from a named approver can approve there: forwarded cards, plain text, stale cards, and Hub relays cannot approve. If the card stream is unavailable, the notice provides a text summary and a settings link instead. Opening a link never approves the request.
 
-`approvers` is optional. Omit it or pass `[]` for API-only approval. A nonempty list explicitly grants this request's Feishu approval to those open IDs, and every ID must already be an allowed participant in the current Feishu topic binding. Group membership, binding membership by itself, the ability to answer a product question, and Hub summaries do not authorize a configuration approval. If that binding epoch changes, a pending request is superseded. A newer proposal for the same setting or a change to its captured settings block revision also supersedes it.
+Omit `approvers` or pass `[]` for API-only approval. A nonempty list explicitly grants card approval for this request. It accepts up to 100 open IDs of at most 128 characters matching `^ou_[A-Za-z0-9]+$`. Each ID must already be an allowed participant in the current Feishu topic binding. Group membership, binding membership, product clarification rights, and Hub summaries do not grant configuration approval by themselves. Changing the binding, replacing the request for the same object, or changing the saved block revision supersedes the pending request.
 
 ### Revision and effect
 
@@ -57,17 +57,19 @@ Keep `projectId` and `id` to query or approve this proposal. The same view inclu
 
 A proposal is valid for up to 15 minutes. An approval is `approved` only after the atomic setting write succeeds. Repeated approval, an expired or superseded proposal, or a revision mismatch returns `409`; no second write occurs. After restart, the same `GET` still reads the durable decision and current effective state. The original trusted card's status action re-queries that same result, including after restart, as long as the same binding, bot, and granted participant are still authorized. If the card is no longer authorized, query through the operator API.
 
+If a card send is interrupted, the host first reads the original bound conversation and looks for that proposal's card from the verified bot. A unique match restores the original message ID. The host retries the same provider idempotency key only if the read completes with no match and the proposal remains current. An incomplete or ambiguous read leaves approval available through the API.
+
 The response does not contain credentials, access tokens, bot secrets, the original request body, or the approver list. The approval body accepts neither actor identity nor a replacement value.
 
 ## Refusals
 
 | Status | Conditions |
 | --- | --- |
-| `400 {error}` | Malformed JSON, oversized body, malformed ID escape, unexpected query parameter, unknown field, invalid value or a change that would not widen the current limit or listening scope. |
-| `403 {error}` | Loopback/same-origin transport check failed, or a proposed card approver is not an authorized participant in the current topic binding. |
-| `404 {error}` | Unknown confirmation ID in this project, no confirmation service on this host, or unknown route. |
-| `409 {error, code}` | Mount and write exclusions: `noProject`, `projectScopeRequired`, `staleProject`, `switching` or `projectConflict`. Refresh the mounted project; do not automatically resubmit the refused operation. |
-| `409 {error}` | Stale block or submitted revision, already approved, expired or superseded request, or Feishu Source not enabled for a listening proposal. Query the original ID, then reload the settings before creating a new proposal. |
+| `400 {error}` | Missing or incorrect JSON media type, malformed JSON, oversized body, malformed ID escape, unexpected query parameter, unknown field or invalid value. A valid change that would not widen the effective setting has `code: "settingsConfirmationNotIncrease"`. |
+| `403 {error}` | Loopback or same-origin transport check failed. A refused card grant has `code: "settingsConfirmationApprovers"`. |
+| `404 {error}` | Unknown confirmation ID in this project (`settingsConfirmationUnknown`), no confirmation service on this host, or unknown route. |
+| `409 {error, code}` | Mount and write exclusions: `noProject`, `projectScopeRequired`, `staleProject`, `switching` or `projectConflict`. Refresh the mounted project before submitting again. |
+| `409 {error, code: "settingsConfirmationStale"}` | Stale block or submitted revision, already approved, expired or superseded request, or Feishu Source not enabled for a listening proposal. Query the original ID, then reload the settings before creating a new proposal. |
 | `500 {error}` | Unexpected server failure; internal diagnostics are not returned. |
 
 `GET` also requires the current managed project header. A correctly scoped request on a host without the confirmation module returns `404`; requests without the managed scope are refused rather than reading a process-global or previous project's record.

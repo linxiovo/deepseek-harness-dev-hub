@@ -32,7 +32,7 @@ import { PlanArtifactFileSchema, type PlanArtifactFile } from './plan-artifacts.
 import { actorIdPattern, TopicBindingError, type TopicBinding } from './topic-binding.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
 import { SettingsApprovalSchema, SettingsProposalSchema } from '../confirmed-settings.ts'
-import { SettingsConfirmationError, type SettingsConfirmations } from './settings-confirmations.ts'
+import type { SettingsConfirmations } from './settings-confirmations.ts'
 import type { Variable } from './execution-environment.ts'
 import { policyHistory } from './settings-history.ts'
 import { overview } from './views/overview.ts'
@@ -256,7 +256,11 @@ function attentionFailure(error: unknown): [number, Record<string, unknown>] {
 function confirmationFailure(error: unknown): [number, Record<string, unknown>] {
   if (error instanceof RouteError) return failure(error)
   if (error instanceof InstallationError) return failure(new InstallationError(error.status, error.code))
-  if (error instanceof SettingsConfirmationError) return [error.status, { error: error.message }]
+  if (error instanceof UserError) {
+    if (error.code === 'settingsConfirmationApprovers') return [403, { error: error.message, code: error.code }]
+    if (error.code === 'settingsConfirmationStale') return [409, { error: error.message, code: error.code }]
+    if (error.code === 'settingsConfirmationUnknown' || error.code === 'settingsConfirmationNotIncrease') return failure(error)
+  }
   return [500, { error: 'Settings confirmation operation failed.' }]
 }
 
@@ -589,7 +593,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         if (route.key === 'GET plans/:id/delivery' && url.searchParams.size !== 0) {
           throw new RouteError(400, 'Invalid plan delivery query')
         }
-        if (route.key === 'POST attention/credentials/:id/verify'
+        if ((route.key === 'POST attention/credentials/:id/verify' || (confirmationRoute && route.key.startsWith('POST ')))
           && req.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') {
           throw new RouteError(400, 'Expected Content-Type: application/json')
         }

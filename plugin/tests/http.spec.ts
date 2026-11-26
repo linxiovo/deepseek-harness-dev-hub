@@ -10,12 +10,11 @@ import { registerHttp } from '../src/app/http.ts'
 import type { SessionMeterView } from '../src/app/session-meter.ts'
 import { PromptConflict } from '../src/app/prompts.ts'
 import { SettingsConflict } from '../src/app/settings.ts'
-import { SettingsConfirmationError } from '../src/app/settings-confirmations.ts'
 import type { HttpHost } from '../src/app/http.ts'
 import { InstallationError, type InstallationApi, type RuntimeView } from '../src/app/installation-api.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { SetupError } from '../src/setup.ts'
-import type { Ticket } from '../src/core/index.ts'
+import { UserError, type Ticket } from '../src/core/index.ts'
 
 type Handler = (req: unknown, res: unknown) => Promise<void>
 type Headers = Record<string, string | undefined>
@@ -40,7 +39,8 @@ function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.
     const response = new TestResponse((code, fields) => { status = code; responseHeaders = fields })
     response.on('data', chunk => output.push(Buffer.from(chunk)))
     const chunks = body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]
-    const sent = Object.fromEntries(Object.entries({ host: '127.0.0.1:3082', 'x-orchestrator-request': '1', ...headers }).filter(([,
+    const sent = Object.fromEntries(Object.entries({ host: '127.0.0.1:3082', 'x-orchestrator-request': '1',
+      ...(body !== undefined && { 'content-type': 'application/json' }), ...headers }).filter(([,
       value]) => value !== undefined))
     const req = { method, url: `/orchestrator/api/${path}`, headers: sent, async *[Symbol.asyncIterator]() {
       if (beforeBody) await beforeBody()
@@ -68,11 +68,11 @@ it('proposes, reads, and approves settings confirmations only through the scoped
   const service: NonNullable<HttpHost['settingsConfirmations']> = {
     propose: input => { calls.push(['propose', input]); return confirmation('request-1') },
     read: id => {
-      if (id !== 'request-1') throw new SettingsConfirmationError(404, 'Settings confirmation not found.')
+      if (id !== 'request-1') throw new UserError('settingsConfirmationUnknown')
       return confirmation(id, decided ? 'approved' : 'pending')
     },
     approve: (id, revision) => {
-      if (revision !== 4 || decided) throw new SettingsConfirmationError(409, 'Confirmation is no longer pending at that revision.')
+      if (revision !== 4 || decided) throw new UserError('settingsConfirmationStale')
       calls.push(['approve', id, revision])
       decided = true
       return confirmation(id, 'approved')
@@ -86,8 +86,8 @@ it('proposes, reads, and approves settings confirmations only through the scoped
     .toMatchObject({ status: 403 })
   expect(await call('POST', 'settings-confirmations', proposal, headers)).toEqual({ status: 200, body: confirmation('request-1') })
   expect(await call('GET', record, undefined, headers)).toEqual({ status: 200, body: confirmation('request-1') })
-  expect(await call('GET', 'settings-confirmations/missing', undefined, headers)).toMatchObject({ status: 404 })
-  expect(await call('POST', approve, { revision: 3 }, headers)).toMatchObject({ status: 409 })
+  expect(await call('GET', 'settings-confirmations/missing', undefined, headers)).toMatchObject({ status: 404, body: { code: 'settingsConfirmationUnknown' } })
+  expect(await call('POST', approve, { revision: 3 }, headers)).toMatchObject({ status: 409, body: { code: 'settingsConfirmationStale' } })
   expect(await call('POST', approve, { revision: 4 }, headers)).toEqual({ status: 200, body: confirmation('request-1', 'approved') })
   expect(await call('POST', approve, { revision: 4 }, headers)).toMatchObject({ status: 409 })
   expect(await call('GET', record, undefined, headers)).toEqual({ status: 200, body: confirmation('request-1', 'approved') })
@@ -104,6 +104,8 @@ it('proposes, reads, and approves settings confirmations only through the scoped
   for (const body of [{ revision: 4, value: 200 }, { revision: 4, actorId: 'ou_admin' }, { revision: '4' }]) {
     expect(await call('POST', approve, body, headers)).toEqual({ status: 400, body: { error: 'Invalid settings confirmation request' } })
   }
+  expect(await call('POST', approve, { revision: 4 }, { ...headers, 'content-type': 'text/plain' }))
+    .toEqual({ status: 400, body: { error: 'Expected Content-Type: application/json' } })
   expect(await call('POST', approve, '{"revision":4,"secret":"not a valid JSON body"', headers))
     .toEqual({ status: 400, body: { error: 'The request body is not JSON' } })
   expect(await call('POST', `${approve}?actorId=ou_admin`, { revision: 4 }, headers)).toMatchObject({ status: 400 })

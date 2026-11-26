@@ -1,18 +1,17 @@
 import { randomUUID } from 'node:crypto'
-import { SettingsProposalSchema, type ConfirmableChange, type SettingsCardAction, type SettingsConfirmationView,
+import { SETTINGS_CONFIRMATION_LIFETIME_MS, type ConfirmableChange, type SettingsCardAction, type SettingsConfirmationView,
   type SettingsProposal } from '../confirmed-settings.ts'
-import { key, type OutboundMessage } from '../core/index.ts'
+import { key, UserError, type OutboundMessage } from '../core/index.ts'
 import type { Commands } from '../infra/commands.ts'
 import { KV } from '../kv.ts'
 import { effectiveRunLimits } from '../policy.ts'
-import { sendSettingsCard } from '../sources/feishu-card.ts'
+import { findSettingsCard, sendSettingsCard } from '../sources/feishu-card.ts'
 import type { FeishuConfig } from '../sources/feishu.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import type { Settings } from './settings.ts'
 import type { Store } from './store.ts'
 import type { TopicBinding } from './topic-binding.ts'
 
-const LIFETIME_MS = 15 * 60_000
 const { latest, request } = KV.settingsConfirmations
 const objectKey = (change: ConfirmableChange) => change.object === 'feishuChat' ? `feishuChat:${change.chatId}` : change.object
 const impacts = {
@@ -34,13 +33,8 @@ export interface SettingsConfirmationRecord {
   decision?: Decision
 }
 
-/** Public refusals contain no operator-supplied text or deployment credentials. */
-export class SettingsConfirmationError extends Error {
-  constructor(readonly status: 400 | 403 | 404 | 409, message: string) { super(message) }
-}
-
 interface Host {
-  store: Pick<Store, 'atomic' | 'get' | 'set' | 'settings' | 'blockRevision'>
+  store: Pick<Store, 'atomic' | 'get' | 'set' | 'settings' | 'blockRevision' | 'receipts'>
   settings: Pick<Settings, 'applyConfirmed'>
   sources: Pick<SourceRegistry, 'instance' | 'send'>
   topic: Pick<TopicBinding, 'view' | 'pollTarget' | 'settingsNotice'>
@@ -53,31 +47,30 @@ interface Host {
 export class SettingsConfirmations {
   constructor(private readonly host: Host) {}
 
-  propose(input: SettingsProposal): SettingsConfirmationView {
-    const { revision, change, approvers } = SettingsProposalSchema.parse(input)
+  propose({ revision, change, approvers }: SettingsProposal): SettingsConfirmationView {
     const { store, projectId, topic } = this.host
     return store.atomic(() => {
       const { effectiveValue, effectiveRevision, available } = this.snapshot(change)
-      if (effectiveRevision !== revision || !available) throw new SettingsConfirmationError(409, 'The settings block changed or is unavailable.')
+      if (effectiveRevision !== revision || !available) throw new UserError('settingsConfirmationStale')
       const higher = typeof effectiveValue === 'number' ? change.value === null || (typeof change.value === 'number' && change.value > effectiveValue)
         : effectiveValue === 'none' || (effectiveValue === 'mentions' && change.value === 'all')
-      if (!higher) throw new SettingsConfirmationError(400, 'The proposal must increase the effective quota or expand the listening scope.')
+      if (!higher) throw new UserError('settingsConfirmationNotIncrease')
       let grant: SettingsConfirmationRecord['grant']
       if (approvers?.length) {
         const binding = topic.pollTarget()
         if (!binding || binding.projectId !== projectId || approvers.some(actor => !binding.allowedActors.includes(actor))) {
-          throw new SettingsConfirmationError(403, 'Choose explicitly authorized participants in the active project binding.')
+          throw new UserError('settingsConfirmationApprovers')
         }
         grant = { epoch: binding.epoch, actors: [...new Set(approvers)] }
       }
       const id = randomUUID(), createdAt = Date.now()
       const record: SettingsConfirmationRecord = { projectId, revision, change, currentValue: effectiveValue, createdAt,
-        expiresAt: createdAt + LIFETIME_MS, ...(grant && { grant }) }
+        expiresAt: createdAt + SETTINGS_CONFIRMATION_LIFETIME_MS, ...(grant && { grant }) }
       store.set(request(id), record)
       store.set(latest(objectKey(change)), id)
       const view = this.view(id, record)
       if (grant) topic.settingsNotice(grant.epoch, `settings-request:${id}`,
-        `Project ${view.repository} (${projectId}) · ${objectKey(change)}: ${effectiveValue} → ${change.value}. ${view.impact} Request ${id}, expires ${view.expiresAt}.`, id)
+        `Project ${view.repository} (${projectId}) · ${objectKey(change)}: ${effectiveValue ?? 'unlimited'} → ${change.value ?? 'unlimited'}. ${view.impact} Request ${id}, expires ${view.expiresAt}.`, id)
       return view
     })
   }
@@ -89,12 +82,12 @@ export class SettingsConfirmations {
   approve(id: string, revision: number): SettingsConfirmationView {
     return this.host.store.atomic(() => {
       const record = this.record(id), view = this.view(id, record)
-      if (view.status !== 'pending' || revision !== view.revision) throw new SettingsConfirmationError(409, 'The proposal is no longer pending at this revision.')
+      if (view.status !== 'pending' || revision !== view.revision) throw new UserError('settingsConfirmationStale')
       return this.apply(id, record, { via: 'panel' })
     })
   }
 
-  /** The Outbox retries the same remote UUID, never a new card or a different delivery mode after an uncertain send. */
+  /** Reconcile any previous send against the original conversation before retrying the native UUID. */
   async deliver(message: OutboundMessage, commands: Commands): Promise<'sent' | 'gone' | 'waiting'> {
     const id = message.channel.address.settingsRequest!, record = this.record(id)
     const { topic, store } = this.host, target = topic.pollTarget()
@@ -107,8 +100,20 @@ export class SettingsConfirmations {
     if (!record.delivery) store.set(request(id), { ...record, delivery })
     if (delivery.kind === 'text') return this.host.sources.send(message, commands)
     if (delivery.botIdentity !== identity) return 'waiting'
-    const messageId = await sendSettingsCard(commands, target, view)
-    // Approval may have committed while the send was in flight. Attach the receipt to the latest record without undoing it.
+    const settingsRevision = store.get(KV.settings.revision), setting = latest(objectKey(record.change))
+    const active = () => topic.pollTarget()?.epoch === target.epoch && this.host.cardIdentity() === delivery.botIdentity &&
+      store.receipts.get(message.id)?.status === 'pending' && store.get(KV.settings.revision) === settingsRevision &&
+      store.get(setting) === id && Date.now() < record.expiresAt
+    let messageId: string | undefined
+    if (record.delivery) {
+      messageId = await findSettingsCard(commands, target, view, delivery.botIdentity, active)
+      if (!active()) return 'waiting'
+    }
+    if (!messageId) {
+      try { messageId = await sendSettingsCard(commands, target, view) }
+      catch { throw new Error('Feishu settings card delivery is unconfirmed.') }
+    }
+    // The operator may have approved while the send was in flight. Preserve that decision.
     store.set(request(id), { ...this.record(id), delivery: { ...delivery, messageId } })
     return 'sent'
   }
@@ -134,7 +139,7 @@ export class SettingsConfirmations {
 
   private record(id: string): SettingsConfirmationRecord {
     const record = this.host.store.get(request(id))
-    if (!record || record.projectId !== this.host.projectId) throw new SettingsConfirmationError(404, 'Settings confirmation not found.')
+    if (!record || record.projectId !== this.host.projectId) throw new UserError('settingsConfirmationUnknown')
     return record
   }
 
@@ -161,7 +166,7 @@ export class SettingsConfirmations {
   }
 
   private summary(record: SettingsConfirmationRecord, view: SettingsConfirmationView): string {
-    return `Project ${view.repository} (${view.projectId}) · ${objectKey(record.change)}: ${view.status}. Effective value: ${view.effectiveValue} (revision ${view.effectiveRevision}).`
+    return `Project ${view.repository} (${view.projectId}) · ${objectKey(record.change)}: ${view.status}. Effective value: ${view.effectiveValue ?? 'unlimited'} (revision ${view.effectiveRevision}).`
   }
 
   private apply(id: string, record: SettingsConfirmationRecord, decision: Decision): SettingsConfirmationView {

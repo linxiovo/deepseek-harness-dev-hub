@@ -12,7 +12,7 @@ import { batchInvocation, validItems, type Tally } from '../infra/commands.ts'
 import { feishuBoundThread, readFeishu, type FeishuRef } from './feishu-read.ts'
 import { feishuRef, feishuTime, feishuTrigger, HistoricalMessageSchema, historyEvent, HistoryPageSchema, SOURCE, topicEvent }
   from './feishu-trigger.ts'
-import { health, type FeishuTopic, type SourceContext } from './host.ts'
+import { health, type FeishuCardProblem, type FeishuTopic, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
 import { cursorAt, POLL_HORIZON_MS, polled, pollThreads as pollEach } from './poll.ts'
 import type { FeishuConfig } from './feishu.ts'
@@ -77,7 +77,6 @@ async function consume(ctx: SourceContext, signal: AbortSignal, cards: boolean):
   if (signal.aborted) return
   const { cli, botId, appId } = bot(ctx), identity = `${appId}:${botId}`
   const connection = cards ? ctx.feishuTopic : undefined
-  connection?.cardReady?.(identity, false)
   const args = ['event', 'consume', cards ? cardEventKey : 'im.message.receive_v1', '--as', 'bot']
   // Discard the update token and fetched card body at the CLI boundary, before they enter the host's queue.
   if (cards) args.push('--jq', 'select((.form_value | length) == 0) | {type,host,action_tag,action_value,operator_id,message_id,chat_id,timestamp,event_id}')
@@ -88,13 +87,17 @@ async function consume(ctx: SourceContext, signal: AbortSignal, cards: boolean):
       env: { ...process.env, LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
   const stdout = createInterface({ input: child.stdout }); const stderr = createInterface({ input: child.stderr })
   let chain = Promise.resolve(); let diagnostic = ''; let ready = false; let eventFailed = false
+  let stopping = false; let failure: FeishuCardProblem | undefined
   const handshake = cards ? Promise.withResolvers<void>() : undefined
   const active = () => !!enabled(ctx) && ctx.deployment.feishu?.appId === appId && ctx.deployment.feishu?.botId === botId
-  const down = () => {
-    if (cards && ready) { ready = false; connection?.cardReady?.(identity, false) }
+  const down = (problem?: FeishuCardProblem) => {
+    if (ready) {
+      ready = false
+      if (problem) connection?.cardReady?.(identity, false, problem)
+      else connection?.cardReady?.(identity, false)
+    } else if (problem) connection?.cardReady?.(identity, false, problem)
     handshake?.resolve()
   }
-  let stopping = false
   const stop = (): void => {
     if (stopping) return
     stopping = true
@@ -108,20 +111,25 @@ async function consume(ctx: SourceContext, signal: AbortSignal, cards: boolean):
       killer.on('close', () => { if (child.exitCode === null) child.kill('SIGTERM') })
     } else child.kill('SIGTERM')
   }
+  const fail = (problem: FeishuCardProblem) => {
+    if (failure || stopping) return
+    failure = problem
+    down(problem)
+    stop()
+  }
   signal.addEventListener('abort', stop, { once: true })
   if (signal.aborted) stop()
-  const timeout = setTimeout(() => { diagnostic = 'Feishu event consumer did not become ready within 45 seconds'; stop() }, 45_000)
+  const timeout = setTimeout(() => { diagnostic = 'Feishu event consumer did not become ready within 45 seconds'; cards ? fail('unavailable') : stop() }, 45_000)
   stderr.on('line', (line: string) => {
     if (stopping) return
     if (!cards) diagnostic = line.slice(0, 4000)
-    if (cards ? line === `[event] ready event_key=${cardEventKey}` : line.startsWith('[event] ready')) {
+    if (cards ? /^\[event\] ready event_key=card\.action\.trigger(?:\s|$)/.test(line) : line.startsWith('[event] ready')) {
       if (!active()) { stop(); return }
       ready = true; clearTimeout(timeout)
       if (cards) { connection?.cardReady?.(identity, true); handshake?.resolve() }
-      // stdout and stderr are independent: late readiness must not erase an event-processing failure.
       else if (!eventFailed) ctx.report('feishu', { state: 'ready', detail: 'Listening for bot events', at: new Date().toISOString() })
-    } else if (/WARN|drop|error/.test(line)) {
-      if (cards) stop()
+    } else if (/WARN|drop|error|disconnect|connection closed/i.test(line)) {
+      if (cards) fail(ready ? 'interrupted' : 'unavailable')
       else ctx.report('feishu', { state: 'error', detail: diagnostic })
     }
   })
@@ -147,18 +155,24 @@ async function consume(ctx: SourceContext, signal: AbortSignal, cards: boolean):
       ctx.state.set(KV.feishu.chats, chats)
       await receive(ctx, trigger)
     }).catch(error => {
-      if (cards) { stop(); return } // Neither raw callback data nor a handler's diagnostic may leave this stream.
+      if (cards) { fail('processing'); return } // Neither callback data nor handler diagnostics leave this stream.
       eventFailed = true; ctx.report('feishu', { state: 'error', detail: String(error) })
     })
   })
   try {
-    await new Promise<void>((resolve, reject) => {
-      child.once('error', reject)
-      const exited = (code: number | null) => new Error(`Feishu event consumer exited (${code}, ready=${ready}): ${diagnostic}`)
-      child.once('close', (code) => signal.aborted ? resolve() : reject(exited(code)))
+    const ended = Promise.withResolvers<void>()
+    child.once('error', () => cards ? fail(ready ? 'interrupted' : 'unavailable') : ended.reject(new Error('Feishu event consumer failed')))
+    child.once('close', code => {
+      if (signal.aborted) ended.resolve()
+      else {
+        if (cards && !failure) fail(ready ? 'interrupted' : 'unavailable')
+        ended.reject(new Error(`Feishu event consumer exited (${code}, ready=${ready}): ${diagnostic}`))
+      }
     })
+    await ended.promise
   } finally {
-    down(); clearTimeout(timeout); signal.removeEventListener('abort', stop); stdout.close(); stderr.close(); await chain
+    if (!stopping) down(failure)
+    clearTimeout(timeout); signal.removeEventListener('abort', stop); stdout.close(); stderr.close(); await chain
   }
 }
 

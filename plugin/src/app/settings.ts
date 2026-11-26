@@ -77,9 +77,9 @@ const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
       if (id === 'feishu') {
         const scope = (settings: SettingsValue) => {
           const source = sources.instance<FeishuConfig>(id, settings)
-          if (!source?.enabled) return null
+          if (!source) return null
           const { directMessages, otherChats, chats } = source.config
-          return [directMessages, otherChats, chats.map(({ chatId, listen }) => [chatId, listen]).sort()]
+          return [source.enabled, directMessages, otherChats, chats.map(({ chatId, listen }) => [chatId, listen]).sort()]
         }
         if (JSON.stringify(scope(current)) !== JSON.stringify(scope(candidate))) throw new UserError('panelOnlyListenScope')
       }

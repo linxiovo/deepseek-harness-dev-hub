@@ -89,8 +89,10 @@ it('accepts a bound approver’s listening change and receives the next message 
   const propose = () => host.api('POST', 'settings-confirmations', { revision, change, approvers: [MEMBER] }, project.id)
   const before = feishu('91', 'Please fix search', { chat_id: change.chatId, mentions: [] })
   expect(await source.receive(before)).toBe('filtered')
+  vi.mocked(Commands.prototype.lark).mockResolvedValue({ message_id: 'om_card91', chat_id: 'oc_team' })
   const old = await propose()
   expect(old.status).toBe(200)
+  await host.runtime.sendReplies()
   vi.mocked(Commands.prototype.lark).mockResolvedValue({ message_id: 'om_card92', chat_id: 'oc_team' })
   const current = await propose()
   expect(current).toMatchObject({ status: 200, body: { projectId: project.id, chatId: 'oc_next', currentValue: 'none', proposedValue: 'all' } })
@@ -101,6 +103,9 @@ it('accepts a bound approver’s listening change and receives the next message 
   await expect(host.runTool(host.runtime.masterId, 'orchestrator_settings_save', { block: 'source', source: 'feishu', revision,
     value: { enabled: true, config: { ...sourceBlock.config, chats: [{ chatId: change.chatId, listen: 'all' }] } } })).rejects.toThrow(/operator authorization/i)
   expect(await host.api('POST', `settings-confirmations/${old.body.id}/approve`, { revision }, project.id)).toMatchObject({ status: 409 })
+  await card.cardAction!({ ...click, requestId: String(old.body.id), messageId: 'om_card91', eventId: 'evt91' })
+  expect(await host.api('GET', `settings-confirmations/${click.requestId}`, undefined, project.id)).toMatchObject({
+    body: { status: 'pending', effectiveRevision: revision, effectiveValue: 'none' } })
   await card.cardAction!(click)
   expect(await host.api('GET', `settings-confirmations/${click.requestId}`, undefined, project.id)).toMatchObject({
     body: { status: 'approved', effectiveRevision: revision + 1, effectiveValue: 'all' } })
@@ -135,6 +140,8 @@ it('keeps a text fallback non-authorizing and refuses expired and rebound propos
   const next = await host.api('POST', 'settings-confirmations', body, project.id)
   expect(next.status).toBe(200)
   await host.runtime.sendReplies()
+  await card.cardAction!({ ...action, requestId: String(next.body.id), messageId: 'om_card96', at: Date.parse(String(next.body.expiresAt)) })
+  expect(await host.api('GET', `settings-confirmations/${next.body.id}`, undefined, project.id)).toMatchObject({ body: { status: 'pending' } })
   const validating = Promise.withResolvers<void>(), resume = Promise.withResolvers<void>()
   vi.spyOn(host.runtime.installation, 'validateWorkspace').mockImplementationOnce(async () => {
     validating.resolve(); await resume.promise; return project.workspace
@@ -157,15 +164,20 @@ it('reconciles the original card after a lost send receipt without accepting an 
   await host.runtime.sendReplies()
   const connection = () => host.runtime.context(feishuKind).feishuTopic!
   connection().cardReady!(botIdentity, true)
-  const published = new Map<string, string>()
-  let attempts = 0
+  let content: string | undefined, sends = 0
   vi.mocked(Commands.prototype.lark).mockImplementation(async args => {
-    if (!args.includes('interactive')) return {}
-    const uuid = args[args.indexOf('--idempotency-key') + 1]!
-    const msg = published.get(uuid) ?? `om_origin${published.size + 1}`
-    published.set(uuid, msg)
-    if (++attempts === 1) throw new Error('Lost response after remote send')
-    return { message_id: msg, chat_id: 'oc_team' }
+    if (args.includes('interactive')) {
+      sends++
+      content = args[args.indexOf('--content') + 1]!
+      throw new Error('Lost response after remote send')
+    }
+    if (args.includes('/open-apis/im/v1/messages/mget')) return { items: [
+      { message_id: 'om_97', chat_id: 'oc_team', thread_id: 'omt_97', deleted: false },
+    ] }
+    if (args.includes('/open-apis/im/v1/messages')) return { has_more: false, items: [{ message_id: 'om_origin1',
+      chat_id: 'oc_team', root_id: 'om_97', thread_id: 'omt_97', msg_type: 'interactive', create_time: String(Date.now()),
+      deleted: false, sender: { sender_type: 'app', id_type: 'app_id', id: 'cli_bot' }, body: { content } }] }
+    return {}
   })
   const { revision } = host.runtime.settings.block('executor')
   const proposal = await host.api('POST', 'settings-confirmations', { revision, change: { object: 'maxWorkers', value: 4 },
@@ -173,7 +185,7 @@ it('reconciles the original card after a lost send receipt without accepting an 
   expect(proposal.status).toBe(200)
   const requestId = String(proposal.body.id), url = `settings-confirmations/${requestId}`
   await host.runtime.sendReplies()
-  expect(published.get(requestId)).toBe('om_origin1')
+  expect(content).toContain(requestId)
   const action = { action: 'approve' as const, requestId, projectId: project.id, revision, actorId: MEMBER,
     eventId: 'evt97', messageId: 'om_origin1', chatId: 'oc_team', botIdentity, at: Date.now() }
   await connection().cardAction!(action)
@@ -183,8 +195,7 @@ it('reconciles the original card after a lost send receipt without accepting an 
   const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 30_000)
   try {
     await host.runtime.sendReplies()
-    expect(attempts).toBe(2)
-    expect([...published.entries()]).toEqual([[requestId, 'om_origin1']])
+    expect(sends).toBe(1)
     await connection().cardAction!({ ...action, messageId: 'om_copy' })
     expect(await host.api('GET', url, undefined, project.id)).toMatchObject({ body: { status: 'pending' } })
     await connection().cardAction!({ ...action, eventId: 'evt98', at: Date.now() })

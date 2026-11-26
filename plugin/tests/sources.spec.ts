@@ -1184,7 +1184,7 @@ if (mode === 'late-ready') {
     fs.writeFileSync(join(dir, 'ready-emitted'), '')
   })
 } else if (mode !== 'never') {
-  fs.writeSync(2, card ? '[event] ready event_key=card.action.trigger\n' : '[event] ready\n')
+  fs.writeSync(2, card ? '[event] ready event_key=card.action.trigger workers=1\n' : '[event] ready\n')
   if (mode === 'warn') fs.writeSync(2, 'WARN the connection was reset\n')
   if (mode === 'flaky' && n === 1) process.exit(1)
   if (mode === 'late') setTimeout(print, 1000)
@@ -1241,7 +1241,7 @@ setInterval(() => {}, 60_000)
   const card = (eventId: string, name: 'approve' | 'status') => ({ type: 'card.action.trigger', host: 'im_message', action_tag: 'button',
     action_value: JSON.stringify(action(name)), event_id: eventId, operator_id: 'ou_alice', chat_id: 'oc_dm', message_id: 'om_original',
     timestamp: '1795661200123', token: 'must-not-leave-source', card_content: 'private card text' })
-  function cardSource(mode: 'cards' | 'old-cli') {
+  function cardSource(mode: 'cards' | 'old-cli' | 'warn') {
     const source = consumerSource(cli(mode))
     const cardReady = vi.fn(), cardAction = vi.fn<(action: SettingsCardAction) => Promise<void>>().mockResolvedValue(undefined)
     source.ctx.feishuTopic = { target: () => undefined, claims: () => false, receive: async () => 'filtered', report: vi.fn(), cardReady, cardAction }
@@ -1299,7 +1299,7 @@ setInterval(() => {}, 60_000)
     await running
     expect(cardAction).toHaveBeenCalledTimes(1)
   }, 20_000)
-  it('keeps ordinary intake live when an older bot CLI cannot consume callbacks', async () => {
+  it('keeps ordinary intake live when an older bot CLI cannot consume callbacks and marks the card stream unavailable', async () => {
     writeFileSync(join(dir, 'events'), event('om_content', 'oc_dm', 'p2p') + '\n')
     const { ctx, health, store, cardReady, cardAction } = cardSource('old-cli')
     running = runFeishu(ctx, controller.signal)
@@ -1307,9 +1307,29 @@ setInterval(() => {}, 60_000)
     writeFileSync(join(dir, 'go'), '')
     await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_content'))).toBeDefined(), until)
     expect(health.feishu).toMatchObject({ state: 'ready' })
-    expect(cardReady).toHaveBeenCalledWith('cli_bot:ou_bot', false)
+    expect(cardReady).toHaveBeenCalledWith('cli_bot:ou_bot', false, 'unavailable')
     expect(cardReady).not.toHaveBeenCalledWith('cli_bot:ou_bot', true)
     expect(cardAction).not.toHaveBeenCalled()
+  }, 20_000)
+  it('reports a processing problem without exposing callback bodies or handler errors', async () => {
+    const secret = 'private callback body and local path C:\\private\\token'
+    writeFileSync(join(dir, 'events'), '')
+    writeFileSync(join(dir, 'card-events'), JSON.stringify(card('evt-fail', 'approve')) + '\n')
+    const { ctx, cardReady, cardAction } = cardSource('cards')
+    cardAction.mockRejectedValueOnce(new Error(secret))
+    running = runFeishu(ctx, controller.signal)
+    await vi.waitFor(() => expect(cardReady).toHaveBeenCalledWith('cli_bot:ou_bot', true), until)
+    writeFileSync(join(dir, 'go'), '')
+    await vi.waitFor(() => expect(cardReady).toHaveBeenCalledWith('cli_bot:ou_bot', false, 'processing'), until)
+    expect(cardReady.mock.calls.flat().join(' ')).not.toContain(secret)
+    expect(JSON.stringify(ctx.feishuTopic)).not.toContain(secret)
+    controller.abort(); await running
+  }, 20_000)
+  it('reports callback stream warnings with a fixed interrupted reason', async () => {
+    const { ctx, cardReady } = cardSource('warn')
+    running = runFeishu(ctx, controller.signal)
+    await vi.waitFor(() => expect(cardReady).toHaveBeenCalledWith('cli_bot:ou_bot', false, 'interrupted'), until)
+    controller.abort(); await running
   }, 20_000)
   it('takes in the event lines it reads, records each chat as direct or not, and reports a malformed line without stopping', async () => {
     writeFileSync(join(dir, 'events'), [event('om_1', 'oc_group', 'group'), event('om_2', 'oc_dm', 'p2p'), 'not json',

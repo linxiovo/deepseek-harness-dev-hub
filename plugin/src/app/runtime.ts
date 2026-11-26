@@ -374,6 +374,7 @@ export class Runtime extends Service implements SourceHost {
         },
       } })
       const topicHealth = project ? board.claim('feishuBinding') : undefined
+      const cardHealth = project ? board.claim('feishuCards') : undefined
       if (project) {
         const link = (view: 'project' | 'settings') => projectNavigationLink(`http://127.0.0.1:${ctx.webServer.port}`, project.id, view)
         this.topicBinding = new TopicBinding({ store, handoffs, outbox, sources, projectId: project.id,
@@ -582,15 +583,20 @@ export class Runtime extends Service implements SourceHost {
         get deployment() { return setup.deployment }, configured: () => this.configured(), closing: sourceInactive,
         get setupProblem() { return runtime.setupProblem }, get feishuProblem() { return setup.feishuProblem },
         ...(topicHealth ? { feishuTopic: { target: () => this.feishuTopic(),
-          cardReady: (identity, ready) => {
+          cardReady: (identity, ready, problem) => {
             const bot = setup.configured() ? setup.deployment.feishu : undefined
-            if (ready && bot && identity === `${bot.appId}:${bot.botId}`) this.feishuCardIdentity = identity
-            else if (!ready && this.feishuCardIdentity === identity) this.feishuCardIdentity = undefined
+            if (this.closing() || !bot || identity !== `${bot.appId}:${bot.botId}`) return
+            this.feishuCardIdentity = ready ? identity : undefined
+            if (problem) cardHealth?.set(health('error', problem === 'unavailable' ? 'feishuCardsUnavailable'
+              : problem === 'interrupted' ? 'feishuCardsInterrupted' : 'feishuCardsProcessing'))
+            else if (ready) cardHealth?.set({ state: 'ready', detail: 'Listening for Feishu card actions', at: now() })
+            else if (cardHealth?.get()?.state !== 'error') cardHealth?.set({ state: 'paused', detail: 'Not listening for Feishu card actions' })
           },
           cardAction: async event => {
             if (!this.topicBindingAvailable() || this.feishuCardIdentity !== event.botIdentity) return
+            const revision = store.get(KV.settings.revision)
             await installation.validateWorkspace()
-            if (this.topicBindingAvailable()) this.settingsConfirmations?.cardAction(event)
+            if (this.topicBindingAvailable() && store.get(KV.settings.revision) === revision) this.settingsConfirmations?.cardAction(event)
           },
           claims: trigger => this.topicBinding?.claims(trigger) === true,
           maintenanceSince: topic => this.maintenance?.feishuSince(topic.epoch, topic.sourceRevision),

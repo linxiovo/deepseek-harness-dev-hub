@@ -839,6 +839,10 @@ const TEXT = {
   'userError.quotaPaused': ['这张工单已因运行限额暂停。', USER_ERRORS.quotaPaused[1]],
   'userError.panelOnlyRunLimits': ['只有操作员能在管理设置中修改并发数或运行限额。', USER_ERRORS.panelOnlyRunLimits[1]],
   'userError.panelOnlyListenScope': ['更改飞书监听范围需要操作员授权。', USER_ERRORS.panelOnlyListenScope[1]],
+  'userError.settingsConfirmationUnknown': ['找不到该配置确认请求。', USER_ERRORS.settingsConfirmationUnknown[1]],
+  'userError.settingsConfirmationStale': ['此配置确认不可用，或已不再等待确认该版本。', USER_ERRORS.settingsConfirmationStale[1]],
+  'userError.settingsConfirmationNotIncrease': ['提案必须提高生效额度或扩大监听范围。', USER_ERRORS.settingsConfirmationNotIncrease[1]],
+  'userError.settingsConfirmationApprovers': ['请选择当前项目绑定中已明确授权的参与者。', USER_ERRORS.settingsConfirmationApprovers[1]],
   'userError.panelOnlyPolicy': ['只有操作员能在管理设置中修改准入策略。', USER_ERRORS.panelOnlyPolicy[1]],
   'userError.panelOnlyRequiredChecks': ['只有操作员能在管理设置中修改必需的 CI 检查。', USER_ERRORS.panelOnlyRequiredChecks[1]],
   'userError.ruleMaintenanceRequired': ['请在提示词设置中通过独立维护工单暂存接单规则变更。', USER_ERRORS.ruleMaintenanceRequired[1]],
@@ -897,6 +901,9 @@ const TEXT = {
   'healthCode.feishuCliUnset': ['来源已打开，还没有设置机器人的 lark-cli', HEALTH_TEXT.feishuCliUnset],
   'healthCode.feishuBotMissing': ['等待飞书机器人', HEALTH_TEXT.feishuBotMissing],
   'healthCode.pollFailures': ['连续 {count} 次轮询失败，最近一次：{error}', HEALTH_TEXT.pollFailures],
+  'healthCode.feishuCardsUnavailable': ['飞书卡片审批不可用，请使用项目配置确认 API。', HEALTH_TEXT.feishuCardsUnavailable],
+  'healthCode.feishuCardsInterrupted': ['飞书卡片连接已中断，重试批准前请查询配置。', HEALTH_TEXT.feishuCardsInterrupted],
+  'healthCode.feishuCardsProcessing': ['飞书卡片操作处理失败，请查询当前配置确认。', HEALTH_TEXT.feishuCardsProcessing],
 } as const satisfies Record<string, readonly [string, string]>
 export type DshSuperagentKey = keyof typeof TEXT
 const language = (index: 0 | 1) => Object.fromEntries(Object.entries(TEXT).map(([key, pair]) => [key, pair[index]])) as Record<DshSuperagentKey, string>

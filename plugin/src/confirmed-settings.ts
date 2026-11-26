@@ -1,6 +1,8 @@
 import { z } from 'zod'
 import { LIMITS } from './limits.ts'
 
+export const SETTINGS_CONFIRMATION_LIFETIME_MS = 15 * 60_000
+
 const revision = z.number().int().nonnegative()
 const change = z.discriminatedUnion('object', [
   z.strictObject({ object: z.enum(['projectTokens', 'ticketTokens']), value: z.number().int().nonnegative().nullable() }),

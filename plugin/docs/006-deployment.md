@@ -254,7 +254,7 @@ The panel uses a local HTTP API that agents can also call. The service script re
 
 Send requests to `http://127.0.0.1:<port>/orchestrator/api/` with `x-orchestrator-request: 1`. `Host` must be exactly `127.0.0.1:<port>` or `localhost:<port>`. If `Origin` is supplied, it must be exactly `http://<Host>`. A mismatch or missing required header receives `403 {error: "Same-origin management request required"}`. The server itself must bind to `127.0.0.1`. Use the SSH tunnel on a remote host.
 
-API saves have the panel's permissions, including execution settings the main Session cannot edit. Managed GitHub identity and project binding are not editable through settings saves. See `012-project-runtime.md` for the installation routes, project-scope contract, and error shapes.
+API saves have the panel's permissions, including execution settings the main Session cannot edit. Managed GitHub identity and project binding are not editable through settings saves. See `012-project-runtime.md` for the installation routes, project-scope contract, and error shapes. Confirmed-settings proposals and approvals use `POST /orchestrator/api/settings-confirmations`, `GET /orchestrator/api/settings-confirmations/:id` and `POST /orchestrator/api/settings-confirmations/:id/approve` in addition to the public API listed here; see `019-confirmed-settings.md`.
 
 Agents may rely on these routes and fields. The other routes in `src/app/api.ts` serve the panel and change with it.
 
@@ -283,7 +283,10 @@ Health entries are grouped by responsibility:
 | `assessment`, `launch`, `delivery`, `relay`, `notice`, `reply` | Stored work described in [003 Execution](003-execution.md); delivery counts waiting work, while reply covers Channel messages |
 | `worker` | Executor Session event handling; appears after its first failure |
 | `github`, `feishu`, `history` | Source polling, events and history recovery |
+| `feishuCards` | Feishu native settings-card callback stream; `unavailable`, `interrupted` and `processing` are fixed, redacted problem codes, cleared only by a later successful ready signal |
 | `sync:<source id>` | Allowed-list synchronization |
+
+When `feishuCards` is unhealthy, ordinary Feishu messages remain independently available. Use the project-scoped management API routes in `019-confirmed-settings.md` for approval or status; a reconnect does not clear the problem until the callback consumer reports ready. For a missing send receipt, first read the original topic record, then recover only the same confirmation UUID as described in `019-confirmed-settings.md`.
 
 A refusal has a status and `error`, its English text:
 

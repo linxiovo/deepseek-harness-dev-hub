@@ -347,6 +347,7 @@ Validation: `tests/session-meter.spec.ts` covers the read seam (absent vs corrup
   | Project Session attribution and business parentage | `ProjectMeter`, through `bind` at a trusted delegation seam |
   | A Source's read positions, and the meta it keeps on its Threads (`label`, `url`, `facts` and its own keys) | That Source, through `SourceContext` |
   | Settings and their history | Settings |
+  | Configuration proposals, scoped card grants, delivery intent and decision | `SettingsConfirmations`, which calls `Settings` in the decision transaction |
   | Prompt versions | Prompts |
   | Effect rows | Effects |
   | Outbox receipts | The Outbox: the Hub's replies, the acceptance acknowledgement, pull-request end notices and Sources' `notify` go through its `send`, and its `reply` effects mark them |
@@ -547,6 +548,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, cross-platform Feishu event consumer launch and cancellation, health |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
+| `tests/feishu-card-recovery.spec.ts` | Feishu card history reconciliation, including original app and topic attribution and incomplete or ambiguous reads |
 | `tests/actions-evidence.spec.ts` | Simulated GitHub REST responses: candidate-SHA runs, PR provenance matching (`number`, `head.sha`, `base.sha`) and `mergeSha` context, workflow and job `success` gates, queued/waiting runs without jobs vs `not_run`, run and job URLs, artifact references, stale SHAs, newer attempts, an empty required set and paginated lists |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |

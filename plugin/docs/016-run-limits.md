@@ -39,6 +39,8 @@ Neither route takes a request body or query arguments. URL-encode `:id` as one p
 
 For a replanned node, the Ticket budget is the shared original pool, including prior usage and sibling reservations. In-flight entries still name the actual Ticket and may carry `poolId` for that original pool. Use the project meter for historical attribution to each consuming Ticket.
 
+For an inspection, `ticketId` stays `null` and the reservation includes `inspectionScope`, the path charged alongside the project pool. `project/inspection` exposes that pool separately; see `019-idle-inspection.md`.
+
 | HTTP refusal | Conditions |
 | --- | --- |
 | `400 {error}` | `Invalid run limits query` or malformed path escape. |

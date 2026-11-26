@@ -37,6 +37,10 @@ Handoffs retain the original goal, constraints and authorization. Each registere
 
 After the first complete project delivery, the resume summary includes `maintenance: "maintenance"`, the resource pointer for authorized pending events. A carried native inbox message can have a separate Stage 2 maintenance record; the rewritten relay itself never authorizes an operator action.
 
+## Inspection Session
+
+The inspection preset has no repository, shell, web, delegation or communication tools. Its only project interfaces are scoped Git reads and reporting findings; see `019-idle-inspection.md`. Its business parent is a Hub generation, not a Ticket writer.
+
 ## Worker Session
 
 An Executor Session is created with `WORKER_PRESET` (`dsh-superagent-worker`) and keeps the file, search, shell, job, web, skill, todo and subagent tools listed in `WORK_TOOLS` (`src/app/sessions.ts`). `Sessions.workOnly` adds only the MCP tools named in `DEV_MCP_TOOLS`, the read-only Context7 lookups `mcp__context7__resolve-library-id` and `mcp__context7__query-docs`. No other MCP server is allowed: a mounted tool such as `mcp__feishu__send_message` is not in the allow list, so a Worker cannot send a person a message through MCP. The preset also keeps the shell's network access: a worker installs dependencies and reaches the Context7 service its MCP tools use. It works in its Ticket directory and may create subagents, which run under DeepSeek Harness's `standard` preset with the worker's permissions. It receives no tool for asking or presenting to a person, changing the deployment profile, scheduling work outside the worker slots, or sending a Channel message.

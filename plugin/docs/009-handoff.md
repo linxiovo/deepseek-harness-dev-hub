@@ -154,7 +154,7 @@ An allowed participant can send `status` or `状态` for a text summary of the c
 
 ## Stage 2 maintenance
 
-`orchestrator_read` on `project/stage` returns `{stage: 1}` until the mounted project has a fully delivered Plan. The first complete artifact-only or verified-release delivery persists `{stage: 2, deliveredPlan, startedAt}` with its final receipt. A restart can adopt a retained, verified delivery from an older store. This is a project milestone, not a claim that the original package remains available forever; its current availability is on `plan/<id>/delivery`. Later work uses the same Hub and separate Plans. There is no idle repository scan or timer that creates maintenance work.
+`orchestrator_read` on `project/stage` returns `{stage: 1}` until the mounted project has a fully delivered Plan. The first complete artifact-only or verified-release delivery persists `{stage: 2, deliveredPlan, startedAt}` with its final receipt. A restart can adopt a retained, verified delivery from an older store. This is a project milestone, not a claim that the original package remains available forever; its current availability is on `plan/<id>/delivery`. Later work uses the same Hub and separate Plans. Stage 2 alone never starts an idle scan; the separate read-only grant is described in `019-idle-inspection.md`.
 
 Stage 2 keeps new Source work out of ordinary Ticket routing, including attach, replay and automatic wake-up. Selected-repository pull request reviews and CI may still reach existing open Tickets as context; that delivery cannot launch a Worker. The Hub considers only fresh, original text from an authorized entrance:
 

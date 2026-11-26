@@ -1,16 +1,16 @@
-/** Prove a physical Hub generation against its creation intent before exposing a live Agent. */
+/** Prove a host-created physical root against its durable creation intent before exposing a live Agent. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { SESSION_FORMAT_VERSION, SessionSeq, type SessionEvent, type SessionHeader, type SessionId } from '@deepseek-ai/dsh-session'
 import { realpathSync } from 'node:fs'
 import { isAbsolute, relative } from 'node:path'
 
-const ROOT = 'dsh-superagent/hub-root'
-type Creation = { token: string; cwd: string }
+type Creation = { token: string; cwd: string; marker?: 'dsh-superagent/inspection-root' }
 
 declare module '@deepseek-ai/dsh-session/types' {
   interface SessionEventMap {
     'dsh-superagent/hub-root': { sessionId: string; token: string }
+    'dsh-superagent/inspection-root': { sessionId: string; token: string }
   }
 }
 
@@ -21,7 +21,8 @@ function rootHeader(header: SessionHeader, inherited: number, id: SessionId, cre
 }
 
 function hasMarker(event: SessionEvent | undefined, id: SessionId, creation: Creation): boolean {
-  return !!creation.token && event?.type === ROOT && event.seq === 0 && event.ignorable === true
+  return !!creation.token && !!event && (event.type === 'dsh-superagent/hub-root' || event.type === 'dsh-superagent/inspection-root')
+    && event.type === (creation.marker ?? 'dsh-superagent/hub-root') && event.seq === 0 && event.ignorable === true
     && event.data?.sessionId === id && event.data.token === creation.token
 }
 
@@ -32,7 +33,7 @@ function foldPreset(current: unknown, event: { type: string; data: unknown }): u
 }
 
 /** Synchronous event ingress must not resolve an Agent (which can itself announce agent/created). */
-export function matchesHubRoot(ctx: Context, agent: Agent, creation: Creation, preset: string): boolean {
+export function matchesNativeRoot(ctx: Context, agent: Agent, creation: Creation, preset: string): boolean {
   try {
     const { session, id } = agent
     if (ctx.agents.get(id) !== agent || session.id !== id || !rootHeader(session.header, session.inheritedEventCount, id, creation, preset)
@@ -44,16 +45,18 @@ export function matchesHubRoot(ctx: Context, agent: Agent, creation: Creation, p
 }
 
 /** Create exclusively if permitted; an existing log is read-only evidence, never somewhere to add a missing marker. */
-export async function openHubRoot(ctx: Context, id: SessionId, creation: Creation, preset: string, allowCreate: boolean): Promise<Agent> {
-  if (!creation.token || !isAbsolute(creation.cwd)) throw new Error('Invalid Hub Session creation intent')
+export async function openNativeRoot(ctx: Context, id: SessionId, creation: Creation, preset: string, allowCreate: boolean,
+  authorize?: () => void): Promise<Agent> {
+  if (!creation.token || !isAbsolute(creation.cwd)) throw new Error('Invalid native Session creation intent')
   const cwd = realpathSync.native(creation.cwd)
-  const foreign = () => new Error(`Hub Session ${id} does not match its persisted creation intent`)
+  const foreign = () => new Error(`Session ${id} does not match its persisted creation intent`)
   const persistence = ctx.sessionPersistence
   if (allowCreate && !ctx.agents.get(id) && !await persistence.stat(id)) {
+    authorize?.()
     const time = Date.now()
     await using fresh = await persistence.create({ version: SESSION_FORMAT_VERSION, id, createdAt: time, cwd, agentPreset: preset, isSeeded: false })
     // V4 preserves unknown, explicitly ignorable, log-only events without projecting them into model history.
-    await fresh.append([{ type: ROOT, seq: SessionSeq(0), time, data: { sessionId: id, token: creation.token }, ignorable: true }])
+    await fresh.append([{ type: creation.marker ?? 'dsh-superagent/hub-root', seq: SessionSeq(0), time, data: { sessionId: id, token: creation.token }, ignorable: true }])
     await fresh.flush()
   } else await persistence.flush() // A same-process read may otherwise observe another handle's buffered writes.
   await using log = await persistence.open(id, 'read')
@@ -67,12 +70,15 @@ export async function openHubRoot(ctx: Context, id: SessionId, creation: Creatio
     offset += events.length
   }
   if (effective !== preset) throw foreign()
-  const matches = (agent: Agent) => agent.id === id && agent.session.header.createdAt === log.header.createdAt && matchesHubRoot(ctx, agent, creation, preset)
+  const matches = (agent: Agent) => agent.id === id && agent.session.header.createdAt === log.header.createdAt && matchesNativeRoot(ctx, agent, creation, preset)
   const live = ctx.agents.get(id)
   if (live && !matches(live)) throw foreign()
+  authorize?.()
   const workspace = await ctx.workspaceRegistry.create(cwd)
   if (!isAbsolute(workspace.path) || relative(cwd, realpathSync.native(workspace.path)) !== '') throw foreign()
+  authorize?.()
   await workspace.attachSession(id)
+  authorize?.()
   const resolved = await ctx.sessionController.resolveAgent(id)
   if ('error' in resolved) throw resolved.error
   if (!matches(resolved.agent)) throw foreign()

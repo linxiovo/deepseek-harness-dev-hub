@@ -10,6 +10,7 @@ import { key, type AssessmentOutcome, type Mandate, type Policy, type PolicyEffe
   type Trigger, type ActorRef, type GateResult } from './core/index.ts'
 import { sameName } from './infra/text.ts'
 import { WORKER_COMMANDS } from './infra/environment.ts'
+import { validInspectionPath } from './executor/inspection-git.ts'
 
 export const RuleIdSchema = z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/)
 export const RuleMatchSchema = z.object({ rule_id: RuleIdSchema, reason: z.string().trim().min(1).max(500) }).strict()
@@ -109,6 +110,9 @@ const RunLimitsSchema = z.strictObject({
     idleSeconds: z.number().int().min(1).max(86_400).optional(),
   }).optional(),
 })
+const InspectionGrantSchema = z.strictObject({ scope: z.string().max(1024).refine(validInspectionPath, 'Expected a literal repository-relative path'),
+  intervalSeconds: z.number().int().min(1).max(31_536_000), maxTokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) })
+export type InspectionGrant = z.infer<typeof InspectionGrantSchema>
 
 const CommandNameSchema = z.string().regex(/^[A-Za-z0-9._-]+$/).refine(name => name !== '.' && name !== '..', 'Not a command name')
   .refine(name => !WORKER_COMMANDS.includes(name), `${WORKER_COMMANDS.join(', ')} cannot be blocked`)
@@ -120,6 +124,8 @@ const absoluteFilesystemPath = (value: string): boolean => posix.isAbsolute(valu
  * Optional/empty values keep previously saved settings readable; they never authorize an empty-directory fallback. */
 export const ExecutorConfigSchema = z.object({
   model: RoleModelSchema.nullable().default(null),
+  lightweightModel: RoleModelSchema.nullable().optional(),
+  idleInspection: InspectionGrantSchema.nullable().optional(),
   maxWorkers: z.number().int().min(LIMITS.maxWorkers.min).max(LIMITS.maxWorkers.max).default(RUN_LIMIT_DEFAULTS.maxWorkers),
   runLimits: RunLimitsSchema.optional(),
   directory: z.string().trim().refine(path => path === '' || absoluteFilesystemPath(path), 'An absolute POSIX, drive, or UNC path, or empty for <stateDir>/work').default(''),

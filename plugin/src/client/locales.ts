@@ -52,6 +52,7 @@ const TEXT = {
   'health.planControlResume': ['计划暂停恢复', 'Plan pause recovery'],
   'health.replanReview': ['停滞重排协调', 'Stalled Plan coordination'],
   'health.requirementScopeReview': ['需求变更范围审查', 'Requirement scope review'],
+  'health.inspection': ['空闲只读巡检', 'Read-only idle inspection'],
   'health.relay': ['转达给主 Session 的消息', 'Relays to the main Session'],
   'health.hubInbox': ['轮换中枢的待收输入', 'Pending inputs from retired Hub Sessions'],
   'health.notice': ['给主 Session 的通知', 'Notices to the main Session'],

@@ -6,6 +6,7 @@ import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import { realpathSync } from 'node:fs'
 import { dirname, isAbsolute, relative } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 import { key, latestAssignment, liveTicket, type ReviewAxis, type Ticket } from '../core/index.ts'
 import { until } from '../executor/background.ts'
@@ -17,7 +18,7 @@ import { AgentDelivery, messageId } from './delivery.ts'
 import { Later, type Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
 import type { HubCreation, HubRotation } from './hub-authority.ts'
-import { matchesHubRoot, openHubRoot } from './hub-session-root.ts'
+import { matchesNativeRoot, openNativeRoot } from './hub-session-root.ts'
 import type { OperatorMessage } from './maintenance.ts'
 import type { HubDeliveryReceipt } from '../kv.ts'
 import { RetryHealth } from './retry-health.ts'
@@ -28,7 +29,9 @@ import type { ProjectMeter } from './project-meter.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
-import { registerScopeTool, scopeHistory, scopeProposalId, scopeRequest, scopeSessionId, scopeToolName } from './tools/requirement-scope.ts'
+import { matchesTaskMessage, registerScopeTool, sealedHistory, scopeProposalId, scopeRequest, scopeSessionId, scopeToolName } from './tools/requirement-scope.ts'
+import { inspectionRequest, inspectionTools, registerInspection, type InspectionHost } from './tools/inspection.ts'
+import type { InspectionTask } from './idle-inspection.ts'
 import type { RequirementScopeTask, ScopeVerdict } from './plan-requirements.ts'
 
 /** Host dependencies used by `Sessions`. */
@@ -74,6 +77,7 @@ export interface SessionsHost {
   scopeTask(proposalId: string): RequirementScopeTask | undefined
   verifyScopeWorkspace(task: RequirementScopeTask): Promise<void>
   recordScopeReview(proposalId: string, reviewer: string, verdict: ScopeVerdict): void
+  readonly inspection?: InspectionHost
   /** In-process writer grant; a stored lease cannot authorize worker turns after a restart. */
   workerAuthorized(ticketId: string, sessionId: string): boolean
   credentialBlocked?(ticketId: string): boolean
@@ -88,6 +92,7 @@ export interface SessionsHost {
 interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; names: Set<string>; dispose: () => void };
   role?: PromptRole; subagent?: true; ready?: Promise<void>; observeDelegation?: (initial?: UserMessage) => void; ticketId?: string;
   scopeReviewer?: true;
+  inspection?: InspectionTask;
   review?: { ticketId: string; grant: z.infer<typeof ReviewAssignmentSchema> } }
 
 /** The agent presets Executor, planner and main Sessions are created with, which the bundle's patch defines. */
@@ -127,6 +132,9 @@ function loadedReviewSkill(events: readonly SessionEvent[], after: number): bool
   return false
 }
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router', PLANNER_PRESET = 'dsh-superagent-planner'
+export const INSPECTION_PRESET = 'dsh-superagent-inspection'
+const INSPECTION_DENIED = promptFile('inspection-denied')
+const inspectionCreation = (task: InspectionTask) => ({ cwd: task.sessionDirectory, token: task.creationToken, marker: 'dsh-superagent/inspection-root' as const })
 const plannerHandoffId = (sessionId: string): string | undefined =>
   sessionId.startsWith('planner-') && sessionId.length > 'planner-'.length ? sessionId.slice('planner-'.length) : undefined
 const SPLITTER_PREFIX = 'splitter-'
@@ -248,6 +256,9 @@ const withdrawnRelay = Symbol('withdrawn relay')
           this.recordOperator(agent.id, event.data, event.time, false)
       }
       const binding = agent && agent.session === session ? this.bindings.get(agent) : undefined
+      if (binding?.inspection && event.type === 'turn/end' && this.host.inspection?.task(session.id)) {
+        this.host.inspection.abandon(session.id, `Inspection turn ended (${event.data.reason.kind}) without recording a conclusion`)
+      }
       if (binding?.observeDelegation && (event.type === 'user/message' || (event.type as string) === 'subagent/descriptor' || event.type === 'tool/result')) {
         binding.observeDelegation()
       }
@@ -276,6 +287,18 @@ const withdrawnRelay = Symbol('withdrawn relay')
       })
     })
     ctx.on('agent/pre-step', async ({ agent, messages, turn }, next) => {
+      if (agent.id.startsWith('inspection-')) {
+        const allowed = (input: readonly UserMessage[]) => {
+          try {
+            const request = inspectionRequest(this.inspectionTaskFor(agent))
+            const { taskSeq, ended } = sealedHistory(agent, request)
+            return ended === undefined && (taskSeq === undefined ? input.length === 1 && matchesTaskMessage(input[0]!, request) : !input.length)
+          } catch { return false }
+        }
+        if (!allowed(messages)) return { kind: 'reject' }
+        const decision = await next()
+        return decision.kind === 'enter' && !allowed(decision.messages) ? { kind: 'reject' } : decision
+      }
       if (!this.host.isHubGeneration(agent.id)) return next()
       if (!this.isHubRoot(agent)) return { kind: 'reject' }
       const blockedInputs = (): Set<string> | undefined => {
@@ -349,7 +372,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
     if (header.id !== agent.id || header.parentSession !== undefined || header.origin === 'subagent') return false
     if (this.verifiedHubRoots.has(agent) || !this.host.hubRequiresProof(agent.id)) return true
     const creation = this.host.hubCreation(agent.id)
-    if (!creation || !matchesHubRoot(this.ctx, agent, creation, ROUTER_PRESET)) return false
+    if (!creation || !matchesNativeRoot(this.ctx, agent, creation, ROUTER_PRESET)) return false
     this.verifiedHubRoots.add(agent)
     return true
   }
@@ -401,7 +424,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
     await this.waitHubOperations()
     this.persistHubInbox(rotation.fromSessionId, old)
     const target = await this.ensure(rotation.targetSessionId, cwd, title, 'orchestrator')
-    if (!rotation.creation || !matchesHubRoot(this.ctx, target, rotation.creation, ROUTER_PRESET)) {
+    if (!rotation.creation || !matchesNativeRoot(this.ctx, target, rotation.creation, ROUTER_PRESET)) {
       throw new Error('The provisioned Hub does not match the rotation intent')
     }
     this.host.activateHub(target.id)
@@ -669,7 +692,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
     const creation = role === 'orchestrator' ? this.host.hubCreation(id) : undefined
     if (role === 'orchestrator' && this.host.hubRequiresProof(id) && !creation) throw new Error('The Hub Session has no creation proof')
     let result = creation
-      ? { agent: await openHubRoot(ctx, id as SessionId, creation, ROUTER_PRESET, this.host.hubTargetId() === id) }
+      ? { agent: await openNativeRoot(ctx, id as SessionId, creation, ROUTER_PRESET, this.host.hubTargetId() === id) }
       : await ctx.sessionController.resolveAgent(id as SessionId)
     if (creation && 'agent' in result) this.verifiedHubRoots.add(result.agent)
     if (!creation && 'error' in result && result.error.code === 'session/not-found') {
@@ -732,7 +755,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
   scopeModelAllowed(id: string): boolean {
     const agent = this.ctx.agents.get(id as SessionId)
     if (!agent || !this.bindings.get(agent)?.scopeReviewer) return false
-    try { return scopeHistory(agent, scopeRequest(this.scopeTaskFor(agent))).taskSeq !== undefined } catch { return false }
+    try { return sealedHistory(agent, scopeRequest(this.scopeTaskFor(agent))).taskSeq !== undefined } catch { return false }
   }
   /** Resolve one sealed request, with the same pinned physical Session on every restart. */
   async deliverScope(id: string, admit: () => void): Promise<void> {
@@ -773,11 +796,11 @@ const withdrawnRelay = Symbol('withdrawn relay')
       await ctx.sessionPersistence.flush()
       pending()
       if (!this.scopeRoot(agent, task)) throw new Error('Requirement scope Session changed before pinning')
-      const { taskSeq, pending: inbox } = scopeHistory(agent, request)
+      const { taskSeq, pending: inbox } = sealedHistory(agent, request)
       if (taskSeq !== undefined || inbox || agent.status !== 'idle' || agent.session.requestHeader()) throw new Error('Expected a fresh scope reviewer')
       host.store.set(pinKey, { sessionId, createdAt: agent.session.header.createdAt })
     }
-    const authorize = () => { pending(); this.scopeTaskFor(agent); scopeHistory(agent, request) }
+    const authorize = () => { pending(); this.scopeTaskFor(agent); sealedHistory(agent, request) }
     authorize()
     this.verifiedScopeRoots.add(agent)
     await this.decorate(agent)
@@ -786,7 +809,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
     authorize()
     await ctx.sessionController.rename({ sessionId, title: `Requirement scope: ${id}` })
     authorize()
-    const state = scopeHistory(agent, request)
+    const state = sealedHistory(agent, request)
     const next = state.taskSeq === undefined ? request : agent.status === 'idle' ? state.wake : undefined
     if (next && agent.status === 'idle' && state.pending && state.pending.id === this.promptedId(next.id) && agent.inbox.remove(state.pending.id)) {
       agent.followup(state.pending)
@@ -794,9 +817,71 @@ const withdrawnRelay = Symbol('withdrawn relay')
     } else if (next) {
       await this.agentDelivery.send(agent, key(next.id), next.text, 'queue', host.lifetime, authorize)
     }
-    const received = scopeHistory(agent, request)
+    const received = sealedHistory(agent, request)
     if (received.taskSeq === undefined && !received.pending) throw new Error('The native scope reviewer did not receive its sealed task')
   }
+  /** The persisted grant owns this exact business edge; neither a name nor a native parent chooses it. */
+  private checkInspectionTask(task: InspectionTask): void {
+    this.host.lifetime.throwIfAborted()
+    const { sessionId, hubSessionId } = task, binding = this.host.store.get(KV.projectMeter.binding(sessionId))
+    if (!sessionId.startsWith('inspection-') || this.host.closing() || !isDeepStrictEqual(this.host.inspection?.task(sessionId), task)
+      || !this.host.isHubGeneration(hubSessionId) || binding?.session_id !== sessionId || binding.parent_session_id !== hubSessionId
+      || binding.roles.length !== 1 || binding.roles[0] !== 'inspection' || binding.ticket_id !== null || binding.plan_id !== null) {
+      throw new Error('Inspection no longer has its authorized project task and business binding')
+    }
+  }
+  private inspectionTaskFor(agent: Agent): InspectionTask {
+    const task = this.bindings.get(agent)?.inspection
+    if (!task || task.sessionId !== agent.id || !Number.isSafeInteger(agent.session.header.createdAt)
+      || this.host.store.get(KV.inspection.native(agent.id)) !== agent.session.header.createdAt
+      || !matchesNativeRoot(this.ctx, agent, inspectionCreation(task), INSPECTION_PRESET)) throw new Error('Unverified native inspection Session')
+    this.checkInspectionTask(task)
+    return task
+  }
+
+  inspectionModelAllowed(id: string): boolean {
+    const agent = this.ctx.agents.get(id as SessionId)
+    if (!agent || agent.status !== 'running') return false
+    try {
+      const state = sealedHistory(agent, inspectionRequest(this.inspectionTaskFor(agent)))
+      return state.taskSeq !== undefined && state.ended === undefined
+    } catch { return false }
+  }
+
+  /** Open only the root minted under the saved intent. An inspection has one request and never resumes with new input. */
+  async deliverInspection(sessionId: string): Promise<void> {
+    const { host, ctx } = this, inspection = host.inspection, task = inspection?.task(sessionId)
+    if (!task || !inspection) return
+    if (task.sessionId !== sessionId) throw new Error('Inspection Session does not match the authorized task')
+    const current = () => this.checkInspectionTask(task), id = sessionId as SessionId, pin = KV.inspection.native(id)
+    current()
+    const agent = await openNativeRoot(ctx, id, inspectionCreation(task), INSPECTION_PRESET, host.store.get(pin) === undefined, current)
+    current()
+    const request = inspectionRequest(task), state = sealedHistory(agent, request)
+    if (host.store.get(pin) === undefined) {
+      if (state.taskSeq !== undefined || state.pending || agent.status !== 'idle' || agent.session.requestHeader()) throw new Error('Expected a fresh inspection root')
+      host.store.set(pin, agent.session.header.createdAt)
+    }
+    await this.decorate(agent, task)
+    const authorize = () => sealedHistory(agent, inspectionRequest(this.inspectionTaskFor(agent)))
+    const prior = authorize()
+    if (prior.ended !== undefined || (prior.taskSeq !== undefined || prior.pending || prior.inserted) && agent.status === 'idle') {
+      inspection.abandon(id, `Inspection stopped (${prior.ended ?? 'interrupted'}) without recording a conclusion`)
+      return
+    }
+    if (prior.taskSeq !== undefined || prior.pending || prior.inserted) return
+    await initializeRoleModel(ctx, agent, task.model)
+    authorize()
+    try { await this.agentDelivery.send(agent, key(request.id), request.text, 'queue', host.lifetime, authorize) }
+    catch (error) {
+      const received = sealedHistory(agent, request)
+      if (received.taskSeq !== undefined || received.pending || received.inserted) throw new Later('Inspection delivery is awaiting its native persistence receipt', { cause: error })
+      throw error
+    }
+    const received = sealedHistory(agent, request)
+    if (received.taskSeq === undefined && !received.pending && !received.inserted) throw new Error('Inspection did not receive its sealed task')
+  }
+
   /** Trusted host dispatch/receipt seam. A binding records attribution, never permission to start a turn. */
   bindWorker(ticketId: string, sessionId: string, retry = false): void {
     const scope = { session_id: sessionId, ticket_id: ticketId,
@@ -918,7 +1003,22 @@ const withdrawnRelay = Symbol('withdrawn relay')
     // DSH canonicalizes the workspace at creation; a confirmed path may name a directory symlink.
     try { return relative(realpathSync.native(workspace), realpathSync.native(cwd)) === '' } catch { return false }
   }
-  private async decorate(agent: Agent): Promise<void> {
+  private async decorate(agent: Agent, inspectionTask?: InspectionTask): Promise<void> {
+    if (agent.id.startsWith('inspection-')) {
+      let binding = this.bindings.get(agent)
+      if (!binding) {
+        binding = { disposers: [agent.ctx.tools.restrict({ allow: [] }), agent.ctx.tools.guard(({ name }) =>
+          inspectionTools.includes(name) && this.ctx.agents.get(agent.id) === agent && this.inspectionModelAllowed(agent.id) ? undefined : INSPECTION_DENIED)] }
+        this.bindings.set(agent, binding)
+      }
+      if (!inspectionTask || binding.inspection) return
+      this.checkInspectionTask(inspectionTask)
+      if (agent.id !== inspectionTask.sessionId || this.host.store.get(KV.inspection.native(agent.id)) !== agent.session.header.createdAt
+        || !matchesNativeRoot(this.ctx, agent, inspectionCreation(inspectionTask), INSPECTION_PRESET)) throw new Error('Unverified inspection root')
+      registerInspection(agent, this.host.inspection!, () => this.inspectionTaskFor(agent), binding.disposers)
+      binding.inspection = inspectionTask
+      return
+    }
     const scopeId = scopeProposalId(agent.id)
     if (scopeId !== undefined) {
       let binding = this.bindings.get(agent)

@@ -44,6 +44,7 @@ import { hubResumeText } from './hub-resume.ts'
 import { PlanStagnation } from './plan-stagnation.ts'
 import { PlanIntegration } from './plan-integration.ts'
 import { Maintenance } from './maintenance.ts'
+import { IdleInspection } from './idle-inspection.ts'
 import { releaseAdapter } from './release-adapter.ts'
 import { ScopedAttention } from './scoped-attention.ts'
 import { PlanDispatcher } from './plan-dispatch.ts'
@@ -70,7 +71,7 @@ import { matchesMeterHeader, ProjectMeter, type MeterLogAccess, type MeterSessio
 import { RunLimits } from './run-limits.ts'
 import { installModelAdmission } from './model-admission.ts'
 import { restoreReviewBindings } from './meter-recovery.ts'
-import { PLANNER_PRESET, ROUTER_PRESET, Sessions, splitterSessionId, WORKER_PRESET } from './sessions.ts'
+import { INSPECTION_PRESET, PLANNER_PRESET, ROUTER_PRESET, Sessions, splitterSessionId, WORKER_PRESET } from './sessions.ts'
 import { HubAuthority } from './hub-authority.ts'
 import { bindRequiredChecks, Settings } from './settings.ts'
 import { sourceContextOf, type SourceContextDeps } from './source-context.ts'
@@ -100,6 +101,7 @@ export class Runtime extends Service implements SourceHost {
   readonly plans: Plans
   private readonly planIntegration: PlanIntegration
   private readonly maintenance?: Maintenance
+  private readonly inspection?: IdleInspection
   readonly planDispatcher: PlanDispatcher
   readonly attention: ScopedAttention
   readonly planning: Planning
@@ -213,6 +215,7 @@ export class Runtime extends Service implements SourceHost {
       })
       const projectMeter = this.projectMeter = new ProjectMeter({ store, meter, plans, masterId, canSample: binding => this.canSample(binding) })
       const runLimits = this.runLimits = new RunLimits({ store, relay: message => this.sessions.relay(message.id, message.text),
+        inspectionRefused: (id, reason) => this.inspection?.quotaRefused(id, reason),
         changed: () => { if (!this.closing()) this.executor.reconcileQuotaPauses() } })
       const sources = this.sources = new SourceRegistry(() => store.settings(), board, kind => {
         if (kind.policy?.sync || project) void this.ready?.then(async () => {
@@ -252,6 +255,7 @@ export class Runtime extends Service implements SourceHost {
         hubResumeDelivered: requestId => { authority.resumeDelivered(requestId); runtime.masterId = authority.visibleSessionId() },
         ...(project ? { recordOperator: (input, transferred, historical) => this.maintenance?.receiveOperator(input, transferred, historical) } : {}),
         lifetime: this.lifetime, boundWorkspace: project?.workspace,
+        get inspection() { return runtime.inspection },
         relayAvailable: requestId => this.planIntegration.relayAvailable(requestId) && this.maintenance?.relayAvailable(requestId) !== false,
         closing: () => this.closing(), environment, ownsPlanner: id => handoffs.get(id) !== undefined,
         plannerActive: id => this.configured() && handoffs.isPlanning(id),
@@ -326,8 +330,11 @@ export class Runtime extends Service implements SourceHost {
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
         sourceHost: this, setup, requestPass: () => { this.passes.request() },
         runLimitsChanged: () => runLimits.configurationChanged(),
+        inspectionChanged: () => this.inspection?.configure(),
         validate: (before, after) => {
           if (this.closing()) throw new InstallationError(409, 'switching')
+          if (after.executor.idleInspection && !project) throw new InstallationError(409, 'noProject')
+          if (after.executor.idleInspection && !after.executor.baseRef) throw new InstallationError(400, 'invalidRequest', 'Inspection requires a project base ref')
           const oldGithub = before.sources.github?.config, newGithub = after.sources.github?.config
           if (project && ((oldGithub?.cli ?? '') !== (newGithub?.cli ?? '')
             || (oldGithub?.repository ?? '') !== (newGithub?.repository ?? '')
@@ -427,6 +434,24 @@ export class Runtime extends Service implements SourceHost {
           ? this.topicBinding?.maintenanceIngress(trigger) : undefined,
         bindingEpoch: () => this.topicBinding?.view()?.epoch,
         relay: (id, text) => sessions.relay(id, text), relayConsumed: id => sessions.relayConsumed(id) })
+      if (project) this.inspection = new IdleInspection({ project, store, commands, effects, limits: runLimits, meter: projectMeter,
+        sessionDirectory: join(projectMachine.stateDir, 'inspection-sessions'), hub: () => {
+          const id = authority.readySessionId(), agent = id ? ctx.agents.get(id as SessionId) : undefined
+          return agent?.status === 'idle' && !agent.inbox.nextTurn.some(message => message.source.kind === 'user') &&
+            !agent.inbox.nextStep.some(message => message.source.kind === 'user') ? id : undefined
+        },
+        closing: () => this.closing(),
+        idle: () => {
+          if (this.paused() || planIntegration.stage().stage !== 2 || !authority.readySessionId() ||
+              store.tickets.open().length || this.maintenance?.pending(0, 1).items.length) return false
+          return handoffs.list().every(handoff => {
+            const delivery = store.get(KV.plans.integration(handoff.id))
+            return delivery?.status === 'delivered' || delivery?.status === 'released' || delivery?.status === 'released-artifact-unavailable'
+          })
+        },
+        deliver: id => sessions.deliverInspection(id), modelAllowed: id => sessions.inspectionModelAllowed(id),
+        cancel: id => ctx.agents.get(id as SessionId)?.cancel({ kind: 'user' }),
+      })
       this.planDispatcher = new PlanDispatcher({ store, plans, engine, executor, attention, limits: runLimits,
         get control() { return planControl },
         paused: () => this.paused(),
@@ -568,7 +593,7 @@ export class Runtime extends Service implements SourceHost {
       }
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
-      const evaluateDue = () => { engine.evaluateDue(); stagnation.scan(); evals.set(evalsHealth(store)) }
+      const evaluateDue = () => { engine.evaluateDue(); stagnation.scan(); this.inspection?.tick(); evals.set(evalsHealth(store)) }
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
         health: this.runtimeHealth, lifetime: this.lifetime, configured: () => this.configured(), closing: () => this.closing() })
       const sourceInactive = () => this.closing() || !installation.github
@@ -592,6 +617,7 @@ export class Runtime extends Service implements SourceHost {
       this.toolHost = { context: ctx, engine, store, sessions, executor, mainline, planDispatcher: this.planDispatcher, settings: this.settings,
         planControl,
         assessor, resources, projectMeter, runLimits, attention, handoffs, plans, planIntegration, maintenance: this.maintenance,
+        inspection: this.inspection,
         stagnation, requirements, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,
@@ -743,12 +769,19 @@ export class Runtime extends Service implements SourceHost {
     this.runLimits.recover()
     this.executor.recoverPauses()
     this.disposeAdmission = installModelAdmission(this.ctx, {
-      owns: id => scopeProposalId(id) !== undefined || this.projectMeter.owns(id) || this.sessions.hasManagedAncestry(id),
+      owns: id => id.startsWith('inspection-') || scopeProposalId(id) !== undefined || this.projectMeter.owns(id) || this.sessions.hasManagedAncestry(id),
       acquire: (id, maximum, signal) => {
         const binding = this.store.get(KV.projectMeter.binding(id))
         if (this.closing() || !binding) return { admitted: false, reason: 'Run limit Session is not authorized in this mount' }
         if (scopeProposalId(id) !== undefined && !this.sessions.scopeModelAllowed(id)) {
           return { admitted: false, reason: 'Requirement scope reviewer has no authorized native task in this mount' }
+        }
+        if (id.startsWith('inspection-') || binding.roles.includes('inspection')) {
+          const task = this.inspection?.task(id), grant = this.store.settings().executor.idleInspection
+          if (!task || !grant || task.scope !== grant.scope || binding.roles.length !== 1 || binding.roles[0] !== 'inspection' ||
+              binding.parent_session_id !== task.hubSessionId || binding.ticket_id !== null || binding.plan_id !== null ||
+              !this.sessions.inspectionModelAllowed(id)) return { admitted: false, reason: 'Inspection has no authorized read-only task' }
+          return this.runLimits.acquire(binding, maximum, signal, grant)
         }
         const { ticket_id: ticket } = binding
         if (ticket && !this.executor.writerAuthorized(ticket, workerSessionId(ticket))) {
@@ -796,6 +829,7 @@ export class Runtime extends Service implements SourceHost {
     this.planDispatcher.resume()
     this.planning.resume()
     this.effects.wakeParked('requirementScopeReview')
+    this.inspection?.resume()
     this.executor.resume()
     this.passes.start()
     this.effects.start()
@@ -832,6 +866,7 @@ export class Runtime extends Service implements SourceHost {
       projectMeter } = this
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, get masterId() { return runtime.masterId }, sourceLinks, projectMeter, installation,
       attention: this.attention, runLimits: this.runLimits, planIntegration: this.planIntegration,
+      inspection: this.inspection,
       planArtifact: async id => {
         const view = this.planIntegration.view(id)
         return view && 'artifact' in view && (!('artifactAvailable' in view) || view.artifactAvailable !== false)
@@ -870,7 +905,8 @@ export class Runtime extends Service implements SourceHost {
     const parent = parentId ? this.store.get(KV.projectMeter.binding(parentId)) : undefined
     const worker = !!ticketId && parent?.roles.includes('hub') && roles.includes('implementation')
     const nativeChild = !!ticketId && !worker && (roles.includes('implementation') || roles.includes('review'))
-    if (!hub && !planning && !worker && !nativeChild && scopeId === undefined) return 'read' // Explicit host registrations (retro and inspection).
+    const inspection = id.startsWith('inspection-')
+    if (!hub && !planning && !worker && !nativeChild && scopeId === undefined && !inspection) return 'read'
     const ticket = ticketId ? this.store.tickets.get(ticketId) : undefined, execution = ticket?.execution
     if (worker && (!ticket || execution?.ownership?.ticket !== ticketId || !execution.ownership.verified || !execution.worktree)) return 'unverified'
     const issued = worker && (execution?.session === id || ticket?.assignments.some(item => item.writer?.session === id))
@@ -889,6 +925,12 @@ export class Runtime extends Service implements SourceHost {
     if (header.id !== id) return 'unverified'
     if (nativeChild) return header.origin === 'subagent' && header.parentSession === parentId ? { header } : 'unverified'
     if (header.origin !== undefined || header.parentSession !== undefined || header.isSeeded) return 'unverified'
+    if (inspection) {
+      const run = this.store.get(KV.inspection.run(id))
+      return roles.length === 1 && roles[0] === 'inspection' && run?.hubSessionId === parentId && !!parentId && this.hubAuthority.isGeneration(parentId)
+        && this.store.get(KV.inspection.native(id)) === header.createdAt && header.agentPreset === INSPECTION_PRESET && header.cwd && isAbsolute(header.cwd)
+        && sameDirectory(header.cwd, join(this.machine.stateDir, 'inspection-sessions')) ? { header } : 'unverified'
+    }
     if (scopeId !== undefined) {
       const pin = this.store.get(KV.planRequirements.reviewer(scopeId))
       const preview = this.store.get(KV.planRequirements.preview(scopeId))
@@ -920,12 +962,13 @@ export class Runtime extends Service implements SourceHost {
         return splitter && this.sessions.isSplitterSession(splitter) ? [`planner-${id}`, splitter.id] : [`planner-${id}`]
       })
       const live = (ids: string[]) => ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
-      const reviewSessions = () => this.ctx.agents.list().filter(agent => scopeProposalId(agent.id) !== undefined && this.projectMeter.owns(agent.id)).map(agent => agent.id)
-      const agents = live([...this.hubAuthority.generations(), this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id)), ...handoffSessions(), ...reviewSessions()])
+      const auxiliarySessions = () => this.ctx.agents.list().filter(agent => (scopeProposalId(agent.id) !== undefined || agent.id.startsWith('inspection-'))
+        && this.projectMeter.owns(agent.id)).map(agent => agent.id)
+      const agents = live([...this.hubAuthority.generations(), this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id)), ...handoffSessions(), ...auxiliarySessions()])
       for (const agent of agents) agent.cancel({ kind: 'user' }, { keepInbox: true })
       await Promise.allSettled([http, passes, this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
       // An effect may have been creating a planner or splitter when shutdown took the first snapshot.
-      const lateHandoffs = live([...handoffSessions(), ...reviewSessions()]).filter(agent => !agents.includes(agent))
+      const lateHandoffs = live([...handoffSessions(), ...auxiliarySessions()]).filter(agent => !agents.includes(agent))
       for (const agent of lateHandoffs) agent.cancel({ kind: 'user' }, { keepInbox: true })
       await Promise.allSettled(lateHandoffs.map(agent => agent.whenIdle()))
       await this.sessions.idleHubTransfers()

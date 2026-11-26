@@ -29,7 +29,7 @@ it('names every health entry of dsh-superagent itself, which the overview shows 
   // Executor and the unavailable Evals of the last hour.
   const entries = { runtime: 0, models: 0, reply: 0, worker: 0, assessment: 0, launch: 0, planning: 0, delivery: 0, relay: 0,
     splitting: 0, notice: 0, evals: 0, mainline: 0, mainlineRepair: 0, mainlineDelivery: 0, planIntegration: 0, planControlResume: 0,
-    replanReview: 0, requirementScopeReview: 0, hubInbox: 0 } satisfies
+    replanReview: 0, requirementScopeReview: 0, inspection: 0, hubInbox: 0 } satisfies
       Record<EffectKind | 'runtime' | 'models' | 'reply' | 'worker' | 'evals', 0>
   expect(Object.keys(entries).filter(name => !(`health.${name}` in zh))).toEqual([])
 })

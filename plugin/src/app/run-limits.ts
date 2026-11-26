@@ -2,8 +2,8 @@
 import { randomUUID } from 'node:crypto'
 import { liveTicket, type Ticket } from '../core/model.ts'
 import { key as stableKey } from '../core/ids.ts'
-import { KV } from '../kv.ts'
-import { effectiveRunLimits, type EffectiveRunLimits } from '../policy.ts'
+import { KV, type Key } from '../kv.ts'
+import { effectiveRunLimits, type EffectiveRunLimits, type InspectionGrant } from '../policy.ts'
 import type { ModelAdmission } from './model-admission.ts'
 import type { MeterSessionBinding } from './project-meter.ts'
 import { projectPushRelay, type Relay } from './notices.ts'
@@ -16,6 +16,8 @@ export interface PendingUsage {
   startedAt: string
   /** Ticket budget key, when work shares a retired Plan node's authorization. */
   poolId?: string
+  /** Set only for a verified inspection; settlement keeps this path even if authorization changes. */
+  inspectionScope?: string
 }
 
 export interface BudgetLedger {
@@ -28,6 +30,7 @@ type BudgetState = 'unlimited' | 'available' | 'reserved' | 'exhausted' | 'usage
 export type QuotaHold = Extract<BudgetState, 'exhausted' | 'usage-missing'>
 export type DispatchLimits = Pick<EffectiveRunLimits['effective'], 'maxWorkers' | 'projectTokens' | 'ticketTokens' | 'stagnation'>
 type DispatchBlock = { state: QuotaHold | 'reserved'; scope: 'project' | 'ticket' }
+type InspectionAllowance = Readonly<Pick<InspectionGrant, 'scope' | 'maxTokens'>>
 
 const EMPTY: BudgetLedger = { accountedTokens: null, reportedCalls: 0, missing: [] }
 function quotaHold(limit: number | null, ledger: BudgetLedger): QuotaHold | undefined {
@@ -37,7 +40,7 @@ function quotaHold(limit: number | null, ledger: BudgetLedger): QuotaHold | unde
   return undefined
 }
 
-interface BudgetView extends BudgetLedger {
+export interface BudgetView extends BudgetLedger {
   state: BudgetState
   limitTokens: number | null
   reservedTokens: number
@@ -58,6 +61,8 @@ interface RunLimitsHost {
   store: Pick<Store, 'get' | 'set' | 'delete' | 'keys' | 'atomic' | 'afterCommit' | 'settings' | 'tickets'>
   relay(message: Relay): void
   changed(): void
+  /** Persist a configuration refusal for the current inspection before the admission transaction returns. */
+  inspectionRefused?(sessionId: string, reason: string): void
 }
 
 /** Reserves both applicable pools before provider I/O, atomically settles one stream, and projects the same budget for dispatch and reads. */
@@ -89,7 +94,9 @@ export class RunLimits {
   configurationChanged(): void {
     const { store } = this.host
     store.atomic(() => {
-      const configuration = effectiveRunLimits(store.settings().executor)
+      const executor = store.settings().executor
+      const configuration = effectiveRunLimits(executor)
+      if (executor.idleInspection) this.updateInspectionHold(executor.idleInspection)
       this.updateHold(null, configuration.effective.projectTokens)
       for (const ticket of store.tickets.open()) this.updateHold(ticket.id, this.ticketLimit(configuration, ticket.plan), this.pool(ticket.id, ticket.plan))
       store.afterCommit(() => { this.wakeWaiters(); this.host.changed() })
@@ -97,30 +104,41 @@ export class RunLimits {
   }
 
   /** Only verified callers reach here. Business attribution is the same append-only binding as the project meter. */
-  acquire({ session_id: sessionId, ticket_id: ticketId }: MeterSessionBinding, maximumTokens: number | null, signal?: AbortSignal): ModelAdmission {
+  acquire(binding: MeterSessionBinding, maximumTokens: number | null, signal?: AbortSignal, inspection?: InspectionAllowance): ModelAdmission {
+    const { session_id: sessionId, ticket_id: ticketId, roles } = binding
     const { store } = this.host
     signal?.throwIfAborted()
     if (this.closed) return { admitted: false, reason: 'Run limits are closing' }
     if (maximumTokens !== null && (!Number.isSafeInteger(maximumTokens) || maximumTokens <= 0)) maximumTokens = null
     return store.atomic(() => {
-      const config = effectiveRunLimits(store.settings().executor)
+      const executor = store.settings().executor
+      if (inspection || roles.includes('inspection')) {
+        const current = executor.idleInspection
+        if (!inspection || !current || roles.length !== 1 || roles[0] !== 'inspection' || ticketId !== null || binding.plan_id !== null
+          || current.scope !== inspection.scope || current.maxTokens !== inspection.maxTokens) {
+          return { admitted: false, reason: 'Inspection requires its exclusive Session binding and current scoped grant' }
+        }
+      }
+      const config = effectiveRunLimits(executor)
       const { projectTokens } = config.effective
       const owner = ticketId === null ? undefined : store.tickets.get(ticketId)
       if (ticketId !== null && (!owner || !liveTicket(owner))) return { admitted: false, reason: 'Run limit Ticket is not live' }
       const poolId = owner ? this.pool(owner.id, owner.plan) : undefined
       const ticketTokens = owner ? this.ticketLimit(config, owner.plan) : null
-      const pending = projectTokens === null && ticketTokens === null ? [] : this.pending()
+      const pending = projectTokens === null && ticketTokens === null && !inspection ? [] : this.pending()
       let waiting = false
       for (const budget of [projectTokens === null ? undefined : this.budget(projectTokens, store.get(KV.runLimits.project), pending),
-        ticketTokens === null || poolId === undefined ? undefined : this.ticketBudget(poolId, ticketTokens, pending)]) {
+        ticketTokens === null || poolId === undefined ? undefined : this.ticketBudget(poolId, ticketTokens, pending),
+        inspection ? this.inspectionPool(inspection.scope, inspection.maxTokens, pending) : undefined]) {
         if (!budget || budget.limitTokens === null) continue
         if (budget.state === 'exhausted' || budget.state === 'usage-missing') {
           return { admitted: false, reason: `Run limit paused: ${budget.state}` }
         }
-        if (maximumTokens === null) return { admitted: false, requiresOperator: true,
-          reason: 'Run limits require a model route with a verified request token bound.' }
-        if (maximumTokens > budget.limitTokens - (budget.accountedTokens ?? 0)) {
-          return { admitted: false, requiresOperator: true, reason: 'The model request bound exceeds the settled run limit balance.' }
+        if (maximumTokens === null || maximumTokens > budget.limitTokens - (budget.accountedTokens ?? 0)) {
+          const reason = maximumTokens === null ? 'Run limits require a model route with a verified request token bound.'
+            : 'The model request bound exceeds the settled run limit balance.'
+          if (inspection) this.host.inspectionRefused?.(sessionId, reason)
+          return { admitted: false, requiresOperator: true, reason }
         }
         waiting ||= budget.availableTokens === null || maximumTokens > budget.availableTokens
       }
@@ -128,7 +146,7 @@ export class RunLimits {
         wait: (this.balanceChanged ??= Promise.withResolvers<void>()).promise }
       const key = KV.runLimits.pending(randomUUID())
       const request: PendingUsage = { sessionId, ticketId, maximumTokens, startedAt: new Date().toISOString(),
-        ...poolId && poolId !== ticketId ? { poolId } : {} }
+        ...poolId && poolId !== ticketId ? { poolId } : {}, ...(inspection && { inspectionScope: inspection.scope }) }
       store.set(key, request)
       return { admitted: true, settle: totalTokens => {
         if (this.closed) return // A late old-mount completion cannot commit into a reopened Store.
@@ -136,7 +154,9 @@ export class RunLimits {
           if (!store.get(key)) return
           store.delete(key)
           this.record(request, totalTokens, false)
-          const config = effectiveRunLimits(store.settings().executor)
+          const executor = store.settings().executor
+          const config = effectiveRunLimits(executor)
+          if (executor.idleInspection && request.inspectionScope === executor.idleInspection.scope) this.updateInspectionHold(executor.idleInspection)
           const projectHeld = this.updateHold(null, config.effective.projectTokens)
           const ticket = ticketId === null ? undefined : store.tickets.get(ticketId)
           const affected = ticket && (liveTicket(ticket) ? ticket : store.tickets.open().find(other => this.pool(other.id, other.plan) === poolId))
@@ -191,6 +211,15 @@ export class RunLimits {
       : { scope: 'project', ticketId: null, configuration, budget: projectBudget }
   }
 
+  /** Read the cumulative ledger for this authorized path, independent of interval and Session identity. */
+  inspectionBudget(scope: string, maxTokens: number): BudgetView {
+    return this.inspectionPool(scope, maxTokens, this.pending())
+  }
+
+  private inspectionPool(scope: string, limit: number, inFlight: PendingUsage[]): BudgetView {
+    return this.budget(limit, this.host.store.get(KV.runLimits.inspection(scope)), inFlight.filter(item => item.inspectionScope === scope))
+  }
+
   private wakeWaiters(): void {
     const waiting = this.balanceChanged
     this.balanceChanged = undefined
@@ -210,7 +239,10 @@ export class RunLimits {
     const { store } = this.host
     const { sessionId, ticketId } = request
     const at = new Date().toISOString()
-    for (const key of ticketId === null ? [KV.runLimits.project] : [KV.runLimits.project, KV.runLimits.ticket(request.poolId ?? ticketId)]) {
+    const pools = [KV.runLimits.project]
+    if (request.inspectionScope !== undefined) pools.push(KV.runLimits.inspection(request.inspectionScope))
+    else if (ticketId !== null) pools.push(KV.runLimits.ticket(request.poolId ?? ticketId))
+    for (const key of pools) {
       const ledger = store.get(key) ?? EMPTY
       if (total !== null && Number.isSafeInteger(total) && total >= 0) {
         const sum = (ledger.accountedTokens ?? 0) + total
@@ -226,27 +258,40 @@ export class RunLimits {
     }
   }
 
-  /** The active marker and its single normal Hub relay commit together. A new episode requires the hold to clear first. */
   private updateHold(ticketId: string | null, limit: number | null, poolId = ticketId): boolean {
     const { store } = this.host
     const key = poolId === null ? KV.runLimits.projectHold : KV.runLimits.ticketHold(poolId)
-    const prior = store.get(key)
     const issue = quotaHold(limit, store.get(poolId === null ? KV.runLimits.project : KV.runLimits.ticket(poolId)) ?? EMPTY)
+    return this.setHold(key, issue, () => {
+      const ticket = ticketId === null ? undefined : store.tickets.get(ticketId)
+      const affectedTickets = ticket?.plan && poolId !== null ? store.tickets.open().filter(other => other.id !== ticketId &&
+        this.pool(other.id, other.plan) === poolId).map(other => other.id) : []
+      return { scope: ticketId === null ? 'project' : 'ticket', ticketId,
+        ...(ticket && { title: ticket.title, planId: ticket.plan?.planId, nodeId: ticket.plan?.nodeId }),
+        ...(affectedTickets.length ? { affectedTickets } : {}),
+        resource: ticketId === null ? 'project/run-limits' : `ticket/${ticketId}/run-limits`,
+      }
+    })
+  }
+
+  private updateInspectionHold({ scope, maxTokens }: InspectionAllowance): void {
+    const issue = quotaHold(maxTokens, this.host.store.get(KV.runLimits.inspection(scope)) ?? EMPTY)
+    this.setHold(KV.runLimits.inspectionHold(scope), issue, () => ({
+      scope: 'inspection', inspectionScope: scope, ticketId: null, resource: 'project/inspection',
+    }))
+  }
+
+  /** The active marker and its single normal Hub relay commit together. A new episode requires the hold to clear first. */
+  private setHold(key: Key<true>, issue: QuotaHold | undefined, payload: () => Record<string, unknown>): boolean {
+    const { store } = this.host
+    const prior = store.get(key)
     if (!issue) {
       if (prior) store.delete(key)
       return false
     }
     if (!prior) {
       store.set(key, true)
-      const ticket = ticketId === null ? undefined : store.tickets.get(ticketId)
-      const affectedTickets = ticket?.plan && poolId !== null ? store.tickets.open().filter(other => other.id !== ticketId &&
-        this.pool(other.id, other.plan) === poolId).map(other => other.id) : []
-      const relay = projectPushRelay({ id: `quota-paused:${randomUUID()}`, kind: 'quota-paused', payload: {
-        scope: ticketId === null ? 'project' : 'ticket', reason: issue, ticketId,
-        ...(ticket && { title: ticket.title, planId: ticket.plan?.planId, nodeId: ticket.plan?.nodeId }),
-        ...(affectedTickets.length ? { affectedTickets } : {}),
-        resource: ticketId === null ? 'project/run-limits' : `ticket/${ticketId}/run-limits`,
-      } })
+      const relay = projectPushRelay({ id: `quota-paused:${randomUUID()}`, kind: 'quota-paused', payload: { ...payload(), reason: issue } })
       if (relay) this.host.relay(relay)
     }
     return true

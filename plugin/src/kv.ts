@@ -21,6 +21,7 @@ import type { BudgetLedger, PendingUsage } from './app/run-limits.ts'
 import type { TopicBindingRecord } from './app/topic-binding.ts'
 import type { CredentialBlocker } from './app/scoped-attention.ts'
 import type { PlanControlState } from './app/plan-control.ts'
+import type { MaintenanceEvent, MaintenanceTarget } from './app/maintenance.ts'
 import type { SettingsSave } from './policy.ts'
 import type { GithubConfig, Retry } from './sources/github.ts'
 
@@ -90,9 +91,13 @@ export const KV = {
    */
   feishu: { chats: record<Record<string, boolean>>('feishu-chats'), history: family<string, [chat: string]>('feishu-history:'),
     topics: family<Record<string, string>, [chat: string]>('feishu-history-threads:'),
-    seen: family<string[], [thread: string]>('thread-seen:'), initialized: family<boolean, [thread: string]>('thread-initialized:') },
+    seen: family<string[], [thread: string]>('thread-seen:'), initialized: family<boolean, [thread: string]>('thread-initialized:'),
+    maintenanceLookup: family<{ epoch: string; at: string; actorId: string; sourceRevision: number; policyVersion: string }>('feishu-maintenance-lookup:') },
   /** Mounted project: one active binding and text-free consumption receipts that survive unbind/rebind. */
   topicBinding: { active: record<TopicBindingRecord>('topic-binding'), received: family<true>('topic-binding-received:') },
+  /** Maintenance: immutable source observations, pending review and durable associations. */
+  maintenance: { event: family<MaintenanceEvent>('maintenance-event:'), pending: family<true>('maintenance-pending:'),
+    feedback: family<MaintenanceTarget>('maintenance-feedback:'), recovery: record<string>('maintenance-recovery-relay') },
   /** Handoffs: current record by project; immutable full records and specs; direct confirmation receipts. */
   handoffs: { current: family<string, [projectId: string]>('handoff-current:'),
     record: family<Handoff, [id: string]>('handoff:'),
@@ -113,6 +118,7 @@ export const KV = {
     claimRevision: family<number, [planId: string, nodeId: string]>('plan-claim-revision:'),
     node: family<PlanNodeState, [id: string, nodeId: string]>('plan-node:', (id, nodeId) => JSON.stringify([id, nodeId])),
     integration: family<PlanIntegrationView>('plan-integration:'),
+    maintenanceStarted: record<{ deliveredPlan: string; startedAt: string }>('plan-maintenance-started'),
     integrationDispatch: family<true>('plan-integration-dispatch:'),
     releaseIntent: family<PlanReleaseIntent>('plan-release-intent:'),
     releaseActive: family<string, [projectId: string, environment: string, target: string]>('plan-release-active:',

@@ -38,6 +38,8 @@ export class TopicBindingError extends Error {
   constructor(readonly status: 400 | 404 | 409, message: string) { super(message) }
 }
 
+export interface FeishuMaintenanceIngress { epoch: string; needsHistory: boolean }
+
 const chatIdPattern = /^oc_[A-Za-z0-9]+$/
 const messageIdPattern = /^om_[A-Za-z0-9_-]+$/
 export const actorIdPattern = /^ou_[A-Za-z0-9]+$/
@@ -74,7 +76,7 @@ const summary = (handoff?: Handoff): string => !handoff ? 'No current handoff.' 
   specified: 'The project specification has been published.',
 }[handoff.status]
 
-/** A project-selected second entrance to the canonical handoff, not a source of general work or approval. */
+/** Binds one Feishu destination for handoff protocol messages and provides its current maintenance identity fence. */
 export class TopicBinding {
   constructor(private readonly options: Options) {}
 
@@ -134,6 +136,7 @@ export class TopicBinding {
       const binding = this.view()
       if (binding) {
         store.delete(KV.topicBinding.active)
+        for (const lookup of store.keys(KV.feishu.maintenanceLookup)) store.delete(lookup)
         for (const receipt of store.receipts.waiting()) {
           if (receipt.channel.source === SOURCE && receipt.channel.address.bindingEpoch === binding.epoch) outbox.withdraw(receipt.id)
         }
@@ -147,6 +150,21 @@ export class TopicBinding {
   matches(trigger: Trigger): boolean {
     const target = targetOf(trigger), binding = this.view()
     return !!target && !!binding && sameTarget(binding, target)
+  }
+
+  /** Identify authorized chat ingress and defer a partial live message to the exact-bound poll. */
+  maintenanceIngress(trigger: Trigger): FeishuMaintenanceIngress | undefined {
+    const record = this.active(), target = targetOf(trigger)
+    if (!record || !target || target.chatId !== record.binding.chatId || target.direct !== record.binding.direct ||
+        !normalized(trigger, target) || trigger.human !== true || trigger.meta.botIdentity !== record.botIdentity ||
+        this.options.botIdentity() !== record.botIdentity || !record.binding.allowedActors.includes(trigger.actor.id) ||
+        trigger.id === record.binding.triggerId || !(Date.parse(trigger.at) >= Date.parse(record.binding.boundAt))) return undefined
+    const { parentId, rootId, messageType, threadId } = trigger.meta
+    if (messageType !== undefined && messageType !== 'text') return undefined
+    if (parentId || (target.direct && rootId)) return undefined
+    const same = sameTarget(target, record.binding)
+    if (!same && (rootId || (messageType !== undefined && !threadId))) return undefined
+    return { epoch: record.binding.epoch, needsHistory: !same || messageType === undefined }
   }
 
   /** Issued answer codes must not become Ticket work after unbinding. Reserve other commands only at the bound target. */

@@ -51,7 +51,7 @@
     "typecheck": "tsc --noEmit",
     "test": "node scripts/test.mjs",
     "test:session-tools": "node scripts/test.mjs tests/tools.spec.ts tests/model-surface.spec.ts tests/cards.spec.ts",
-    "test:recovery": "node scripts/test.mjs tests/plans.spec.ts tests/runtime-concurrency.spec.ts tests/runtime-crash.spec.ts",
+    "test:recovery": "node scripts/test.mjs tests/plans.spec.ts tests/runtime-concurrency.spec.ts tests/runtime-crash.spec.ts tests/maintenance-recovery.spec.ts",
     "check": "node scripts/check.mjs",
     "hooks:install": "node scripts/install-hooks.mjs",
     "verify:linux": "node scripts/verify-linux.mjs",

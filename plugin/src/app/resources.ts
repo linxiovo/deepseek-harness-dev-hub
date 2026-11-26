@@ -40,7 +40,8 @@ import type { SessionMeter } from './session-meter.ts'
 import type { Sessions } from './sessions.ts'
 import type { Settings } from './settings.ts'
 import type { Store } from './store.ts'
-import type { PlanIntegrationView } from '../core/plan-integration.ts'
+import type { PlanIntegration } from './plan-integration.ts'
+import type { Maintenance } from './maintenance.ts'
 import type { TextCache } from './cache.ts'
 
 /** Resource descriptors exposed via orchestrator_read, marking which resources worker sessions may also read for their own ticket. */
@@ -93,6 +94,9 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'project/meter', holds: 'deduplicated usage including shared overhead and Session details' },
   { name: 'project/run-limits', holds: 'effective run limits and project token budget status' },
   { name: 'project/attention', holds: 'project Plan status counts and credential actions' },
+  { name: 'project/stage', holds: 'project delivery or Stage 2 maintenance milestone' },
+  { name: 'maintenance', holds: 'pending Stage 2 feedback to assess' },
+  { name: 'maintenance/<id>', holds: 'one Stage 2 event or its decision and associated work' },
   { name: 'plan/<id>/meter', holds: 'Plan usage with shared overhead separate' },
   { name: 'ticket/<id>/meter', holds: 'Ticket usage with shared overhead separate' },
   { name: 'ticket/<id>/run-limits', holds: 'effective run limits and Ticket and project token budget status' },
@@ -128,7 +132,8 @@ export interface MainResourceHost extends ResourceHost {
   readonly sessions: Pick<Sessions, 'status' | 'modelRetry'>
   readonly settings: Pick<Settings, 'view' | 'block'>
   readonly handoffs: Pick<Handoffs, 'get' | 'spec'>
-  readonly planIntegration?: { view(id: string): PlanIntegrationView | undefined }
+  readonly planIntegration?: Pick<PlanIntegration, 'view' | 'stage'>
+  readonly maintenance?: Pick<Maintenance, 'pending' | 'read'>
   readonly planControl: Pick<PlanControl, 'view'>
   readonly plans: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'testHistory' | 'view' | 'node' | 'at' | 'revision'>
   readonly stagnation: Pick<PlanStagnation, 'view' | 'failure'>
@@ -796,6 +801,18 @@ const ROUTES: readonly Route[] = [
   ['project/meter', read => projectMeter(read, 'project')],
   ['project/run-limits', read => runLimitStatus(read)],
   ['project/attention', read => main(read).attention.summary()],
+  ['project/stage', read => {
+    const host = main(read)
+    if (!host.planIntegration) throw new Error('Project stage is unavailable')
+    return host.planIntegration.stage()
+  }],
+  ['maintenance', read => main(read).maintenance?.pending(read.offset, Math.min(read.limit ?? DEFAULT_LIST_SIZE, MAX_LIST_SIZE))
+    ?? { items: [], next_offset: null }],
+  ['maintenance/', read => {
+    const host = main(read)
+    if (!host.maintenance) throw new Error('Maintenance is unavailable in this project')
+    return host.maintenance.read(read.rest)
+  }],
   ['feishu/', async read => {
     const source = trigger(read.host, read.rest.split('/')[0]!, read.ticketId)
     const ref = feishuRef(source)

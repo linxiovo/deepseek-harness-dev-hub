@@ -2,14 +2,14 @@
 
 This document follows a confirmed Harness handoff from the conversation to a published specification and registered Plan DAG. It builds on [001 Domain model](001-domain.md), [003 Execution](003-execution.md), [004 Prompts](004-prompts.md) and [007 Architecture](007-architecture.md).
 
-A handoff is one product brief a person confirmed in the main Session ("the Hub") conversation. It is not a Source Trigger and not a Ticket: it carries the project, goal, constraints, acceptance scope and authorization, and a read-only planner Session turns it into a specification. The Hub confirms, relays and reads the result; repository investigation and specification writing belong to the planner, and the Hub does not modify the repository.
+A handoff carries a project, goal, constraints, acceptance scope and authorization; it is neither a Source Trigger nor a Ticket. A person confirms the initial product brief in the Hub's Harness conversation and a read-only planner writes the specification. After delivery, a matching maintenance rule can authorize a separate brief and specification without a human confirmation; see Stage 2 below. The Hub does not modify the repository.
 
 ## Records
 
 | Record | Fields | Rules |
 | --- | --- | --- |
 | Project | `id`, `repository`, `workspace` | `workspace` is resolved to an absolute path. `id` derives from the repository and that path, so one checkout keeps one identity |
-| Handoff | `id`, `project`, `goal`, `constraints`, `acceptanceScope`, `authorization {scope, release, releaseTarget?}`, `confirmedBy {sessionId, messageId, text}`, `status`, `question?`, `spec?` | The brief is written once. A confirmation receipt binds one direct user message to one brief; a project has at most one handoff that is not `specified`. `releaseTarget {environment, target, scope}` is required when `release: authorized`; legacy authorized records without it cannot publish. Earlier records stay readable |
+| Handoff | `id`, `project`, `goal`, `constraints`, `acceptanceScope`, `authorization {scope, release, releaseTarget?}`, `confirmedBy` or `maintenance`, `status`, `question?`, `spec?` | The brief is written once. Direct confirmation binds one user message to one brief; a project has at most one handoff that is not `specified`. Maintenance records the intake event and matching rules instead and grants no release authority. `releaseTarget {environment, target, scope}` is required when `release: authorized`; older records without it cannot publish. |
 | Question | `id`, `text`, `why`, `affectedAcceptance`, `status`, `answer?`, `answeredBy?` | At most one per handoff. Its status is `awaiting` or `answered`; every affected item belongs to `acceptanceScope`. Feishu answers retain the sender's open ID and the originating Trigger ID. |
 | Spec | `id`, `handoffId`, `revision`, `body`, `acceptance`, `testInterfaces`, `outOfScope` | Stored once with revision `1`; never updated in place. `outOfScope` is required and may be empty: `[]` explicitly means there are no confirmed exclusions, while every entry is an actual excluded item; the field is neither omitted nor filled with invented items |
 
@@ -71,7 +71,7 @@ The main Session reads the flow with `orchestrator_read`:
 
 | Resource | Returns |
 | --- | --- |
-| `handoff/<id>` | The whole handoff record: project, brief, confirmation, status, question and answer |
+| `handoff/<id>` | The whole handoff record: project, brief, authorization provenance, status, question and answer |
 | `spec/<id>` | The published specification, or `{handoffId, status: 'pending'}` before publication |
 | `plan/<id>` | The Plan DAG with roles, acceptance references, blocked-by edges, role totals and delivered counts, plus root background. `offset` and `limit` page the nodes and background in parallel. Before registration the status is `awaiting-spec`, `pending`, or `unclassified-spec` |
 | `plan/<id>/node/<node-id>` | One registered Slice Ticket with a page of its addressed instructions, without root background or other nodes' instructions |
@@ -150,7 +150,27 @@ Use the existing loopback management API under `/orchestrator/api/`, with `x-orc
 
 The Hub sends a binding confirmation once. Question and result notices link back to the selected project; they do not copy conversation history, answers or specification text into a group. To answer a pending product question, use the reply format in its notice. The Hub verifies the question reference and the sender reported by Feishu before recording an answer on the same handoff that Harness reads. Plain assent such as `同意` is not an approval. Settings links open Harness; they do not apply a change by themselves.
 
-An allowed participant can send `status` or `状态` in the bound conversation for a text summary of the current handoff. An answer uses `answer <code>: <answer>` with the 24-character code from the current question's notice. The reply format is reserved even if a code is stale; ordinary follow-ups such as `Answer export: use CSV.` continue through normal Ticket intake. A forwarded link or code is not a grant. Links use the Harness loopback port: open them on the Harness machine or through an authorized tunnel to that port. If another project is active, the link asks the operator to select the named project instead of opening the wrong settings.
+An allowed participant can send `status` or `状态` for a text summary of the current handoff. An answer uses `answer <code>: <answer>` with the 24-character code from the current question's notice. The reply format stays reserved even when the code is stale. A forwarded link or code is not a grant. Harness links open on the Harness machine or through an authorized tunnel. If another project is active, the link asks the operator to select the named project.
+
+## Stage 2 maintenance
+
+`orchestrator_read` on `project/stage` returns `{stage: 1}` until the mounted project has a fully delivered Plan. The first complete artifact-only or verified-release delivery persists `{stage: 2, deliveredPlan, startedAt}` with its final receipt. A restart can adopt a retained, verified delivery from an older store. This is a project milestone, not a claim that the original package remains available forever; its current availability is on `plan/<id>/delivery`. Later work uses the same Hub and separate Plans. There is no idle repository scan or timer that creates maintenance work.
+
+Stage 2 keeps new Source work out of ordinary Ticket routing, including attach, replay and automatic wake-up. Selected-repository pull request reviews and CI may still reach existing open Tickets as context; that delivery cannot launch a Worker. The Hub considers only fresh, original text from an authorized entrance:
+
+| Entrance | Required authority |
+| --- | --- |
+| Harness | A fresh single-text direct operator message. Native inputs are recorded before adjudication; cold recovery of unrecorded messages requires unchanged authorization since arrival. During rotation the host records native inbox evidence, not the carried relay. |
+| GitHub | A new issue or conversation comment in the selected repository, an enabled receive-all scope, a listed human account and a row that admits unaddressed messages. A later edit to a pre-delivery comment does not make it eligible. |
+| Feishu | The exact current private chat or group root, matching bot and binding epoch, a listed human who is also an allowed binding participant, and an enabled Source scope. A group must receive all messages; direct chat must be enabled. Partial live events await their record in the exact-bound history; an unresolved admitted message pins the cursor for up to 14 days. Native replies with a direct parent, forwards, quoted text, system and join events convey no work. |
+
+`off` disables intake; `observe` permits assessment without registration; `auto` permits registration after an enabled rule matches. A pending event binds its intake Policy version, Source settings revision and Feishu binding epoch where applicable. The host rechecks authorization and the mounted repository before registering work. Stage 2 settings and manual Source policy sync are operator operations; explicitly configured automatic Source sync still runs. Reading a chat, joining it, being in an allowlist, mentions and existing Ticket subscriptions never confer topic authority. Stage 1 and legacy installations retain their ordinary Source intake.
+
+The Hub receives `maintenance-candidate` with `event_id` and a `maintenance/<id>` resource. That read gives the author's text, actor and time, the final decision, or `withdrawn`. `maintenance` lists authorized pending references with `offset`, `limit` and `next_offset`. A restart sends one grouped recovery relay for undecided events, even when a candidate relay is already in the Hub history. `orchestrator_maintenance {event_id?, verdict}` takes `ignore` with `reason`, `checked` with `reason`, `existing` with `ticketId`, or `plan` with `scope`, `direction`, `spec` and `draft`. All except `ignore` also require `intentEvidence` and `ruleAssessments`. Omit `event_id` only for the current direct Harness message. `existing` records a reference without delivering a message or waking a Worker.
+
+The host requires a verbatim excerpt from the author, one assessment per enabled rule and at least one match before recording a positive verdict. A `plan` also needs a settled implementation request. Semantic classification belongs to the Hub; the host enforces identity, mode, rule IDs and Plan structure. A new Plan contains one feature: a single node for single-end work or a backend contract and dependent frontend node for cross-end work. Registration and the event receipt are atomic. Dispatch still uses the normal Frontier, worktree, budget, review and delivery gates.
+
+Replaying an adjudicated native event returns its original result. Edits of the same GitHub comment and matching text in the same source conversation (ignoring surrounding whitespace and CRLF) associate to already registered work. Different issues, chats and entrances are not automatically deduplicated against each other. For paraphrases and cross-entrance feedback, the Hub identifies matching work and uses `existing`. Association leaves the Ticket, Plan and delivery evidence unchanged.
 
 ## Tests
 
@@ -159,6 +179,14 @@ An allowed participant can send `status` or `状态` in the bound conversation f
 Run `pnpm test tests/handoff.spec.ts tests/topic-binding.spec.ts tests/http.spec.ts` for the Harness flow, Feishu channel contract and project-scoped management routes.
 
 `pnpm test tests/plans.spec.ts` exercises automatic delegation, restart deduplication, graph validation and reads, message isolation, Frontier claims, role/session/action visibility, slot races, formal delivery gating and claim replay through the Hub and splitter tools using a simulated Harness host.
+
+`pnpm test tests/mainline-queue.spec.ts -t 'verifies the integrated package'` drives delivery and Stage 2 through real temporary Git worktrees, simulated GitHub and Feishu sources, direct Harness messages and the controlled local release adapter.
+
+`pnpm test tests/maintenance-recovery.spec.ts` isolates the interruption points at the Runtime boundary. It seeds the saved project milestone; the Git integration cases above establish when that milestone is written.
+
+The [lark-cli 1.0.100 private-chat fixture](../tests/fixtures/feishu-bound-private-lark-cli-1.0.100.json) retains the actual event and history shapes with anonymized values. A standalone text has no parent or root field. A reply to the binding anchor has `reply_to` in the event and `parent_id` in history; both also have `root_id` equal to the anchor. The Runtime check simulates delayed visibility of these history items: the standalone message enters maintenance once, and the reply does not. These samples cover a bot private chat, not a live group topic.
+
+To verify the live Feishu protocol, use a bot authorized for a dedicated test chat. For both an unmentioned standalone text in the bound conversation and a direct reply to its root, capture the `im.message.receive_v1` event and the matching item from the exact-bound history query (`GET /open-apis/im/v1/messages`, using the resolved thread ID for a group or the chat ID for a private chat). Record the CLI version. Before saving a fixture, replace identifiers consistently across the pair and redact text and unrelated data without changing field presence or types. Check native `message_id`, chat/thread identity, live `reply_to` versus history `parent_id`, and the original text message type. A delayed history read must recover the standalone message once and must not put the root reply in the maintenance inbox. Constructed history responses do not verify the live protocol.
 
 ## Limitations
 

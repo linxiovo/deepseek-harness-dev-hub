@@ -91,6 +91,8 @@ The routes require the normal loopback Host, `x-orchestrator-request: 1`, same-o
 | `released-artifact-unavailable` | The deployed package passed environment verification, but the original regression package cannot currently be downloaded from Harness. This is not Plan completion. |
 | `released` | The environment verified the exact deployment of the regression SHA and checksum, and the verified package is available. The final relay separates package, deployment and environment verification. |
 
+Only `delivered` and `released` establish the project's [Stage 2 maintenance milestone](009-handoff.md#stage-2-maintenance). Waiting, failed or unverified publication does not.
+
 Pure optional retro follow-ups are not Plan nodes and do not delay verification. Configuration and implementation entry points are `src/deployment.ts`, `src/app/plan-integration.ts`, `src/app/plan-release.ts`, `src/app/release-adapter.ts`, `src/app/plan-artifacts.ts`, `src/executor/mainline-git.ts`, and `src/sources/actions-evidence.ts`. The repository regression workflow is `.github/workflows/plugin-ci.yml`.
 
 ## Code and verification

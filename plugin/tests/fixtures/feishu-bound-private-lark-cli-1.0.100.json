@@ -1,0 +1,96 @@
+{
+  "root": {
+    "chat_id": "oc_privatecapture",
+    "chat_type": "p2p",
+    "content": "Private test binding anchor.",
+    "create_time": "1780000000000",
+    "event_id": "sample_event_root",
+    "id": "om_sample_root",
+    "message_id": "om_sample_root",
+    "message_type": "text",
+    "sender_id": "ou_alice",
+    "sender_type": "user",
+    "timestamp": "1780000001000",
+    "type": "im.message.receive_v1"
+  },
+  "standalone": {
+    "live": {
+      "chat_id": "oc_privatecapture",
+      "chat_type": "p2p",
+      "content": "Correct the label “Widgtes” to “Widgets”.",
+      "create_time": "1780000002000",
+      "event_id": "sample_event_standalone",
+      "id": "om_sample_standalone",
+      "message_id": "om_sample_standalone",
+      "message_type": "text",
+      "sender_id": "ou_alice",
+      "sender_type": "user",
+      "timestamp": "1780000003000",
+      "type": "im.message.receive_v1"
+    },
+    "history": {
+      "body": {
+        "content": "{\"text\":\"Correct the label “Widgtes” to “Widgets”.\"}"
+      },
+      "chat_default_name": "",
+      "chat_id": "oc_privatecapture",
+      "chat_type": "p2p",
+      "create_time": "1780000002000",
+      "deleted": false,
+      "message_id": "om_sample_standalone",
+      "message_position": "2",
+      "msg_type": "text",
+      "sender": {
+        "id": "ou_alice",
+        "id_type": "open_id",
+        "is_agent": false,
+        "sender_type": "user",
+        "tenant_key": "sample_tenant"
+      },
+      "update_time": "1780000002000",
+      "updated": false
+    }
+  },
+  "rootReply": {
+    "live": {
+      "chat_id": "oc_privatecapture",
+      "chat_type": "p2p",
+      "content": "This is a test reply to the binding anchor.",
+      "create_time": "1780000004000",
+      "event_id": "sample_event_rootReply",
+      "id": "om_sample_rootReply",
+      "message_id": "om_sample_rootReply",
+      "message_type": "text",
+      "reply_to": "om_sample_root",
+      "root_id": "om_sample_root",
+      "sender_id": "ou_alice",
+      "sender_type": "user",
+      "timestamp": "1780000005000",
+      "type": "im.message.receive_v1"
+    },
+    "history": {
+      "body": {
+        "content": "{\"text\":\"This is a test reply to the binding anchor.\"}"
+      },
+      "chat_default_name": "",
+      "chat_id": "oc_privatecapture",
+      "chat_type": "p2p",
+      "create_time": "1780000004000",
+      "deleted": false,
+      "message_id": "om_sample_rootReply",
+      "message_position": "3",
+      "msg_type": "text",
+      "parent_id": "om_sample_root",
+      "root_id": "om_sample_root",
+      "sender": {
+        "id": "ou_alice",
+        "id_type": "open_id",
+        "is_agent": false,
+        "sender_type": "user",
+        "tenant_key": "sample_tenant"
+      },
+      "update_time": "1780000004000",
+      "updated": false
+    }
+  }
+}

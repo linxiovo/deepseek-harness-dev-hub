@@ -11,7 +11,7 @@ import { RESOURCES } from '../src/app/resources.ts'
 import { CliError, Commands } from '../src/infra/commands.ts'
 import { commentTrigger } from '../src/sources/github-trigger.ts'
 import { IM_WORDS, NOTE_WORDS } from '../src/infra/text.ts'
-import { CHAT, feishu, startRuntime, type Host } from './fixtures/host.ts'
+import { CHAT, feishu, startManagedProject, startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host
 beforeEach(async () => { h = await startRuntime() })
@@ -37,6 +37,28 @@ const checkouts = (directories: Record<string, { sha: string; remote?: string; r
       default: throw new Error(`Unexpected git command: ${args.join(' ')}`)
     }
   })
+
+it('lets the mounted Hub find and decide a maintenance event, but not its Worker', async () => {
+  await h.stop()
+  h = (await startManagedProject()).host
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot Fix the display label'))
+  const hub = h.runtime.masterId
+  await expect(h.runTool(sessionId, 'orchestrator_read', { resource: `ticket/${ticket.id}` })).resolves.toMatchObject({ ticket_id: ticket.id })
+  expect(h.tools.get(hub)?.has('orchestrator_maintenance')).toBe(true)
+  expect(h.tools.get(sessionId)?.has('orchestrator_maintenance')).toBe(false)
+
+  h.runtime.store.set(KV.plans.maintenanceStarted, { deliveredPlan: 'prior-delivery', startedAt: new Date().toISOString() })
+  h.sendUserMessage(hub, 'Thanks for the update.')
+  const { items } = await read('maintenance') as { items: { event_id: string; read: string }[] }
+  expect(items).toHaveLength(1)
+  const event = items[0]!
+  const verdict = { kind: 'ignore', reason: 'No implementation requested.' }
+  await expect(h.runTool(sessionId, 'orchestrator_maintenance', { event_id: event.event_id, verdict })).rejects.toThrow(/not registered/i)
+  expect(await read(event.read)).toMatchObject({ status: 'pending', text: 'Thanks for the update.' })
+  expect(await h.runTool(hub, 'orchestrator_maintenance', { event_id: event.event_id, verdict })).toEqual({ status: 'ignored', reason: verdict.reason })
+  expect(await read(event.read)).toMatchObject({ status: 'ignored', reason: verdict.reason })
+  expect(await read('maintenance')).toEqual({ items: [], next_offset: null })
+})
 
 it('reads the lists, a ticket, a decision, the settings, the prompts and the models as resources', async () => {
   const { ticket, trigger } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))

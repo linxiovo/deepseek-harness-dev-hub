@@ -69,6 +69,11 @@ export class PlanIntegration {
     host.effects.handle('planIntegration', (_, id) => this.verify(id), { limit: () => host.paused() ? 0 : 4, retry: [15_000, 60_000] })
   }
 
+  stage(): { stage: 1 } | { stage: 2; deliveredPlan: string; startedAt: string } {
+    const completed = this.host.store.get(KV.plans.maintenanceStarted)
+    return completed ? { stage: 2, ...completed } : { stage: 1 }
+  }
+
   view(planId: string): PlanIntegrationView | undefined {
     const required = this.host.plans.requiredDelivery(planId)
     if (!required) return undefined
@@ -117,6 +122,7 @@ export class PlanIntegration {
         }
         if (!await this.retainedArtifactAvailable(prior)) this.invalidateArtifact(prior)
         else if (!terminal(prior)) this.rearm(id)
+        else if (prior.status === 'delivered' || prior.status === 'released') this.enterMaintenance(id)
       } else this.rearm(id)
     }
   }
@@ -349,8 +355,16 @@ export class PlanIntegration {
     }
   }
 
+  private enterMaintenance(deliveredPlan: string): void {
+    const { store, plans } = this.host
+    if (!store.get(KV.plans.maintenanceStarted) && plans.requiredDelivery(deliveredPlan)?.waitingFor.length === 0) {
+      store.set(KV.plans.maintenanceStarted, { deliveredPlan, startedAt: new Date().toISOString() })
+    }
+  }
+
   private deliver(view: PlanIntegratedArtifact & { planId: string } | Extract<PlanIntegrationView, { status: 'released' }>): void {
     const { planId, version, artifact, run } = view
+    this.enterMaintenance(planId)
     const relay = projectPushRelay({ id: deliveryRelayId(planId), kind: 'plan-delivered', payload: {
       planId, version, artifact, verification: run.url,
       ...'deployment' in view ? { release: view.release, deployment: view.deployment, environmentVerification: view.verification } : {},

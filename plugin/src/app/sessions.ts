@@ -18,6 +18,7 @@ import { Later, type Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
 import type { HubCreation, HubRotation } from './hub-authority.ts'
 import { matchesHubRoot, openHubRoot } from './hub-session-root.ts'
+import type { OperatorMessage } from './maintenance.ts'
 import type { HubDeliveryReceipt } from '../kv.ts'
 import { RetryHealth } from './retry-health.ts'
 import { initializeRoleModel } from './role-models.ts'
@@ -57,6 +58,7 @@ export interface SessionsHost {
   readonly activateHub: (sessionId: string) => void
   readonly hubResume: () => { epoch: number; requestId: string; text: string } | undefined
   readonly hubResumeDelivered: (requestId: string) => void
+  readonly recordOperator?: (input: OperatorMessage, transferred: boolean, historical: boolean) => void
   readonly lifetime: AbortSignal
   /** Called immediately before delivering an ordered relay to the Hub inbox. */
   relayAvailable(requestId: string): boolean
@@ -225,7 +227,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
       this.retryHealth.clear(agent.id); this.updateModelHealth()
     })
     ctx.on('agent/inbox/inserted', ({ agent, message }) => {
-      if (this.isHubRoot(agent) && !this.acceptsHubInput(agent)) this.queueHubTransferMessage(agent.id, message)
+      if (this.isHubRoot(agent) && !this.acceptsHubInput(agent)) this.queueHubTransferMessage(agent.id, message, Date.now())
     })
     ctx.on('agent/inbox/claimed', ({ agent, message }) => {
       if (this.isHubRoot(agent)) {
@@ -240,7 +242,11 @@ const withdrawnRelay = Symbol('withdrawn relay')
     })
     ctx.on('session/event', (session, event) => {
       const agent = ctx.agents.get(session.id)
-      if (agent?.session === session && event.type === 'user/message') this.claimedHubInputs.get(agent)?.delete(event.data.id)
+      if (agent?.session === session && event.type === 'user/message') {
+        this.claimedHubInputs.get(agent)?.delete(event.data.id)
+        if (this.host.recordOperator && event.seq >= session.inheritedEventCount && this.acceptsHubInput(agent))
+          this.recordOperator(agent.id, event.data, event.time, false)
+      }
       const binding = agent && agent.session === session ? this.bindings.get(agent) : undefined
       if (binding?.observeDelegation && (event.type === 'user/message' || (event.type as string) === 'subagent/descriptor' || event.type === 'tool/result')) {
         binding.observeDelegation()
@@ -326,6 +332,14 @@ const withdrawnRelay = Symbol('withdrawn relay')
     const agent = await this.ensure(this.host.currentHubId() ?? this.host.masterId, cwd, title, 'orchestrator')
     await this.resumeHub(agent)
     await this.transferHubInboxes(agent)
+    if (this.host.recordOperator) {
+      const history = agent.session.snapshotEvents()
+      for (let i = history.length - 1; i >= agent.session.inheritedEventCount; i--) {
+        const event = history[i]
+        if (event?.type === 'turn/end') break
+        if (event?.type === 'user/message') this.recordOperator(agent.id, event.data, event.time, false, true)
+      }
+    }
     return agent
   }
 
@@ -418,15 +432,34 @@ const withdrawnRelay = Symbol('withdrawn relay')
       ...(originalRequestId !== undefined ? { originalRequestId } : {}) } }) as UserMessage
   }
 
-  private queueHubTransferMessage(fromSessionId: string, message: UserMessage): void {
+  private queueHubTransferMessage(fromSessionId: string, message: UserMessage, insertedAt?: number, historical = insertedAt === undefined): void {
     this.host.store.atomic(() => {
       if (this.isTransferredInput(fromSessionId, message)) return
       const transferKey = KV.runtime.transfer(fromSessionId)
       const saved = this.host.store.get(transferKey) ?? []
       this.host.store.set(this.hubInputKey(message), { sessionId: fromSessionId, messageId: message.id })
       if (!saved.some(item => item.id === message.id)) this.host.store.set(transferKey, [...saved, message])
+      if (this.host.recordOperator && message.source.kind === 'user') {
+        const session = this.ctx.agents.get(fromSessionId as SessionId)?.session
+        const at = insertedAt ?? session?.snapshotEvents().find(event => event.type === 'agent/inbox/spliced' &&
+          event.data.inserted?.some(item => item.id === message.id && item.source.kind === 'user'))?.time
+        if (at !== undefined) this.recordOperator(fromSessionId, message, at, true, historical)
+      }
       if (!this.host.effects.pending('hubInbox', fromSessionId)) this.host.effects.enqueue('hubInbox', fromSessionId, {})
     })
+  }
+
+  private recordOperator(sessionId: string, message: UserMessage, at: number, transferred: boolean, historical = false): void {
+    const [block] = message.content
+    if (message.source.kind === 'user' && message.content.length === 1 && block?.type === 'text')
+      this.host.recordOperator?.({ sessionId, messageId: message.id, at, text: block.text }, transferred, historical)
+  }
+
+  /** Prove a previous logical relay reached native history before issuing a new recovery wake-up. */
+  async relayConsumed(id: string): Promise<boolean> {
+    const requestId = key(id)
+    for (const sessionId of this.host.hubGenerations()) if (await this.agentDelivery.holdsIn(sessionId, requestId)) return true
+    return false
   }
 
   private persistHubInbox(fromSessionId: string, agent: Agent | undefined): void {
@@ -445,7 +478,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
       const id = fence.slice(KV.runtime.inboxFence.prefix.length)
       if (!this.host.isHubGeneration(id)) throw new Error('Hub input fence belongs to an unknown generation')
       let offset = this.host.store.get(KV.runtime.inboxFence(id)) ?? 0
-      const inputs = new Map<string, UserMessage>()
+      const inputs = new Map<string, { message: UserMessage; at: number }>()
       await using log = await this.ctx.sessionPersistence.open(id as SessionId, 'read')
       if (log.inheritedEventCount) throw new Error('A Hub input fence cannot refer to a forked Session')
       for (;;) {
@@ -453,13 +486,15 @@ const withdrawnRelay = Symbol('withdrawn relay')
         if (!events.length) break
         for (const event of events) {
           if (event.type === 'agent/inbox/spliced') {
-            for (const message of event.data.inserted ?? []) inputs.set(message.id, message)
+            for (const message of event.data.inserted ?? []) {
+              if (!inputs.has(message.id)) inputs.set(message.id, { message, at: event.time })
+            }
           } else if (event.type === 'user/message') inputs.delete(event.data.id)
         }
         offset += events.length
       }
       this.host.store.atomic(() => {
-        for (const message of inputs.values()) this.queueHubTransferMessage(id, message)
+        for (const { message, at } of inputs.values()) this.queueHubTransferMessage(id, message, at, true)
         this.host.store.set(KV.runtime.inboxFence(id), offset)
       })
     }

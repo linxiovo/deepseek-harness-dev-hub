@@ -43,6 +43,7 @@ import { PlanControl } from './plan-control.ts'
 import { hubResumeText } from './hub-resume.ts'
 import { PlanStagnation } from './plan-stagnation.ts'
 import { PlanIntegration } from './plan-integration.ts'
+import { Maintenance } from './maintenance.ts'
 import { releaseAdapter } from './release-adapter.ts'
 import { ScopedAttention } from './scoped-attention.ts'
 import { PlanDispatcher } from './plan-dispatch.ts'
@@ -98,6 +99,7 @@ export class Runtime extends Service implements SourceHost {
   readonly topicBinding?: TopicBinding
   readonly plans: Plans
   private readonly planIntegration: PlanIntegration
+  private readonly maintenance?: Maintenance
   readonly planDispatcher: PlanDispatcher
   readonly attention: ScopedAttention
   readonly planning: Planning
@@ -213,9 +215,12 @@ export class Runtime extends Service implements SourceHost {
       const runLimits = this.runLimits = new RunLimits({ store, relay: message => this.sessions.relay(message.id, message.text),
         changed: () => { if (!this.closing()) this.executor.reconcileQuotaPauses() } })
       const sources = this.sources = new SourceRegistry(() => store.settings(), board, kind => {
-        // Sync source member lists once startup completes when a source plugin loads dynamically.
-        if (kind.policy?.sync) void this.ready?.then(() => this.settings.syncable().includes(kind.kind) ? this.settings.sync(kind.kind) : undefined)
-          .catch(() => { /* sync() records its failure in health. */ })
+        if (kind.policy?.sync || project) void this.ready?.then(async () => {
+          if (this.closing() || this.sources.kind(kind.kind) !== kind) return
+          if (kind.policy?.sync && this.settings.syncable().includes(kind.kind))
+            await this.settings.sync(kind.kind).catch(() => { /* sync() records its failure in health. */ })
+          if (!this.closing() && this.sources.kind(kind.kind) === kind) await this.maintenance?.resume(kind.kind)
+        }).catch((error: unknown) => ctx.logger.warn('Could not resume Source %s: %s', kind.kind, String(error)))
         return () => {}
       })
       const links: LinkHost = { store, links: this.sourceLinks, commands, sources, lifetime: this.lifetime }
@@ -245,8 +250,9 @@ export class Runtime extends Service implements SourceHost {
             project: installation.project, hubId: runtime.hubId, epoch: resume.epoch }) }
         },
         hubResumeDelivered: requestId => { authority.resumeDelivered(requestId); runtime.masterId = authority.visibleSessionId() },
+        ...(project ? { recordOperator: (input, transferred, historical) => this.maintenance?.receiveOperator(input, transferred, historical) } : {}),
         lifetime: this.lifetime, boundWorkspace: project?.workspace,
-        relayAvailable: requestId => this.planIntegration.relayAvailable(requestId),
+        relayAvailable: requestId => this.planIntegration.relayAvailable(requestId) && this.maintenance?.relayAvailable(requestId) !== false,
         closing: () => this.closing(), environment, ownsPlanner: id => handoffs.get(id) !== undefined,
         plannerActive: id => this.configured() && handoffs.isPlanning(id),
         scopeTask: id => {
@@ -415,6 +421,12 @@ export class Runtime extends Service implements SourceHost {
             for (const message of pullEndNotices(ended, request, setup.deployment.repository)) outbox.send(message)
           }
         } })
+      if (project) this.maintenance = new Maintenance({ store, effects, project, handoffs, plans, sources,
+        stage: () => planIntegration.stage(), observe: (trigger, mode) => engine.receive(trigger, mode),
+        feishuIngress: trigger => feishu() && sources.instance(FEISHU)?.config.cli === this.setupFeishuCli
+          ? this.topicBinding?.maintenanceIngress(trigger) : undefined,
+        bindingEpoch: () => this.topicBinding?.view()?.epoch,
+        relay: (id, text) => sessions.relay(id, text), relayConsumed: id => sessions.relayConsumed(id) })
       this.planDispatcher = new PlanDispatcher({ store, plans, engine, executor, attention, limits: runLimits,
         get control() { return planControl },
         paused: () => this.paused(),
@@ -565,15 +577,22 @@ export class Runtime extends Service implements SourceHost {
         get setupProblem() { return runtime.setupProblem }, get feishuProblem() { return setup.feishuProblem },
         ...(topicHealth ? { feishuTopic: { target: () => this.feishuTopic(),
           claims: trigger => this.topicBinding?.claims(trigger) === true,
+          maintenanceSince: topic => this.maintenance?.feishuSince(topic.epoch, topic.sourceRevision),
+          resolvedMaintenance: (topic, messageId) => {
+            const lookup = KV.feishu.maintenanceLookup(messageId)
+            if (store.get(lookup)?.epoch === topic.epoch) store.delete(lookup)
+          },
           receive: (trigger, epoch) => this.receiveBoundFeishu(trigger, epoch), report: value => topicHealth.set(value) } } : {}),
         receive: (trigger, kind) => {
           if (sourceInactive()) throw new InstallationError(409, installation.transitioning() ? 'switching' : 'githubSetupRequired')
+          if (trigger.source !== kind) return 'filtered'
           if (kind === FEISHU && this.topicBinding?.claims(trigger)) return this.receiveBoundFeishu(trigger)
-          return passes.receive(trigger)
+          return this.receive(trigger)
         } }
       this.toolHost = { context: ctx, engine, store, sessions, executor, mainline, planDispatcher: this.planDispatcher, settings: this.settings,
         planControl,
-        assessor, resources, projectMeter, runLimits, attention, handoffs, plans, planIntegration, stagnation, requirements, lifetime: this.lifetime,
+        assessor, resources, projectMeter, runLimits, attention, handoffs, plans, planIntegration, maintenance: this.maintenance,
+        stagnation, requirements, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
@@ -608,7 +627,15 @@ export class Runtime extends Service implements SourceHost {
     return ticketEnvironment({ deployment, sources, settings: this.store.settings(), ticket, ...trigger ? { trigger } : {} })
   }
   checkSetup(): void { if (this.recoveryPending) this.setup.restart(); else this.setup.check() }
-  receive(trigger: Trigger): ReceiveResult { return this.passes.receive(trigger) }
+  receive(trigger: Trigger): ReceiveResult {
+    if (this.closing()) throw new Error('Orchestrator is stopping')
+    if (this.maintenance && this.planIntegration.stage().stage === 2) {
+      const result = this.maintenance.receive(trigger)
+      if (result === 'stored') this.passes.request()
+      return result
+    }
+    return this.passes.receive(trigger)
+  }
   /** Rotate the physical Hub Session while retaining the project identity and durable work state. */
   async rotateHub(): Promise<string> {
     this.installation.assertNewWork()
@@ -662,8 +689,12 @@ export class Runtime extends Service implements SourceHost {
   }
   private async receiveBoundFeishu(trigger: Trigger, expectedEpoch?: string): Promise<ReceiveResult> {
     const binding = this.topicBinding
-    // Normal ingress has already classified protocol traffic. Exact polling gets no generic fallback.
-    if (this.closing() || !binding || (expectedEpoch !== undefined && !binding.claims(trigger))) return 'filtered'
+    if (this.closing() || !binding) return 'filtered'
+    // Exact-topic polling never falls back to normal intake for an unclaimed protocol message.
+    if (expectedEpoch !== undefined && !binding.claims(trigger)) {
+      if (this.feishuTopic()?.epoch !== expectedEpoch || this.planIntegration.stage().stage !== 2) return 'filtered'
+      return this.maintenance?.receive(trigger, expectedEpoch) ?? 'filtered'
+    }
     const target = this.feishuTopic()
     if ((expectedEpoch !== undefined && target?.epoch !== expectedEpoch) || !binding.matches(trigger)) return 'filtered'
     if (!binding.eligible(trigger)) {
@@ -676,6 +707,10 @@ export class Runtime extends Service implements SourceHost {
     const current = this.feishuTopic()
     if (current?.epoch !== target.epoch || current.sourceRevision !== target.sourceRevision) {
       if (!this.closing() && binding.view()?.epoch !== target.epoch) binding.discard(trigger)
+      return 'filtered'
+    }
+    if (this.planIntegration.stage().stage === 2 && (trigger.meta.parentId || trigger.meta.messageType !== 'text')) {
+      if (trigger.meta.parentId || trigger.meta.messageType !== undefined) binding.discard(trigger)
       return 'filtered'
     }
     return binding.receive(trigger) ? 'stored' : 'filtered'
@@ -755,6 +790,8 @@ export class Runtime extends Service implements SourceHost {
     // Reconcile the package receipt before restarting other Plan work or background loops.
     if (this.closing()) return
     await this.planIntegration.resume()
+    if (this.closing()) return
+    await this.maintenance?.resume()
     if (this.closing()) return
     this.planDispatcher.resume()
     this.planning.resume()

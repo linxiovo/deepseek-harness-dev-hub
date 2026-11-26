@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const runner = new URL('../../scripts/test.mjs', import.meta.url)
 async function publishOffset(path, value) {
@@ -42,8 +42,8 @@ async function checkout(root, name) {
   return plugin
 }
 
-function start(cwd, previousPid, nodeOptions = []) {
-  const child = spawn(process.execPath, [...nodeOptions, 'scripts/test.mjs', ...args], {
+function start(cwd, previousPid, nodeOptions = [], vitestArgs = args) {
+  const child = spawn(process.execPath, [...nodeOptions, 'scripts/test.mjs', ...vitestArgs], {
     cwd,
     env: { ...process.env, PROBE_PREVIOUS_PID: previousPid ? String(previousPid) : '' },
     stdio: 'pipe',
@@ -202,3 +202,30 @@ for (const interrupt of [false, true]) {
     if (windows) assert.match(second.stderr, /Acquired the Windows Vitest gate/)
   })
 }
+
+test('an explicit Vitest filter must run at least one test, even with a custom reporter', { timeout: 25_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'test selection '))
+  const runs = []
+  t.after(async () => {
+    for (const run of runs) if (!run.closed) run.child.kill('SIGKILL')
+    await Promise.allSettled(runs.map(run => run.exit))
+    await rm(root, { recursive: true, force: true })
+  })
+  await mkdir(join(root, 'tests'))
+  await writeFile(join(root, 'tests', 'selected.spec.ts'), `test('selected probe', () => console.log('probe assertion reached'))\n`)
+  await writeFile(join(root, 'tests', 'skipped.spec.ts'), `test.skip('skipped probe', () => { throw new Error('must stay skipped') })\n`)
+  const plugin = fileURLToPath(new URL('../../', import.meta.url))
+  const options = ['--root', root, '--config', join(plugin, 'vitest.config.ts'), '--globals', '--reporter=dot', '--passWithNoTests']
+  for (const [selection, code] of [
+    [['tests/selected.spec.ts', '--testNamePattern=^missing probe$'], 1],
+    [['tests/skipped.spec.ts'], 1],
+    [['tests/selected.spec.ts', '-t', '^selected probe$'], 0],
+  ]) {
+    const run = start(plugin, undefined, [], [...options, ...selection])
+    runs.push(run)
+    run.child.stdin.end()
+    assert.deepEqual(await run.exit, { code, signal: null }, `${run.stdout}\n${run.stderr}`)
+    if (code) assert.match(run.stderr, /\[test\] The explicit test filter ran no tests\./)
+    else assert.match(run.stdout, /probe assertion reached/)
+  }
+})

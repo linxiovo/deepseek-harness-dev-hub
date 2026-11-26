@@ -416,6 +416,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/effects.ts` | Effects |
 | `src/app/handoffs.ts` | `Handoffs`: the durable project and handoff records, their single question, answer and immutable specification |
 | `src/app/topic-binding.ts` | Binds one observed Feishu destination to the selected project and accepts correlated answers from explicitly authorized senders; see `009-handoff.md` |
+| `src/app/maintenance.ts` | `Maintenance`: Stage 2 event intake, rule-based registration, recovery relays and durable feedback associations; see `009-handoff.md#stage-2-maintenance` |
 | `src/app/planning.ts` | `Planning`: durable `planning` and `splitting` effects for the specification planner and the Plan DAG splitter |
 | `src/app/plans.ts` | `Plans`: validates and publishes immutable Plan revisions, retains old node definitions and claims, and gates Frontier and delivery |
 | `src/app/plan-dispatch.ts` | `PlanDispatcher`: validates Frontier predecessors, reserves a launch slot, atomically claims a node into a stable Ticket/Assignment, and rearms the same claim on restart |
@@ -567,12 +568,13 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP, verifying the Hub, Worker and subagent boundaries in `010-session-boundaries.md` |
 | `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |
 | `tests/plan-integration-crash.spec.ts` | SIGKILL after GitHub accepts workflow dispatch but before the effect records a result; SQLite recovery observes the existing run without another dispatch |
-| `tests/mainline-queue.spec.ts` | Queue admission, versioned CI, same-target serialization, conflicts, formal closure and Frontier; Plan regression, artifact delivery and a local subprocess release that changes an isolated target before its lost response is reconciled |
+| `tests/maintenance-recovery.spec.ts` | Stage 2 inbox and native-history recovery, stale authority during workspace validation, and maintenance replay of paired live/history Feishu private-chat samples |
+| `tests/mainline-queue.spec.ts` | Queue admission, CI, conflicts, formal closure and Frontier; artifact and controlled release delivery; Stage 2 through Harness, GitHub and bound Feishu events |
 | `tests/plan-artifacts.spec.ts` | Exact workflow attempt/profile binding, safe filenames and media types, package SHA-256, strict archive contents, restart staging cleanup and retained-file tamper rejection |
 | `tests/plan-release.spec.ts` | Public PlanIntegration effect seam: no release without exact authorization, credentials or target match; exact artifact verification, controlled credential relay and lost-response restart reconciliation |
 | `tests/panel-execution.spec.tsx` | Ticket delivery status in Harness, release-verification hold and project-scoped artifact download |
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
-| `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, review evidence and child-only review submission, including Hub-only metering and Actions evidence bound to a work item, checkout or PR; worktree and writer facts, main tools, and internal Worker take-up without an outbound message |
+| `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, review and Actions evidence bound to a work item and checkout, main tools including mounted Hub maintenance, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
 | `tests/topic-binding.spec.ts` | Uses a mounted project and normalized Feishu events to verify topic isolation, answer provenance and idempotent outbound delivery |
 | `tests/plans.spec.ts` | Automatic spec continuation, graph and role queries, invalid graph refusal, root/node message isolation, usage, credential and quota pauses, concurrent model admission and claim replay through public Session tools, DSH streams and HTTP |
@@ -601,7 +603,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
 | `tests/docs.spec.ts` | Numbered documents are consecutive, indexed in `plugin/DOCS.md` with `plugin/README.md` linking to that index, link only to earlier ones with inline-code guidance on violations, every local link resolves including root `DOCS.md` and `plugin/DOCS.md`, no document has merge conflict markers, `010` explicit file paths exist, and this document's tables list every module and every test |
 
-`tests/fixtures/` holds shared test inputs: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; `async.ts`; and `feishu-live-reply-lark-cli-1.0.100.json`, the minimal published live-event field shape that distinguishes `reply_to` from history `parent_id`.
+`tests/fixtures/` holds shared test inputs: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; `async.ts`; and `feishu-live-reply-lark-cli-1.0.100.json`, an example from the live-event schema. See `plugin/docs/009-handoff.md` for the paired private-chat capture.
 
 ## Persistence
 

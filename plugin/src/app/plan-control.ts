@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 import { key } from '../core/ids.ts'
+import { handoffHubSession } from '../core/handoff.ts'
 import { latestAssignment } from '../core/model.ts'
 import { UserError } from '../core/errors.ts'
 import type { Plan } from '../core/plan.ts'
@@ -272,7 +273,7 @@ export class PlanControl {
   private nodes(plan: Plan, hold: Hold): string[] { return hold.scope.kind === 'plan' ? plan.nodes.map(node => node.id) : hold.nodes }
 
   private requireOwner(plan: Plan, sessionId: string): void {
-    const handoff = this.host.handoffs.get(plan.handoffId), owner = handoff?.confirmedBy.sessionId
+    const handoff = this.host.handoffs.get(plan.handoffId), owner = handoff && handoffHubSession(handoff)
     if (!this.host.isCurrentHub(sessionId) || handoff?.status !== 'specified' || !owner ||
       (owner !== sessionId && !this.host.isHubGeneration(owner))) return refuse('Only the current Hub of the confirming project can control this Plan')
   }

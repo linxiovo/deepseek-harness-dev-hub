@@ -244,6 +244,7 @@ export class WorkerSlots {
 interface WorkHold {
   drain: Promise<void>
   drained: boolean
+  drainFailed?: boolean
   slot: boolean
   resumeAfterQuota: boolean
   resumeQueued?: boolean
@@ -642,14 +643,16 @@ export class DshExecutor implements Executor {
     if (!ticket || !liveTicket(ticket)) { this.holds.delete(ticketId); return }
     if (this.host.planControlBlocked?.(ticketId) || this.host.credentialBlocked?.(ticketId)
       || this.host.quota?.blocked(ticketId) || this.host.controlResumeBlocked?.(ticket)) throw new Later()
+    if (this.holds.get(ticketId)?.drainFailed) this.suspend(ticketId, 'control')
     const hold = this.holds.get(ticketId)
-    if (!hold) throw new Error('Plan resume has no Worker drain')
-    await hold.drain
+    if (hold) await hold.drain
     ticket = this.host.store.tickets.get(ticketId)
     if (!ticket || !liveTicket(ticket)) { this.holds.delete(ticketId); return }
-    if (this.host.closing() || this.holds.get(ticketId) !== hold || this.host.controlResumeBlocked?.(ticket)) throw new Later()
+    if (this.host.closing() || this.holds.get(ticketId) !== hold || this.host.planControlBlocked?.(ticketId) ||
+      this.host.credentialBlocked?.(ticketId) || this.host.quota?.blocked(ticketId) || this.host.controlResumeBlocked?.(ticket)) throw new Later()
     const assignment = latestAssignment(ticket)
     if (assignment?.state === 'running') {
+      if (!hold) return
       if (hold.resumeQueued) this.deliver(ticket, assignment)
       else this.host.engine.assignmentInterrupted(ticketId, assignment.id, recoveryNote)
     } else if (assignment?.state === 'pending' && !waitsForPerson(ticket)) this.start(ticket, assignment)
@@ -686,10 +689,8 @@ export class DshExecutor implements Executor {
 
   private suspend(ticketId: string, cause: 'credential' | 'quota' | 'control'): void {
     const existing = this.holds.get(ticketId)
-    if (existing) {
-      if (cause === 'quota') existing.resumeAfterQuota = true
-      return
-    }
+    if (existing && cause === 'quota') existing.resumeAfterQuota = true
+    if (existing && (cause !== 'control' || !existing.drainFailed)) return
     const ticket = this.host.store.tickets.get(ticketId)
     if (!ticket || !liveTicket(ticket)) return
     const assignment = latestAssignment(ticket), sessionId = workerSessionId(ticketId)
@@ -744,8 +745,10 @@ export class DshExecutor implements Executor {
       if (cause === 'credential' && !this.credentialWriterIdle(ticketId)) throw new Error(`The suspended writer of ticket ${ticketId} is not idle`)
       hold.drained = true
       if (assignment && this.host.planControlBlocked?.(ticketId)) this.host.controlDrained?.(ticketId, assignment.id)
-    })
-    const hold: WorkHold = { drain, drained: false, slot, resumeAfterQuota: cause === 'quota' }
+    }).catch((error: unknown) => { hold.drainFailed = true; throw error })
+    const hold: WorkHold = existing ?? { drain, drained: false, slot, resumeAfterQuota: cause === 'quota' }
+    hold.drain = drain
+    hold.drainFailed = false
     this.holds.set(ticketId, hold)
     this.track(ticketId, drain)
   }

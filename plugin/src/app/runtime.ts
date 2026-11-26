@@ -337,7 +337,7 @@ export class Runtime extends Service implements SourceHost {
       this.executor = new DshExecutor({ context: ctx, commands, get engine() { return runtime.engine }, store, effects,
         health: board.claim('worker'), machine: projectMachine, lifetime: this.lifetime, sessions, closing: () => this.closing(),
         credentialBlocked: ticketId => attention.blocked(ticketId),
-        planControlBlocked: ticketId => planControl.blocksTicket(ticketId),
+        planControlBlocked: ticketId => planControl.blocksWorker(ticketId),
         controlDrained: (ticketId, assignmentId) => planControl.stopped(ticketId, assignmentId),
         controlResumeBlocked: ({ plan }) => !plan || !!this.planDispatcher.resumeBlock(plan.planId, plan.nodeId),
         diagnosisAllowed: (ticket, inputId) => runtime.stagnation.allowed(ticket, inputId),
@@ -448,6 +448,7 @@ export class Runtime extends Service implements SourceHost {
       const requirements = new PlanRequirements({ store, plans, handoffs, limits: runLimits,
         stop: (ticketId, reason) => { engine.stopTicket(ticketId, reason) }, authorize: () => installation.assertNewWork(),
         migrateHolds: (planId, replacements) => planControl.replaceNodes(planId, replacements),
+        mainlineHeld: ticketId => planControl.blocksTicket(ticketId), cancelQueuedMerge: ticketId => mainline.cancelQueued(ticketId),
         requestScopeReview: id => effects.enqueue('requirementScopeReview', id, {}), isHubGeneration: id => authority.isGeneration(id), isCurrentHub: id => authority.isCurrent(id) })
       const scopeDispatchOpen = () => {
         if (this.paused()) return false
@@ -527,14 +528,14 @@ export class Runtime extends Service implements SourceHost {
           if (this.closing()) throw new InstallationError(409, 'switching')
         },
         suspend: ticketId => executor.pauseForControl(ticketId), waiting: (id, node) => this.planDispatcher.resumeBlock(id, node),
-        rearm: (planId, ticketIds) => {
+        rearm: (planId, ticketIds, retryOnly) => {
           for (const ticketId of ticketIds) {
-            if (planControl.blocksTicket(ticketId)) continue
             const ticket = store.tickets.get(ticketId)
-            if (ticket && !ticket.ended && latestAssignment(ticket)?.state !== 'ended') effects.enqueue('planControlResume', ticketId, {})
-            mainline.resumeTicket(ticketId)
+            if (ticket && !ticket.ended && latestAssignment(ticket)?.state !== 'ended' && !planControl.blocksWorker(ticketId) &&
+                (!retryOnly || effects.pending('planControlResume', ticketId))) effects.enqueue('planControlResume', ticketId, {})
+            if (!retryOnly) mainline.resumeTicket(ticketId)
           }
-          planIntegration.resumePlan(planId)
+          if (!retryOnly) planIntegration.resumePlan(planId)
         } })
 
       // Reconcile historical dispatch receipts before serving even paused/setup-pending reads. This grants no tools or writer lease.

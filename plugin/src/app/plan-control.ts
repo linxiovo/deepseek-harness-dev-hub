@@ -8,6 +8,7 @@ import { KV } from '../kv.ts'
 import type { Handoffs } from './handoffs.ts'
 import { mainlineAttempts } from './mainline-queue.ts'
 import type { Plans } from './plans.ts'
+import { promptFile } from './skill-files.ts'
 import type { Store } from './store.ts'
 
 const id = z.string().trim().min(1).max(200)
@@ -38,7 +39,7 @@ interface ControlHost {
   isHubGeneration(sessionId: string): boolean
   authorize(): void
   suspend(ticketId: string): void
-  rearm(planId: string, ticketIds: readonly string[]): void
+  rearm(planId: string, ticketIds: readonly string[], retryOnly?: boolean): void
   waiting(planId: string, nodeId: string): string | undefined
 }
 
@@ -63,7 +64,7 @@ function successors(plan: Plan, roots: readonly string[]): Set<string> {
   return nodes
 }
 
-function matches(command: Mutation, message: string): boolean {
+function match(command: Mutation, message: string): 'exact' | 'different' | 'needs-target' {
   let value: unknown
   try { value = JSON.parse(message) }
   catch {
@@ -71,14 +72,16 @@ function matches(command: Mutation, message: string): boolean {
     const verb = action === 'pause' ? '暂停' : '恢复'
     const english = action === 'pause' ? 'Pause' : 'Resume'
     const text = message.trim()
-    switch (scope.kind) {
-      case 'ticket': return text === `${verb}工单 ${scope.ticketId}` || text === `${english} Ticket ${scope.ticketId}`
-      case 'branch': return text === `${verb}计划 ${planId} 的分支 ${scope.nodeId}` || text === `${english} branch ${scope.nodeId} of Plan ${planId}`
-      case 'plan': return text === `${verb}整个计划 ${planId}` || text === `${english} entire Plan ${planId}`
-    }
+    const exact = scope.kind === 'ticket' ? text === `${verb}工单 ${scope.ticketId}` || text === `${english} Ticket ${scope.ticketId}`
+      : scope.kind === 'branch' ? text === `${verb}计划 ${planId} 的分支 ${scope.nodeId}` || text === `${english} branch ${scope.nodeId} of Plan ${planId}`
+        : text === `${verb}整个计划 ${planId}` || text === `${english} entire Plan ${planId}`
+    if (exact) return 'exact'
+    const chinese = /^(?:暂停|恢复)(?:工单 \S+|整个计划 \S+|计划 \S+ 的分支 \S+)$/u
+    const englishCommand = /^(?:Pause|Resume) (?:Ticket \S+|entire Plan \S+|branch \S+ of Plan \S+)$/u
+    return chinese.test(text) || englishCommand.test(text) ? 'different' : 'needs-target'
   }
   const parsed = Mutation.safeParse(value)
-  return parsed.success && isDeepStrictEqual(parsed.data, command)
+  return !parsed.success ? 'needs-target' : isDeepStrictEqual(parsed.data, command) ? 'exact' : 'different'
 }
 
 /** Persists scoped operator holds separately from Ticket lifecycle and external-write receipts. */
@@ -86,7 +89,10 @@ export class PlanControl {
   constructor(private readonly host: ControlHost) {}
 
   change(command: Mutation, event: OperatorEvent) {
-    if (!event.messageId || !matches(command, event.text)) return refuse('Control must match the latest direct operator message and its exact scope')
+    if (!event.messageId) return refuse('Control must match the latest direct operator message and its exact scope')
+    const matched = match(command, event.text)
+    if (matched === 'different') return refuse('Control must match the latest direct operator message and its exact scope')
+    if (matched === 'needs-target') return { status: 'needs-target' as const, question: promptFile('plan-control-target') }
     const { store } = this.host, { planId, scope, action } = command
     const result = store.atomic(() => {
       const plan = this.plan(planId)
@@ -97,13 +103,16 @@ export class PlanControl {
       const prior = store.get(receipt)
       if (prior !== undefined) {
         if (prior !== fingerprint) return refuse('This operator event already authorized a different Plan control command')
+        if (action === 'resume' && !this.holds(planId).some(hold => sameScope(hold.scope, scope))) {
+          this.host.rearm(planId, this.resumeTickets(plan, this.resolve(plan, scope, true), scope), true)
+        }
         return { status: 'unchanged' as const, nodes: [] }
       }
 
       const holds = this.holds(planId), existing = holds.find(item => sameScope(item.scope, scope))
       const nodes = existing ? this.nodes(plan, existing) : this.resolve(plan, scope)
       if (action === 'pause' && !existing) {
-        const workers = this.workersFor(planId, nodes)
+        const workers = this.workersFor(planId, this.dispatchNodes(plan, nodes, scope))
         store.set(KV.plans.control(planId), [...holds, { scope, roots: scope.kind === 'plan' ? [] : nodes.slice(0, 1),
           nodes: scope.kind === 'plan' ? [] : nodes, workers }])
         store.afterCommit(() => { for (const worker of workers) this.host.suspend(worker.ticketId) })
@@ -111,12 +120,9 @@ export class PlanControl {
         const remaining = holds.filter(hold => hold !== existing)
         if (remaining.length) store.set(KV.plans.control(planId), remaining)
         else store.delete(KV.plans.control(planId))
-        const ticketIds = new Set(existing.workers.map(worker => worker.ticketId))
-        for (const nodeId of nodes) {
-          const claim = this.host.plans.state(planId, nodeId)?.claim
-          if (claim) ticketIds.add(claim.ticketId)
-        }
-        this.host.rearm(planId, [...ticketIds])
+        this.host.rearm(planId, this.resumeTickets(plan, nodes, scope, existing.workers))
+      } else if (action === 'resume') {
+        this.host.rearm(planId, this.resumeTickets(plan, nodes, scope), true)
       }
       store.set(receipt, fingerprint)
       return { status: action === 'pause' ? 'paused' as const : existing ? 'resumed' as const : 'unchanged' as const,
@@ -137,6 +143,17 @@ export class PlanControl {
   blocksTicket(ticketId: string): boolean {
     const binding = this.host.store.tickets.get(ticketId)?.plan
     return !!binding && this.blocksNode(binding.planId, binding.nodeId)
+  }
+
+  blocksWorker(ticketId: string): boolean {
+    const binding = this.host.store.tickets.get(ticketId)?.plan
+    if (!binding) return false
+    const { planId, nodeId } = binding, holds = this.holds(planId)
+    if (holds.length === 0) return false
+    if (holds.some(hold => hold.scope.kind === 'plan' || hold.nodes.includes(nodeId) || hold.workers.some(worker => worker.ticketId === ticketId))) return true
+    const claim = this.host.plans.state(planId, nodeId)?.claim
+    const plan = claim?.ticketId === ticketId && !claim.startedAt && this.host.plans.get(planId)
+    return !!plan && this.dispatchBlocked(plan, nodeId)
   }
 
   blocksRelease(planId: string): boolean { return this.holds(planId).length > 0 }
@@ -182,7 +199,7 @@ export class PlanControl {
     for (const node of plan.nodes) {
       const claim = this.host.plans.state(planId, node.id)?.claim
       const paused = holds.some(hold => hold.scope.kind === 'plan' || hold.nodes.includes(node.id))
-      if (paused || (!claim && descendants.has(node.id))) actions.push({ kind: 'dispatch', nodeId: node.id,
+      if (paused || (descendants.has(node.id) && (!claim?.startedAt || workers.has(claim.ticketId)))) actions.push({ kind: 'dispatch', nodeId: node.id,
         ...(claim ? { ticketId: claim.ticketId } : {}), status: claim?.startedAt ? 'already-happened'
           : claim && workers.get(claim.ticketId)?.stopped === false ? 'stop-requested' : 'stopped' })
       if (!claim) continue
@@ -210,18 +227,37 @@ export class PlanControl {
     return { planId, activeScopes: holds.map(hold => hold.scope), actions, read: `plan/${planId}/control` }
   }
 
-  private resolve(plan: Plan, scope: ScopeInput): string[] {
+  private resolve(plan: Plan, scope: ScopeInput, replay = false): string[] {
     if (scope.kind === 'plan') return plan.nodes.map(node => node.id)
     if (scope.kind === 'branch') {
-      if (!plan.nodes.some(node => node.id === scope.nodeId)) throw new UserError('unknownPlanNode', { id: plan.id, node: scope.nodeId })
+      if (!plan.nodes.some(node => node.id === scope.nodeId)) {
+        if (replay) return []
+        throw new UserError('unknownPlanNode', { id: plan.id, node: scope.nodeId })
+      }
       return [...successors(plan, [scope.nodeId])]
     }
     const binding = this.host.store.tickets.get(scope.ticketId)?.plan
     if (binding?.planId !== plan.id || !plan.nodes.some(node => node.id === binding.nodeId) ||
       this.host.plans.state(plan.id, binding.nodeId)?.claim.ticketId !== scope.ticketId) {
+      if (replay) return []
       return refuse('The named Ticket is not a current claim in this Plan')
     }
     return [binding.nodeId]
+  }
+
+  private dispatchNodes(plan: Plan, nodes: string[], scope: ScopeInput): string[] {
+    if (scope.kind !== 'ticket') return nodes
+    const pending = [...successors(plan, nodes)].filter(node => !nodes.includes(node) && !this.host.plans.state(plan.id, node)?.claim.startedAt)
+    return [...nodes, ...pending]
+  }
+
+  private resumeTickets(plan: Plan, nodes: string[], scope: ScopeInput, workers: Worker[] = []): string[] {
+    const tickets = new Set(workers.map(worker => worker.ticketId))
+    for (const nodeId of this.dispatchNodes(plan, nodes, scope)) {
+      const claim = this.host.plans.state(plan.id, nodeId)?.claim
+      if (claim) tickets.add(claim.ticketId)
+    }
+    return [...tickets]
   }
 
   private workersFor(planId: string, nodes: string[]): Hold['workers'] {

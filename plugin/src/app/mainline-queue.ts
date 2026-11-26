@@ -147,6 +147,19 @@ export class MainlineQueue {
     }
   }
 
+  /** Retire an unadmitted candidate in the same transaction that supersedes its Ticket. */
+  cancelQueued(ticketId: string): void {
+    const intent = mainlineIntent(this.host.store, ticketId)
+    if (intent?.status !== 'queued') return
+    if (!this.host.controlBlocked(ticketId)) throw new Error('Cannot retire an unpaused mainline candidate')
+    this.finish(intent, 'waiting', { reason: 'The approved requirement revision superseded the queued candidate before Git authorization' })
+  }
+
+  private current(intent: MainlineIntent): boolean {
+    const latest = mainlineIntent(this.host.store, intent.ticket_id)
+    return latest?.id === intent.id && latest.status === intent.status
+  }
+
   private update(intent: MainlineIntent, status: MainlineIntent['status'], fields: Partial<MainlineIntent> = {}): void {
     const { store } = this.host
     const attempts = mainlineAttempts(store, intent.ticket_id)
@@ -292,11 +305,13 @@ export class MainlineQueue {
       }
     } catch (error) {
       host.lifetime.throwIfAborted()
+      if (!this.current(intent)) return undefined
       this.update(live, intent.status, { reason: 'Cannot verify the actual Git target; will check again' })
       if (reconcileOnly()) return live
       throw error
     }
     host.lifetime.throwIfAborted()
+    if (!this.current(intent)) return undefined
     if (outcome?.status === 'verified') {
       this.finish(live, 'verified', { reason: outcome.reason,
         verification: { status: 'passed', at: observedAt, method: 'integration_on_target' } })
@@ -321,7 +336,9 @@ export class MainlineQueue {
     }
     const observed = await this.observe(intent, blocked)
     if (!observed) return false
-    if (blocked || host.controlBlocked(intent.ticket_id)) return intent.status === 'applying'
+    // The old base does not prove an admitted receive-pack has stopped, even before any pause.
+    if (intent.status === 'applying') return true
+    if (blocked || host.controlBlocked(intent.ticket_id)) return false
     if (host.paused()) throw new Later()
     let applying = observed
     try {
@@ -335,6 +352,7 @@ export class MainlineQueue {
         }
         return () => {
           host.lifetime.throwIfAborted()
+          if (!this.current(intent)) throw new Later()
           if (host.controlBlocked(intent.ticket_id) || host.paused()) throw new Later()
           host.authorize(intent.ticket_id, approval)
           const admitted: MainlineIntent = { ...observed, status: 'applying', applying_at: observed.applying_at ?? now(), integration, ci: approval.ci }
@@ -346,25 +364,26 @@ export class MainlineQueue {
       host.lifetime.throwIfAborted()
     } catch (error) {
       host.lifetime.throwIfAborted()
-      if (host.controlBlocked(intent.ticket_id) && intent.status === 'queued' && error instanceof GitLeaseRejected) {
+      if (!this.current(applying)) return false
+      const rejected = error instanceof GitLeaseRejected
+      if (host.controlBlocked(intent.ticket_id) && rejected) {
         this.finish(applying, 'waiting', { reason: error.message })
         return false
       }
-      if (host.controlBlocked(intent.ticket_id) && (applying.status === 'queued' || error instanceof Later)) {
-        return applying.status === 'applying'
+      if (error instanceof Later) {
+        if (host.controlBlocked(intent.ticket_id)) return false
+        throw error
       }
-      if (error instanceof Later) throw error
       const live = await this.observe(applying)
       if (!live) return false
-      if (host.controlBlocked(intent.ticket_id)) return applying.status === 'applying'
-      this.finish(live, 'waiting', { reason: message(error) })
+      if (applying.status === 'applying' && !rejected) {
+        this.update(live, 'applying', { reason: 'Git write result is unconfirmed; the actual target does not prove the queued integration' })
+        return true
+      }
+      if (rejected || !host.controlBlocked(intent.ticket_id)) this.finish(live, 'waiting', { reason: message(error) })
       return false
     }
-    const live = await this.observe(applying)
-    if (!live) return false
-    if (host.controlBlocked(intent.ticket_id)) return applying.status === 'applying'
-    this.finish(live, 'waiting', { reason: 'The target did not retain the candidate; no merge verification issued' })
-    return false
+    return !!await this.observe(applying, true)
   }
 }
 

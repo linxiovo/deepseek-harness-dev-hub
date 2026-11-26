@@ -6,6 +6,8 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { resolve } from 'node:path'
 import { startManagedProject, startRuntime, type Host } from './fixtures/host.ts'
+import { KV } from '../src/kv.ts'
+import { planDeliveryWriter } from '../src/app/plans.ts'
 
 let h: Host
 let brief: { project: { repository: string; workspace: string }; goal: string; constraints: string[];
@@ -1000,6 +1002,10 @@ it('pauses one Plan Ticket without blocking unrelated frontier work and exposes 
   const status = () => read(`plan/${id}/control`)
 
   h.sendUserMessage(h.runtime.masterId, '暂停一下')
+  expect(await control('pause')).toMatchObject({ status: 'needs-target', question: expect.stringMatching(/one Ticket.*Plan branch.*entire Plan/) })
+  h.sendUserMessage(h.runtime.masterId, `Pause Ticket ${ticketId} or another-ticket`)
+  expect(await control('pause')).toMatchObject({ status: 'needs-target' })
+  h.sendUserMessage(h.runtime.masterId, 'Pause Ticket another-ticket')
   await expect(control('pause')).rejects.toThrow(/exact scope/)
   await expect(h.runTool(session, 'orchestrator_plan_control', { action: 'pause', planId: id, scope })).rejects.toThrow(/not registered/i)
   expect(await status()).toMatchObject({ activeScopes: [] })
@@ -1038,6 +1044,41 @@ it('pauses one Plan Ticket without blocking unrelated frontier work and exposes 
   await expect(h.runTool(session, 'orchestrator_report', { state: 'ready', summary: 'Resumed writer can report.' })).resolves.toBeDefined()
 })
 
+it('fences the launch of an already claimed successor while its delivered predecessor is paused', async () => {
+  const { id, catalogClaim, accountsClaim } = await dispatchedFanIn()
+  const { plans, engine, store } = h.runtime
+  const deliver = planDeliveryWriter(plans, ticketId => engine.closePlanTicket(ticketId))
+  for (const [nodeId, claim] of [['catalog', catalogClaim], ['accounts', accountsClaim]] as const) {
+    await h.runTool(claim.session, 'orchestrator_report', { state: 'ready', summary: 'Ready for formal delivery.' })
+    // Start at the trusted delivery boundary. Git verification is covered by the mainline queue tests.
+    deliver.deliver(id, nodeId, receiptFor(nodeId, claim))
+  }
+  await h.runtime.idle()
+  const settings = store.settings()
+  store.saveSettings({ ...settings, paused: true })
+  const claim = h.runtime.planDispatcher.dispatch(id, 'dashboard').claim!
+  const control = (action: 'pause' | 'resume') => {
+    const hub = h.runtime.masterId, { ticketId } = catalogClaim
+    h.sendUserMessage(hub, `${action === 'pause' ? 'Pause' : 'Resume'} Ticket ${ticketId}`)
+    return h.runTool(hub, 'orchestrator_plan_control', { action, planId: id, scope: { kind: 'ticket', ticketId } })
+  }
+  const deliveries = () => h.deliveries.mock.calls.filter(([call]) => call.sessionId === claim.session && call.text.startsWith('{'))
+  expect(await control('pause')).toMatchObject({ actions: expect.arrayContaining([
+    expect.objectContaining({ kind: 'dispatch', nodeId: 'dashboard', ticketId: claim.ticketId }),
+  ]) })
+  await h.runtime.settings.pause(false, 'panel')
+  await h.runtime.idle()
+  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', reason: 'Paused by Plan control', claim })
+  expect(deliveries()).toHaveLength(0)
+  await h.restart()
+  await h.runtime.idle()
+  expect(deliveries()).toHaveLength(0)
+  await control('resume')
+  await h.runtime.idle()
+  expect(deliveries()).toHaveLength(1)
+  expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'running', claim: { ticketId: claim.ticketId, assignmentId: claim.assignmentId } })
+})
+
 it('records a dispatched Worker while paused even when its local start receipt was interrupted', async () => {
   const { id } = await registeredFanIn(), hub = h.runtime.masterId
   const pause = Promise.withResolvers<Record<string, unknown>>()
@@ -1060,6 +1101,41 @@ it('records a dispatched Worker while paused even when its local start receipt w
   await h.runTool(hub, 'orchestrator_plan_control', { action: 'resume', planId: id, scope: { kind: 'ticket', ticketId } })
   await h.runtime.idle()
   expect(h.deliveries.mock.calls.filter(([input]) => input.sessionId === session && input.text.startsWith('{'))).toHaveLength(1)
+})
+
+it('retries a timed-out Worker drain on the same resume command', async () => {
+  const { id } = await registeredFanIn(), hub = h.runtime.masterId
+  const { ticketId, session, assignmentId } = (await dispatchPlan(id, 'catalog')).claim!
+  await h.runtime.idle()
+  const control = (action: 'pause' | 'resume') => h.runTool(hub, 'orchestrator_plan_control', {
+    action, planId: id, scope: { kind: 'ticket', ticketId },
+  })
+  const child = h.subagents.spawn(session), release = Promise.withResolvers<void>()
+  const first = Promise.withResolvers<void>(), second = Promise.withResolvers<void>()
+  const drain = h.subagents.service.drainChildren
+  drain.mockImplementationOnce(async () => { first.resolve(); await release.promise })
+    .mockImplementationOnce(async () => { second.resolve(); await release.promise })
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  try {
+    h.sendUserMessage(hub, `Pause Ticket ${ticketId}`)
+    expect(await control('pause')).toMatchObject({ status: 'paused' })
+    await first.promise
+    await vi.advanceTimersByTimeAsync(10_000)
+    await second.promise
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(h.subagents.live(child)).toBe(true)
+  } finally { vi.useRealTimers(); release.resolve() }
+  expect(await read(`plan/${id}/control`)).toMatchObject({ actions: expect.arrayContaining([
+    { kind: 'worker', ticketId, operationId: assignmentId, status: 'stop-requested' },
+  ]) })
+  h.sendUserMessage(hub, `Resume Ticket ${ticketId}`)
+  expect(await control('resume')).toMatchObject({ status: 'resumed' })
+  h.subagents.settle(child, false)
+  expect(await control('resume')).toMatchObject({ status: 'unchanged' })
+  await h.runtime.idle()
+  expect(h.runtime.effects.pending('planControlResume', ticketId)).toBe(false)
+  expect(await dispatchPlan(id, 'catalog')).toMatchObject({ claim: { ticketId, assignmentId, session } })
+  await expect(h.runTool(session, 'orchestrator_report', { state: 'ready', summary: 'Worker resumed after the child stopped.' })).resolves.toBeDefined()
 })
 
 it('clears only the named Plan hold and keeps quota and predecessor waits', async () => {
@@ -1352,6 +1428,48 @@ async function reviewRequirement(proposalId: string, status: 'within-handoff' | 
   const verdict = z.object({ status: z.literal(status), reviewId: z.uuid(), reviewerSessionId: z.literal(reviewer) }).parse(scopeReview)
   return verdict.reviewId
 }
+
+it('replans a paused unadmitted merge and retires it when the approved revision applies', async () => {
+  const { id } = await registeredFanIn(), hub = h.runtime.masterId
+  const { ticketId, assignmentId } = (await dispatchPlan(id, 'catalog')).claim!
+  await h.runtime.idle()
+  const base = h.localGit!.base.sha, target = { slug: brief.project.repository, ref: 'refs/heads/main', repository: brief.project.workspace }
+  const attempt = { id: 'queued-before-write', ticket_id: ticketId, queued_at: new Date().toISOString(), status: 'queued' as const,
+    target, candidate: 'a'.repeat(40), base, assignment: assignmentId, generation: 1 }
+  const pending = KV.mainline.pending(JSON.stringify([target.slug.toLowerCase(), target.ref]))
+  h.runtime.store.set(KV.mainline.ticket(ticketId), [attempt])
+  h.runtime.store.set(pending, [ticketId])
+  const scope = { kind: 'ticket', ticketId }
+  const preview = () => {
+    h.sendUserMessage(hub, JSON.stringify({ intent: 'change-plan-requirements', planId: id, authorizedScope: brief.authorization.scope,
+      changes: [{ criterion: 1, statement: 'Search matches prefixes.', observable: 'The catalog excludes non-prefix matches.' }] }))
+    return h.runTool(hub, 'orchestrator_plan_requirements', { mode: 'preview' })
+  }
+  await expect(preview()).rejects.toThrow(/mainline write/)
+  h.sendUserMessage(hub, `Pause Ticket ${ticketId}`)
+  await h.runTool(hub, 'orchestrator_plan_control', { action: 'pause', planId: id, scope })
+  await h.runtime.idle()
+  h.runtime.store.set(KV.mainline.ticket(ticketId), [{ ...attempt, status: 'applying' }])
+  await expect(preview()).rejects.toThrow(/unreconciled mainline write/)
+  h.runtime.store.set(KV.mainline.ticket(ticketId), [attempt])
+  const draft = await preview()
+  expect(draft).toMatchObject({ status: 'preview', affected: expect.arrayContaining([
+    expect.objectContaining({ nodeId: 'catalog', tickets: expect.arrayContaining([
+      expect.objectContaining({ ticketId, evidence: expect.arrayContaining([expect.objectContaining({ kind: 'mainline', status: 'queued' })]) }),
+    ]) }),
+  ]) })
+  const proposal = z.object({ proposalId: z.uuid(), requestMessageId: z.string() }).parse(draft)
+  const scopeReviewId = await reviewRequirement(proposal.proposalId)
+  h.sendUserMessage(hub, JSON.stringify({ approved: true, ...proposal, scopeReviewId, scopeDecision: 'within-handoff' }))
+  expect(await h.runTool(hub, 'orchestrator_plan_requirements', { mode: 'apply', proposalId: proposal.proposalId }))
+    .toMatchObject({ status: 'applied', revision: 2 })
+  await h.restart()
+  expect(await read(`ticket/${ticketId}`)).toMatchObject({ state: 'stopped', ended: { by: 'human' }, mainline: {
+    id: attempt.id, status: 'waiting', reason: expect.stringMatching(/superseded.*before Git authorization/),
+  } })
+  expect(h.runtime.store.get(pending)).toBeUndefined()
+  expect(await read(`plan/${id}/control`)).toMatchObject({ activeScopes: [scope] })
+})
 
 it('resumes the approved Plan goal after restart without promoting pending or denied changes', async () => {
   const { id, register } = await publish()

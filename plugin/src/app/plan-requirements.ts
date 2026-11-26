@@ -106,6 +106,8 @@ export type RequirementScopeTask = {
   store: Pick<Store, 'atomic' | 'get' | 'set' | 'tickets'>
   plans: Pick<Plans, 'current' | 'state' | 'requiredDelivery' | 'revision' | 'revise'>
   migrateHolds(planId: string, replacements: Record<string, string[]>): void
+  mainlineHeld(ticketId: string): boolean
+  cancelQueuedMerge(ticketId: string): void
   handoffs: Pick<Handoffs, 'get'>
   limits: Pick<RunLimits, 'forDispatch'>
   stop: (ticketId: string, reason: string) => void
@@ -361,13 +363,15 @@ export class PlanRequirements {
       const { revision } = plans.revise(preview.planId, preview.expectedRevision,
         { draft: { features: active.plan.features, nodes }, replacements },
         { kind: 'requirements', proposalId, approval: message, goal: preview.goal, acceptance })
-      this.host.migrateHolds(planId, replacements)
-      const stopped = new Set<string>()
-      for (const node of affected) for (const ticket of node.tickets) if (ticket.open && !stopped.has(ticket.ticketId)) {
-        stopped.add(ticket.ticketId)
+      const handled = new Set<string>()
+      for (const node of affected) for (const ticket of node.tickets) if (!handled.has(ticket.ticketId)) {
+        handled.add(ticket.ticketId)
+        this.host.cancelQueuedMerge(ticket.ticketId)
+        if (!ticket.open) continue
         this.host.stop(ticket.ticketId, `Requirement proposal ${proposalId} superseded Plan node ${ticket.nodeId}`)
         if (!store.tickets.get(ticket.ticketId)?.ended) refuse(`Superseded Ticket ${ticket.ticketId} is still open`)
       }
+      this.host.migrateHolds(planId, replacements)
       const applied: AppliedPreview = { ...preview, status: 'applied', revision, appliedAt: new Date(now).toISOString(),
         approvedBy: { sessionId: message.sessionId, messageId: message.messageId } }
       store.set(KV.planRequirements.preview(proposalId), applied)
@@ -435,8 +439,9 @@ export class PlanRequirements {
         refuse(`Ticket or claim for Plan node ${nodeId} does not match the registered Plan`)
       }
       const attempts = ticket ? mainlineAttempts(store, ticketId) : []
-      if (inScope && attempts.some(attempt => attempt.status === 'queued' || attempt.status === 'applying')) {
-        refuse(`Ticket ${ticketId} has a queued or unreconciled mainline write; reconcile it before replanning`)
+      if (inScope && attempts.some(attempt => attempt.status === 'applying' ||
+        (attempt.status === 'queued' && !this.host.mainlineHeld(ticketId)))) {
+        refuse(`Ticket ${ticketId} has an active or unreconciled mainline write; pause or reconcile it before replanning`)
       }
       // Recovery reacquires a writer generation on the same Assignment. Evidence keeps its own recorded generation;
       // superseding this work requires fresh evidence and drains the actual writer, independent of its current lease.

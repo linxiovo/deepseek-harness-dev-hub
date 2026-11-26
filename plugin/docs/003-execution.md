@@ -131,11 +131,11 @@ The host persists the intent and FIFO position before starting Git. One write at
 
 If the target moved forward before the candidate could be applied, the intent records `repair` and the host sends a durable input to that Ticket's Worker with the new pinned base. Resolve code and Doc Tree conflicts in the Ticket worktree, preserve the earlier candidate's lineage, and obtain fresh dual review, acceptance, test, Doc Tree and CI evidence on the new pair. The Hub queues the new candidate; failed or unavailable repair and recheck remain visible. A rewritten target, a candidate already on the branch before the queued write, or a rejected Git write without matching verification is `waiting`, not success.
 
-After interruption, a queued intent can continue at the original base if the exact pair still passes the gate and the previous Worker is confirmed idle or still holds the valid lease. An `applying` intent checks actual Git before authorizing any write: if its integration commit is present, it records the missing observation without pushing again. A branch containing only the candidate, not the intent-specific commit, does not prove a queue write. Processing pause prevents new writes but does not erase a completed write. See `006-deployment.md` for repository permissions.
+After interruption, a queued intent can continue at the original base if the exact pair still passes the gate and the previous Worker is confirmed idle or still holds the valid lease. An `applying` intent only reads the actual target. If its integration commit is reachable there, the queue records the observation. A branch containing only the candidate does not establish that receipt. See `006-deployment.md` for repository permissions.
 
 A current Plan credential blocker prevents a new mainline write or a new repair dispatch for that Ticket. It does not erase an integration already observed on the target.
 
-A Plan control hold blocks new merge, repair and formal closure for the affected Ticket. The queue checks the actual target for an admitted Git intent and preserves verified writes. An exact lease rejection confirms that the first attempt stopped. If the outcome remains unknown, it stays pending while unrelated Tickets can proceed under their own exact leases. See `009-handoff.md`.
+A Plan control hold blocks new merge, repair and formal closure for the affected Ticket. A lost reply followed by a read of the old base leaves an admitted write pending, even if the hold comes later. An exact lease rejection confirms the push stopped. Unrelated Tickets can still proceed under their own exact leases. See `009-handoff.md`.
 
 ## Formal Plan closure
 

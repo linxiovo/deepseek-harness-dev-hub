@@ -31,7 +31,7 @@ interface PlanDispatcherHost {
   readonly executor: Pick<DshExecutor, 'reserveLaunch' | 'releaseLaunch' | 'start'>
   readonly attention: Pick<ScopedAttention, 'forTicket' | 'blocked'>
   readonly limits: Pick<RunLimits, 'forDispatch'>
-  readonly control: Pick<PlanControl, 'blocksNode' | 'dispatchBlocked'>
+  readonly control: Pick<PlanControl, 'blocksWorker' | 'dispatchBlocked'>
   paused(): boolean
   bindWorker(ticketId: string, sessionId: string): void
   readonly now?: () => string
@@ -54,7 +54,8 @@ export class PlanDispatcher {
     if (current) {
       this.bindClaim(current, node.role)
       const replay = this.result(request, current, true)
-      if (this.host.control.blocksNode(planId, nodeId) && (current.status === 'claimed' || current.status === 'running' || current.status === 'awaiting-delivery')) {
+      if (this.host.control.blocksWorker(ticketId) &&
+          (current.status === 'claimed' || current.status === 'running' || current.status === 'awaiting-delivery')) {
         return { ...replay, status: 'blocked', reason: 'Paused by Plan control' }
       }
       if (block && block.state !== 'reserved' && (current.status === 'claimed' || current.status === 'running' || current.status === 'awaiting-delivery')) {
@@ -134,7 +135,7 @@ export class PlanDispatcher {
     const claim = host.plans.state(planId, nodeId)?.claim
     const ticketId = claim?.ticketId ?? key('plan-ticket', planId, nodeId)
     if (claim && host.store.tickets.get(ticketId)?.ended) return undefined
-    if (claim ? host.control.blocksNode(planId, nodeId) : host.control.dispatchBlocked(plan, nodeId)) return 'Paused by Plan control'
+    if (claim ? host.control.blocksWorker(ticketId) : host.control.dispatchBlocked(plan, nodeId)) return 'Paused by Plan control'
     if (host.paused()) return 'Project processing is paused or unavailable'
     if (host.attention.blocked(ticketId)) return 'Awaiting credential verification'
     const predecessors = host.plans.waitingOn(planId, node)

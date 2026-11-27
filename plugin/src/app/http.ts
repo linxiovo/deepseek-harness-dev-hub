@@ -24,6 +24,7 @@ import type { Sessions } from './sessions.ts'
 import type { ProjectMeter } from './project-meter.ts'
 import type { RunLimitStatus } from './run-limits.ts'
 import type { ScopedAttention } from './scoped-attention.ts'
+import type { IdleInspection } from './idle-inspection.ts'
 import type { SessionMeter } from './session-meter.ts'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
@@ -65,6 +66,7 @@ export interface HttpHost {
   readonly meter: Pick<SessionMeter, 'read'>
   readonly projectMeter: Pick<ProjectMeter, 'read'>
   readonly runLimits?: { view(ticketId?: string): RunLimitStatus | undefined }
+  readonly inspection?: Pick<IdleInspection, 'view'>
   readonly planIntegration?: { view(id: string): PlanIntegrationView | undefined }
   readonly planArtifact?: (id: string) => Promise<PlanArtifactFile | undefined>
   readonly attention: Pick<ScopedAttention, 'summary' | 'entry' | 'verify'>
@@ -179,6 +181,7 @@ type RouteOutput<K extends keyof Api> = K extends 'GET plans/:id/artifact' ? Pla
 type Routes = { [K in keyof Api]: (input: Input<K>) => RouteOutput<K> | Promise<RouteOutput<K>> }
 const offset = z.coerce.number().int().nonnegative().catch(0)
 const limit = (fallback: number, max: number) => z.coerce.number().int().positive().catch(fallback).transform(value => Math.min(max, value))
+const InspectionQuery = z.object({ offset, limit: limit(20, 100) })
 const TicketsQuery = z.object({ state: z.enum(TICKET_FILTERS).catch('open'), offset, limit: limit(20, 1000) })
 const ThreadsQuery = z.object({ filter: z.enum(THREAD_FILTERS).catch('subscribed'), offset, limit: limit(20, 1000) })
 const ThreadQuery = z.object({ limit: limit(50, 100), before: z.string().optional(), around: z.string().optional() })
@@ -283,6 +286,7 @@ const projectMeterRoutes: Partial<Record<keyof Api, true>> = {
 
 const requiredProjectRoutes: Partial<Record<keyof Api, true>> = {
   'GET hub/conversation': true, 'GET plans/:id/delivery': true, 'GET plans/:id/artifact': true,
+  'GET project/inspection': true,
 }
 
 const runLimitRoutes: Partial<Record<keyof Api, true>> = {
@@ -468,6 +472,11 @@ function routes(runtime: HttpHost): Routes {
       return view
     },
     'GET project/meter': () => meter('project'),
+    'GET project/inspection': ({ query }) => {
+      if (!runtime.inspection) throw new InstallationError(409, 'noProject')
+      const { offset, limit } = InspectionQuery.parse(query)
+      return runtime.inspection.view(offset, limit)
+    },
     'GET plans/:id/delivery': ({ params }) => {
       const view = runtime.planIntegration?.view(params.id)
       if (!view) throw new UserError('unknownPlan', { id: params.id })

@@ -23,6 +23,7 @@ import type { SettingsConfirmationRecord } from './app/settings-confirmations.ts
 import type { CredentialBlocker } from './app/scoped-attention.ts'
 import type { PlanControlState } from './app/plan-control.ts'
 import type { MaintenanceEvent, MaintenanceTarget } from './app/maintenance.ts'
+import type { InspectionRun, InspectionSchedule, InspectionTodo } from './app/idle-inspection.ts'
 import type { SettingsSave } from './policy.ts'
 import type { GithubConfig, Retry } from './sources/github.ts'
 
@@ -70,6 +71,7 @@ export const KV = {
   /** Run-limit ledger: aggregate project pool, per-Ticket pools and unreceipted authorized calls. */
   runLimits: { since: record<string>('run-limits-since'), project: record<BudgetLedger>('run-limits-project'),
     ticket: family<BudgetLedger>('run-limits-ticket:'), pending: family<PendingUsage>('run-limits-pending:'),
+    inspection: family<BudgetLedger>('run-limits-inspection:'), inspectionHold: family<true>('run-limits-inspection-hold:'),
     projectHold: record<true>('run-limits-project-hold'), ticketHold: family<true>('run-limits-ticket-hold:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */
   queues: { relays: record<{ id: string; text: string }[]>('relay-queue'), unsubscribed: record<string[]>('subscription-results'),
@@ -101,6 +103,10 @@ export const KV = {
   /** Maintenance: immutable source observations, pending review and durable associations. */
   maintenance: { event: family<MaintenanceEvent>('maintenance-event:'), pending: family<true>('maintenance-pending:'),
     feedback: family<MaintenanceTarget>('maintenance-feedback:'), recovery: record<string>('maintenance-recovery-relay') },
+  /** Inspection scheduler and evidence; the Session adapter independently pins the native root at creation. */
+  inspection: { schedule: record<InspectionSchedule>('inspection-schedule'), run: family<InspectionRun>('inspection-run:'),
+    native: family<number>('inspection-native:'), todo: family<InspectionTodo>('inspection-todo:'),
+    page: family<true, [string, string, number]>('inspection-page:', (id, path, offset) => `${id}:${JSON.stringify([path, offset])}`) },
   /** Handoffs: current record by project; immutable full records and specs; direct confirmation receipts. */
   handoffs: { current: family<string, [projectId: string]>('handoff-current:'),
     record: family<Handoff, [id: string]>('handoff:'),

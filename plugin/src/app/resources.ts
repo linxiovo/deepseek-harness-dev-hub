@@ -42,6 +42,7 @@ import type { Settings } from './settings.ts'
 import type { Store } from './store.ts'
 import type { PlanIntegration } from './plan-integration.ts'
 import type { Maintenance } from './maintenance.ts'
+import type { IdleInspection } from './idle-inspection.ts'
 import type { TextCache } from './cache.ts'
 
 /** Resource descriptors exposed via orchestrator_read, marking which resources worker sessions may also read for their own ticket. */
@@ -95,6 +96,7 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'project/run-limits', holds: 'effective run limits and project token budget status' },
   { name: 'project/attention', holds: 'project Plan status counts and credential actions' },
   { name: 'project/stage', holds: 'project delivery or Stage 2 maintenance milestone' },
+  { name: 'project/inspection', holds: 'inspection grant, usage, last run and independent findings' },
   { name: 'maintenance', holds: 'pending Stage 2 feedback to assess' },
   { name: 'maintenance/<id>', holds: 'one Stage 2 event or its decision and associated work' },
   { name: 'plan/<id>/meter', holds: 'Plan usage with shared overhead separate' },
@@ -134,6 +136,7 @@ export interface MainResourceHost extends ResourceHost {
   readonly handoffs: Pick<Handoffs, 'get' | 'spec'>
   readonly planIntegration?: Pick<PlanIntegration, 'view' | 'stage'>
   readonly maintenance?: Pick<Maintenance, 'pending' | 'read'>
+  readonly inspection?: Pick<IdleInspection, 'view'>
   readonly planControl: Pick<PlanControl, 'view'>
   readonly plans: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'testHistory' | 'view' | 'node' | 'at' | 'revision'>
   readonly stagnation: Pick<PlanStagnation, 'view' | 'failure'>
@@ -781,7 +784,7 @@ const ROUTES: readonly Route[] = [
   }],
   ['models', async read => {
     const host = main(read), catalog = await host.context.sessionController.modelCatalog(), settings = host.store.settings()
-    const roles = { orchestrator: settings.eval.model, worker: settings.executor.model }
+    const roles = { orchestrator: settings.eval.model, worker: settings.executor.model, lightweight: settings.executor.lightweightModel ?? null }
     return { default: catalog.default, roles, failures: catalog.failures,
       providers: catalog.groups.map(group => ({ id: group.id, name: group.name, count: group.models.length, read: `models/${group.id}` })) }
   }],
@@ -805,6 +808,11 @@ const ROUTES: readonly Route[] = [
     const host = main(read)
     if (!host.planIntegration) throw new Error('Project stage is unavailable')
     return host.planIntegration.stage()
+  }],
+  ['project/inspection', read => {
+    const inspection = main(read).inspection
+    if (!inspection) throw new Error('Inspection is unavailable in this project')
+    return inspection.view(read.offset, Math.min(read.limit ?? DEFAULT_LIST_SIZE, MAX_LIST_SIZE))
   }],
   ['maintenance', read => main(read).maintenance?.pending(read.offset, Math.min(read.limit ?? DEFAULT_LIST_SIZE, MAX_LIST_SIZE))
     ?? { items: [], next_offset: null }],

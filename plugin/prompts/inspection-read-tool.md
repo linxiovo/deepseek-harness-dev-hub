@@ -1,0 +1,1 @@
+Read one page of the authorized Git object or a listed descendant, using its exact repository-relative path. Start at offset 0 (the default), then use the returned nextOffset. File offsets count UTF-16 units; directory offsets count entries.

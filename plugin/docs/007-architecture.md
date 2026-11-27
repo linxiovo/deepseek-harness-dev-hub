@@ -197,6 +197,7 @@ Failures retry with exponential backoff. Throwing `Later` defers work without co
 | `mainlineDelivery` | MainlineQueue | Rechecks one verified intent for [formal Plan closure](003-execution.md#formal-plan-closure) | 8, only when configured | Resumes pending work on restart; evidence gaps stay on the Ticket until rechecked |
 | `planIntegration` | PlanIntegration, using PlanRelease for publication | Verifies the target and attempt-matched package after all formal Ticket receipts; then, only for an authorized release, rechecks prerequisites, publishes and reconciles environment evidence | 4, none while paused | Persists each intent before its write, resumes by observing the exact Actions context or release request; preserves a verified deployment when restoring its specific package |
 | `requirementScopeReview` | Runtime | Dispatches the sealed requirement scope comparison to its read-only reviewer | 1, when configured and unpaused | Reconciles the same Session and dispatch on restart |
+| `inspection` | IdleInspection | Opens the already authorized inspection root and delivers its pinned scope | 1 | Reconciles the same intent and native inbox/history after restart; no second dispatch for a consumed task |
 | `hubInbox` | Sessions | Moves a message claimed by a retired physical Hub generation into the current Hub through a durable per-source inbox queue, marking transferred user input as a relay rather than a new direct approval | 1 per current target | 2 s doubling to 60 s; resumes from the persisted queue after restart |
 | `relay` | Sessions | Steers a worker's report or question, or a person's follow-up, into the main Session's turn | 1, in queue order | 2 s doubling to 60 s |
 | `notice` | Sessions | Injects a notice into the main Session without waking it | 1, in queue order | 2 s doubling to 60 s |
@@ -420,6 +421,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/topic-binding.ts` | Binds one observed Feishu destination to the selected project and accepts correlated answers from explicitly authorized senders; see `009-handoff.md` |
 | `src/app/settings-confirmations.ts` | Proposal versions, per-request Feishu grants, original-card delivery receipts and atomic settings decisions |
 | `src/app/maintenance.ts` | `Maintenance`: Stage 2 event intake, rule-based registration, recovery relays and durable feedback associations; see `009-handoff.md#stage-2-maintenance` |
+| `src/app/idle-inspection.ts` | Due-time scheduling, authorization, inspected-page evidence and independent finding associations. Contract: `020-idle-inspection.md`. |
 | `src/app/planning.ts` | `Planning`: durable `planning` and `splitting` effects for the specification planner and the Plan DAG splitter |
 | `src/app/plans.ts` | `Plans`: validates and publishes immutable Plan revisions, retains old node definitions and claims, and gates Frontier and delivery |
 | `src/app/plan-dispatch.ts` | `PlanDispatcher`: validates Frontier predecessors, reserves a launch slot, atomically claims a node into a stable Ticket/Assignment, and rearms the same claim on restart |
@@ -442,11 +444,11 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
 | `src/app/sessions.ts` | Sessions |
 | `src/app/hub-authority.ts` | `HubAuthority`: durable project Hub identity, monotonic physical Session generations, and crash-recoverable rotation intent |
-| `src/app/hub-session-root.ts` | `openHubRoot` creates a successor exclusively and verifies its own first log record, original root, workspace, and preset before resolving it; `matchesHubRoot` verifies the live Agent at ingress. |
+| `src/app/hub-session-root.ts` | `openNativeRoot` and `matchesNativeRoot` verify the exclusive creation marker, physical workspace, preset and original root before using a Hub successor or inspection Session. |
 | `src/app/hub-resume.ts` | `hubResumeText`: bounded continuation from mounted durable tickets, unresolved Source events, authorized Handoffs, Plans, and effect metadata with readable resource pointers |
 | `src/app/session-meter.ts` | `SessionMeter`: one Session's context snapshot and cumulative usage from its durable event log, with provenance, missing and in-flight ranges, and the persisted exclusive cursor; forked prefixes are excluded |
 | `src/app/project-meter.ts` | `ProjectMeter`: project-local Session bindings and deduplicated scoped usage; contract in `plugin/docs/014-project-metering.md` |
-| `src/app/run-limits.ts` | Mounted project and Ticket budget reservations, authoritative settlements and scoped hold notifications; contract in `016-run-limits.md` |
+| `src/app/run-limits.ts` | Atomic project, Ticket and inspection-scope reservations, authoritative settlements and scoped hold notifications; see `016-run-limits.md` and `020-idle-inspection.md`. |
 | `src/app/model-admission.ts` | Pre-provider DSH stream admission and once-per-attempt usage receipt |
 | `src/app/meter-recovery.ts` | Restores detached review attribution from durable review receipts and verified Session parent metadata |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id across restored and rotated Hub Sessions |
@@ -463,6 +465,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/planner.ts` | `plannerTools`: a planner Session's own handoff read, product-intent question and specification publication |
 | `src/app/tools/splitter.ts` | The splitter's scoped handoff and spec read and Plan DAG registration |
 | `src/app/tools/requirement-scope.ts` | The proposal's independent read-only Session records its scoped verdict |
+| `src/app/tools/inspection.ts` | Mounts paged snapshot reads and evidenced findings on the verified native inspection root only. |
 | `src/app/tools/executor.ts` | An Executor Session's tools |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
@@ -476,6 +479,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/executor/dsh.ts` | The DshExecutor, its worktree preparation and writer-claim flow, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents` (descendant cleanup per `010-session-boundaries.md`), `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/executor/worktree.ts` | Read-only inspection of the canonical clone, linked worktrees, branch, base and destination. On repair, Worker reclaim accepts the last queued candidate as a temporary lineage anchor, but evidence still requires the new base. |
+| `src/executor/inspection-git.ts` | Pins the scoped object in the local project ref and reads only ordinary Git tree/blob pages at that commit. |
 | `src/executor/repository-identity.ts` | `validateRepositoryIdentity` reads the clone's local `remote.origin.url` without modifying it or contacting GitHub; it accepts one direct github.com HTTPS, SSH or Git URL for the configured owner/name, case-insensitively and with an optional `.git` suffix, and refuses missing, ambiguous, unsupported or mismatched origins with `WorktreeRejected` |
 | `src/executor/mainline-git.ts` | Isolated GitHub branch observation, committed shared-rule manifest inspection, reproducible integration commits and lease-checked fast-forward writes |
 | `src/executor/doc-tree.ts` | Candidate-bound Doc Tree structure and changed-path evidence; see `011-doc-tree-impact.md` |
@@ -574,6 +578,9 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |
 | `tests/plan-integration-crash.spec.ts` | SIGKILL after GitHub accepts workflow dispatch but before the effect records a result; SQLite recovery observes the existing run without another dispatch |
 | `tests/maintenance-recovery.spec.ts` | Stage 2 inbox and native-history recovery, stale authority during workspace validation, and maintenance replay of paired live/history Feishu private-chat samples |
+| `tests/idle-inspection.spec.ts` | Explicit grants, controllable clock, actual native tool calls, findings, model selection, project usage and event precedence. |
+| `tests/inspection-git.spec.ts` | Immutable snapshot pagination, path and object boundaries, missing objects, and preservation of checkout/index/ref. |
+| `tests/inspection-quota.spec.ts` | Dual-pool reservation, settlement and recovery; missing usage pauses the strict scope, not independently authorized Tickets. |
 | `tests/mainline-queue.spec.ts` | Queue admission, CI, conflicts, formal closure and Frontier; artifact and controlled release delivery; Stage 2 through Harness, GitHub and bound Feishu events |
 | `tests/plan-artifacts.spec.ts` | Exact workflow attempt/profile binding, safe filenames and media types, package SHA-256, strict archive contents, restart staging cleanup and retained-file tamper rejection |
 | `tests/plan-release.spec.ts` | Public PlanIntegration effect seam: no release without exact authorization, credentials or target match; exact artifact verification, controlled credential relay and lost-response restart reconciliation |

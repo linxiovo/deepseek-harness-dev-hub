@@ -1,0 +1,1 @@
+Conclude the inspection and record evidenced findings as pending work. Each finding gives the path, offset of a page already read in this Session (default 0), an exact single-line quotation, and a concise summary. Use an empty array for an inspected object with no findings.

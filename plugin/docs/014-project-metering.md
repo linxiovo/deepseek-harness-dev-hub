@@ -70,7 +70,7 @@ After a same-ID log recreation, cumulative tokens include the earlier verified p
 
 Attribution is recorded by the plugin at trusted delegation points; reading a meter, opening a Session, or forking its history grants no attribution or permissions. A Plan claim binds its Worker to that Ticket and Plan before launch. Verified standalone Workers are bound to their Tickets. An accepted retry can add `retry` to the existing Worker row without splitting its history. Native Worker descendants retain their direct business parent; a delegated review is recorded separately from implementation. The Hub and pre-Plan planning Sessions are project shared.
 
-A trusted lifecycle caller can bind a separate retro Session to its Ticket, or register `inspection` with no Ticket. That caller must use a fresh Session ID for each dispatch, never an ID recycled from different work; registration is neither a dispatch mechanism nor a permission grant. Startup reconciles existing review receipts against host metadata for detached reviewers, excluding replacement logs created after the receipt. A receipt restores attribution, not a Session or its permission to submit evidence.
+A trusted lifecycle caller can bind a separate retro Session to its Ticket. Idle inspections bind a fresh `inspection` Session to the project and its Hub generation, with no Ticket or Plan; the host checks its pinned native identity before sampling. Binding records attribution, not permission to start a turn. Startup reconciles existing review receipts against host metadata for detached reviewers, excluding replacement logs created after the receipt. A receipt restores attribution, not a Session or its permission to submit evidence.
 
 ## Errors
 

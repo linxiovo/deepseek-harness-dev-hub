@@ -872,6 +872,28 @@ it.each<[name: string, scenario: {
   expect(await read('project/stage')).toMatchObject(stageTwo ? { stage: 2, deliveredPlan: id } : { stage: 1 })
   await h.runtime.pump()
   expect(maintenanceCandidates()).toEqual([])
+  if (_scenario === 'artifact-only') {
+    const config = async (idleInspection: object | null) => {
+      const { value, revision } = JSON.parse(String((await read('settings/executor')).text))
+      expect(await h.api('PUT', 'settings/executor', { value: { ...value, idleInspection }, revision }, mounted.project.id)).toMatchObject({ status: 200 })
+    }
+    const main = git('rev-parse', targetRef), originalText = git('show', `${main}:shared.txt`)
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const now = Date.now()
+      await config({ scope: 'shared.txt', intervalSeconds: 5, maxTokens: 1000 })
+      vi.setSystemTime(now + 5000)
+      await h.runtime.pump(); await h.runtime.idle()
+      const { lastRun } = z.object({ lastRun: z.object({ sessionId: z.string(), commit: z.literal(main) }) }).parse(await read('project/inspection'))
+      await h.modelTool(lastRun.sessionId, 'orchestrator_inspection_read', { path: 'shared.txt' })
+      await h.modelTool(lastRun.sessionId, 'orchestrator_inspection_finish', { findings: [{ path: 'shared.txt', evidence: originalText, summary: 'Clarify the baseline label.' }] })
+      expect(await read('project/inspection')).toMatchObject({ lastRun: { status: 'completed' }, items: [expect.objectContaining({ path: 'shared.txt' })] })
+    } finally { vi.useRealTimers() }
+    expect([git('rev-parse', targetRef), tip(), git('show', `${main}:shared.txt`)]).toEqual([main, integration, originalText])
+    expect(await read(`plan/${id}/delivery`)).toEqual(resource)
+    expect((await read(`ticket/${worker.ticketId}`)).state).toBe('merged')
+    await config(null)
+  }
   if (controlledRelease) await exerciseBoundMaintenance(mounted.project.id)
   else if (release === 'not-authorized' && !pauseOnRefusal && !rerunDuringDownload && !rerunDuringFinalTargetRead)
     await exerciseGithubAndHarnessMaintenance(mounted.project.id, id, worker)

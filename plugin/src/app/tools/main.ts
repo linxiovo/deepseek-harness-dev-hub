@@ -135,6 +135,7 @@ export interface MainToolsHost {
   readonly attention: Pick<ScopedAttention, 'summary' | 'forTicket'>
   readonly planIntegration?: MainResourceHost['planIntegration']
   readonly maintenance?: Maintenance
+  readonly inspection?: MainResourceHost['inspection']
   readonly handoffs: Pick<Handoffs, 'confirm' | 'answer' | 'get' | 'spec'>
   readonly plans: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'testHistory' | 'view' | 'node' | 'append' | 'at' | 'revision' | 'current' | 'state' | 'requiredDelivery' | 'revise'>
   readonly stagnation: MainResourceHost['stagnation']
@@ -275,7 +276,7 @@ function routeTool(host: MainToolsHost): Tool {
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings,
     handoffs: host.handoffs, plans: host.plans, projectMeter: host.projectMeter, runLimits: host.runLimits, attention: host.attention,
-    planIntegration: host.planIntegration, maintenance: host.maintenance, stagnation: host.stagnation,
+    planIntegration: host.planIntegration, maintenance: host.maintenance, inspection: host.inspection, stagnation: host.stagnation,
     requirements: host.requirements, planControl: host.planControl }
   const maintenance = host.maintenance
   return [

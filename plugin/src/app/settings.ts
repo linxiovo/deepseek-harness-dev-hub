@@ -33,6 +33,8 @@ const now = (): string => new Date().toISOString()
 /** Executor settings that control shell execution paths, repository identity, pinned base selection, prepare commands, and command shims. */
 const environment = ({ executor }: SettingsValue) => JSON.stringify([executor.directory, executor.repository, executor.baseRef, executor.prepare, executor.blockedCommands])
 const runLimitFingerprint = ({ executor }: SettingsValue) => JSON.stringify([executor.maxWorkers, executor.runLimits])
+const inspectionFingerprint = ({ executor }: SettingsValue) => JSON.stringify([executor.idleInspection ?? null, executor.lightweightModel ?? null,
+  executor.idleInspection ? [executor.baseRef, executor.runLimits?.projectTokens ?? null] : null])
 
 /** Schema parser, settings merger, and non-panel origin guard for one settings block kind. */
 interface Block {
@@ -64,6 +66,7 @@ const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
     guard: (current, candidate, origin) => {
       if (origin === 'panel') return
       if (runLimitFingerprint(current) !== runLimitFingerprint(candidate)) throw new UserError('panelOnlyRunLimits')
+      if (inspectionFingerprint(current) !== inspectionFingerprint(candidate)) throw new UserError('panelOnlyRunLimits')
       if (environment(current) !== environment(candidate)) throw new UserError('panelOnlyEnvironment')
     },
   },
@@ -109,6 +112,8 @@ export interface SettingsHost {
   validate?(before: SettingsValue, after: SettingsValue): void
   /** Reconcile live admission only after an executor run-limit change commits. */
   runLimitsChanged?(): void
+  /** Revoke the old inspection intent in the same transaction as the operator's change. */
+  inspectionChanged?(): void
   /** Triggers an immediate pass so work newly allowed by a settings save runs right away. */
   requestPass(): void
 }
@@ -199,9 +204,9 @@ export class Settings {
     const candidate = rules.merge(current, parsed, id)
     rules.guard?.(current, candidate, origin, sources, id)
     this.host.validate?.(current, candidate)
-    const model = block === 'eval' ? candidate.eval.model : block === 'executor' ? candidate.executor.model : null
-    const previous = block === 'eval' ? current.eval.model : block === 'executor' ? current.executor.model : null
-    if (model && JSON.stringify(model) !== JSON.stringify(previous)) {
+    const routes = block === 'eval' ? [[current.eval.model, candidate.eval.model]] : block === 'executor'
+      ? [[current.executor.model, candidate.executor.model], [current.executor.lightweightModel, candidate.executor.lightweightModel]] : []
+    for (const [previous, model] of routes) if (model && JSON.stringify(model) !== JSON.stringify(previous)) {
       try { await resolveRoleModel(this.host.context, model) }
       catch (error) { throw new UserError('modelUnavailable', { block, error: error instanceof Error ? error.message : String(error) }) }
     }
@@ -268,7 +273,9 @@ export class Settings {
       }
       if (origin !== 'tool') sessions.notify(...settingsNotice(block, changedPaths(old, settings)))
       if (policyChanged) engine.policyChanged(before, after, effects)
-      if (block === 'executor' && this.host.runLimitsChanged && runLimitFingerprint(old) !== runLimitFingerprint(settings)) {
+      const inspectionChanged = block === 'executor' && inspectionFingerprint(old) !== inspectionFingerprint(settings)
+      if (inspectionChanged) this.host.inspectionChanged?.()
+      if (block === 'executor' && this.host.runLimitsChanged && (inspectionChanged || runLimitFingerprint(old) !== runLimitFingerprint(settings))) {
         store.afterCommit(() => this.host.runLimitsChanged?.())
       }
     })

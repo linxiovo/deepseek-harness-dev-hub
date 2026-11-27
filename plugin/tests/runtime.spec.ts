@@ -1885,6 +1885,20 @@ it('reapplies Hub restrictions and coordination to live Sessions after a service
     .toMatchObject({ results: [{ trigger_id: trigger.id, kind: 'ignore', decision: 'ignore' }] })
 })
 
+it('denies inherited tools on an unassigned inspection root even under a writable profile preset', async () => {
+  const sessionId = 'inspection-unassigned', path = join(directory, 'inspection-profile.md')
+  writeFileSync(path, 'outside the grant')
+  const create = controller.create as (options: { sessionId: string }) => Promise<void>
+  await create({ sessionId })
+  const ctx = Reflect.get(runtime, 'ctx')
+  if (!(ctx instanceof Context)) throw new Error('Missing Cordis context on Runtime')
+  await ctx.parallel('agent/created', { agent: agents.get(sessionId)! } as never)
+  for (const name of ['read', 'write', 'edit', 'apply_patch', 'bash', 'pwsh', 'orchestrator_inspection_finish']) {
+    expect((await dispatch(sessionId, name, { path, content: 'changed' })).isError, name).toBe(true)
+  }
+  expect(readFileSync(path, 'utf8')).toBe('outside the grant')
+})
+
 it('lets a worker and any-depth subagents write during its ticket, and refuses all of them once it ends', async () => {
   const { ticket, sessionId } = await acceptedTicket()
   const created = (runtime as unknown as { ctx: Context }).ctx

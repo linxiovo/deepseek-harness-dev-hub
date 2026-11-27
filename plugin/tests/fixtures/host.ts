@@ -5,6 +5,8 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { execFileSync } from 'node:child_process'
 import { Context } from '@deepseek-ai/cordis'
+import { agentEvents, type Agent } from '@deepseek-ai/dsh-agent'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -40,7 +42,7 @@ export function feishu(id: string, text: string, overrides: Record<string, unkno
 
 type RegisteredTool = { name: string; execute: (args: unknown, execution: { signal: AbortSignal }) => Promise<unknown> }
 type FakeAgent = {
-  id: string; status: string; inbox: { nextTurn: UserMessage[]; nextStep: UserMessage[] }
+  id: string; ctx: Context; status: string; inbox: { nextTurn: UserMessage[]; nextStep: UserMessage[] }
   cancel: Mock; inject: Mock<(message: UserMessage) => void>; steer: Mock<(message: UserMessage) => void>; followup: Mock<(message: UserMessage) => void>
   directUserMessage: (text: string) => void
   session?: { id: string }
@@ -243,9 +245,11 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
       const sessionTools = new Map<string, RegisteredTool>()
       tools.set(sessionId, sessionTools)
       const register = (tool: RegisteredTool) => { sessionTools.set(tool.name, tool); return () => sessionTools.delete(tool.name) }
-      agentCtx.reflect.provide('tools', { register, get: () => undefined, restrict: vi.fn(() => () => {}), guard: vi.fn(() => () => {}) })
+      agentCtx.reflect.provide('tools', { register, get: () => undefined, restrict: vi.fn(() => () => {}), guard: vi.fn(() => () => {}),
+        presentAs: () => () => {} })
       agentCtx.reflect.provide('skills', skillRegistry(sessionId))
-      agentCtx.reflect.provide('systemPrompt', { section: () => () => {} })
+      if (sessionId.startsWith('inspection-')) await agentCtx.plugin(SystemPrompt)
+      else agentCtx.reflect.provide('systemPrompt', { section: () => () => {} })
       const inbox = { nextTurn: [] as UserMessage[], nextStep: [] as UserMessage[],
         // A pending message taken out, as DSH's inbox does by its id.
         remove: (id: string) => [inbox.nextTurn, inbox.nextStep].some(list => {
@@ -468,6 +472,16 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     if (!tool) throw new Error(`Tool ${name} is not registered for ${sessionId}`)
     return await tool.execute(args, { signal: new AbortController().signal }) as Record<string, unknown>
   }
+  /** Dispatch an observed native model tool call, including the DSH execution identity and turn conclusion. */
+  let modelCallSequence = 0
+  async function modelTool(sessionId: string, name: string, args: unknown) {
+    const agent = agents.get(sessionId), tool = tools.get(sessionId)?.get(name)
+    if (!agent || !tool) throw new Error(`Tool ${name} is not registered for ${sessionId}`)
+    const step = ++modelCallSequence, callId = `model-call-${step}`
+    record(sessionId, [{ type: 'tool/call', data: { turn: 1, step, callId, name, arguments: JSON.stringify(args) } }])
+    const execution = { agent, callId, rootCallId: callId, signal: new AbortController().signal, concludeTurn: () => { agent.status = 'idle' } }
+    return tool.execute(args, execution)
+  }
   /** Create a real Cordis Agent boundary for a Worker descendant; authorization still runs through Sessions and DSH tools. */
   async function reviewSubagent(parentId: string, axis: ReviewAxis, childId = `review-${++reviewChildSequence}`, loadReviewSkill = true,
     inherited: readonly Omit<StoredEvent, 'seq'>[] = [], beforeSkill?: (childId: string) => Promise<void>) {
@@ -567,16 +581,21 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     if (options.separateCheckout) rmSync(gitRoot, { recursive: true, force: true })
   }
   /** Execute the host's public streaming waterfall, replacing only provider I/O. */
-  function modelRequest(sessionId: string, contextWindow: number, providerCall: () => AsyncIterable<StreamChunk>, signal?: AbortSignal) {
-    const model = { provider: 'fixture', model: 'fixture-model' }
-    modelContexts.set(sessionId, { ...model, contextWindow })
-    const request = Object.freeze({ ...model, sessionId: sessionId as SessionId, messages: [], ...(signal ? { signal } : {}) }) satisfies GenerateOptions
+  function modelRequest(sessionId: string, contextWindow: number, providerCall: (request: GenerateOptions) => AsyncIterable<StreamChunk>, signal?: AbortSignal) {
+    const agent = agents.get(sessionId)
     const stream = async () => {
+      let model = { provider: 'fixture', model: 'fixture-model' }
+      if (agent && sessionId.startsWith('inspection-')) {
+        const native = agent as unknown as Agent
+        await agent.ctx.systemPrompt.assemble()
+        model = await agentEvents(agent.ctx, native).waterfall('agent/request', { turn: 1, step: 1, signal: signal ?? new AbortController().signal }, async () => model)
+      }
+      modelContexts.set(sessionId, { ...model, contextWindow })
+      const request = Object.freeze({ ...model, sessionId: sessionId as SessionId, messages: [], ...(signal ? { signal } : {}) }) satisfies GenerateOptions
       const chunks: StreamChunk[] = []
-      for await (const chunk of ctx.waterfall(ctx.llm, 'llm/stream', markAgentLoopRequest(request), providerCall)) chunks.push(chunk)
+      for await (const chunk of ctx.waterfall(ctx.llm, 'llm/stream', markAgentLoopRequest(request), () => providerCall(request))) chunks.push(chunk)
       return chunks
     }
-    const agent = agents.get(sessionId)
     return agent ? initiator.run(agent, stream) : stream()
   }
   /** The Session's model takes its next step, which takes the messages steered in since its last. */
@@ -584,6 +603,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
   return { get runtime() { return runtime }, get ctx() { return ctx }, get toolLimits() { return toolLimits }, restart, idlePlanning, idleRelay, directory, localGit, agents, tools, deliveries, relays, jsonRelays, candidates, runTool, sendUserMessage, record, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
+    modelTool,
     jobs, subagents, reviewSubagent, useStoredLog, step, claim, modelRequest, mountedSkills,
     nativeStep: (id: string, options: { starts: boolean; beforeHistory?: () => void; cut?: boolean }) =>
       nativeSteps.get(id)!(options.starts, options.beforeHistory, options.cut) }

@@ -217,3 +217,13 @@
             config:
               fetch: false
               searchTimeoutMs: 60000
+    # Inspection reads immutable Git objects through its two host tools. Even read-only filesystem and AGENTS.md plugins
+    # would expose ungranted workspace content before a tool guard could intervene.
+    - id: dsh-superagent-inspection-preset
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: dsh-superagent-inspection
+        name: dsh-superagent 空闲巡检
+        description: dsh-superagent 的授权巡检专用，仅通过限定对象的宿主工具读取证据和登记待办。
+        order: 93
+        plugins: []

@@ -24,7 +24,7 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 - GitHub CLI (`gh`) 2.48 or later. Source CLI fields must point to `gh` or `lark-cli` wrappers; the host relies on their subcommands and output formats.
 - A repository on github.com; GitHub Enterprise Server is not supported. Keep a local clone of it and name that clone in the Execution settings: the Executor creates one worktree per Ticket there. Install `git-lfs` if that repository uses Git LFS.
 - A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
-- For Feishu: `lark-cli` (tested with 1.0.90) and a Feishu or Lark app with a bot
+- For Feishu: a Feishu or Lark app with a bot. Pin `lark-cli` 1.0.100 for interactive settings approvals. A CLI without `card.action.trigger` can still receive ordinary messages.
 
 ### Development checks
 
@@ -116,6 +116,12 @@ Keep repository **Allow auto-merge** enabled and restrict the `owner-auto-merge`
    Both configurations share the keychain entry for the app secret. To remove only the bot configuration, delete its directory; do not run `lark-cli config remove`, which would affect the shared secret.
 
    On Windows, the live event consumer also accepts `.cmd` and `.bat` wrappers. Use a path without `cmd.exe` metacharacters; paths containing them are rejected.
+
+3. For native settings approvals, grant the bot `im:message:send_as_bot` to send and reply, and `im:message:readonly` for the card event consumer. Under **Events & Callbacks → Callback Configuration**, select the long connection and add **Card action trigger** (`card.action.trigger`). Keep the ordinary message event subscription separately. Publish the updated version and ensure the bot is in the bound group or has a DM relationship with the recipient. Card 2.0 buttons require Feishu/Lark client 7.20 or later.
+
+   Check that the pinned wrapper supports `lark-bot event schema card.action.trigger`. The host starts a separate bot-only consumer for that event. Its ready marker confirms the CLI stream, **not** the console subscription: a missing callback subscription can produce no clicks even though the stream appears ready. Never collect raw event lines in logs or support tickets; they may contain a temporary update token, form data and the fetched card body.
+
+   Cards go only to the bound DM or as a reply in its exact group topic. Only a designated participant's native button click on the original receipted card is eligible; typing “approve”, quoting the card or forwarding a message never approves. **Check current status** requests the effective value from the same project record; the printed card is a snapshot. When callbacks are unavailable, use the project-scoped management API. Any fallback text is guidance, not an approval channel.
 
 ## Install
 
@@ -248,7 +254,7 @@ The panel uses a local HTTP API that agents can also call. The service script re
 
 Send requests to `http://127.0.0.1:<port>/orchestrator/api/` with `x-orchestrator-request: 1`. `Host` must be exactly `127.0.0.1:<port>` or `localhost:<port>`. If `Origin` is supplied, it must be exactly `http://<Host>`. A mismatch or missing required header receives `403 {error: "Same-origin management request required"}`. The server itself must bind to `127.0.0.1`. Use the SSH tunnel on a remote host.
 
-API saves have the panel's permissions, including execution settings the main Session cannot edit. Managed GitHub identity and project binding are not editable through settings saves. See `012-project-runtime.md` for the installation routes, project-scope contract, and error shapes.
+API saves have the panel's permissions, including execution settings the main Session cannot edit. Managed GitHub identity and project binding are not editable through settings saves. See `012-project-runtime.md` for the installation routes, project-scope contract, and error shapes. Confirmed-settings proposals and approvals use `POST /orchestrator/api/settings-confirmations`, `GET /orchestrator/api/settings-confirmations/:id` and `POST /orchestrator/api/settings-confirmations/:id/approve` in addition to the public API listed here; see `019-confirmed-settings.md`.
 
 Agents may rely on these routes and fields. The other routes in `src/app/api.ts` serve the panel and change with it.
 
@@ -277,7 +283,10 @@ Health entries are grouped by responsibility:
 | `assessment`, `launch`, `delivery`, `relay`, `notice`, `reply` | Stored work described in [003 Execution](003-execution.md); delivery counts waiting work, while reply covers Channel messages |
 | `worker` | Executor Session event handling; appears after its first failure |
 | `github`, `feishu`, `history` | Source polling, events and history recovery |
+| `feishuCards` | Feishu native settings-card callback stream; `unavailable`, `interrupted` and `processing` are fixed, redacted problem codes, cleared only by a later successful ready signal |
 | `sync:<source id>` | Allowed-list synchronization |
+
+When `feishuCards` is unhealthy, ordinary Feishu messages remain independently available. Use the project-scoped management API routes in `019-confirmed-settings.md` for approval or status; a reconnect does not clear the problem until the callback consumer reports ready. For a missing send receipt, first read the original topic record, then recover only the same confirmation UUID as described in `019-confirmed-settings.md`.
 
 A refusal has a status and `error`, its English text:
 

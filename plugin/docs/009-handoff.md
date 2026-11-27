@@ -148,7 +148,7 @@ A selected, registered project can use one Feishu private chat or group topic as
 
 Use the existing loopback management API under `/orchestrator/api/`, with `x-orchestrator-request: 1` and `x-orchestrator-project-id` set to the selected project ID. `POST topic-binding` accepts `{ "triggerId": "…", "allowedActors": ["ou_…"] }`. Select a message observed by the project's Feishu Source, not a caller-supplied chat address. The operator grants those open IDs permission to answer product questions in that destination; group membership and the Source admission list do not confer that permission. `GET topic-binding` reads the binding; `POST topic-binding/unbind` removes it. Unbind before changing destination or participants.
 
-The Hub sends a binding confirmation once. Question and result notices link back to the selected project; they do not copy conversation history, answers or specification text into a group. To answer a pending product question, use the reply format in its notice. The Hub verifies the question reference and the sender reported by Feishu before recording an answer on the same handoff that Harness reads. Plain assent such as `同意` is not an approval. Settings links open Harness; they do not apply a change by themselves.
+The Hub sends a binding confirmation once. Question and result notices link back to the selected project; they do not copy conversation history, answers or specification text into a group. To answer a pending product question, use the reply format in its notice. The Hub verifies the question reference and the sender reported by Feishu before recording an answer on the same handoff that Harness reads. Plain assent such as `同意` is not an approval. Configuration proposals use the separate, versioned authorization flow in `019-confirmed-settings.md`; Hub summaries and question-answer authority do not grant that approval. Settings links open Harness; they do not apply a change by themselves.
 
 An allowed participant can send `status` or `状态` for a text summary of the current handoff. An answer uses `answer <code>: <answer>` with the 24-character code from the current question's notice. The reply format stays reserved even when the code is stale. A forwarded link or code is not a grant. Harness links open on the Harness machine or through an authorized tunnel. If another project is active, the link asks the operator to select the named project.
 
@@ -190,5 +190,5 @@ To verify the live Feishu protocol, use a bot authorized for a dedicated test ch
 
 ## Limitations
 
-- The Feishu entry answers product questions; it does not accept configuration approvals. Other IM connectors and interactive confirmation cards are not part of this contract.
+- The Feishu entry answers product questions and may carry a separately authorized settings confirmation; it does not turn conversation answers into configuration approvals. Other IM connectors are not part of this contract.
 - Specification publication is one-way. Changes within an active Plan use the explicit approval in `018-plan-replanning.md`; a different authorized scope requires a new handoff.

@@ -69,7 +69,7 @@ describe('account-isolated operations', () => {
     expect(run).toHaveBeenCalledWith(deployment.feishu!.cli, expect.arrayContaining(['--markdown', '-']), undefined, text)
     expect(run.mock.calls[0]![1]).not.toContain(text)
   })
-  it.skipIf(process.platform !== 'win32')('forwards Feishu Markdown through a real Windows batch CLI as exact UTF-8 stdin', async () => {
+  it.skipIf(process.platform !== 'win32')('forwards Feishu Markdown and card JSON through a real Windows batch CLI as exact UTF-8 stdin', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'commands-batch-'))
     const cli = join(directory, 'capture.cmd')
     const capture = join(directory, 'capture.mjs')
@@ -85,10 +85,12 @@ describe('account-isolated operations', () => {
       writeFileSync(cli, `@echo off\r\n"${process.execPath}" "%~dp0capture.mjs" %*\r\n`)
 
       const commands = new Commands(() => testDeployment({ feishu: { ...testDeployment().feishu!, cli } }), {}, new AbortController().signal)
-      const result = await commands.lark<{ args: string[]; stdin: string }>(['im', '+messages-send', '--markdown', body])
-      const expectedArgs = ['im', '+messages-send', '--markdown', '-', '--as', 'bot', '--format', 'json']
-      expect(result.args.length === expectedArgs.length && result.args.every((arg, index) => arg === expectedArgs[index]) && result.stdin === body,
-        'Windows batch CLI received unexpected argv or stdin').toBe(true)
+      for (const [flag, input] of [['--markdown', body], ['--content', JSON.stringify({ text: body })]] as const) {
+        const result = await commands.lark<{ args: string[]; stdin: string }>(['im', '+messages-send', flag, input])
+        const expectedArgs = ['im', '+messages-send', flag, '-', '--as', 'bot', '--format', 'json']
+        expect(result.args).toEqual(expectedArgs)
+        expect(result.stdin).toBe(input)
+      }
     } finally {
       rmSync(directory, { recursive: true, force: true })
     }

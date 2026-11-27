@@ -4,6 +4,8 @@ import { z } from 'zod'
 import { UserError, type EngineForSettings } from '../core/index.ts'
 import { EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema, policyEffects, policyVersion } from '../policy.ts'
 import type { Settings as SettingsValue, SettingsBlock, SettingsOrigin, SettingsSave } from '../policy.ts'
+import type { ConfirmableChange } from '../confirmed-settings.ts'
+import type { FeishuConfig } from '../sources/feishu.ts'
 import type { SourceHost } from '../sources/host.ts'
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
@@ -36,7 +38,7 @@ const runLimitFingerprint = ({ executor }: SettingsValue) => JSON.stringify([exe
 interface Block {
   parse(value: unknown, sources: SourceRegistry, id: string): unknown
   merge(settings: SettingsValue, value: unknown, id: string): SettingsValue
-  guard?(current: SettingsValue, candidate: SettingsValue, origin: SettingsOrigin): void
+  guard?(current: SettingsValue, candidate: SettingsValue, origin: SettingsOrigin, sources: SourceRegistry, id: string): void
 }
 const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
   policy: {
@@ -69,9 +71,18 @@ const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
     parse: (value, sources, id) => sources.validate(id, z.object({ enabled: z.boolean(), config: z.unknown() }).parse(value)),
     merge: (settings, value, id) => ({ ...settings, sources: { ...settings.sources, [id]: value as SettingsValue['sources'][string] } }),
     // Only the management panel may switch source accounts.
-    guard: (current, candidate, origin) => {
+    guard: (current, candidate, origin, sources, id) => {
       if (origin === 'panel') return
       if (setupChanged(current, candidate)) throw new UserError('panelOnlyAccounts')
+      if (id === 'feishu') {
+        const scope = (settings: SettingsValue) => {
+          const source = sources.instance<FeishuConfig>(id, settings)
+          if (!source) return null
+          const { directMessages, otherChats, chats } = source.config
+          return [source.enabled, directMessages, otherChats, chats.map(({ chatId, listen }) => [chatId, listen]).sort()]
+        }
+        if (JSON.stringify(scope(current)) !== JSON.stringify(scope(candidate))) throw new UserError('panelOnlyListenScope')
+      }
       if (JSON.stringify(current.sources.github?.config.requiredChecks ?? []) !==
           JSON.stringify(candidate.sources.github?.config.requiredChecks ?? [])) throw new UserError('panelOnlyRequiredChecks')
     },
@@ -175,7 +186,7 @@ export class Settings {
    * @throws UserError | z.ZodError when `block` is unknown, the source is not installed, `value` is invalid (such as an `executor` block carrying `paused`, which only `pause` sets), a non-panel `origin` changes panel-only fields, or a role-model or account check fails.
    */
   async save(block: SettingsBlock, value: unknown, revision: number, origin: SettingsOrigin) {
-    const { store, sources, engine, sessions } = this.host
+    const { store, sources, sessions } = this.host
     const stale = () => revision !== store.blockRevision(block)
     if (stale()) throw new SettingsConflict('Settings changed. Reload before saving.')
     const id = block.startsWith('source:') ? block.slice(7) : block
@@ -186,7 +197,7 @@ export class Settings {
     const parsed = rules.parse(value, sources, id)
     const current = store.settings()
     const candidate = rules.merge(current, parsed, id)
-    rules.guard?.(current, candidate, origin)
+    rules.guard?.(current, candidate, origin, sources, id)
     this.host.validate?.(current, candidate)
     const model = block === 'eval' ? candidate.eval.model : block === 'executor' ? candidate.executor.model : null
     const previous = block === 'eval' ? current.eval.model : block === 'executor' ? current.executor.model : null
@@ -199,30 +210,14 @@ export class Settings {
     // Re-read current settings after async checks in case unrelated blocks were saved concurrently.
     const old = store.settings()
     const settings = rules.merge(old, parsed, id)
-    rules.guard?.(old, settings, origin)
+    rules.guard?.(old, settings, origin, sources, id)
     this.host.validate?.(old, settings)
     if (JSON.stringify(SettingsSchema.parse(settings)) === JSON.stringify(old)) {
       const delivery = await sessions.delivery(`settings:${block}`)
       return { saved: true, revision: store.blockRevision(block), policy_changed: false, restarting: false, context_delivery: delivery }
     }
     const restarting = setupChanged(old, settings) || !this.host.setup.configured()
-    const before = policyVersion(old), after = policyVersion(settings)
-    const scope = (version: SettingsValue) => ({
-      scope: (input: { source: string; meta: Record<string, unknown> }) => this.host.sources.scope(input, version) })
-    const effects = before === after ? new Map() : policyEffects(store.tickets.open(), old, SettingsSchema.parse(settings), scope)
-    const notified = [...effects.keys()]
-    store.atomic(() => {
-      store.saveSettings(SettingsSchema.parse(settings), { source: origin, block, policyVersion: after, policyChanged: before !== after, notified })
-      if (block === 'source:github') {
-        const { requiredChecks } = githubKind.schema.parse(settings.sources.github?.config ?? {})
-        for (const ticket of store.tickets.open()) if (ticket.plan) bindRequiredChecks(store, ticket.id, requiredChecks)
-      }
-      if (origin !== 'tool') sessions.notify(...settingsNotice(block, changedPaths(old, settings)))
-      if (before !== after) engine.policyChanged(before, after, effects)
-      if (block === 'executor' && this.host.runLimitsChanged && runLimitFingerprint(old) !== runLimitFingerprint(settings)) {
-        store.afterCommit(() => this.host.runLimitsChanged?.())
-      }
-    })
+    const policyChanged = this.persist(block, origin, old, settings)
     // Rewrite worker command shims immediately when `blockedCommands` changes.
     const blocked = settings.executor.blockedCommands
     const changed = blocked.join(' ') !== old.executor.blockedCommands.join(' ')
@@ -231,8 +226,55 @@ export class Settings {
     const delivery = restarting ? 'pending' : await sessions.delivery(`settings:${block}`)
     if (restarting) this.host.setup.restart()
     else this.host.requestPass()
-    return { saved: true, revision: store.blockRevision(block), policy_changed: before !== after, restarting, context_delivery: delivery }
+    return { saved: true, revision: store.blockRevision(block), policy_changed: policyChanged, restarting, context_delivery: delivery }
   }
+
+  /** Apply the single reviewed field inside the decision transaction. These fields require no external setup checks. */
+  applyConfirmed(change: ConfirmableChange, origin: 'panel' | 'feishu'): void {
+    const { store, sources } = this.host, old = store.settings()
+    let settings: SettingsValue, block: 'executor' | 'source:feishu'
+    if (change.object === 'feishuChat') {
+      block = 'source:feishu'
+      const source = sources.instance<FeishuConfig>('feishu', old)
+      if (!source?.enabled) throw new UserError('sourceNotInstalled', { source: 'feishu' })
+      const chats = [...source.config.chats], index = chats.findIndex(chat => chat.chatId === change.chatId)
+      if (index === -1) chats.push({ chatId: change.chatId, listen: change.value })
+      else chats[index] = { ...chats[index]!, listen: change.value }
+      const value = sources.validate('feishu', { enabled: true, config: { ...source.config, chats } })
+      settings = { ...old, sources: { ...old.sources, feishu: value } }
+    } else {
+      block = 'executor'
+      const executor = change.object === 'maxWorkers' ? { ...old.executor, maxWorkers: change.value }
+        : { ...old.executor, runLimits: { ...old.executor.runLimits, [change.object]: change.value } }
+      settings = { ...old, executor }
+    }
+    this.host.validate?.(old, settings)
+    this.persist(block, origin, old, settings)
+    store.afterCommit(() => this.host.requestPass())
+  }
+
+  private persist(block: SettingsBlock, origin: SettingsOrigin | 'feishu', old: SettingsValue, candidate: SettingsValue): boolean {
+    const { store, engine, sessions } = this.host
+    const settings = SettingsSchema.parse(candidate)
+    const before = policyVersion(old), after = policyVersion(settings), policyChanged = before !== after
+    const scope = (version: SettingsValue) => ({
+      scope: (input: { source: string; meta: Record<string, unknown> }) => this.host.sources.scope(input, version) })
+    const effects = policyChanged ? policyEffects(store.tickets.open(), old, settings, scope) : new Map()
+    store.atomic(() => {
+      store.saveSettings(settings, { source: origin, block, policyVersion: after, policyChanged, notified: [...effects.keys()] })
+      if (block === 'source:github') {
+        const { requiredChecks } = githubKind.schema.parse(settings.sources.github?.config ?? {})
+        for (const ticket of store.tickets.open()) if (ticket.plan) bindRequiredChecks(store, ticket.id, requiredChecks)
+      }
+      if (origin !== 'tool') sessions.notify(...settingsNotice(block, changedPaths(old, settings)))
+      if (policyChanged) engine.policyChanged(before, after, effects)
+      if (block === 'executor' && this.host.runLimitsChanged && runLimitFingerprint(old) !== runLimitFingerprint(settings)) {
+        store.afterCommit(() => this.host.runLimitsChanged?.())
+      }
+    })
+    return policyChanged
+  }
+
   /**
    * Pauses or resumes processing (new evaluations, worker dispatch, and channel delivery, while Sources continue recording
    * Triggers); saved in its own `'pause'` block so concurrent `executor` edits remain valid across it.

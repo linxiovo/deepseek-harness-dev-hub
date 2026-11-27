@@ -263,10 +263,16 @@ export class TopicBinding {
     })
   }
 
-  private notice(binding: Binding, event: string, text: string): string {
+  /** Queue configuration notices only into the epoch the operator selected for this request. */
+  settingsNotice(epoch: string, event: string, text: string, requestId?: string): void {
+    const binding = this.pollTarget()
+    if (binding?.epoch === epoch) this.notice(binding, event, text, requestId)
+  }
+
+  private notice(binding: Binding, event: string, text: string, settingsRequest?: string): string {
     const { outbox, projectLink, settingsLink, sources } = this.options
     const id = key('topic-binding', binding.epoch, event)
-    const address = { chatId: binding.chatId, bindingEpoch: binding.epoch, ...(binding.direct ? { direct: 'true', delivery: 'direct-chat' }
+    const address = { chatId: binding.chatId, bindingEpoch: binding.epoch, ...(settingsRequest && { settingsRequest }), ...(binding.direct ? { direct: 'true', delivery: 'direct-chat' }
       : { messageId: binding.rootId!, delivery: 'group-topic' }) }
     outbox.send({ id, kind: 'notice', channel: { source: SOURCE, thread: `feishu:${binding.chatId}`, address },
       text: `${sources.confirmationNotice(SOURCE, { summary: text, settingsLink })} · [Project](${projectLink})` })

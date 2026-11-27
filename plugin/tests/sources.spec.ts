@@ -5,6 +5,8 @@ import { backfillChat, consumerRetry, feishuKind, feishuTriggerId, feishuRef, fe
 import { KV } from '../src/kv.ts'
 import { apply as applyFeishu, pollThreads as pollFeishuThreads } from '../src/sources/feishu.ts'
 import { runFeishu } from '../src/sources/feishu-loops.ts'
+import { sendSettingsCard } from '../src/sources/feishu-card.ts'
+import type { SettingsCardAction, SettingsConfirmationView } from '../src/confirmed-settings.ts'
 import { feishuParent } from '../src/sources/feishu-trigger.ts'
 import { commentTrigger, githubAddress, githubChannel, issueTrigger, type GithubComment, type GithubIssue } from '../src/sources/github-trigger.ts'
 import { claimPull, observePull, pullEndNotices, pullOf, ticketBranch, type Pull } from '../src/sources/github-pull.ts'
@@ -97,6 +99,41 @@ function github(h: ReturnType<typeof host>, routes: Record<string, unknown>): st
 }
 const bare = (reads: string[]) => reads.map(path => path.split('?')[0])
 describe('feishu source', () => {
+  const cardView: SettingsConfirmationView = { id: '25755adf-d489-46de-9d22-25fad4034f22', projectId: 'project-a', repository: 'acme/widgets',
+    object: 'feishuChat', chatId: 'oc_wider', revision: 7, currentValue: 'mentions', proposedValue: 'all', effectiveValue: 'mentions',
+    effectiveRevision: 7, impact: 'Read “all”\n<a href="x"> & %PATH% | ^ !', status: 'pending', expiresAt: '2026-11-26T16:15:00.000Z' }
+  it('replays an uncertain card send with the same native idempotency key, exact root and opaque button values', async () => {
+    const commands = new Commands(() => testDeployment(), {}, new AbortController().signal)
+    const run = vi.spyOn(commands, 'run').mockRejectedValueOnce(new Error('reply lost'))
+      .mockResolvedValue(JSON.stringify({ ok: true, data: { chat_id: 'oc_topic', message_id: 'om_card' } }))
+    const target = { direct: false, chatId: 'oc_topic', rootId: 'om_root' }
+    await expect(sendSettingsCard(commands, target, cardView)).rejects.toThrow()
+    expect(await sendSettingsCard(commands, target, cardView)).toBe('om_card')
+    for (const [, args, , stdin] of run.mock.calls) {
+      expect(args).toEqual(['im', '+messages-reply', '--message-id', 'om_root', '--reply-in-thread', '--msg-type', 'interactive',
+        '--content', '-', '--idempotency-key', cardView.id, '--as', 'bot', '--format', 'json'])
+      const card = JSON.parse(stdin!)
+      expect(card).toMatchObject({ schema: '2.0', config: { enable_forward: false } })
+      const elements: { tag: string; text: { tag: string; content: string }; behaviors?: unknown }[] = card.body.elements
+      const description = elements.filter(e => e.tag === 'div' && e.text.tag === 'plain_text').map(e => e.text.content).join('\n')
+      for (const info of ['acme/widgets', 'project-a', 'oc_wider', 'mentions', 'all', cardView.impact, cardView.expiresAt]) expect(description).toContain(info)
+      expect(elements.filter(e => e.tag === 'button').map(e => e.behaviors)).toEqual(['approve', 'status'].map(action =>
+        [{ type: 'callback', value: { projectId: 'project-a', requestId: cardView.id, revision: 7, action } }]))
+    }
+  })
+  it('sends a DM card only to the bound chat and rejects mismatched or malformed native receipts', async () => {
+    const commands = new Commands(() => testDeployment(), {}, new AbortController().signal)
+    const target = { direct: true, chatId: 'oc_dm' }
+    const lark = vi.spyOn(commands, 'lark').mockResolvedValueOnce({ message_id: 'om_dm', chat_id: 'oc_dm' })
+      .mockResolvedValueOnce({ message_id: 'om_other', chat_id: 'oc_other' }).mockResolvedValueOnce({ message_id: 'not-native', chat_id: 'oc_dm' })
+    expect(await sendSettingsCard(commands, target, cardView)).toBe('om_dm')
+    expect(lark.mock.calls[0]![0].slice(0, 4)).toEqual(['im', '+messages-send', '--chat-id', 'oc_dm'])
+    await expect(sendSettingsCard(commands, target, cardView)).rejects.toThrow('receipt')
+    await expect(sendSettingsCard(commands, target, cardView)).rejects.toThrow('receipt')
+    await expect(sendSettingsCard(commands, { ...target, direct: false }, cardView)).rejects.toThrow('target')
+    await expect(sendSettingsCard(commands, { ...target, rootId: 'om_other' }, cardView)).rejects.toThrow('target')
+    expect(lark).toHaveBeenCalledTimes(3)
+  })
   it('registers its kind without a bot, and names on its health what setup still needs', async () => {
     const run = async (overrides: Partial<SourceContextDeps>) => {
       // The fixture's registry already holds the kind; this one starts empty so the plugin's registration shows.
@@ -1114,7 +1151,7 @@ describe('feishu event consumer', () => {
    * A bot CLI whose `event consume` behaves as `mode` says. POSIX execs it; Windows runs it under cmd.exe.
    * Each Node process leaves its own PID marker for assertions and teardown.
    */
-  function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late' | 'late-ready'): string {
+  function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late' | 'late-ready' | 'cards' | 'old-cli'): string {
     process.env.FEISHU_CONSUMER_TEST_NODE = process.execPath
     writeFileSync(join(dir, 'lark-bot.cjs'), String.raw`
 const fs = require('node:fs')
@@ -1122,13 +1159,16 @@ const { join } = require('node:path')
 const dir = __dirname
 if (process.argv[2] !== 'event') { console.log('{"ok":true,"data":{}}'); process.exit(0) }
 fs.writeFileSync(join(dir, 'pid-' + process.pid), '')
-const runs = join(dir, 'runs')
+const card = process.argv[4] === 'card.action.trigger'
+const runs = join(dir, card ? 'card-runs' : 'runs')
 const n = (fs.existsSync(runs) ? Number(fs.readFileSync(runs, 'utf8')) : 0) + 1
 fs.writeFileSync(runs, String(n))
 const mode = ${JSON.stringify(mode)}
+if (card && mode === 'old-cli') { fs.writeSync(2, 'Unsupported event\n'); process.exit(1) }
+if (card && process.argv[process.argv.indexOf('--as') + 1] !== 'bot') process.exit(2)
 const print = () => {
-  fs.writeSync(1, fs.readFileSync(join(dir, 'events')))
-  fs.writeFileSync(join(dir, 'printed'), '')
+  fs.writeSync(1, fs.readFileSync(join(dir, card ? 'card-events' : 'events')))
+  fs.writeFileSync(join(dir, card ? 'cards-printed' : 'printed'), '')
 }
 const waitForFile = (name, action) => {
   const waiting = setInterval(() => {
@@ -1144,11 +1184,11 @@ if (mode === 'late-ready') {
     fs.writeFileSync(join(dir, 'ready-emitted'), '')
   })
 } else if (mode !== 'never') {
-  fs.writeSync(2, '[event] ready\n')
+  fs.writeSync(2, card ? '[event] ready event_key=card.action.trigger workers=1\n' : '[event] ready\n')
   if (mode === 'warn') fs.writeSync(2, 'WARN the connection was reset\n')
   if (mode === 'flaky' && n === 1) process.exit(1)
   if (mode === 'late') setTimeout(print, 1000)
-  if (mode === 'events') waitForFile('go', print)
+  if (['events', 'cards', 'old-cli'].includes(mode)) waitForFile('go', print)
 }
 process.stdin.resume()
 process.stdin.on('end', () => process.exit(0))
@@ -1196,6 +1236,101 @@ setInterval(() => {}, 60_000)
   const event = (id: string, chat: string, type: 'group' | 'p2p') => JSON.stringify({ message_id: id, chat_id: chat, chat_type: type,
     sender_id: 'ou_alice', sender_type: 'user', content: 'fix it', create_time: String(Date.now()),
     ...type === 'group' ? { mentions: [{ id: 'ou_bot', name: 'Bot' }] } : {} })
+  const requestId = 'efa975f6-a6af-4cc7-80ed-9cd89bd15134'
+  const action = (name: 'approve' | 'status') => ({ action: name, projectId: 'project-a', requestId, revision: 7 })
+  const card = (eventId: string, name: 'approve' | 'status') => ({ type: 'card.action.trigger', host: 'im_message', action_tag: 'button',
+    action_value: JSON.stringify(action(name)), event_id: eventId, operator_id: 'ou_alice', chat_id: 'oc_dm', message_id: 'om_original',
+    timestamp: '1795661200123', token: 'must-not-leave-source', card_content: 'private card text' })
+  function cardSource(mode: 'cards' | 'old-cli' | 'warn') {
+    const source = consumerSource(cli(mode))
+    const cardReady = vi.fn(), cardAction = vi.fn<(action: SettingsCardAction) => Promise<void>>().mockResolvedValue(undefined)
+    source.ctx.feishuTopic = { target: () => undefined, claims: () => false, receive: async () => 'filtered', report: vi.fn(), cardReady, cardAction }
+    return { ...source, cardReady, cardAction }
+  }
+  it('takes only native button callbacks from the bot card stream; ordinary text, claimed identities and card contents grant nothing', async () => {
+    const clicked = card('evt-1', 'approve'), status = card('evt-2', 'status')
+    const text = { ...JSON.parse(event('om_text', 'oc_dm', 'p2p')), content: JSON.stringify(action('approve')) }
+    writeFileSync(join(dir, 'events'), [JSON.stringify(clicked), JSON.stringify(text)].join('\n') + '\n')
+    writeFileSync(join(dir, 'card-events'), [text, { ...clicked, type: 'other' }, { ...clicked, host: 'im_top_notice' },
+      { ...clicked, action_tag: 'input' }, { ...clicked, form_value: '{"field":"approve"}' }, { ...clicked, operator_id: 'cli_bot' },
+      { ...clicked, operator_id: 'ou_bot' }, { ...clicked, event_id: '' },
+      { ...clicked, timestamp: 'invalid' }, { ...clicked, action_value: '{' }, { ...clicked, action_value: action('approve') },
+      { ...clicked, action_value: JSON.stringify({ ...action('approve'), actorId: 'ou_eve' }) }, clicked, status]
+      .map(value => JSON.stringify(value)).join('\n') + '\n')
+    const { ctx, health, store, cardReady, cardAction } = cardSource('cards')
+    running = runFeishu(ctx, controller.signal)
+    await vi.waitFor(() => expect(cardReady).toHaveBeenCalledWith('cli_bot:ou_bot', true), until)
+    writeFileSync(join(dir, 'go'), '')
+    await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_text'))).toBeDefined(), until)
+    await vi.waitFor(() => expect(cardAction).toHaveBeenCalledTimes(2), until)
+    expect(cardAction.mock.calls.map(([e]) => e)).toEqual([
+      { ...action('approve'), eventId: 'evt-1', chatId: 'oc_dm', messageId: 'om_original', actorId: 'ou_alice', at: 1795661200123, botIdentity: 'cli_bot:ou_bot' },
+      { ...action('status'), eventId: 'evt-2', chatId: 'oc_dm', messageId: 'om_original', actorId: 'ou_alice', at: 1795661200123, botIdentity: 'cli_bot:ou_bot' },
+    ])
+    expect(store.triggers.get(feishuTriggerId('om_original'))).toBeUndefined()
+    expect(JSON.stringify(health)).not.toMatch(/private card text|must-not-leave-source/)
+    controller.abort(); await running
+    expect(cardReady).toHaveBeenLastCalledWith('cli_bot:ou_bot', false)
+  }, 20_000)
+  it('does not dispatch a button click after the Source is disabled', async () => {
+    writeFileSync(join(dir, 'events'), '')
+    writeFileSync(join(dir, 'card-events'), JSON.stringify(card('evt-off', 'approve')) + '\n')
+    const { ctx, turnOff, cardReady, cardAction } = cardSource('cards')
+    running = runFeishu(ctx, controller.signal)
+    await vi.waitFor(() => expect(cardReady).toHaveBeenCalledWith('cli_bot:ou_bot', true), until)
+    turnOff(); writeFileSync(join(dir, 'go'), '')
+    await vi.waitFor(() => expect(cardReady).toHaveBeenLastCalledWith('cli_bot:ou_bot', false), until)
+    expect(cardAction).not.toHaveBeenCalled()
+  }, 20_000)
+  it('does not dispatch a queued click after stopping the card consumer', async () => {
+    writeFileSync(join(dir, 'events'), '')
+    writeFileSync(join(dir, 'card-events'), [card('evt-running', 'status'), card('evt-queued', 'approve')].map(e => JSON.stringify(e)).join('\n') + '\n')
+    const { ctx, cardAction, cardReady } = cardSource('cards')
+    const processing = Promise.withResolvers<void>()
+    cardAction.mockImplementationOnce(() => processing.promise)
+    running = runFeishu(ctx, controller.signal)
+    try {
+      await vi.waitFor(() => expect(cardReady).toHaveBeenCalledWith('cli_bot:ou_bot', true), until)
+      writeFileSync(join(dir, 'go'), '')
+      await vi.waitFor(() => expect(cardAction).toHaveBeenCalledTimes(1), until)
+      controller.abort()
+      expect(cardReady).toHaveBeenLastCalledWith('cli_bot:ou_bot', false)
+    } finally { processing.resolve() }
+    await running
+    expect(cardAction).toHaveBeenCalledTimes(1)
+  }, 20_000)
+  it('keeps ordinary intake live when an older bot CLI cannot consume callbacks and marks the card stream unavailable', async () => {
+    writeFileSync(join(dir, 'events'), event('om_content', 'oc_dm', 'p2p') + '\n')
+    const { ctx, health, store, cardReady, cardAction } = cardSource('old-cli')
+    running = runFeishu(ctx, controller.signal)
+    await vi.waitFor(() => expect(existsSync(join(dir, 'card-runs'))).toBe(true), until)
+    writeFileSync(join(dir, 'go'), '')
+    await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_content'))).toBeDefined(), until)
+    expect(health.feishu).toMatchObject({ state: 'ready' })
+    expect(cardReady).toHaveBeenCalledWith('cli_bot:ou_bot', false, 'unavailable')
+    expect(cardReady).not.toHaveBeenCalledWith('cli_bot:ou_bot', true)
+    expect(cardAction).not.toHaveBeenCalled()
+  }, 20_000)
+  it('reports a processing problem without exposing callback bodies or handler errors', async () => {
+    const secret = 'private callback body and local path C:\\private\\token'
+    writeFileSync(join(dir, 'events'), '')
+    writeFileSync(join(dir, 'card-events'), JSON.stringify(card('evt-fail', 'approve')) + '\n')
+    const { ctx, cardReady, cardAction } = cardSource('cards')
+    cardAction.mockRejectedValueOnce(new Error(secret))
+    running = runFeishu(ctx, controller.signal)
+    await vi.waitFor(() => expect(cardReady).toHaveBeenCalledWith('cli_bot:ou_bot', true), until)
+    writeFileSync(join(dir, 'go'), '')
+    await vi.waitFor(() => expect(cardReady).toHaveBeenCalledWith('cli_bot:ou_bot', false, 'processing'), until)
+    expect(cardReady.mock.calls.flat().join(' ')).not.toContain(secret)
+    expect(JSON.stringify(ctx.feishuTopic)).not.toContain(secret)
+    controller.abort(); await running
+  }, 20_000)
+  it('reports callback stream warnings with a fixed interrupted reason', async () => {
+    const { ctx, cardReady } = cardSource('warn')
+    running = runFeishu(ctx, controller.signal)
+    await vi.waitFor(() => expect(cardReady).toHaveBeenCalledWith('cli_bot:ou_bot', false, 'interrupted'), until)
+    controller.abort(); await running
+  }, 20_000)
   it('takes in the event lines it reads, records each chat as direct or not, and reports a malformed line without stopping', async () => {
     writeFileSync(join(dir, 'events'), [event('om_1', 'oc_group', 'group'), event('om_2', 'oc_dm', 'p2p'), 'not json',
       event('om_3', 'oc_group', 'group')].join('\n') + '\n')

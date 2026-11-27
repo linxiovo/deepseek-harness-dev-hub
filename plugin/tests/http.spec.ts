@@ -14,7 +14,7 @@ import type { HttpHost } from '../src/app/http.ts'
 import { InstallationError, type InstallationApi, type RuntimeView } from '../src/app/installation-api.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { SetupError } from '../src/setup.ts'
-import type { Ticket } from '../src/core/index.ts'
+import { UserError, type Ticket } from '../src/core/index.ts'
 
 type Handler = (req: unknown, res: unknown) => Promise<void>
 type Headers = Record<string, string | undefined>
@@ -39,7 +39,8 @@ function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.
     const response = new TestResponse((code, fields) => { status = code; responseHeaders = fields })
     response.on('data', chunk => output.push(Buffer.from(chunk)))
     const chunks = body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]
-    const sent = Object.fromEntries(Object.entries({ host: '127.0.0.1:3082', 'x-orchestrator-request': '1', ...headers }).filter(([,
+    const sent = Object.fromEntries(Object.entries({ host: '127.0.0.1:3082', 'x-orchestrator-request': '1',
+      ...(body !== undefined && { 'content-type': 'application/json' }), ...headers }).filter(([,
       value]) => value !== undefined))
     const req = { method, url: `/orchestrator/api/${path}`, headers: sent, async *[Symbol.asyncIterator]() {
       if (beforeBody) await beforeBody()
@@ -54,6 +55,133 @@ function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.
     return { status, body: result, ...(responseHeaders['content-disposition'] ? { headers: responseHeaders } : {}) }
   }
 }
+
+const confirmation = (id: string, status: 'pending' | 'approved' = 'pending') => ({
+  id, projectId: alpha.id, repository: alpha.repository, object: 'projectTokens' as const, revision: 4, currentValue: 100, proposedValue: 200,
+  effectiveValue: status === 'approved' ? 200 : 100, effectiveRevision: status === 'approved' ? 5 : 4,
+  impact: 'Raises the project token cap.', status, expiresAt: '2026-11-26T12:15:00.000Z',
+})
+
+it('proposes, reads, and approves settings confirmations only through the scoped management API', async () => {
+  const calls: unknown[][] = []
+  let decided = false
+  const service: NonNullable<HttpHost['settingsConfirmations']> = {
+    propose: input => { calls.push(['propose', input]); return confirmation('request-1') },
+    read: id => {
+      if (id !== 'request-1') throw new UserError('settingsConfirmationUnknown')
+      return confirmation(id, decided ? 'approved' : 'pending')
+    },
+    approve: (id, revision) => {
+      if (revision !== 4 || decided) throw new UserError('settingsConfirmationStale')
+      calls.push(['approve', id, revision])
+      decided = true
+      return confirmation(id, 'approved')
+    },
+  }
+  const call = serve({ installation: bindingInstallation(), settingsConfirmations: service })
+  const headers = projectHeader(alpha.id)
+  const proposal = { revision: 4, change: { object: 'projectTokens', value: 200 }, approvers: ['ou_alice'] }
+  const record = 'settings-confirmations/request-1', approve = `${record}/approve`
+  expect(await call('POST', 'settings-confirmations', proposal, { ...headers, origin: 'https://untrusted.example' }))
+    .toMatchObject({ status: 403 })
+  expect(await call('POST', 'settings-confirmations', proposal, headers)).toEqual({ status: 200, body: confirmation('request-1') })
+  expect(await call('GET', record, undefined, headers)).toEqual({ status: 200, body: confirmation('request-1') })
+  expect(await call('GET', 'settings-confirmations/missing', undefined, headers)).toMatchObject({ status: 404, body: { code: 'settingsConfirmationUnknown' } })
+  expect(await call('POST', approve, { revision: 3 }, headers)).toMatchObject({ status: 409, body: { code: 'settingsConfirmationStale' } })
+  expect(await call('POST', approve, { revision: 4 }, headers)).toEqual({ status: 200, body: confirmation('request-1', 'approved') })
+  expect(await call('POST', approve, { revision: 4 }, headers)).toMatchObject({ status: 409 })
+  expect(await call('GET', record, undefined, headers)).toEqual({ status: 200, body: confirmation('request-1', 'approved') })
+  for (const invalid of [
+    { ...proposal, actorId: 'ou_admin' },
+    { ...proposal, change: { ...proposal.change, actorId: 'ou_admin' } },
+    { ...proposal, change: { object: 'projectTokens', value: 200, secret: 'credential' } },
+    { ...proposal, change: { object: 'feishuChat', chatId: 'oc_team', value: 'none' } },
+    { ...proposal, change: { object: 'maxWorkers', value: null } },
+  ]) {
+    expect(await call('POST', 'settings-confirmations', invalid, headers))
+      .toEqual({ status: 400, body: { error: 'Invalid settings confirmation request' } })
+  }
+  for (const body of [{ revision: 4, value: 200 }, { revision: 4, actorId: 'ou_admin' }, { revision: '4' }]) {
+    expect(await call('POST', approve, body, headers)).toEqual({ status: 400, body: { error: 'Invalid settings confirmation request' } })
+  }
+  expect(await call('POST', approve, { revision: 4 }, { ...headers, 'content-type': 'text/plain' }))
+    .toEqual({ status: 400, body: { error: 'Expected Content-Type: application/json' } })
+  expect(await call('POST', approve, '{"revision":4,"secret":"not a valid JSON body"', headers))
+    .toEqual({ status: 400, body: { error: 'The request body is not JSON' } })
+  expect(await call('POST', `${approve}?actorId=ou_admin`, { revision: 4 }, headers)).toMatchObject({ status: 400 })
+  expect(calls).toEqual([['propose', proposal], ['approve', 'request-1', 4]])
+})
+
+it('requires the current managed project before confirmation reads and writes', async () => {
+  let proposed = false
+  const service = { propose: () => { proposed = true; return confirmation('request-1') }, read: () => confirmation('request-1'),
+    approve: () => confirmation('request-1', 'approved') }
+  const call = serve({ installation: bindingInstallation(), settingsConfirmations: service })
+  expect(await call('POST', 'settings-confirmations', { revision: 4, change: { object: 'projectTokens', value: 200 } }))
+    .toMatchObject({ status: 409, body: { code: 'projectScopeRequired' } })
+  expect(await call('GET', 'settings-confirmations/request-1', undefined, projectHeader(beta.id)))
+    .toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  expect(await call('GET', 'settings-confirmations/request-1')).toMatchObject({ status: 409, body: { code: 'projectScopeRequired' } })
+  expect(await call('POST', 'settings-confirmations/request-1/approve', { revision: 4 }, projectHeader(beta.id)))
+    .toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  const legacy = serve({ installation: { runtime: legacyReady }, settingsConfirmations: service })
+  expect(await legacy('GET', 'settings-confirmations/request-1')).toMatchObject({ status: 409, body: { code: 'noProject' } })
+  expect(proposed).toBe(false)
+  expect(await call('GET', 'settings-confirmations/request-1', undefined, projectHeader(alpha.id)))
+    .toEqual({ status: 200, body: confirmation('request-1') })
+  const unavailable = serve({ installation: bindingInstallation() })
+  expect(await unavailable('GET', 'settings-confirmations/request-1', undefined, projectHeader(alpha.id)))
+    .toMatchObject({ status: 404 })
+  const headers = projectHeader(alpha.id)
+  expect(await unavailable('POST', 'settings-confirmations', { revision: 4, change: { object: 'projectTokens', value: 200 } }, headers))
+    .toMatchObject({ status: 404 })
+  expect(await unavailable('POST', 'settings-confirmations/request-1/approve', { revision: 4 }, headers)).toMatchObject({ status: 404 })
+})
+
+it('rejects a confirmation proposal if the mounted project changes while its body is read', async () => {
+  let activeProjectId = alpha.id, proposed = false
+  const call = serve({
+    installation: bindingInstallation(() => activeProjectId),
+    settingsConfirmations: { propose: () => { proposed = true; return confirmation('request-1') },
+      read: () => confirmation('request-1'), approve: () => confirmation('request-1', 'approved') },
+  })
+  const result = await call('POST', 'settings-confirmations', { revision: 4, change: { object: 'projectTokens', value: 200 } },
+    projectHeader(alpha.id), async () => { activeProjectId = beta.id })
+  expect(result).toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  expect(proposed).toBe(false)
+})
+
+it('uses the shared project write gate for settings approval and hides unexpected service diagnostics', async () => {
+  const selected = Promise.withResolvers<void>(), finishSelect = Promise.withResolvers<void>()
+  const paused = Promise.withResolvers<void>(), finishPause = Promise.withResolvers<void>()
+  let approvals = 0
+  const call = serve({
+    installation: { ...bindingInstallation(), selectProject: async () => {
+      selected.resolve(); await finishSelect.promise; return { project: beta, restarting: true }
+    } },
+    settings: { pause: async () => { paused.resolve(); await finishPause.promise; return { paused: true } } },
+    settingsConfirmations: {
+      read: () => { throw new Error('Private credential') },
+      approve: () => { approvals++; return confirmation('request-1', 'approved') },
+    },
+  })
+  const headers = projectHeader(alpha.id), record = 'settings-confirmations/request-1'
+  expect(await call('GET', record, undefined, headers)).toEqual({ status: 500, body: { error: 'Settings confirmation operation failed.' } })
+  const pausing = call('POST', 'executor/pause', { paused: true }, headers)
+  await paused.promise
+  try {
+    expect(await call('POST', `${record}/approve`, { revision: 4 }, headers)).toMatchObject({ status: 409, body: { code: 'projectConflict' } })
+    expect(approvals).toBe(0)
+  } finally { finishPause.resolve() }
+  expect(await pausing).toMatchObject({ status: 200 })
+  const selecting = call('POST', 'projects/beta/select')
+  await selected.promise
+  try {
+    expect(await call('POST', `${record}/approve`, { revision: 4 }, headers)).toMatchObject({ status: 409, body: { code: 'switching' } })
+    expect(approvals).toBe(0)
+  } finally { finishSelect.resolve() }
+  await selecting
+})
 
 it('answers each kind of failure with its own status', async () => {
   const saves: unknown[] = []

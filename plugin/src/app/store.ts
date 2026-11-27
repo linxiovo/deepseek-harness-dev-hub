@@ -20,7 +20,7 @@ export interface Receipt extends OutboundMessage { status: ReplyStatus; dropped?
 export type Dropped = Receipt & { dropped: { at: string; reason: DropReason } }
 /** Saved settings snapshot with the policy version and ticket notifications it produced (`internal` saves have no origin). */
 export interface SettingsVersion {
-  revision: number; savedAt: string; source: SettingsOrigin | 'internal'; block?: SettingsSave
+  revision: number; savedAt: string; source: SettingsOrigin | 'feishu' | 'internal'; block?: SettingsSave
   policyVersion: string; policyChanged: boolean; notified: string[]; settings: Settings
 }
 /**

@@ -259,7 +259,7 @@ Its `context`, `read` and `decide` methods serve `orchestrator_eval`, `orchestra
 
 `Settings` (`src/app/settings.ts`) reads and writes revisioned settings blocks. `current` and `view` read them; `save(block, value, revision, origin)` validates a save; `pause(paused, origin)` changes the separate `paused` setting.
 
-Settings saves name their origin (`panel`, `tool`, `sync`). Only `panel` may change accept mode, Source authorization (apart from configured synchronization), required CI, execution environment, authorized run limits, or fields listed in `SETUP_FIELDS`. Admission rule text and enablement change only through [rule publication](004-prompts.md#versions).
+General settings saves name their origin (`panel`, `tool`, `sync`). Only the operator may change accept mode, Source authorization (apart from configured synchronization), required CI, execution environment, authorized run limits, Feishu listening scope, or fields listed in `SETUP_FIELDS`. A scoped settings confirmation (`019-confirmed-settings.md`) changes only its reviewed field, with history origin `panel` or `feishu`. Admission rule text and enablement change only through [rule publication](004-prompts.md#versions).
 
 A Policy-version change calculates `policyEffects`, records which Tickets were notified, and calls `Engine.policyChanged`. `syncable` and `sync(id)` refresh a Source's Policy part. `refreshLabels(id)` refreshes display names.
 
@@ -348,6 +348,7 @@ Validation: `tests/session-meter.spec.ts` covers the read seam (absent vs corrup
   | Project Session attribution and business parentage | `ProjectMeter`, through `bind` at a trusted delegation seam |
   | A Source's read positions, and the meta it keeps on its Threads (`label`, `url`, `facts` and its own keys) | That Source, through `SourceContext` |
   | Settings and their history | Settings |
+  | Configuration proposals, scoped card grants, delivery intent and decision | `SettingsConfirmations`, which calls `Settings` in the decision transaction |
   | Prompt versions | Prompts |
   | Effect rows | Effects |
   | Outbox receipts | The Outbox: the Hub's replies, the acceptance acknowledgement, pull-request end notices and Sources' `notify` go through its `send`, and its `reply` effects mark them |
@@ -379,6 +380,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/deployment.ts` | The plugin `Config` and `Machine`; `resolveDeployment` and `resolveFeishuBot` read the repository and the accounts from the Source settings, each CLI run as Executor shells run it; `SETUP_FIELDS` lists the Source fields setup reads. The code names no person, account or organization |
 | `src/setup.ts` | Setup problems: `SetupError`, with a code, the place that fixes it and the English text the log, the main Session and the panel share |
 | `src/policy.ts` | The Policy: the settings schemas by block, the Policy version, the gate and Mandate revalidation, and `worktreePreparationConfig`, whether the Execution settings name a repository and base ref able to prepare a real worktree |
+| `src/confirmed-settings.ts` | Strict proposal and approval inputs, secret-free confirmation projection and native card-action identity |
 | `src/admission.ts` | The admission table's values, each cell's options and defaults, shared with the panel |
 | `src/limits.ts` | The limits of the values a person sets, which the settings schemas check and the panel's fields offer |
 | `src/kv.ts` | `KV`: every family of `kv` records with its key, its value's type and its owner, and the `Key` and `Family` types the Store and `SourceContext.state` take |
@@ -417,8 +419,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/effects.ts` | Effects |
 | `src/app/handoffs.ts` | `Handoffs`: the durable project and handoff records, their single question, answer and immutable specification |
 | `src/app/topic-binding.ts` | Binds one observed Feishu destination to the selected project and accepts correlated answers from explicitly authorized senders; see `009-handoff.md` |
+| `src/app/settings-confirmations.ts` | Proposal versions, per-request Feishu grants, original-card delivery receipts and atomic settings decisions |
 | `src/app/maintenance.ts` | `Maintenance`: Stage 2 event intake, rule-based registration, recovery relays and durable feedback associations; see `009-handoff.md#stage-2-maintenance` |
-| `src/app/idle-inspection.ts` | Due-time scheduling, authorization, inspected-page evidence and independent finding associations. Contract: `019-idle-inspection.md`. |
+| `src/app/idle-inspection.ts` | Due-time scheduling, authorization, inspected-page evidence and independent finding associations. Contract: `020-idle-inspection.md`. |
 | `src/app/planning.ts` | `Planning`: durable `planning` and `splitting` effects for the specification planner and the Plan DAG splitter |
 | `src/app/plans.ts` | `Plans`: validates and publishes immutable Plan revisions, retains old node definitions and claims, and gates Frontier and delivery |
 | `src/app/plan-dispatch.ts` | `PlanDispatcher`: validates Frontier predecessors, reserves a launch slot, atomically claims a node into a stable Ticket/Assignment, and rearms the same claim on restart |
@@ -445,7 +448,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/hub-resume.ts` | `hubResumeText`: bounded continuation from mounted durable tickets, unresolved Source events, authorized Handoffs, Plans, and effect metadata with readable resource pointers |
 | `src/app/session-meter.ts` | `SessionMeter`: one Session's context snapshot and cumulative usage from its durable event log, with provenance, missing and in-flight ranges, and the persisted exclusive cursor; forked prefixes are excluded |
 | `src/app/project-meter.ts` | `ProjectMeter`: project-local Session bindings and deduplicated scoped usage; contract in `plugin/docs/014-project-metering.md` |
-| `src/app/run-limits.ts` | Atomic project, Ticket and inspection-scope reservations, authoritative settlements and scoped hold notifications; see `016-run-limits.md` and `019-idle-inspection.md`. |
+| `src/app/run-limits.ts` | Atomic project, Ticket and inspection-scope reservations, authoritative settlements and scoped hold notifications; see `016-run-limits.md` and `020-idle-inspection.md`. |
 | `src/app/model-admission.ts` | Pre-provider DSH stream admission and once-per-attempt usage receipt |
 | `src/app/meter-recovery.ts` | Restores detached review attribution from durable review receipts and verified Session parent metadata |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id across restored and rotated Hub Sessions |
@@ -501,6 +504,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers: live `reply_to` and history/topic `parent_id` identify the direct parent, not the topic root (`root_id`) |
 | `src/sources/feishu-loops.ts` | The Feishu event consumer, including Windows batch-wrapper launch and process-tree cancellation, history recovery, chat names and polling of subscribed topics. Event-processing errors stay visible for that consumer run even if readiness arrives later |
 | `src/sources/feishu-channel.ts` | The Feishu Channel: private-chat sends and topic replies, `sent` or `gone`. The CLI transport sends Markdown via UTF-8 stdin (`--markdown -`), not as a shell argument. |
+| `src/sources/feishu-card.ts` | Renders the operator's reviewed change, sends an interactive card to the bound destination, and accepts only native button events |
 | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
@@ -548,6 +552,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, cross-platform Feishu event consumer launch and cancellation, health |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
+| `tests/feishu-card-recovery.spec.ts` | Feishu card history reconciliation, including original app and topic attribution and incomplete or ambiguous reads |
 | `tests/actions-evidence.spec.ts` | Simulated GitHub REST responses: candidate-SHA runs, PR provenance matching (`number`, `head.sha`, `base.sha`) and `mergeSha` context, workflow and job `success` gates, queued/waiting runs without jobs vs `not_run`, run and job URLs, artifact references, stale SHAs, newer attempts, an empty required set and paginated lists |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
@@ -583,7 +588,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/session-meter.spec.ts` | Context capacity and occupancy, deduplicated usage, missing ranges, fork exclusion, and replay or concurrent reads |
 | `tests/tools.spec.ts` | Role-scoped `orchestrator_read`, review and Actions evidence bound to a work item and checkout, main tools including mounted Hub maintenance, and internal Worker take-up without an outbound message |
 | `tests/handoff.spec.ts` | A confirmed handoff through the public Hub and planner tools: persistence across a restart, one planner task, the single question and resume, publication, and the refusals |
-| `tests/topic-binding.spec.ts` | Uses a mounted project and normalized Feishu events to verify topic isolation, answer provenance and idempotent outbound delivery |
+| `tests/topic-binding.spec.ts` | Mounted-project Feishu topic isolation, answer provenance, card and API confirmation races, fallback/expiry, effective listening and model admission after a quota approval |
 | `tests/plans.spec.ts` | Automatic spec continuation, graph and role queries, invalid graph refusal, root/node message isolation, usage, credential and quota pauses, concurrent model admission and claim replay through public Session tools, DSH streams and HTTP |
 | `tests/credential-smoke.spec.ts` | Credential smoke CLI against loopback HTTP: request scope, explicit verification and safe results; not a live account check |
 | `tests/runtime-concurrency.spec.ts` | Overlapping Triggers, deliveries and launches; Worker inbox recovery after restart, checked after the runtime drains launch and delivery effects against real Git worktrees |

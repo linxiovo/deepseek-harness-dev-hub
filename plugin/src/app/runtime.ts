@@ -34,6 +34,7 @@ import { TextCache } from './cache.ts'
 import { Effects, Later, Park } from './effects.ts'
 import { Handoffs } from './handoffs.ts'
 import { TopicBinding } from './topic-binding.ts'
+import { SettingsConfirmations } from './settings-confirmations.ts'
 import { Installation, projectDatabase, projectHubId } from './installation.ts'
 import { InstallationError } from './installation-api.ts'
 import { Planning } from './planning.ts'
@@ -98,6 +99,7 @@ export class Runtime extends Service implements SourceHost {
   readonly effects: Effects
   readonly handoffs: Handoffs
   readonly topicBinding?: TopicBinding
+  readonly settingsConfirmations?: SettingsConfirmations
   readonly plans: Plans
   private readonly planIntegration: PlanIntegration
   private readonly maintenance?: Maintenance
@@ -123,6 +125,7 @@ export class Runtime extends Service implements SourceHost {
   private readonly board = new HealthBoard()
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
   masterId: string
+  private feishuCardIdentity: string | undefined
   readonly hubId: string
   private readonly hubAuthority: HubAuthority
   private readonly sourceLinks = new TextCache(200_000)
@@ -372,11 +375,13 @@ export class Runtime extends Service implements SourceHost {
             // Answering in Harness can withdraw the question while the checkout is being verified.
             if (store.receipts.get(message.id)?.status !== 'pending') return 'waiting'
             if (!this.topicBinding.allows(message.channel) || revision !== store.get(KV.settings.revision)) return 'waiting'
+            if (message.channel.address.settingsRequest) return this.settingsConfirmations!.deliver(message, deliveryCommands)
           }
           return sources.send(message, deliveryCommands)
         },
       } })
       const topicHealth = project ? board.claim('feishuBinding') : undefined
+      const cardHealth = project ? board.claim('feishuCards') : undefined
       if (project) {
         const link = (view: 'project' | 'settings') => projectNavigationLink(`http://127.0.0.1:${ctx.webServer.port}`, project.id, view)
         this.topicBinding = new TopicBinding({ store, handoffs, outbox, sources, projectId: project.id,
@@ -390,6 +395,8 @@ export class Runtime extends Service implements SourceHost {
               topicHealth?.set({ state: 'ready', detail: 'No Feishu topic is bound', at: now() })
           },
         })
+        this.settingsConfirmations = new SettingsConfirmations({ store, settings: this.settings, sources, topic: this.topicBinding,
+          projectId: project.id, repository: project.repository, cardIdentity: () => this.feishuCardIdentity })
       }
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
@@ -601,6 +608,21 @@ export class Runtime extends Service implements SourceHost {
         get deployment() { return setup.deployment }, configured: () => this.configured(), closing: sourceInactive,
         get setupProblem() { return runtime.setupProblem }, get feishuProblem() { return setup.feishuProblem },
         ...(topicHealth ? { feishuTopic: { target: () => this.feishuTopic(),
+          cardReady: (identity, ready, problem) => {
+            const bot = setup.configured() ? setup.deployment.feishu : undefined
+            if (this.closing() || !bot || identity !== `${bot.appId}:${bot.botId}`) return
+            this.feishuCardIdentity = ready ? identity : undefined
+            if (problem) cardHealth?.set(health('error', problem === 'unavailable' ? 'feishuCardsUnavailable'
+              : problem === 'interrupted' ? 'feishuCardsInterrupted' : 'feishuCardsProcessing'))
+            else if (ready) cardHealth?.set({ state: 'ready', detail: 'Listening for Feishu card actions', at: now() })
+            else if (cardHealth?.get()?.state !== 'error') cardHealth?.set({ state: 'paused', detail: 'Not listening for Feishu card actions' })
+          },
+          cardAction: async event => {
+            if (!this.topicBindingAvailable() || this.feishuCardIdentity !== event.botIdentity) return
+            const revision = store.get(KV.settings.revision)
+            await installation.validateWorkspace()
+            if (this.topicBindingAvailable() && store.get(KV.settings.revision) === revision) this.settingsConfirmations?.cardAction(event)
+          },
           claims: trigger => this.topicBinding?.claims(trigger) === true,
           maintenanceSince: topic => this.maintenance?.feishuSince(topic.epoch, topic.sourceRevision),
           resolvedMaintenance: (topic, messageId) => {
@@ -873,7 +895,7 @@ export class Runtime extends Service implements SourceHost {
           ? await openPlanArtifact(machine.stateDir, id, view) : undefined
       },
       meter: { read: (id, signal) => this.readScopedMeter(id, signal) },
-      topicBinding: this.topicBinding, verifyTopicBinding: () => this.verifyTopicBinding(),
+      topicBinding: this.topicBinding, settingsConfirmations: this.settingsConfirmations, verifyTopicBinding: () => this.verifyTopicBinding(),
       get ready() { return runtime.ready }, assertNewWork: () => installation.assertNewWork(), rotateHub: () => runtime.rotateHub(),
       hubConversation: id => runtime.hubConversation(id),
       ownsSession: id => this.ownsSession(id),

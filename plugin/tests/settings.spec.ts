@@ -43,6 +43,21 @@ it('refuses a save of a block that another save changed during its model or acco
   expect(store.settings().sources.github!.config).toMatchObject({ cli: value.config.cli, pollSeconds: 90 })
 })
 
+it('refuses a Hub listening expansion stored while Feishu is disabled', async () => {
+  h = await startRuntime()
+  const block = 'source:feishu'
+  const source = h.runtime.sources.instance(block.slice(7))!
+  const disabled = await h.api('PUT', `settings/${block}`, { revision: 0, value: { enabled: false, config: source.config } })
+  expect(disabled.status).toBe(200)
+  const revision = disabled.body.revision
+  await expect(h.runTool(h.runtime.masterId, 'orchestrator_settings_save', { block: 'source', source: 'feishu', revision,
+    value: { enabled: false, config: { ...source.config, otherChats: 'mentions' } } })).rejects.toThrow(/operator authorization/i)
+  const enabled = await h.api('PUT', `settings/${block}`, { revision, value: { enabled: true, config: source.config } })
+  expect(enabled.status).toBe(200)
+  const scope = h.runtime.sources.scope({ source: 'feishu', meta: { chatId: 'oc_unreviewed', direct: false } })
+  expect(scope).toEqual({ listened: false, reason: 'chat_not_allowed' })
+})
+
 it('keeps legacy executor settings readable while validating and guarding explicit local repository and base ref', async () => {
   const legacy = ExecutorConfigSchema.parse({ prepare: 'git worktree add "$DSH_SUPERAGENT_DIR"' })
   expect(legacy).not.toHaveProperty('repository')

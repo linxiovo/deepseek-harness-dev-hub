@@ -2,6 +2,7 @@
 import type { ReceiveResult, OutboundMessage, Thread, ThreadFact, ThreadRef, Ticket, Trigger } from '../core/index.ts'
 import type { Commands } from '../infra/commands.ts'
 import type { Deployment } from '../deployment.ts'
+import type { SettingsCardAction } from '../confirmed-settings.ts'
 import type { SourceRegistry } from './registry.ts'
 import type { SetupProblem } from '../setup.ts'
 import type { Family, Key } from '../kv.ts'
@@ -14,12 +15,17 @@ export const HEALTH_TEXT = {
   feishuCliUnset: 'The Source is on, and its bot lark-cli is not set',
   feishuBotMissing: 'Waiting for the Feishu bot',
   pollFailures: '{count} consecutive failed polls; last: {error}',
+  feishuCardsUnavailable: 'Feishu card approvals are unavailable. Use the project settings confirmation API.',
+  feishuCardsInterrupted: 'The Feishu card connection was interrupted. Check settings before retrying approval.',
+  feishuCardsProcessing: 'A Feishu card action could not be processed. Check the current settings confirmation.',
 } as const
 export type HealthCode = keyof typeof HEALTH_TEXT
 export type Health = { state: 'starting' | 'ready' | 'paused' | 'error'; detail: string; at?: string; code?: HealthCode; values?: Record<string, string> }
 export function health(state: Health['state'], code: HealthCode, values: Record<string, string> = {}): Health {
   return { state, detail: fill(HEALTH_TEXT[code], values), code, ...Object.keys(values).length ? { values } : {} }
 }
+
+export type FeishuCardProblem = 'unavailable' | 'interrupted' | 'processing'
 export interface SourceHost {
   readonly sources: SourceRegistry
   /** Returns the context for one Source kind; its `report` writes only the health entries declared by the kind. */
@@ -52,6 +58,8 @@ export interface SourceContext {
   /** Exact-epoch ingress for handoff protocol and authorized maintenance, never ordinary Ticket follow-up. */
   feishuTopic?: {
     target(): FeishuTopic | undefined
+    cardReady?(botIdentity: string, ready: boolean, problem?: FeishuCardProblem): void
+    cardAction?(event: SettingsCardAction): Promise<void>
     /** Unresolved native messages pin the history read to their earliest arrival, independent of its ordinary cursor. */
     maintenanceSince?(topic: FeishuTopic): string | undefined
     resolvedMaintenance?(topic: FeishuTopic, messageId: string): void

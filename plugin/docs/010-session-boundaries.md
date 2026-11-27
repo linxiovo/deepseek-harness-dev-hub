@@ -39,7 +39,7 @@ After the first complete project delivery, the resume summary includes `maintena
 
 ## Inspection Session
 
-The inspection preset has no repository, shell, web, delegation or communication tools. Its only project interfaces are scoped Git reads and reporting findings; see `019-idle-inspection.md`. Its business parent is a Hub generation, not a Ticket writer.
+The inspection preset has no repository, shell, web, delegation or communication tools. Its only project interfaces are scoped Git reads and reporting findings; see `020-idle-inspection.md`. Its business parent is a Hub generation, not a Ticket writer.
 
 ## Worker Session
 

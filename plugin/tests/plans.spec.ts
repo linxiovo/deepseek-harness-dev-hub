@@ -532,9 +532,13 @@ describe('managed project plan pause', () => {
     expect(await dispatchPlan(id, 'dashboard')).toMatchObject({ status: 'blocked', waitingOn: ['catalog', 'accounts'] })
 
     const current = await readExecutorSettings()
-    expect(await h.api('PUT', 'settings/executor', { revision: current.revision, value: { ...current.value,
-      runLimits: { ticketTokens: 80 },
-    } }, project.id)).toMatchObject({ status: 200 })
+    const proposal = await h.api('POST', 'settings-confirmations', { revision: current.revision,
+      change: { object: 'ticketTokens', value: 80 } }, project.id)
+    expect(proposal).toMatchObject({ status: 200, body: { status: 'pending', currentValue: 40, effectiveValue: 40 } })
+    expect(await dispatchPlan(id, 'catalog')).toMatchObject({ status: 'quota-paused', reused: true, claim: identity })
+    expect(await h.api('POST', `settings-confirmations/${proposal.body.id}/approve`, { revision: current.revision }, project.id))
+      .toMatchObject({ status: 200, body: { status: 'approved', effectiveValue: 80 } })
+    expect(await read(`handoff/${id}`)).toMatchObject({ authorization: { release: 'not-authorized' } })
     await h.runtime.idle()
 
     expect(await dispatchPlan(id, 'catalog')).toMatchObject({ status: 'running', reused: true, claim: identity })

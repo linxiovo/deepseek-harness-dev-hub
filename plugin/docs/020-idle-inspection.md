@@ -1,4 +1,4 @@
-# 019 Read-only idle inspection
+# 020 Read-only idle inspection
 
 An operator can authorize read-only idle inspection for a mounted project in Stage 2. Inspection is off by default. Findings go into a project backlog. Maintenance events, Worker document-impact checks and independent reviews continue when inspection is disabled. See [Stage 2](009-handoff.md#stage-2-maintenance).
 

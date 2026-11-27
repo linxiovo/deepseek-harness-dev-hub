@@ -91,6 +91,10 @@ For an adopted legacy deployment, the first physical Hub keeps the adoption-era 
 
 Rotation uses the project write lock: a concurrent project selection is refused with `409 projectConflict`, and selection already in progress prevents rotation with `409 switching`. Success is `200 {hubSessionId: string}` with the new physical Hub Session ID. The project ID and its durable work stay unchanged. If rotation fails, HTTP returns an error without confirming a new Session. On restart, Runtime recovers any persisted in-progress rotation; the HTTP adapter does not retry it.
 
+### Confirmed settings
+
+Confirmation reads also require the managed project scope. The proposal and approval POSTs use the same exclusive write gate as other project mutations. See `019-confirmed-settings.md` for the API contract.
+
 ## Code and verification
 
 | Entry | Evidence |

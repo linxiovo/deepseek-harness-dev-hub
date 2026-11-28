@@ -5,6 +5,7 @@ import { expect, it, vi } from 'vitest'
 import type { Fiber } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { Effects } from '../src/app/effects.ts'
+import type { ApiResponse } from '../src/app/api.ts'
 import { Handoffs } from '../src/app/handoffs.ts'
 import { InstallationError, type CreateProjectResult, type ProjectView } from '../src/app/installation-api.ts'
 import { Plans } from '../src/app/plans.ts'
@@ -19,7 +20,7 @@ import { credentialHelper, workerGitConfig } from '../src/infra/environment.ts'
 import { HealthBoard } from '../src/infra/health.ts'
 import { KV } from '../src/kv.ts'
 import * as githubSource from '../src/sources/github.ts'
-import { testMachine } from './fixtures/deployment.ts'
+import { developmentModels, testMachine } from './fixtures/deployment.ts'
 import { gitRepository } from './fixtures/git.ts'
 import { feishu, startRuntime, type Host } from './fixtures/host.ts'
 
@@ -227,7 +228,12 @@ async function managedHarness(runtimeMode: RuntimeMode = 'desktop') {
       expect(await host.api('POST', `projects/${project.id}/select`)).toMatchObject({ status: 200, body: { restarting: true } })
     }
     await mount()
-    expect(await host.api('POST', 'onboarding/github/verify', { cli })).toMatchObject({ status: 200, body: { status: 'ready' } })
+    expect(await host.api('POST', 'onboarding/github/verify', { cli })).toMatchObject({ status: 200, body: { status: 'models-required' } })
+    const setup = await host.api('GET', 'settings')
+    const { blocks: { executor } } = setup.body as ApiResponse<'GET settings'>
+    expect(await host.api('PUT', 'settings/executor', { ...executor, value: { ...executor.value, ...developmentModels } }))
+      .toMatchObject({ status: 200, body: { restarting: true } })
+    await mount()
     const first = await create(0, 'acme/widgets', 'alice')
     const runtime = await mount()
     const second = await create(1, 'acme/gadgets', 'bob')

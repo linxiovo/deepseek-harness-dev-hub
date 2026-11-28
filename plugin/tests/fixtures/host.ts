@@ -24,7 +24,7 @@ import { githubKind } from '../../src/sources/github.ts'
 import { Commands } from '../../src/infra/commands.ts'
 import { credentialHelper, workerGitConfig } from '../../src/infra/environment.ts'
 import type { ReviewAxis, Trigger } from '../../src/core/index.ts'
-import { testMachine } from './deployment.ts'
+import { developmentModels, testMachine } from './deployment.ts'
 import { gitEnv, gitRepository } from './git.ts'
 
 export const MEMBER = 'ou_alice'
@@ -165,13 +165,13 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   else git.mockResolvedValue('')
   vi.spyOn(Commands.prototype, 'run').mockResolvedValue('{"ok":true,"data":{}}')
   const scoped = 'git config -z --show-scope --get-regexp ^(credential\\..*|http\\..*extraheader)$'
+  const helperOrigin = 'git config -z --show-origin --get-all credential.https://github.com.helper'
   const answers: Record<string, string> = {
     [`${AGENT} api user --hostname github.com`]: '{"login":"agent-bot","id":7}',
     [`${AGENT} api repos/acme/widgets --hostname github.com --jq {name: .full_name, push: .permissions.push}`]: '{"name":"acme/widgets","push":true}\n',
     [`${BOT} auth status`]: JSON.stringify({ appId: 'cli_bot', brand: 'feishu', identities: { bot: { status: 'ready' } } }),
     [`${BOT} config strict-mode`]: 'strict-mode: bot (source: profile)',
     [`${BOT} api GET /open-apis/bot/v3/info --as bot --format ndjson`]: '{"bot":{"open_id":"ou_bot"},"code":0,"msg":"ok"}',
-    ['git config -z --show-origin --get-all credential.https://github.com.helper']: `file:${workerGitConfig(directory)}\0${credentialHelper(AGENT)}\0`,
     [scoped]: `global\0credential.helper\n\0global\0credential.https://github.com.helper\n${credentialHelper(AGENT)}\0`,
   }
   /** A prepare command (`sh -c`) waits for this while it is set. */
@@ -208,7 +208,10 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
       return { done, collected: { stdout: reader(() => ''), stderr: reader(() => stderr) } }
     }
     const done = argv[0] === 'sh' && hooks.prepare ? hooks.prepare.then(() => exited) : Promise.resolve(exited)
-    return { done, collected: { stdout: reader(() => answers[argv.join(' ')] ?? ''), stderr: reader(() => '') } }
+    const invocation = argv.join(' ')
+    const output = invocation === helperOrigin && spec.cwd
+      ? `file:${workerGitConfig(spec.cwd)}\0${credentialHelper(AGENT)}\0` : answers[invocation] ?? ''
+    return { done, collected: { stdout: reader(() => output), stderr: reader(() => '') } }
   }) }
   const agents = new Map<string, FakeAgent>()
   /** One durable entry of a Session's log; controller-made messages carry no `time`, as their creation time is not an event. */
@@ -248,7 +251,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
       agentCtx.reflect.provide('tools', { register, get: () => undefined, restrict: vi.fn(() => () => {}), guard: vi.fn(() => () => {}),
         presentAs: () => () => {} })
       agentCtx.reflect.provide('skills', skillRegistry(sessionId))
-      if (sessionId.startsWith('inspection-')) await agentCtx.plugin(SystemPrompt)
+      if (/^(worker|inspection|lookup)-/.test(sessionId)) await agentCtx.plugin(SystemPrompt)
       else agentCtx.reflect.provide('systemPrompt', { section: () => () => {} })
       const inbox = { nextTurn: [] as UserMessage[], nextStep: [] as UserMessage[],
         // A pending message taken out, as DSH's inbox does by its id.
@@ -420,8 +423,8 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   const sources = { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT } },
     ...(options.withFeishu === false ? {} : { feishu: { enabled: true, config: { cli: BOT } } }) }
   const initial = seeded.settings()
-  seeded.saveSettings(SettingsSchema.parse({ ...initial, sources, ...(localGit ? { executor: { ...initial.executor,
-    repository: localGit.repository, baseRef: localGit.base.ref, prepare: WORKTREE_PREPARE } } : {}) }))
+  seeded.saveSettings(SettingsSchema.parse({ ...initial, sources, executor: { ...initial.executor, ...developmentModels,
+    ...(localGit && { repository: localGit.repository, baseRef: localGit.base.ref, prepare: WORKTREE_PREPARE }) } }))
   seed?.(seeded)
   seeded.close()
   let runtime = new Runtime(ctx, testMachine({ stateDir: directory }), vi.fn())
@@ -585,13 +588,15 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
     const agent = agents.get(sessionId)
     const stream = async () => {
       let model = { provider: 'fixture', model: 'fixture-model' }
-      if (agent && sessionId.startsWith('inspection-')) {
-        const native = agent as unknown as Agent
-        await agent.ctx.systemPrompt.assemble()
-        model = await agentEvents(agent.ctx, native).waterfall('agent/request', { turn: 1, step: 1, signal: signal ?? new AbortController().signal }, async () => model)
+      const native = agent as unknown as Agent | undefined
+      if (native && /^(worker|inspection|lookup)-/.test(sessionId)) {
+        await native.ctx.systemPrompt.assemble()
+        model = await agentEvents(native.ctx, native).waterfall('agent/request', { turn: 1, step: 1, signal: signal ?? new AbortController().signal }, async () => model)
       }
       modelContexts.set(sessionId, { ...model, contextWindow })
-      const request = Object.freeze({ ...model, sessionId: sessionId as SessionId, messages: [], ...(signal ? { signal } : {}) }) satisfies GenerateOptions
+      const messages = native && sessionId.startsWith('lookup-')
+        ? native.session.snapshotEvents().flatMap(event => event.type === 'user/message' ? [event.data] : []) : []
+      const request = Object.freeze({ ...model, sessionId: sessionId as SessionId, messages, ...(signal ? { signal } : {}) }) satisfies GenerateOptions
       const chunks: StreamChunk[] = []
       for await (const chunk of ctx.waterfall(ctx.llm, 'llm/stream', markAgentLoopRequest(request), () => providerCall(request))) chunks.push(chunk)
       return chunks

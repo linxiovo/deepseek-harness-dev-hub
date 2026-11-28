@@ -672,14 +672,15 @@ const withdrawnRelay = Symbol('withdrawn relay')
     if (role === 'worker' && (!ticketId || !this.host.workerAuthorized(ticketId, id))) {
       throw new Error(`Worker ${id} has no verified writer grant; refusing to create its Session`)
     }
-    const bind = () => {
+    const bind = (reserve = false) => {
       if (this.host.closing()) throw new Error('Session dispatch is stopping')
       if (role === 'orchestrator') {
         const expected = this.host.hubTargetId() ?? this.host.currentHubId()
         if (id !== expected) throw new Error('The Hub Session is not the current persisted authority target')
       } else if (ticketId !== undefined) {
         if (!this.host.workerAuthorized(ticketId, id)) throw new Error(`Worker ${id} lost its writer grant before Session setup`)
-        this.bindWorker(ticketId, id)
+        if (reserve) this.reserveWorker(ticketId, id)
+        else this.bindWorker(ticketId, id)
       } else if (role === 'planner' || role === 'splitter') {
         if (plannerId ? !this.host.plannerActive(plannerId) : !splitterId || this.host.splitterWorkspace(splitterId) !== cwd) {
           throw new Error('Planning dispatch changed before Session setup')
@@ -697,7 +698,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
     if (creation && 'agent' in result) this.verifiedHubRoots.add(result.agent)
     if (!creation && 'error' in result && result.error.code === 'session/not-found') {
       const workspace = await ctx.workspaceRegistry.create(cwd)
-      if (role === 'worker') bind() // Plan Workers already have a durable reservation; standalone Workers reserve here.
+      if (ticketId !== undefined) bind(true) // Plan Workers already have a durable reservation; standalone Workers reserve here.
       // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml).
       await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id,
         agentPreset: role === 'planner' || role === 'splitter' ? PLANNER_PRESET : role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
@@ -718,6 +719,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
       }
     }
     if (role === 'worker') {
+      this.requireWorkerRoot(result.agent, id)
       const createdIn = result.agent.session.header.cwd
       if (!createdIn) throw new Error(`Worker ${id} has no recorded workspace directory`)
       const [sessionPath, expectedPath] = await Promise.all([physicalPath(createdIn), physicalPath(cwd)])
@@ -725,8 +727,11 @@ const withdrawnRelay = Symbol('withdrawn relay')
       if (!same) throw new Error(`Worker ${id} belongs to ${createdIn}, not the verified ticket worktree ${cwd}`)
     }
     bind()
-    const settings = this.host.store.settings()
-    await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
+    if (ticketId !== undefined) await initializeRoleModel(ctx, result.agent, () => this.initialWorkerModel(ticketId, id))
+    else {
+      const settings = this.host.store.settings()
+      await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
+    }
     await this.decorate(result.agent)
     ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
@@ -882,6 +887,32 @@ const withdrawnRelay = Symbol('withdrawn relay')
     if (received.taskSeq === undefined && !received.pending && !received.inserted) throw new Error('Inspection did not receive its sealed task')
   }
 
+  /** Pin a new Worker's initial model in the same transaction as its business reservation. */
+  reserveWorker(ticketId: string, sessionId: string): void {
+    if (sessionId !== workerSessionId(ticketId)) throw new Error('Worker reservation does not match its Ticket')
+    this.host.store.atomic(() => {
+      this.bindWorker(ticketId, sessionId)
+      this.initialWorkerModel(ticketId, sessionId)
+    })
+  }
+  private initialWorkerModel(ticketId: string, sessionId: string) {
+    const { store } = this.host
+    const key = KV.sessions.workerModel(sessionId), pinned = store.get(key)
+    if (pinned !== undefined) return pinned
+    const ticket = store.tickets.get(ticketId)
+    if (!ticket) throw new Error(`Unknown Worker Ticket ${ticketId}`)
+    const { executor } = store.settings(), role = ticket.plan?.role
+    const model = role === 'backend' ? executor.backendModel : role === 'frontend' ? executor.frontendModel : executor.model
+    if (!model && (role === 'backend' || role === 'frontend')) throw new Error(`Missing executor.${role}Model for Worker ${sessionId}`)
+    store.set(key, model ?? null)
+    return model ?? null
+  }
+  private requireWorkerRoot(agent: Agent, sessionId: string): void {
+    const { header } = agent.session
+    if (agent.id !== sessionId || header.id !== sessionId || header.parentSession !== undefined || header.origin === 'subagent') {
+      throw new Error(`Resolved Session is not the Ticket's root Worker ${sessionId}`)
+    }
+  }
   /** Trusted host dispatch/receipt seam. A binding records attribution, never permission to start a turn. */
   bindWorker(ticketId: string, sessionId: string, retry = false): void {
     const scope = { session_id: sessionId, ticket_id: ticketId,
@@ -921,6 +952,10 @@ const withdrawnRelay = Symbol('withdrawn relay')
     granted()
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
     if ('error' in result) throw result.error
+    if (ticketId !== undefined) {
+      this.requireWorkerRoot(result.agent, sessionId)
+      await initializeRoleModel(this.ctx, result.agent, () => this.initialWorkerModel(ticketId, sessionId))
+    }
     await this.agentDelivery.send(result.agent, key(requestId), text, mode, this.host.lifetime, granted, accepted)
   }
   /** The id of the message `prompt` delivers under `requestId`, which DSH's inbox events name it by. */
@@ -972,8 +1007,9 @@ const withdrawnRelay = Symbol('withdrawn relay')
           return image ? [text, { type: 'image' as const, attachment: image }] : [text]
         } },
         execute: async (args, execution) => {
+          if (name === 'orchestrator_lookup' && execution.agent !== agent) throw new Error('Only the calling Hub may delegate a lookup')
           const release = binding.role === 'orchestrator' ? this.beginHubOperation(agent.id) : undefined
-          try { return await execute(schema.parse(args), execution.signal) }
+          try { return await execute(schema.parse(args), execution.signal, execution.callId) }
           finally { release?.() }
         } }))
     }

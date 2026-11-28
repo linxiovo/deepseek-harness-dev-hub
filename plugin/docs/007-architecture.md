@@ -453,7 +453,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/meter-recovery.ts` | Restores detached review attribution from durable review receipts and verified Session parent metadata |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id across restored and rotated Hub Sessions |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
-| `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
+| `src/app/role-models.ts` | Resolves configured DSH model routes and seeds the initial native request without changing the profile default |
+| `src/app/lightweight-lookup.ts` | `LightweightLookup`: one read-only Session per Hub query, bounded project context and project-only model admission |
 | `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers |
 | `src/app/execution-environment.ts` | The execution environment: its variables, including the pinned repository, base ref and SHA and the reserved branch, a Ticket's values, the worktree root and the lines of the prompt section, which `src/app/prompts.ts` fills into its template |
 | `src/app/source-context.ts` | `sourceContextOf`: each Source kind's `SourceContext` |
@@ -579,6 +580,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/plan-integration-crash.spec.ts` | SIGKILL after GitHub accepts workflow dispatch but before the effect records a result; SQLite recovery observes the existing run without another dispatch |
 | `tests/maintenance-recovery.spec.ts` | Stage 2 inbox and native-history recovery, stale authority during workspace validation, and maintenance replay of paired live/history Feishu private-chat samples |
 | `tests/idle-inspection.spec.ts` | Explicit grants, controllable clock, actual native tool calls, findings, model selection, project usage and event precedence. |
+| `tests/lightweight-lookup.spec.ts` | Hub code lookup, Doc Tree navigation and status summary through the native model request, default routing and project authorization |
 | `tests/inspection-git.spec.ts` | Immutable snapshot pagination, path and object boundaries, missing objects, and preservation of checkout/index/ref. |
 | `tests/inspection-quota.spec.ts` | Dual-pool reservation, settlement and recovery; missing usage pauses the strict scope, not independently authorized Tickets. |
 | `tests/mainline-queue.spec.ts` | Queue admission, CI, conflicts, formal closure and Frontier; artifact and controlled release delivery; Stage 2 through Harness, GitHub and bound Feishu events |

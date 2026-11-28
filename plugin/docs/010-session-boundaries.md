@@ -18,6 +18,8 @@ The Hub also owns `orchestrator_handoff_confirm`, `orchestrator_handoff_answer`,
 
 On a mounted project, only the Hub has `orchestrator_maintenance` and the Stage 2 event resources. Maintenance authority and the distinction between native inputs and relays are defined in [Stage 2 maintenance](009-handoff.md#stage-2-maintenance).
 
+`orchestrator_lookup` is also restricted to the active mounted Hub. The dedicated Lookup Session receives only the bounded query and its project evidence; it does not inherit Hub history, project instructions, repository tools or write tools. See `021-lightweight-lookup.md` for the request and model routing contract.
+
 `orchestrator_plan_replan` and `orchestrator_plan_requirements` are also Hub-only. Technical recovery does not confer product authority, and requirement changes require a direct Harness approval after preview. Workers can read their own `ticket/<id>/plan-scope`, not the Plan's approvals or graph history. See `018-plan-replanning.md`.
 
 The Hub alone owns `orchestrator_queue_merge`; it requests the checked, durable operation in [Merging](003-execution.md#merging), not a general Git command. Worker and planning tools cannot start it.

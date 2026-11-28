@@ -2,6 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, ModelSelection } from '@deepseek-ai/dsh-agent'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { SessionLogOffset } from '@deepseek-ai/dsh-session'
 import type { RoleModel } from '../policy.ts'
 
 /** Resolve a configured route through the live provider; catalog membership is not a restriction. */
@@ -11,19 +12,35 @@ export async function resolveRoleModel(ctx: Context, model: RoleModel): Promise<
   return { provider: value.provider, model: value.model, ...(value.reasoningEffort ? { reasoningEffort: value.reasoningEffort } : {}) }
 }
 
-/** Seed a role's configured model onto a brand-new session before its first request, leaving later manual or durable selections intact. */
-export async function initializeRoleModel(ctx: Context, agent: Agent, model: RoleModel | null): Promise<void> {
-  if (!model) return
-  if (agent.session.requestHeader() || agent.session.snapshotEvents().some(event => event.type === 'model/selection')) return
-  const selected = await resolveRoleModel(ctx, model)
-  // Avoid selectModel because it mutates the global DSH default; inject the selection for the initial request only.
-  agent.session.append('model/selection', selected)
-  let initial = true
+const initialSelections = new WeakMap<Agent, Promise<void>>()
+
+/** Seed a Session's initial model, or reapply a native selection recorded before its first request. */
+export async function initializeRoleModel(ctx: Context, agent: Agent, model: RoleModel | null | (() => RoleModel | null)): Promise<void> {
+  const { session } = agent
+  if (session.requestHeader()) return
+  const initialized = initialSelections.get(agent)
+  if (initialized) return initialized
+  let selected = session.snapshotEvents().findLast(event => event.type === 'model/selection')
+  if (!selected) {
+    const configured = typeof model === 'function' ? model() : model
+    if (!configured) return
+    const resolved = await resolveRoleModel(ctx, configured)
+    if (session.requestHeader()) return
+    const concurrent = initialSelections.get(agent)
+    if (concurrent) return concurrent
+    // Native selectModel also changes DSH's global default. Only write the Session-local event.
+    selected = session.snapshotEvents().findLast(event => event.type === 'model/selection') ?? session.append('model/selection', resolved)
+  }
+  const { provider, model: name, reasoningEffort } = selected.data
+  const initial: ModelSelection = { provider, model: name,
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(reasoningEffort) }) }
+  const start = SessionLogOffset(selected.seq + 1)
   let assembled: ModelSelection | undefined
-  agent.ctx.effect(() => {
+  const dispose = agent.ctx.effect(() => {
     const disposers = [
       agent.ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
-        const selection = initial ? selected : undefined
+        const selection = session.requestHeader() || session.snapshotEvents(start).some(event => event.type === 'model/selection')
+          ? undefined : initial
         const result = await next()
         assembled = selection
         return selection ? { ...result, variables: { ...result.variables, provider: selection.provider, model: selection.model } } : result
@@ -34,11 +51,14 @@ export async function initializeRoleModel(ctx: Context, agent: Agent, model: Rol
         const { reasoningEffort: _inherited, ...rest } = result
         return { ...rest, ...assembled }
       }, { prepend: true }),
-      ctx.on('session/event', (session, event) => {
-        if (session === agent.session && (event.type === 'request/header' || event.type === 'model/selection')) initial = false
-      }),
     ]
     return () => disposers.forEach(dispose => dispose())
   })
-  await ctx.sessionPersistence.flush()
+  const ready = ctx.sessionPersistence.flush().catch(async (error: unknown) => {
+    await dispose()
+    initialSelections.delete(agent)
+    throw error
+  })
+  initialSelections.set(agent, ready)
+  await ready
 }

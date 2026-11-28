@@ -9,6 +9,7 @@ import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
 import type { Handoffs } from '../handoffs.ts'
 import { InstallationError } from '../installation-api.ts'
+import { LookupSchema, type LightweightLookup } from '../lightweight-lookup.ts'
 import { PlanDraftSchema, PlanTargetSchema, type Plans } from '../plans.ts'
 import type { PlanDispatcher } from '../plan-dispatch.ts'
 import { replanTechnical, TechnicalReplanSchema } from '../plan-replan.ts'
@@ -136,6 +137,7 @@ export interface MainToolsHost {
   readonly planIntegration?: MainResourceHost['planIntegration']
   readonly maintenance?: Maintenance
   readonly inspection?: MainResourceHost['inspection']
+  readonly lookup?: Pick<LightweightLookup, 'run'>
   readonly handoffs: Pick<Handoffs, 'confirm' | 'answer' | 'get' | 'spec'>
   readonly plans: Pick<Plans, 'get' | 'definition' | 'repairSource' | 'testHistory' | 'view' | 'node' | 'append' | 'at' | 'revision' | 'current' | 'state' | 'requiredDelivery' | 'revise'>
   readonly stagnation: MainResourceHost['stagnation']
@@ -279,9 +281,12 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     planIntegration: host.planIntegration, maintenance: host.maintenance, inspection: host.inspection, stagnation: host.stagnation,
     requirements: host.requirements, planControl: host.planControl }
   const maintenance = host.maintenance
+  const lookup = host.lookup
   return [
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
+    ...lookup ? [tool({ name: 'orchestrator_lookup', description: promptFile('lightweight-lookup-tool'), schema: LookupSchema,
+      execute: (input, signal, callId) => lookup.run(agent, input, signal, callId) })] : [],
     ...maintenance ? [tool({
       name: 'orchestrator_maintenance', description: promptFile('maintenance-tool'),
       schema: z.strictObject({ event_id: z.string().regex(/^[0-9a-f]{32}$/).optional(), verdict: MaintenanceVerdictSchema }),

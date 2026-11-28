@@ -22,6 +22,7 @@ export const USER_ERRORS = {
   credentialBlocked: ['refused', 'This ticket waits for its credential check to pass.'],
   quotaPaused: ['refused', 'This ticket is paused by its run limits.'],
   panelOnlyRunLimits: ['refused', 'Only the operator can change worker concurrency or run limits in management settings.'],
+  panelOnlyModelRouting: ['refused', 'Only the operator can change project model routing in management settings.'],
   panelOnlyListenScope: ['refused', 'Feishu listening scope requires operator authorization.'],
   settingsConfirmationUnknown: ['missing', 'Settings confirmation not found.'],
   settingsConfirmationStale: ['refused', 'The settings confirmation is unavailable or no longer pending at this revision.'],

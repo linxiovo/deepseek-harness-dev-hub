@@ -12,7 +12,7 @@ Plugin configuration holds the installation state directory, runtime mode and ma
 
 ### Permissions and isolation
 
-The bundle defines `dsh-superagent-worker`, `dsh-superagent-router`, `dsh-superagent-planner` and `dsh-superagent-inspection`. Do not select these presets for personal Sessions or disable their configuration rows. The application needs them to create and resume managed Sessions.
+The bundle defines `dsh-superagent-worker`, `dsh-superagent-router`, `dsh-superagent-planner`, `dsh-superagent-inspection` and `dsh-superagent-lookup`. Do not select these presets for personal Sessions or disable their configuration rows. The application needs them to create or recover managed Sessions.
 
 Opening a blank managed Session in the Web UI can select the profile's default preset. dsh-superagent restores its role-specific preset before the first turn.
 
@@ -23,7 +23,7 @@ The Worker and Hub presets run with `danger-full-access` as the operator's OS us
 - Node.js 22.19+ or 24+, pnpm, git 2.32+, plus Python 3.8+ and tmux on POSIX hosts for `scripts/dsh-superagent`
 - GitHub CLI (`gh`) 2.48 or later. Source CLI fields must point to `gh` or `lark-cli` wrappers; the host relies on their subcommands and output formats.
 - A repository on github.com; GitHub Enterprise Server is not supported. Keep a local clone of it and name that clone in the Execution settings: the Executor creates one worktree per Ticket there. Install `git-lfs` if that repository uses Git LFS.
-- A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
+- Model providers configured for DeepSeek Harness. Before registering a project or dispatching work, set both development routes. See `012-project-runtime.md` for the model configuration contract.
 - For Feishu: a Feishu or Lark app with a bot. Pin `lark-cli` 1.0.100 for interactive settings approvals. A CLI without `card.action.trigger` can still receive ordinary messages.
 
 ### Development checks
@@ -232,7 +232,7 @@ Check dsh-superagent: run `scripts/dsh-superagent --profile superagent status` i
 
 Setup must succeed before polling or work starts. Overview lists missing requirements and links to their settings. A settings change runs setup again. If you fix something outside the application, such as CLI authentication, choose **Check again**.
 
-1. **GitHub onboarding and project.** Verify the dedicated `gh` executable via `POST /orchestrator/api/onboarding/github/verify`, then register the server-local checkout, `owner/name` and explicit base ref via `POST /orchestrator/api/projects`. On an existing installation, adopt its original binding first (see Upgrade). Register additional projects without moving the active mount; explicitly select when switching. Check `GET /orchestrator/api/runtime` for the intended `projectId` and setup status before operating on a project.
+1. **GitHub onboarding and project.** Verify the dedicated `gh` executable via `POST /orchestrator/api/onboarding/github/verify`. Save the backend and frontend model selections in the executor block, then check `GET /orchestrator/api/onboarding` before registering the server-local checkout, `owner/name` and explicit base ref via `POST /orchestrator/api/projects`. On an existing installation, adopt its original binding first (see Upgrade). Register additional projects without moving the active mount; explicitly select when switching. Check `GET /orchestrator/api/runtime` for the intended `projectId` and setup status before operating on a project.
 2. **Sources.** Set intake for the active project. GitHub requests normally arrive through the agent account's notifications. A new Issue or comment mentioning the account arrives on the next poll; adding a mention by editing an existing Issue body does not. Post a new comment instead. For Feishu, set the bot CLI, chats, each chat's receive-all or mentions-only mode, and whether to receive direct messages.
 3. **Policy.** The two example rules can be edited or removed. Under **On each Source**, add the GitHub accounts and Feishu users who may ask for work; until a list has someone, no request can become a Ticket. With Feishu, a chat can be chosen to sync the list from, at startup and on **Sync now**.
 4. **Execution.** Registration supplies the local clone and starting ref, such as `refs/heads/main`. Review the base for new work, optional prepare command and blocked commands. An empty repository or base ref leaves existing settings readable but prepares no new worktree; it does not fall back to an empty directory. Before a Ticket's first Assignment, the Executor resolves the ref to a pinned commit and exposes `DSH_SUPERAGENT_REPOSITORY`, `DSH_SUPERAGENT_BASE_REF`, the pinned `DSH_SUPERAGENT_BASE_SHA` and the reserved `DSH_SUPERAGENT_BRANCH` to the preparation. With no prepare command, the Executor creates each Ticket's worktree itself with the same `git worktree add` call at the pinned commit. A non-empty prepare command takes over that creation and must use the pinned variables:

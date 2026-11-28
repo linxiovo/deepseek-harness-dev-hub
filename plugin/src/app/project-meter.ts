@@ -5,7 +5,7 @@ import type { Plans } from './plans.ts'
 import { SessionMeterIdentityError, sessionMeterView, type Range, type SessionMeter, type SessionMeterView } from './session-meter.ts'
 import type { Store } from './store.ts'
 
-const ROLES = ['hub', 'implementation', 'review', 'retro', 'retry', 'inspection', 'planner', 'splitter'] as const
+const ROLES = ['hub', 'implementation', 'review', 'retro', 'retry', 'inspection', 'lookup', 'planner', 'splitter'] as const
 type MeterRole = typeof ROLES[number]
 export interface MeterBinding {
   session_id: string

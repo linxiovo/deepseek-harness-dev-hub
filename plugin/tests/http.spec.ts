@@ -454,9 +454,11 @@ it('lets the panel verify GitHub and create or select projects without returning
   const installation: InstallationApi = {
     onboarding: () => ({ status: 'unconfigured' }),
     runtime: idleRuntime,
-    verifyGithub: ({ cli }) => cli === 'gh-agent'
-      ? { status: 'ready', identity: Object.assign({ ...identity }, { cli }) }
-      : { status: 'blocked', problem: new SetupError('agentCliSignedOut', { output: 'token=private' }).problem },
+    verifyGithub: ({ cli }) => {
+      if (cli === 'gh-agent') return { status: 'ready', identity: Object.assign({ ...identity }, { cli }) }
+      if (cli === 'gh-needs-frontend') return { status: 'models-required', identity: Object.assign({ ...identity }, { cli }), missing: ['frontend'] }
+      return { status: 'blocked', problem: new SetupError('agentCliSignedOut', { output: 'token=private' }).problem }
+    },
     projects: () => ({ activeProjectId: null, projects: [privateProject] }),
     createProject: input => {
       expect(input).toEqual({ repository: 'org/repo', workspace: 'D:/repos/repo', baseRef: 'main', policy: { rules: [], sources: {} } })
@@ -470,6 +472,8 @@ it('lets the panel verify GitHub and create or select projects without returning
   const call = serve({ installation })
   expect(await call('GET', 'onboarding')).toEqual({ status: 200, body: { status: 'unconfigured' } })
   expect(await call('POST', 'onboarding/github/verify', { cli: 'gh-agent' })).toEqual({ status: 200, body: { status: 'ready', identity } })
+  expect(await call('POST', 'onboarding/github/verify', { cli: 'gh-needs-frontend' }))
+    .toEqual({ status: 200, body: { status: 'models-required', identity, missing: ['frontend'] } })
   expect(await call('POST', 'onboarding/github/verify', { cli: 'bad' })).toEqual({ status: 200, body: { status: 'blocked',
     problem: { place: 'github', code: 'agentCliSignedOut', values: {}, detail: 'The agent GitHub CLI cannot read its account.' } } })
   expect(await call('GET', 'projects')).toEqual({ status: 200, body: { activeProjectId: null, projects: [project] } })
@@ -753,7 +757,12 @@ it('fences executor settings from the old mount during selection and after recov
   const selection = oldMount('POST', 'projects/beta/select')
   await Promise.race([selectionStarted.promise, selection])
   let duringSelection
-  try { duringSelection = await oldMount('GET', 'settings', undefined, oldScope) }
+  try {
+    duringSelection = await Promise.all([
+      oldMount('GET', 'settings', undefined, oldScope), oldMount('GET', 'onboarding', undefined, oldScope),
+      oldMount('GET', 'prompts', undefined, oldScope), oldMount('POST', 'prompts/preview', {}, oldScope),
+    ])
+  }
   finally { finishSelection.resolve() }
   const selectionResult = await selection.finally(finishBody.resolve)
   const pendingResult = await pending
@@ -765,7 +774,7 @@ it('fences executor settings from the old mount during selection and after recov
   const newReadWithOldScope = await newMount('GET', 'settings', undefined, oldScope)
   const newWriteWithOldScope = await newMount('PUT', 'settings/executor', update, oldScope)
   expect(selectionResult).toEqual({ status: 200, body: { project: beta, restarting: true } })
-  for (const response of [duringSelection, retiredRead, pendingResult]) {
+  for (const response of [...duringSelection, retiredRead, pendingResult]) {
     expect(response).toMatchObject({ status: 409, body: { code: 'switching' } })
   }
   for (const response of [newReadWithOldScope, newWriteWithOldScope]) {

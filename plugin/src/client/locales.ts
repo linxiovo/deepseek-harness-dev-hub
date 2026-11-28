@@ -839,6 +839,7 @@ const TEXT = {
   'userError.credentialBlocked': ['这张工单正在等待凭据验证通过。', USER_ERRORS.credentialBlocked[1]],
   'userError.quotaPaused': ['这张工单已因运行限额暂停。', USER_ERRORS.quotaPaused[1]],
   'userError.panelOnlyRunLimits': ['只有操作员能在管理设置中修改并发数或运行限额。', USER_ERRORS.panelOnlyRunLimits[1]],
+  'userError.panelOnlyModelRouting': ['只有操作员能在管理设置中修改项目模型路由。', USER_ERRORS.panelOnlyModelRouting[1]],
   'userError.panelOnlyListenScope': ['更改飞书监听范围需要操作员授权。', USER_ERRORS.panelOnlyListenScope[1]],
   'userError.settingsConfirmationUnknown': ['找不到该配置确认请求。', USER_ERRORS.settingsConfirmationUnknown[1]],
   'userError.settingsConfirmationStale': ['此配置确认不可用，或已不再等待确认该版本。', USER_ERRORS.settingsConfirmationStale[1]],

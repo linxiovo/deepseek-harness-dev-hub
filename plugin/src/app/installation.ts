@@ -7,7 +7,7 @@ import type { ProjectRef } from '../core/handoff.ts'
 import { verifyGithubAccount, verifyGithubRepository, type Machine, type Probe, type VerifiedGithub } from '../deployment.ts'
 import { validateRepositoryIdentity } from '../executor/repository-identity.ts'
 import { agentVariables, sameDirectory } from '../infra/environment.ts'
-import { ExecutorConfigSchema, PolicyConfigSchema, type Settings } from '../policy.ts'
+import { developmentModelsReady, ExecutorConfigSchema, PolicyConfigSchema, type Settings } from '../policy.ts'
 import { SetupError } from '../setup.ts'
 import { InstallationError, type InstallationApi, type OnboardingView, type ProjectView, type RuntimeView } from './installation-api.ts'
 import { containsWorkspace, isAbsoluteWorkspace, ProjectCatalog, ProjectConflict, type Project, type ProjectSuspension } from './projects.ts'
@@ -34,7 +34,7 @@ interface InstallationHost {
 export class Installation implements InstallationApi {
   readonly project: Project | undefined
   private readonly catalog: ProjectCatalog
-  private onboardingState: OnboardingView = { status: 'unconfigured' }
+  private onboardingState: Exclude<OnboardingView, { status: 'models-required' }> = { status: 'unconfigured' }
   private verifiedAccount?: VerifiedGithub
   private legacyAccount?: VerifiedGithub
   private resumed: ProjectSuspension | null = null
@@ -54,7 +54,15 @@ export class Installation implements InstallationApi {
     return this.onboardingState.status === 'ready' ? this.legacyAccount : undefined
   }
   transitioning(): boolean { return this.switching || this.host.signal.aborted }
-  onboarding(): OnboardingView { return this.onboardingState }
+  onboarding(): OnboardingView {
+    const github = this.onboardingState
+    if (github.status !== 'ready') return github
+    const { backendModel, frontendModel } = this.host.settings().executor
+    const missing: ('backend' | 'frontend')[] = []
+    if (!backendModel) missing.push('backend')
+    if (!frontendModel) missing.push('frontend')
+    return missing.length ? { ...github, status: 'models-required', missing } : github
+  }
 
   async initialize(): Promise<void> {
     const saved = this.catalog.account()
@@ -120,8 +128,10 @@ export class Installation implements InstallationApi {
     const projectId = this.project?.id ?? null
     const state = { mode, projectId, resumedFrom: this.resumed }
     if (!this.started) return { ...state, status: 'starting', reason: null }
-    const reason = this.transitioning() ? 'switching' : !this.github ? 'githubSetupRequired' : !this.project && !this.legacyRepository() ? 'noProject'
+    const reason = this.transitioning() ? 'switching' : !this.github ? 'githubSetupRequired'
       : this.host.recoveryPending() ? 'recoveryPending'
+      : !developmentModelsReady(this.host.settings().executor) ? 'developmentModelsRequired'
+      : !this.project && !this.legacyRepository() ? 'noProject'
       : !this.host.configured() ? 'projectSetupRequired' : this.host.paused() ? 'operatorPaused' : null
     return { ...state, status: reason ? 'paused' : 'ready', reason }
   }
@@ -131,6 +141,7 @@ export class Installation implements InstallationApi {
     this.requireGithub()
     if (!this.project && !this.legacyRepository()) throw new InstallationError(409, 'noProject')
     if (!this.host.configured()) throw new InstallationError(409, 'projectSetupRequired', 'Project setup is not ready.')
+    if (!developmentModelsReady(this.host.settings().executor)) throw new InstallationError(409, 'developmentModelsRequired')
     if (this.project && this.host.paused()) throw new InstallationError(409, 'operatorPaused')
   }
 
@@ -177,11 +188,10 @@ export class Installation implements InstallationApi {
     }
   }
 
-  private publish(account: VerifiedGithub): OnboardingView {
+  private publish(account: VerifiedGithub): void {
     this.catalog.setAccount(account)
     this.verifiedAccount = account
     this.onboardingState = { status: 'ready', identity: { id: account.id, login: account.login, noreply: account.noreply } }
-    return this.onboardingState
   }
 
   private async change<Result>(operation: () => Promise<Result>): Promise<Result> {
@@ -206,10 +216,10 @@ export class Installation implements InstallationApi {
         const sourceCli = this.project ? undefined : this.legacyCli()
         const legacy = sourceCli ? sourceCli === cli.trim() ? verified : await this.verifyLegacyGithub(sourceCli, verified) : undefined
         this.host.signal.throwIfAborted()
-        const view = this.publish(verified)
+        this.publish(verified)
         if (this.project && (!this.host.configured() || previous?.cli !== verified.cli || previous.login !== verified.login)) this.restart()
         else if (legacy && this.legacyRepository() && (!previous || this.legacyAccount?.cli !== legacy.cli || this.legacyAccount.login !== legacy.login)) this.restart()
-        return view
+        return this.onboarding()
       } catch (error) {
         if (!(error instanceof SetupError)) throw error
         const rejected: OnboardingView = { status: 'blocked', problem: error.problem }
@@ -222,6 +232,7 @@ export class Installation implements InstallationApi {
   createProject(input: Parameters<InstallationApi['createProject']>[0]): Promise<Awaited<ReturnType<InstallationApi['createProject']>>> {
     return this.change(async () => {
       const account = await this.revalidate()
+      if (!developmentModelsReady(this.host.settings().executor)) throw new InstallationError(409, 'developmentModelsRequired')
       const repository = await verifyGithubRepository(account, input.repository, this.host.probe)
       const baseRef = ExecutorConfigSchema.parse({ baseRef: input.baseRef }).baseRef
       if (!baseRef) throw new InstallationError(400, 'invalidProject', 'An explicit Git base reference is required.')
@@ -251,10 +262,13 @@ export class Installation implements InstallationApi {
         }
         this.host.signal.throwIfAborted()
       }
+      const { backendModel, frontendModel, lightweightModel } = this.host.settings().executor
+      if (!backendModel || !frontendModel) throw new InstallationError(409, 'developmentModelsRequired')
+      const models = existing ? existing.initial?.models : { backendModel, frontendModel, lightweightModel: lightweightModel ?? null }
       let project: Project
       try {
         project = existing?.initial === undefined && existing ? existing : this.catalog.register({ repository, workspace,
-          ...(legacyStorage ? { legacyStorage } : { initial: { baseRef, policy } }) })
+          ...(legacyStorage ? { legacyStorage } : { initial: { baseRef, policy, ...(models && { models }) } }) })
       } catch (error) {
         if (error instanceof ProjectConflict) throw new InstallationError(409, 'projectConflict')
         throw error

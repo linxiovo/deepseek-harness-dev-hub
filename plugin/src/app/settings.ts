@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { z } from 'zod'
 import { UserError, type EngineForSettings } from '../core/index.ts'
-import { EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema, policyEffects, policyVersion } from '../policy.ts'
+import { developmentModelsReady, EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema, policyEffects, policyVersion } from '../policy.ts'
 import type { Settings as SettingsValue, SettingsBlock, SettingsOrigin, SettingsSave } from '../policy.ts'
 import type { ConfirmableChange } from '../confirmed-settings.ts'
 import type { FeishuConfig } from '../sources/feishu.ts'
@@ -10,6 +10,7 @@ import type { SourceHost } from '../sources/host.ts'
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import { githubKind, type GithubConfig } from '../sources/github.ts'
+import { InstallationError } from './installation-api.ts'
 import { resolveRoleModel } from './role-models.ts'
 import { changedPaths, settingsNotice } from './notices.ts'
 import type { Sessions } from './sessions.ts'
@@ -33,6 +34,8 @@ const now = (): string => new Date().toISOString()
 /** Executor settings that control shell execution paths, repository identity, pinned base selection, prepare commands, and command shims. */
 const environment = ({ executor }: SettingsValue) => JSON.stringify([executor.directory, executor.repository, executor.baseRef, executor.prepare, executor.blockedCommands])
 const runLimitFingerprint = ({ executor }: SettingsValue) => JSON.stringify([executor.maxWorkers, executor.runLimits])
+const projectModelFields = ['backendModel', 'frontendModel', 'lightweightModel'] as const
+const changedModel = (before: unknown, after: unknown): boolean => JSON.stringify(before ?? null) !== JSON.stringify(after ?? null)
 const inspectionFingerprint = ({ executor }: SettingsValue) => JSON.stringify([executor.idleInspection ?? null, executor.lightweightModel ?? null,
   executor.idleInspection ? [executor.baseRef, executor.runLimits?.projectTokens ?? null] : null])
 
@@ -65,6 +68,8 @@ const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
     merge: (settings, value) => ({ ...settings, executor: value as SettingsValue['executor'] }),
     guard: (current, candidate, origin) => {
       if (origin === 'panel') return
+      if (projectModelFields.some(field => changedModel(current.executor[field], candidate.executor[field])))
+        throw new UserError('panelOnlyModelRouting')
       if (runLimitFingerprint(current) !== runLimitFingerprint(candidate)) throw new UserError('panelOnlyRunLimits')
       if (inspectionFingerprint(current) !== inspectionFingerprint(candidate)) throw new UserError('panelOnlyRunLimits')
       if (environment(current) !== environment(candidate)) throw new UserError('panelOnlyEnvironment')
@@ -203,12 +208,13 @@ export class Settings {
     const current = store.settings()
     const candidate = rules.merge(current, parsed, id)
     rules.guard?.(current, candidate, origin, sources, id)
+    if (block === 'executor' && !developmentModelsReady(candidate.executor)) throw new InstallationError(400, 'developmentModelsRequired')
     this.host.validate?.(current, candidate)
-    const routes = block === 'eval' ? [[current.eval.model, candidate.eval.model]] : block === 'executor'
-      ? [[current.executor.model, candidate.executor.model], [current.executor.lightweightModel, candidate.executor.lightweightModel]] : []
-    for (const [previous, model] of routes) if (model && JSON.stringify(model) !== JSON.stringify(previous)) {
+    const routes = block === 'eval' ? [['eval', current.eval.model, candidate.eval.model] as const] : block === 'executor'
+      ? (['model', ...projectModelFields] as const).map(field => [`executor.${field}`, current.executor[field], candidate.executor[field]] as const) : []
+    for (const [field, previous, model] of routes) if (model && changedModel(previous, model)) {
       try { await resolveRoleModel(this.host.context, model) }
-      catch (error) { throw new UserError('modelUnavailable', { block, error: error instanceof Error ? error.message : String(error) }) }
+      catch (error) { throw new UserError('modelUnavailable', { block: field, error: error instanceof Error ? error.message : String(error) }) }
     }
     if (setupChanged(current, candidate)) await this.host.setup.checkAccounts(block, candidate)
     if (stale()) throw new SettingsConflict('Settings changed during the checks. Reload before saving.')

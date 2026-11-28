@@ -8,6 +8,7 @@ import { failedCheckObligations, type TestHistory } from '../core/delivery-check
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { inspectWorktree } from '../executor/worktree.ts'
 import { docTreeImpactSchema, docTreeScopeSchema } from '../executor/doc-tree.ts'
+import { inspectionRepairViolation } from '../executor/inspection-git.ts'
 import { inspectRulesChange } from '../executor/mainline-git.ts'
 import { readGithub } from '../sources/github-read.ts'
 import { actionsEvidence, type ActionsEvidence } from '../sources/actions-evidence.ts'
@@ -444,6 +445,11 @@ async function inspectDelivery(host: ResourceHost, id: string, signal?: AbortSig
   let observation: DeliveryTargetObservation | undefined
   let rulesRevision: number | undefined
   let rulesMissing: string | undefined
+  const handoff = checkout?.clean && state.ticket.plan ? host.store.get(KV.handoffs.record(state.ticket.plan.planId)) : undefined
+  const repair = handoff?.inspectionRepair
+  const repairMissing = checkout && repair ? checkout.baseRef !== repair.baseRef ? 'inspection_repair_target'
+    : await inspectionRepairViolation(commands, handoff.project, repair, handoff.authorization.scope, checkout.base, checkout.candidate) : undefined
+  if (repairMissing) result.missing.add(repairMissing)
   if (checkout?.clean && state.ticket.plan) {
     const change = await inspectRulesChange(commands, checkout.worktree, checkout.base, checkout.candidate, host.rulesManifestMaxBytes())
     if (change.kind === 'not-isolated') rulesMissing = 'shared_rules_not_isolated'
@@ -907,10 +913,12 @@ const ROUTES: readonly Route[] = [
       const definition = host.plans?.definition(planId, nodeId)
       if (!definition) throw new UserError('unknownPlanNode', { id: planId, node: nodeId })
       const { node, goal, constraints, authorization, retired, testInterfaces, acceptanceScope, outOfScope } = definition
+      const inspectionRepair = host.store.get(KV.handoffs.record(planId))?.inspectionRepair
       const repair = host.plans?.repairSource(planId, nodeId)
       const inheritedChecks = host.plans?.testHistory(planId, nodeId)?.failures
       return { planId, nodeId, goal, constraints, authorizedScope: authorization.scope, role: node.role,
         demonstration: node.demonstration, interfaceContract: node.interfaceContract, acceptance: deliveryAcceptance(host, ticket), testInterfaces,
+        ...(inspectionRepair && { authorizedSupportingPaths: inspectionRepair.supportingPaths }),
         acceptanceScope, outOfScope, ...(inheritedChecks?.length ? { inheritedChecks } : {}),
         ...(repair ? { repair } : {}), ...(retired ? { superseded: retired } : {}), evidence: `ticket/${id}/delivery-check` }
     }

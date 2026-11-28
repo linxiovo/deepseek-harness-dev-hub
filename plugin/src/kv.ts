@@ -108,6 +108,7 @@ export const KV = {
   /** Inspection scheduler and evidence; the Session adapter independently pins the native root at creation. */
   inspection: { schedule: record<InspectionSchedule>('inspection-schedule'), run: family<InspectionRun>('inspection-run:'),
     native: family<number>('inspection-native:'), todo: family<InspectionTodo>('inspection-todo:'),
+    repairWake: family<string>('inspection-repair-wake:'),
     page: family<true, [string, string, number]>('inspection-page:', (id, path, offset) => `${id}:${JSON.stringify([path, offset])}`) },
   /** A lookup reserves its creation proof before opening a native root; only a verified root has a creation time. */
   lookup: { native: family<{ token: string; createdAt?: number }>('lookup-native:') },

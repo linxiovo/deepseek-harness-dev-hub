@@ -16,7 +16,7 @@ import type { CreateProjectInput, CreateProjectResult, OnboardingView, ProjectsV
 import type { TopicBindingView } from './topic-binding.ts'
 import type { ScopedAttention } from './scoped-attention.ts'
 import type { PlanIntegrationView } from '../core/plan-integration.ts'
-import type { InspectionView } from './idle-inspection.ts'
+import type { InspectionRepairApproval, InspectionRepairInput, InspectionView } from './idle-inspection.ts'
 import type { SettingsProposal, SettingsConfirmationView } from '../confirmed-settings.ts'
 
 export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
@@ -74,6 +74,7 @@ export interface Api {
   'GET sessions/:id/meter': { response: SessionMeterView }
   'GET project/meter': { response: ProjectMeterView }
   'GET project/inspection': { query?: Paged; response: InspectionView }
+  'POST project/inspection/:id/repair': { body: InspectionRepairInput; response: InspectionRepairApproval }
   'GET plans/:id/meter': { response: ProjectMeterView }
   'GET plans/:id/artifact': { response: Blob }
   'GET plans/:id/delivery': { response: PlanIntegrationView }

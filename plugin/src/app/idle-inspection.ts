@@ -1,12 +1,17 @@
 import { randomUUID } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
-import type { ProjectRef } from '../core/handoff.ts'
+import { z } from 'zod'
+import type { InspectionObservation, ProjectRef } from '../core/handoff.ts'
 import { key } from '../core/ids.ts'
-import { inspectionCommit, readInspectionPath } from '../executor/inspection-git.ts'
+import { PLAN_ROLES } from '../core/plan.ts'
+import { inInspectionScope, inspectionCommit, inspectionFindingCurrent, readInspectionPath, validInspectionPath } from '../executor/inspection-git.ts'
 import type { Commands } from '../infra/commands.ts'
 import { KV } from '../kv.ts'
 import type { InspectionGrant, RoleModel } from '../policy.ts'
 import { Later, Park, type Effects } from './effects.ts'
+import type { Handoffs } from './handoffs.ts'
+import { InstallationError } from './installation-api.ts'
+import type { Plans } from './plans.ts'
 import type { ProjectMeter } from './project-meter.ts'
 import type { BudgetView, RunLimits } from './run-limits.ts'
 import type { Store } from './store.ts'
@@ -21,9 +26,18 @@ export interface InspectionRun {
   startedAt: string; commit?: string; inspected?: true; endedAt?: string; reason?: string; todoIds?: string[]
   status: 'pending' | 'running' | 'completed' | 'withdrawn' | 'failed' | 'quota-paused'
 }
-interface Observation { sessionId: string; scope: string; commit: string; at: string }
+const approvalText = z.string().trim().min(1).max(200)
+const repairPath = z.string().max(1024).refine(path => validInspectionPath(path) && !path.includes('\uFFFD'))
+export const InspectionRepairSchema = z.strictObject({ path: repairPath,
+  sessionId: z.string().min(1).max(100), role: z.enum(PLAN_ROLES), goal: approvalText,
+  supportingPaths: z.array(repairPath).max(16).optional(),
+  check: z.strictObject({ seam: approvalText, observable: z.string().trim().min(1).max(1000) }) })
+  .refine(({ path, supportingPaths }) => !supportingPaths || !supportingPaths.includes(path) && new Set(supportingPaths).size === supportingPaths.length)
+export type InspectionRepairInput = z.infer<typeof InspectionRepairSchema>
+export interface InspectionRepairApproval { planId: string; reused: boolean }
 export interface InspectionTodo {
-  id: string; projectId: string; path: string; evidence: string; summary: string; first: Observation; latest: Observation
+  id: string; projectId: string; path: string; evidence: string; summary: string
+  first: InspectionObservation; latest: InspectionObservation; repairPlanId?: string
 }
 export interface InspectionView {
   grant: InspectionGrant | null; nextDueAt: string | null; budget: BudgetView | null; pausedReason: string | null
@@ -36,11 +50,17 @@ interface Host {
   project: ProjectRef; sessionDirectory: string; commands: Commands; store: Store
   effects: Pick<Effects, 'handle' | 'enqueue' | 'cancel' | 'wakeParked' | 'pending'>
   meter: Pick<ProjectMeter, 'bind'>; limits: Pick<RunLimits, 'inspectionBudget' | 'view'>
+  handoffs: Pick<Handoffs, 'get' | 'list' | 'recordStageTwo'>; plans: Pick<Plans, 'get' | 'state' | 'register'>
+  stageTwo(): boolean; readyHub(): string | undefined; assertNewWork(): void
+  relayConsumed(id: string): Promise<boolean>
   hub(): string | undefined; idle(): boolean; closing(): boolean
   deliver(sessionId: string): Promise<void>; modelAllowed(sessionId: string): boolean; cancel(sessionId: string): void
 }
 
-/** Schedules one read-only turn at a time and records evidenced findings, never Tickets, Plan changes or repository writes. */
+const repairRelayPrefix = 'inspection-repair:'
+const repairNode = 'repair'
+
+/** Runs read-only inspections and promotes their findings only through separate operator approval. */
 export class IdleInspection {
   constructor(private readonly host: Host) {
     host.effects.handle('inspection', (_, id) => this.deliver(id), { limit: () => host.closing() ? 0 : 1 })
@@ -55,13 +75,49 @@ export class IdleInspection {
       ...(prior?.last && { last: prior.last }) })
   }
 
-  resume(): void {
+  async resume(): Promise<void> {
     const { store, effects } = this.host, schedule = store.get(KV.inspection.schedule)
     if (!schedule && store.settings().executor.idleInspection) this.configure()
     if (schedule?.active) {
       if (!effects.pending('inspection', schedule.active)) effects.enqueue('inspection', schedule.active, {})
       else effects.wakeParked('inspection')
     }
+    if (!this.host.stageTwo()) return
+    for (const handoff of this.host.handoffs.list()) {
+      if (this.host.closing()) return
+      const planId = handoff.id
+      if (!handoff.inspectionRepair || !this.awaitingRepairClaim(planId)) continue
+      const wake = KV.inspection.repairWake(planId), id = this.repairRelayId(planId)
+      const consumed = await this.host.relayConsumed(id)
+      store.atomic(() => {
+        if (this.host.closing() || !this.awaitingRepairClaim(planId) || this.repairRelayId(planId) !== id) return
+        if (consumed) {
+          effects.cancel('relay', id)
+          store.set(wake, `${repairRelayPrefix}${planId}:${randomUUID()}`)
+        } else if (effects.pending('relay', id)) return
+        this.relayRepair(planId)
+      })
+    }
+  }
+
+  private awaitingRepairClaim(planId: string): boolean {
+    return !this.host.plans.state(planId, repairNode) && this.host.plans.get(planId)?.nodes.some(node => node.id === repairNode) === true
+  }
+
+  private repairRelayId(planId: string): string {
+    return this.host.store.get(KV.inspection.repairWake(planId)) ?? `${repairRelayPrefix}${planId}`
+  }
+
+  private relayRepair(planId: string): void {
+    this.host.effects.enqueue('relay', this.repairRelayId(planId), {
+      text: JSON.stringify({ kind: 'inspection-repair-approved', planId, nodeId: repairNode, read: `plan/${planId}` }),
+    })
+  }
+
+  relayAvailable(id: string): boolean {
+    if (!id.startsWith(repairRelayPrefix)) return true
+    const planId = id.slice(repairRelayPrefix.length).split(':', 1)[0]!
+    return this.awaitingRepairClaim(planId) && this.repairRelayId(planId) === id
   }
 
   tick(): void {
@@ -183,7 +239,7 @@ export class IdleInspection {
     store.atomic(() => {
       this.authorized(id)
       assertNativeCall()
-      const latest: Observation = { sessionId: id, scope: task.scope, commit: task.commit, at: new Date().toISOString() }
+      const latest: InspectionObservation = { sessionId: id, scope: task.scope, commit: task.commit, at: new Date().toISOString() }
       for (const [todoId, { path, evidence, summary }] of observed) {
         const todoKey = KV.inspection.todo(todoId)
         const prior = store.get(todoKey)
@@ -207,6 +263,61 @@ export class IdleInspection {
       effects.cancel('inspection', id)
       for (const page of store.keys(`${KV.inspection.page.prefix}${id}:`)) store.delete(page)
       if (status !== 'completed') store.afterCommit(() => this.host.cancel(id))
+    })
+  }
+
+  async approveRepair(todoId: string, { path, sessionId, role, goal, check, supportingPaths = [] }: InspectionRepairInput): Promise<InspectionRepairApproval> {
+    const { host } = this, { store, project, handoffs } = host, todoKey = KV.inspection.todo(todoId)
+    const finding = () => {
+      const todo = store.get(todoKey)
+      if (!todo || todo.projectId !== project.id) throw new InstallationError(404, 'inspectionFindingNotFound')
+      if (path !== todo.path) throw new InstallationError(409, 'inspectionRepairConflict', 'Approval must name the exact finding path.')
+      return todo
+    }
+    const before = finding(), run = store.get(KV.inspection.run(sessionId))
+    if (!before.repairPlanId) {
+      if (before.latest.sessionId !== sessionId || run?.status !== 'completed' || run.commit !== before.latest.commit ||
+          run.grant.scope !== before.latest.scope || !run.todoIds?.includes(todoId) || !inInspectionScope(path, before.latest.scope) ||
+          run.baseRef !== store.settings().executor.baseRef) {
+        throw new InstallationError(409, 'inspectionRepairConflict', 'Approval must match the finding’s latest in-scope observation on the configured ref.')
+      }
+      const freshness = await inspectionFindingCurrent(host.commands, project, run.baseRef, before.latest.commit, path)
+      if (freshness !== 'current') throw new InstallationError(409, 'inspectionRepairConflict', freshness === 'ref-moved'
+        ? 'The target ref moved during approval; retry against the current target.'
+        : 'The observed file changed or disappeared; inspect it again before approving repair.')
+    }
+    return store.atomic(() => {
+      host.assertNewWork()
+      const todo = finding()
+      if (todo.repairPlanId) {
+        const prior = handoffs.get(todo.repairPlanId), receipt = prior?.inspectionRepair, criterion = prior?.spec?.acceptance[0]
+        if (receipt?.observation.sessionId !== sessionId || prior?.goal !== goal || criterion?.delivery !== role ||
+            criterion.observable !== check.observable || prior.spec?.testInterfaces[0]?.seam !== check.seam ||
+            receipt.supportingPaths.length !== supportingPaths.length || supportingPaths.some(path => !receipt.supportingPaths.includes(path))) {
+          throw new InstallationError(409, 'inspectionRepairConflict', 'This finding already has a different repair approval.')
+        }
+        return { planId: todo.repairPlanId, reused: true }
+      }
+      const hubSessionId = host.readyHub()
+      if (!host.stageTwo() || host.closing() || !hubSessionId) {
+        throw new InstallationError(409, 'inspectionRepairConflict', 'Repair approval requires Stage 2 and a ready Hub.')
+      }
+      const { latest } = todo
+      if (!run || latest.sessionId !== sessionId || latest.commit !== before.latest.commit || run.baseRef !== store.settings().executor.baseRef) {
+        throw new InstallationError(409, 'inspectionRepairConflict', 'The observation or target changed during approval.')
+      }
+      const spec = handoffs.recordStageTwo({ inspectionRepair: { todoId, observation: latest, hubSessionId,
+        baseRef: run.baseRef, supportingPaths, approvedAt: new Date().toISOString() } }, { scope: path, goal, constraints: [] }, {
+        body: goal, acceptance: [{ statement: goal, observable: check.observable, delivery: role }],
+        testInterfaces: [{ seam: check.seam, kind: 'proposed', note: check.observable }], outOfScope: [],
+      })
+      const { id: planId } = host.plans.register(spec.handoffId, spec.id, {
+        features: [{ id: repairNode, kind: role }],
+        nodes: [{ id: repairNode, featureId: repairNode, title: goal, role, acceptance: [1], demonstration: check.observable, blockedBy: [] }],
+      })
+      store.set(todoKey, { ...todo, repairPlanId: planId })
+      this.relayRepair(planId)
+      return { planId, reused: false }
     })
   }
 

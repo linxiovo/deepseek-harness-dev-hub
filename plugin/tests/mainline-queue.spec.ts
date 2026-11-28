@@ -642,6 +642,7 @@ it.each<[name: string, scenario: {
   advanceTargetDuringFinalRunLookup?: boolean; rerunDuringFinalTargetRead?: boolean; loseArtifactBeforeRelay?: boolean
 }]>([
   ['artifact-only', { release: 'not-authorized', dispatchFailure: 'lost-response' }],
+  ['inspection-repair', { release: 'not-authorized', dispatchFailure: 'lost-response' }],
   ['authorized-release-unverified', { release: 'authorized', dispatchFailure: 'lost-response' }],
   ['verified-release', { release: 'authorized', dispatchFailure: 'lost-response', controlledRelease: true }],
   ['dispatch-refused', { release: 'not-authorized', dispatchFailure: 'forbidden', pauseOnRefusal: true }],
@@ -882,30 +883,117 @@ it.each<[name: string, scenario: {
   expect(await read('project/stage')).toMatchObject(stageTwo ? { stage: 2, deliveredPlan: id } : { stage: 1 })
   await h.runtime.pump()
   expect(maintenanceCandidates()).toEqual([])
-  if (_scenario === 'artifact-only') {
+  if (_scenario === 'artifact-only' || _scenario === 'inspection-repair') {
+    const repair = _scenario === 'inspection-repair', project = mounted.project.id
+    if (repair) {
+      git('fetch', '--no-tags', remote, targetRef)
+      git('merge', '--ff-only', 'FETCH_HEAD')
+    }
+    const path = repair ? labelFile : 'shared.txt'
     const config = async (idleInspection: object | null) => {
       const { value, revision } = JSON.parse(String((await read('settings/executor')).text))
-      expect(await h.api('PUT', 'settings/executor', { value: { ...value, idleInspection }, revision }, mounted.project.id)).toMatchObject({ status: 200 })
+      expect(await h.api('PUT', 'settings/executor', { value: { ...value, idleInspection }, revision }, project)).toMatchObject({ status: 200 })
     }
-    const main = git('rev-parse', targetRef), originalText = git('show', `${main}:shared.txt`)
+    const main = git('rev-parse', targetRef), originalText = git('show', `${main}:${path}`)
+    let inspectionSession: string
+    let todoId: string
     vi.useFakeTimers({ toFake: ['Date'] })
     try {
       const now = Date.now()
-      await config({ scope: 'shared.txt', intervalSeconds: 5, maxTokens: 1000 })
+      await config({ scope: path, intervalSeconds: 5, maxTokens: 1000 })
       vi.setSystemTime(now + 5000)
       await h.runtime.pump(); await h.runtime.idle()
       const { lastRun } = z.object({ lastRun: z.object({ sessionId: z.string(), commit: z.literal(main) }) }).parse(await read('project/inspection'))
-      await h.modelTool(lastRun.sessionId, 'orchestrator_inspection_read', { path: 'shared.txt' })
-      await h.modelTool(lastRun.sessionId, 'orchestrator_inspection_finish', { findings: [{ path: 'shared.txt', evidence: originalText, summary: 'Clarify the baseline label.' }] })
-      expect(await read('project/inspection')).toMatchObject({ lastRun: { status: 'completed' }, items: [expect.objectContaining({ path: 'shared.txt' })] })
+      inspectionSession = lastRun.sessionId
+      h.record(inspectionSession, [{ type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [] },
+        stream: [], usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 } } }])
+      await h.modelTool(inspectionSession, 'orchestrator_inspection_read', { path })
+      await h.modelTool(inspectionSession, 'orchestrator_inspection_finish', { findings: [{ path, evidence: originalText, summary: 'Normalize label casing.' }] })
+      const finding = await read('project/inspection')
+      expect(finding).toMatchObject({ lastRun: { status: 'completed' }, items: [{ path }] })
+      todoId = z.object({ items: z.array(z.object({ id: z.string() })).length(1) }).parse(finding).items[0]!.id
     } finally { vi.useRealTimers() }
-    expect([git('rev-parse', targetRef), tip(), git('show', `${main}:shared.txt`)]).toEqual([main, integration, originalText])
+    expect([git('rev-parse', targetRef), tip(), git('show', `${main}:${path}`)]).toEqual([main, integration, originalText])
     expect(await read(`plan/${id}/delivery`)).toEqual(resource)
     expect((await read(`ticket/${worker.ticketId}`)).state).toBe('merged')
     await config(null)
+
+    if (repair) {
+      expect(await read('tickets')).toMatchObject({ items: [{ ticket_id: worker.ticketId }] })
+      const approval = { path, sessionId: inspectionSession, role: 'backend', goal: 'Lowercase trimmed labels',
+        supportingPaths: [routeDoc, contractDoc],
+        check: { seam: 'label()', observable: 'A mixed-case padded label returns lowercase text without surrounding spaces' } }
+      const approve = () => h.api('POST', `project/inspection/${todoId}/repair`, approval, project)
+      const approved = await approve()
+      expect(approved).toMatchObject({ status: 200, body: { reused: false } })
+      const repairId = z.string().parse(approved.body.planId)
+      expect(repairId).not.toBe(id)
+      await h.idleRelay()
+      expect(h.jsonRelays(h.runtime.masterId, 'inspection-repair-approved')).toMatchObject([{ planId: repairId }])
+      const { claim } = await hub('orchestrator_plan_dispatch', { planId: repairId, nodeId: 'repair' })
+      await h.runtime.idle()
+      const identity = claimIdentity.parse(claim), { session, ticketId } = identity
+      const child = { ...identity, directory: z.string().parse((await read(`ticket/${ticketId}`)).directory) }
+      expect(ticketId).not.toBe(worker.ticketId)
+      expect(child.directory).not.toBe(worker.directory)
+      expect(git('-C', child.directory, 'rev-parse', 'HEAD')).toBe(integration)
+      expect(await h.runTool(session, 'orchestrator_read', { resource: `ticket/${ticketId}/plan-scope` }))
+        .toMatchObject({ authorizedScope: path, authorizedSupportingPaths: [routeDoc, contractDoc], testInterfaces: [{ seam: 'label()' }] })
+      await expect(h.modelTool(inspectionSession, 'orchestrator_inspection_read', { path })).rejects.toThrow()
+      h.record(session, [{ type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [] },
+        stream: [], usage: { inputTokens: 13, outputTokens: 7, totalTokens: 20 } } }])
+      expect(await read(`plan/${repairId}/meter`)).toMatchObject({ total: { reported_total_tokens: 20 }, shared: { reported_total_tokens: 10 } })
+      expect(await read('project/meter')).toMatchObject({ total: { reported_total_tokens: 30 }, sessions: expect.arrayContaining([
+        expect.objectContaining({ session_id: inspectionSession, roles: ['inspection'], ticket_id: null, plan_id: null }),
+        expect.objectContaining({ session_id: session, roles: ['implementation'], ticket_id: ticketId, plan_id: repairId }),
+      ]) })
+
+      formatLabel(child.directory, 'value.trim().toLowerCase()', 'Trim and lowercase labels')
+      write(child.directory, routeDoc, '# Labels\n\n[Contract](missing-contract.md)\n')
+      write(child.directory, 'docs/unapproved.txt', 'A sibling of the approved paths is not itself approved.\n')
+      const outside = commit(child.directory, 'Try to change an unapproved path')
+      await expect(queue(ticketId, outside)).rejects.toThrow(/inspection_repair_scope/)
+      expect(tip()).toBe(integration)
+      rmSync(join(child.directory, 'docs', 'unapproved.txt'))
+      git('-C', child.directory, 'add', '-u')
+      git('-C', child.directory, 'commit', '--amend', '--no-edit')
+      const before = git('-C', child.directory, 'rev-parse', 'HEAD')
+      await expect(queue(ticketId, before)).rejects.toThrow(/dual-review/)
+      expect(await delivery(ticketId)).toMatchObject({ ready: false,
+        missing: expect.arrayContaining(['dual-review', 'acceptance', 'docs', 'tests', 'required_ci']) })
+      await reviewAndTest(child, repairId, integration, before, 'alert')
+      const broken = await inspectDocs(child, before)
+      expect(broken).toMatchObject({ structure: 'issues' })
+      await retro(child, before, { kind: 'first-retro', findings: [{ id: 'broken-doc-link', category: 'standard',
+        summary: 'The label contract link is broken.', affects: ['docs'], evidence: [broken.read] }] })
+      await expect(queue(ticketId, before)).rejects.toThrow(/repair:broken-doc-link/)
+      expect(tip()).toBe(integration)
+
+      formatLabel(child.directory, 'value.trim().toLowerCase()', 'Trim and lowercase labels')
+      const fixed = commit(child.directory, 'Restore the Doc Tree link')
+      await retro(child, fixed, { kind: 'repair', fixes: [{ id: 'broken-doc-link', evidence: [`${fixed}:${routeDoc}`] }] })
+      const passing = await reviewAndTest(child, repairId, integration, fixed, 'alert')
+      await expect(inspectDocs(child, fixed)).resolves.toMatchObject({ structure: 'checked', issues: [] })
+      await accept(child, fixed, '1', passing)
+      ci.publish(fixed, undefined, git('-C', child.directory, 'branch', '--show-current'))
+      await expect(queue(ticketId, fixed)).rejects.toThrow(/final-retro/)
+      await retro(child, fixed, { kind: 'final-retro', findings: [] })
+      await h.runTool(session, 'orchestrator_report', { state: 'ready', summary: 'The lowercase label passes its checks.' })
+      const repairIntent = await queue(ticketId, fixed)
+      await h.runtime.idle()
+      const repaired = tip()
+      expect(repaired).not.toBe(integration)
+      await delivered(repairId, 'repair', child, repairIntent, integration, fixed, repaired)
+      expect(await read(`plan/${repairId}/delivery`)).toMatchObject({ status: 'delivered', version: { sha: repaired } })
+      expect(await read(`plan/${id}/delivery`)).toEqual(resource)
+      expect(await read('project/stage')).toMatchObject({ deliveredPlan: id })
+      expect(await approve()).toMatchObject({ status: 200, body: { planId: repairId, reused: true } })
+      expect(await h.api('POST', `project/inspection/${todoId}/repair`, { ...approval, supportingPaths: [routeDoc] }, project))
+        .toMatchObject({ status: 409, body: { code: 'inspectionRepairConflict' } })
+    }
   }
   if (controlledRelease) await exerciseBoundMaintenance(mounted.project.id)
-  else if (release === 'not-authorized' && !pauseOnRefusal && !rerunDuringDownload && !rerunDuringFinalTargetRead)
+  else if (_scenario !== 'inspection-repair' && release === 'not-authorized' && !pauseOnRefusal && !rerunDuringDownload && !rerunDuringFinalTargetRead)
     await exerciseGithubAndHarnessMaintenance(mounted.project.id, id, worker)
 }, 180_000)
 async function interruptedByRestart(lifetime: AbortSignal): Promise<never> {

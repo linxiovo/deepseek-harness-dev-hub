@@ -421,7 +421,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/topic-binding.ts` | Binds one observed Feishu destination to the selected project and accepts correlated answers from explicitly authorized senders; see `009-handoff.md` |
 | `src/app/settings-confirmations.ts` | Proposal versions, per-request Feishu grants, original-card delivery receipts and atomic settings decisions |
 | `src/app/maintenance.ts` | `Maintenance`: Stage 2 event intake, rule-based registration, recovery relays and durable feedback associations; see `009-handoff.md#stage-2-maintenance` |
-| `src/app/idle-inspection.ts` | Due-time scheduling, authorization, inspected-page evidence and independent finding associations. Contract: `020-idle-inspection.md`. |
+| `src/app/idle-inspection.ts` | Due-time scheduling, read authorization, inspected-page evidence and operator-approved finding promotion through the shared Plan registry. Contract: `020-idle-inspection.md`. |
 | `src/app/planning.ts` | `Planning`: durable `planning` and `splitting` effects for the specification planner and the Plan DAG splitter |
 | `src/app/plans.ts` | `Plans`: validates and publishes immutable Plan revisions, retains old node definitions and claims, and gates Frontier and delivery |
 | `src/app/plan-dispatch.ts` | `PlanDispatcher`: validates Frontier predecessors, reserves a launch slot, atomically claims a node into a stable Ticket/Assignment, and rearms the same claim on restart |
@@ -579,7 +579,7 @@ The TypeScript build configuration uses tsdown's automatic loader. The `unrun` d
 | `tests/runtime-crash.spec.ts` | Process-level recovery after `SIGKILL` at project selection, unconfirmed Worker dispatch, and a GitHub merge not yet observed locally |
 | `tests/plan-integration-crash.spec.ts` | SIGKILL after GitHub accepts workflow dispatch but before the effect records a result; SQLite recovery observes the existing run without another dispatch |
 | `tests/maintenance-recovery.spec.ts` | Stage 2 inbox and native-history recovery, stale authority during workspace validation, and maintenance replay of paired live/history Feishu private-chat samples |
-| `tests/idle-inspection.spec.ts` | Explicit grants, controllable clock, actual native tool calls, findings, model selection, project usage and event precedence. |
+| `tests/idle-inspection.spec.ts` | Explicit read and repair grants, controllable clock, native tool calls, finding and approval replay, model selection, project usage and event precedence. |
 | `tests/lightweight-lookup.spec.ts` | Hub code lookup, Doc Tree navigation and status summary through the native model request, default routing and project authorization |
 | `tests/inspection-git.spec.ts` | Immutable snapshot pagination, path and object boundaries, missing objects, and preservation of checkout/index/ref. |
 | `tests/inspection-quota.spec.ts` | Dual-pool reservation, settlement and recovery; missing usage pauses the strict scope, not independently authorized Tickets. |

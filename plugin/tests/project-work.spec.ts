@@ -174,6 +174,7 @@ async function managedHarness(runtimeMode: RuntimeMode = 'desktop') {
   const host = await startRuntime(undefined, { withFeishu: false })
   // Keep the host's Sessions alive, but give the managed installation a fresh catalog and scoped plugin lifecycle.
   const scope = host.ctx.isolate('orchestrator')
+  let current: Runtime
   let mounted: Fiber | undefined
   let watcher: Fiber | undefined
   const unwatch = async () => { await watcher?.dispose(); watcher = undefined }
@@ -208,14 +209,13 @@ async function managedHarness(runtimeMode: RuntimeMode = 'desktop') {
     const mount = async () => {
       await unwatch()
       await mounted?.dispose()
-      let runtime!: Runtime
       mounted = scope.plugin({ async apply(ctx) {
-        const value = runtime = new Runtime(ctx, testMachine({ stateDir, runtimeMode }), vi.fn())
+        const value = current = new Runtime(ctx, testMachine({ stateDir, runtimeMode }), vi.fn())
         ctx.effect(() => () => value.stop())
         await value.ready
       } })
       await mounted
-      return runtime
+      return current
     }
     const watchGithub = async () => { watcher = scope.plugin(githubSource); await watcher }
     const create = async (index: 0 | 1, repository: string, allowed: string) => {
@@ -238,7 +238,8 @@ async function managedHarness(runtimeMode: RuntimeMode = 'desktop') {
     const first = await create(0, 'acme/widgets', 'alice')
     const runtime = await mount()
     const second = await create(1, 'acme/gadgets', 'bob')
-    return { host, first, second, runtime, mount, select, watchGithub, stop, restartFiber: () => mounted!.restart() }
+    return { host, first, second, runtime, mount, select, watchGithub, stop,
+      restartFiber: async () => { await mounted!.restart(); return current } }
   } catch (error) { await stop(); throw error }
 }
 
@@ -340,12 +341,19 @@ it('keeps Worker model admission closed through a real Cordis Fiber restart', as
     if (!claim || typeof claim !== 'object' || !('session' in claim) || typeof claim.session !== 'string') throw new Error('Missing Worker claim')
     const id = claim.session
     await runtime.idle()
+    const settings = await host.api('GET', 'settings', undefined, first.id)
+    const { blocks: { executor } } = settings.body as ApiResponse<'GET settings'>
+    expect(executor.value.backendModel).toEqual(developmentModels.backendModel)
+    expect(await host.api('PUT', 'settings/executor', { ...executor, value: { ...executor.value, backendModel: { provider: 'other', model: 'new' } } }, first.id))
+      .toMatchObject({ status: 200, body: { restarting: false } })
+    await runtime.idle()
     const provider = vi.fn(async function* (_request: GenerateOptions): AsyncGenerator<StreamChunk> {
       yield { type: 'finish', reason: { kind: 'stop' } }
     })
     const flushing = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
     vi.mocked(host.ctx.sessionPersistence.flush).mockImplementationOnce(() => { flushing.resolve(); return release.promise })
     const restart = restartFiber()
+    let resumed: Runtime
     try {
       await Promise.race([flushing.promise, restart.then(() => { throw new Error('Fiber restarted before the expected log flush') })])
       // Dispatch from the surviving host, not from the child Fiber that is already unloading.
@@ -354,8 +362,13 @@ it('keeps Worker model admission closed through a real Cordis Fiber restart', as
       expect(await host.nativeStep(id, { starts: true })).toBe(false)
       await expect(host.modelRequest(id, 10, provider)).rejects.toMatchObject({ code: 'SUPERAGENT_RUN_LIMIT' })
       expect(provider).not.toHaveBeenCalled()
-    } finally { release.resolve(); await restart }
+    } finally { release.resolve(); resumed = await restart }
     expect(await host.api('GET', 'runtime')).toMatchObject({ status: 200, body: { projectId: first.id, status: 'ready' } })
+    await resumed.idle()
+    await host.modelRequest(id, 10, provider)
+    expect(provider).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(developmentModels.backendModel))
+    await using log = await host.ctx.sessionPersistence.open(id as SessionId, 'read')
+    expect((await log.read()).events.filter(event => event.type === 'model/selection').map(event => event.data)).toEqual([developmentModels.backendModel])
   } finally { await stop() }
 })
 

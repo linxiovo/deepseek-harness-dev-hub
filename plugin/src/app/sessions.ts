@@ -189,6 +189,32 @@ const withdrawnRelay = Symbol('withdrawn relay')
 interface WorkerGate { allows?: (agent: Agent, ticketId: string) => boolean }
 const workerGates = new WeakMap<Context, WorkerGate>()
 
+function workerGateFor(root: Context): WorkerGate {
+  const existing = workerGates.get(root)
+  if (existing) return existing
+  const profile: WorkerGate = {}
+  root.on('agent/pre-step', async ({ agent }, next) => {
+    const ticketId = ticketOfSession(agent.id)
+    if (ticketId === undefined) return next()
+    const allows = profile.allows
+    if (!allows?.(agent, ticketId)) return { kind: 'reject' }
+    const decision = await next()
+    return decision.kind === 'enter' && (profile.allows !== allows || !allows(agent, ticketId)) ? { kind: 'reject' } : decision
+  }, { global: true })
+  root.on('llm/stream', (request, next) => {
+    if (!profile.allows) {
+      const initiator = root.get('agents')?.currentInitiator()
+      if ((request.sessionId && ticketOfSession(request.sessionId) !== undefined) ||
+        (initiator && ticketOfSession(initiator.id) !== undefined)) {
+        throw new LlmError('Worker Session has no ready model and writer in the current mount', RUN_LIMIT_REFUSAL)
+      }
+    }
+    return next()
+  }, { global: true })
+  workerGates.set(root, profile)
+  return profile
+}
+
 /**
  * Creates and decorates orchestrator and worker DSH `Agent` sessions with role models, system prompt sections from `Prompts`, runtime skills, and restricted tool sets.
  * `Runtime`, `DshExecutor`, `MasterAssessor`, `Settings`, and management routes/tools use it to ensure sessions, deliver deduplicated messages via `AgentDelivery`, and process ordered `relay` and `notice` effects.
@@ -228,28 +254,7 @@ const workerGates = new WeakMap<Context, WorkerGate>()
   }
   /** Own the permanent dispatch fence at profile scope; a Cordis remount disposes child listeners concurrently. */
   installWorkerGate(): void {
-    const root = this.ctx.root
-    let gate = workerGates.get(root)
-    if (!gate) {
-      const profile: WorkerGate = {}
-      root.on('agent/pre-step', async ({ agent }, next) => {
-        const ticketId = ticketOfSession(agent.id)
-        if (ticketId === undefined) return next()
-        const allows = profile.allows
-        if (!allows?.(agent, ticketId)) return { kind: 'reject' }
-        const decision = await next()
-        return decision.kind === 'enter' && (profile.allows !== allows || !allows(agent, ticketId)) ? { kind: 'reject' } : decision
-      }, { global: true })
-      root.on('llm/stream', (request, next) => {
-        const id = request.sessionId ?? root.get('agents')?.currentInitiator()?.id
-        if (id && ticketOfSession(id) !== undefined && !profile.allows) {
-          throw new LlmError('Worker Session has no ready model and writer in the current mount', RUN_LIMIT_REFUSAL)
-        }
-        return next()
-      }, { global: true })
-      workerGates.set(root, gate = profile)
-    }
-    const profile = gate
+    const profile = workerGateFor(this.ctx.root)
     const allows = (agent: Agent, ticketId: string) => !this.host.closing() && this.readyWorkerModels.has(agent)
       && this.ctx.agents.get(agent.id) === agent && this.host.workerAuthorized(ticketId, agent.id)
     profile.allows = allows

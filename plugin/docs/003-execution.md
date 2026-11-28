@@ -36,7 +36,7 @@ A Plan Ticket's registered `backend` or `frontend` role selects `executor.backen
 
 The Plan claim pins the configured route before launch. A standalone Worker pins its override (or absence of one) before Session creation. A configured override is recorded as a native `model/selection` before the first request. If interrupted before that request, recovery uses the same Worker Session ID and its durable selection if present, otherwise the pinned route. Settings changes apply to new reservations; they do not replace a pinned route or an existing native selection. Explicit native selections made later still take effect.
 
-A Worker Session cannot enter a native model step or call a provider unless the mounted project holds its writer lease and has initialized the route for that physical Agent. The step guard is installed before startup's GitHub probe and recovery reads, stays through the final log flush on shutdown, and rejects reserved Worker IDs belonging to an inactive project.
+A Worker Session cannot enter a native model step or call a provider unless the mounted project holds its writer lease and has initialized the route for that physical Agent. The profile owns the guard independently of the plugin's Cordis mount. It rejects reserved Worker IDs during startup, shutdown and between project mounts, including IDs from an inactive project.
 
 ### Background work and worker slots
 

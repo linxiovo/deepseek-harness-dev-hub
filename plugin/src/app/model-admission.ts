@@ -55,7 +55,8 @@ function receipt(usage: TokenUsage): TokenUsage | null {
  */
 export function installModelAdmission(context: Context, host: AdmissionHost, lifetime: AbortSignal): () => void {
   let installed = true
-  const remove = context.on('llm/stream', (options, next) => {
+  // Runtime owns disposal after draining; Cordis must not detach admission concurrently with its shutdown callback.
+  const remove = context.root.on('llm/stream', (options, next) => {
     // Capture at dispatch, not at first pull: the initiating async scope and the Session's prepared route
     // belong to the caller, not necessarily to the consumer that later iterates the returned handle.
     const initiator = context.agents.currentInitiator()

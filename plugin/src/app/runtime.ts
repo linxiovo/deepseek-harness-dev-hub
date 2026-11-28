@@ -797,6 +797,7 @@ export class Runtime extends Service implements SourceHost {
     } finally { database.close() }
   }
   private async initialize(): Promise<void> {
+    this.sessions.installWorkerGate()
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposeHttp = registerHttp(this.ctx, this.httpHost())
     this.runLimits.recover()

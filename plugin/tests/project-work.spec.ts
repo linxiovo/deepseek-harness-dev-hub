@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
 import type { Fiber } from '@deepseek-ai/cordis'
+import { freezeMessage, MessageId, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { Effects } from '../src/app/effects.ts'
 import type { ApiResponse } from '../src/app/api.ts'
@@ -237,7 +238,7 @@ async function managedHarness(runtimeMode: RuntimeMode = 'desktop') {
     const first = await create(0, 'acme/widgets', 'alice')
     const runtime = await mount()
     const second = await create(1, 'acme/gadgets', 'bob')
-    return { host, first, second, runtime, mount, select, watchGithub, stop }
+    return { host, first, second, runtime, mount, select, watchGithub, stop, restartFiber: () => mounted!.restart() }
   } catch (error) { await stop(); throw error }
 }
 
@@ -326,6 +327,35 @@ it('keeps confirmed handoffs, specifications and Plan DAGs isolated across manag
     await select(second)
     await mount()
     expect(await readWork(second, b.id)).toEqual(savedB)
+  } finally { await stop() }
+})
+
+it('keeps Worker model admission closed through a real Cordis Fiber restart', async () => {
+  const { host, first, runtime, restartFiber, stop } = await managedHarness()
+  try {
+    const plan = await publishSpec(host, runtime, first, 'saved products')
+    await host.runTool(plan.splitter, 'orchestrator_plan_register', plan.registration)
+    const result = await host.runTool(runtime.masterId, 'orchestrator_plan_dispatch', { planId: plan.id, nodeId: 'api' })
+    const claim = result.claim
+    if (!claim || typeof claim !== 'object' || !('session' in claim) || typeof claim.session !== 'string') throw new Error('Missing Worker claim')
+    const id = claim.session
+    await runtime.idle()
+    const provider = vi.fn(async function* (_request: GenerateOptions): AsyncGenerator<StreamChunk> {
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    })
+    const flushing = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+    vi.mocked(host.ctx.sessionPersistence.flush).mockImplementationOnce(() => { flushing.resolve(); return release.promise })
+    const restart = restartFiber()
+    try {
+      await Promise.race([flushing.promise, restart.then(() => { throw new Error('Fiber restarted before the expected log flush') })])
+      // Dispatch from the surviving host, not from the child Fiber that is already unloading.
+      host.agents.get(id)!.inbox.nextTurn.push(freezeMessage({ role: 'user', source: { kind: 'user' }, id: MessageId('during-fiber-restart'),
+        content: [{ type: 'text', text: 'Continue' }] }))
+      expect(await host.nativeStep(id, { starts: true })).toBe(false)
+      await expect(host.modelRequest(id, 10, provider)).rejects.toMatchObject({ code: 'SUPERAGENT_RUN_LIMIT' })
+      expect(provider).not.toHaveBeenCalled()
+    } finally { release.resolve(); await restart }
+    expect(await host.api('GET', 'runtime')).toMatchObject({ status: 200, body: { projectId: first.id, status: 'ready' } })
   } finally { await stop() }
 })
 

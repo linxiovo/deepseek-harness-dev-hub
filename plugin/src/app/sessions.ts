@@ -1,7 +1,7 @@
 /** Lifecycle, prompt/tool/skill decoration, message delivery, and budget retry tracking for managed DSH Sessions. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { freezeMessage, type MessageId, type UserMessage } from '@deepseek-ai/dsh-llm'
+import { freezeMessage, LlmError, type MessageId, type UserMessage } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import { realpathSync } from 'node:fs'
@@ -21,6 +21,7 @@ import type { HubCreation, HubRotation } from './hub-authority.ts'
 import { matchesNativeRoot, openNativeRoot } from './hub-session-root.ts'
 import type { OperatorMessage } from './maintenance.ts'
 import type { HubDeliveryReceipt } from '../kv.ts'
+import { RUN_LIMIT_REFUSAL } from './model-admission.ts'
 import { RetryHealth } from './retry-health.ts'
 import { initializeRoleModel } from './role-models.ts'
 import { bundledSkills, isBundledSkill, promptFile, splitterSkill } from './skill-files.ts'
@@ -185,6 +186,9 @@ const DEV_MCP_TOOLS = ['mcp__context7__resolve-library-id', 'mcp__context7__quer
 
 const withdrawnRelay = Symbol('withdrawn relay')
 
+interface WorkerGate { allows?: (agent: Agent, ticketId: string) => boolean }
+const workerGates = new WeakMap<Context, WorkerGate>()
+
 /**
  * Creates and decorates orchestrator and worker DSH `Agent` sessions with role models, system prompt sections from `Prompts`, runtime skills, and restricted tool sets.
  * `Runtime`, `DshExecutor`, `MasterAssessor`, `Settings`, and management routes/tools use it to ensure sessions, deliver deduplicated messages via `AgentDelivery`, and process ordered `relay` and `notice` effects.
@@ -192,7 +196,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
  */
  export class Sessions {
   private readonly agentDelivery: AgentDelivery
-  private readonly stopWorkerAdmission: () => void
+  private stopWorkerAdmission?: () => void
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
   /** A durable pin alone cannot open model admission before this mount verifies the checkout. */
@@ -212,15 +216,6 @@ const withdrawnRelay = Symbol('withdrawn relay')
   constructor(private readonly host: SessionsHost) {
     this.ctx = host.context
     this.agentDelivery = new AgentDelivery(host.context)
-    // Block native steps before startup's GitHub and recovery waits can let a default request header persist.
-    this.stopWorkerAdmission = this.ctx.on('agent/pre-step', async ({ agent }, next) => {
-      const ticketId = ticketOfSession(agent.id)
-      if (ticketId === undefined) return next()
-      const allowed = () => this.readyWorkerModels.has(agent) && this.ctx.agents.get(agent.id) === agent && this.host.workerAuthorized(ticketId, agent.id)
-      if (!allowed()) return { kind: 'reject' }
-      const decision = await next()
-      return decision.kind === 'enter' && !allowed() ? { kind: 'reject' } : decision
-    })
     // Deliver relays and notices to the main Session in the order they were queued.
     host.effects.handle('relay', ({ text }, requestId) => this.deliverRelay(requestId, text), { ordered: true })
     host.effects.handle('notice', ({ value, summary }, name) => this.inject(name, value, summary), { ordered: true })
@@ -230,6 +225,35 @@ const withdrawnRelay = Symbol('withdrawn relay')
       if (!target || !this.isHubRoot(target)) throw new Later('No verified Hub is ready for inbox transfer')
       if (!await this.transferHubInbox(fromSessionId, target)) throw new Later('Hub input has not reached durable history')
     }, { limit: () => this.host.closing() ? 0 : 1 })
+  }
+  /** Own the permanent dispatch fence at profile scope; a Cordis remount disposes child listeners concurrently. */
+  installWorkerGate(): void {
+    const root = this.ctx.root
+    let gate = workerGates.get(root)
+    if (!gate) {
+      const profile: WorkerGate = {}
+      root.on('agent/pre-step', async ({ agent }, next) => {
+        const ticketId = ticketOfSession(agent.id)
+        if (ticketId === undefined) return next()
+        const allows = profile.allows
+        if (!allows?.(agent, ticketId)) return { kind: 'reject' }
+        const decision = await next()
+        return decision.kind === 'enter' && (profile.allows !== allows || !allows(agent, ticketId)) ? { kind: 'reject' } : decision
+      }, { global: true })
+      root.on('llm/stream', (request, next) => {
+        const id = request.sessionId ?? root.get('agents')?.currentInitiator()?.id
+        if (id && ticketOfSession(id) !== undefined && !profile.allows) {
+          throw new LlmError('Worker Session has no ready model and writer in the current mount', RUN_LIMIT_REFUSAL)
+        }
+        return next()
+      }, { global: true })
+      workerGates.set(root, gate = profile)
+    }
+    const profile = gate
+    const allows = (agent: Agent, ticketId: string) => !this.host.closing() && this.readyWorkerModels.has(agent)
+      && this.ctx.agents.get(agent.id) === agent && this.host.workerAuthorized(ticketId, agent.id)
+    profile.allows = allows
+    this.stopWorkerAdmission = () => { if (profile.allows === allows) delete profile.allows }
   }
   /** Subscribes to host agent and session events so newly created sessions are decorated and model-budget retries are reflected in health. Call once at startup. */
   install(): void {
@@ -1384,7 +1408,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
   }
   /** Releases prompt sections, skills, and tools registered by `Sessions` across all decorated agents. */
   dispose(): void {
-    this.stopWorkerAdmission()
+    this.stopWorkerAdmission?.()
     for (const agent of [...this.bindings.keys()]) this.release(agent)
   }
 }

@@ -24,6 +24,7 @@ it('keeps a person\'s own value where another save changed the same setting, and
 })
 
 it('saves the Eval block on the Policy settings and the Executor with its execution environment on the Execution settings, each against its own revision', async () => {
+  server.settings.executor = { ...server.settings.executor, backendModel: null, frontendModel: null }
   await mount()
   await click(zh['tab.eval'])
   await click(find(zh['tab.settings'], '.dt-status-head button'))
@@ -59,10 +60,20 @@ it('saves the Eval block on the Policy settings and the Executor with its execut
   await type(workerProvider as HTMLInputElement, 'worker-provider'); await type(workerModel as HTMLInputElement,
     'worker-model'); await type(effort as HTMLInputElement, 'high')
   expect([...document.querySelectorAll('#dt-worker-model-efforts option')].map(option => option.getAttribute('value'))).toEqual(['high'])
+  const routeField = (group: string, part: 'provider' | 'model') =>
+    document.querySelector<HTMLInputElement>(`[aria-label="${group}"] input[list$="-${part}s"]`)!
+  await type(routeField(zh.backendModel, 'provider'), 'worker-provider')
+  await type(routeField(zh.backendModel, 'model'), 'worker-model')
+  expect(routeField(zh.frontendModel, 'model').validity.valueMissing).toBe(true)
+  await type(routeField(zh.frontendModel, 'provider'), 'ui-provider')
+  await type(routeField(zh.frontendModel, 'model'), 'ui-model')
+  await type(routeField(zh.lightweightModel, 'provider'), 'worker-provider')
+  await type(routeField(zh.lightweightModel, 'model'), 'small-model')
   await click(zh.save)
   expect(server.settings.executor).toEqual({ maxWorkers: 5, directory: '/srv/work', repository: '/srv/widgets', baseRef: 'refs/heads/main',
     prepare: 'git worktree add "$DSH_SUPERAGENT_DIR"', blockedCommands: ['gh-personal', 'gh.other'], model: { provider: 'worker-provider',
-      model: 'worker-model', reasoningEffort: 'high' } })
+      model: 'worker-model', reasoningEffort: 'high' }, backendModel: { provider: 'worker-provider', model: 'worker-model' },
+    frontendModel: { provider: 'ui-provider', model: 'ui-model' }, lightweightModel: { provider: 'worker-provider', model: 'small-model' } })
   expect(server.requests.filter(request => request.method === 'PUT').map(request => request.path)).toEqual(['settings/eval',
     'settings/executor'])
 })

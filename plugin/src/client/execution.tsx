@@ -96,6 +96,12 @@ export function ExecutionSettings() {
           <h2 className="dt-block-title">{t('term.executor')}<InfoTip text={t('executorIntro')} /></h2>
           <Section title={t('executorModel')} hint={t('executorModelHint')}><ModelField id="dt-worker-model" value={value.model}
             onChange={model => edit({ model })} /></Section>
+          {(['backendModel', 'frontendModel', 'lightweightModel'] as const).map(key => {
+            const title = t(key), required = key !== 'lightweightModel'
+            return <Section key={key} title={title} hint={t(required ? 'developmentModelHint' : 'lightweightModelHint')}>
+              <ModelField id={`dt-${key}`} label={title} required={required} value={value[key] ?? null} onChange={model => edit({ [key]: model })} />
+            </Section>
+          })}
           <Field label={t('maxWorkers')} hint={t('maxWorkersHint')}>
             <Input type="number" min={LIMITS.maxWorkers.min} max={LIMITS.maxWorkers.max} required value={value.maxWorkers}
               onChange={event => edit({ maxWorkers: event.target.value })} />

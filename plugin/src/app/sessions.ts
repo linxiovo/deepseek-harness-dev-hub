@@ -196,6 +196,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
   private readonly bindings = new Map<Agent, SessionBinding>()
   /** A durable pin alone cannot open model admission before this mount verifies the checkout. */
   private readonly verifiedScopeRoots = new WeakSet<Agent>()
+  private readonly readyWorkerModels = new WeakSet<Agent>()
   private readonly retryHealth = new RetryHealth()
   private readonly ctx: Context
   private hubOperations = 0
@@ -298,6 +299,13 @@ const withdrawnRelay = Symbol('withdrawn relay')
         if (!allowed(messages)) return { kind: 'reject' }
         const decision = await next()
         return decision.kind === 'enter' && !allowed(decision.messages) ? { kind: 'reject' } : decision
+      }
+      const ticketId = ticketOfSession(agent.id)
+      if (ticketId && (this.host.closing() || this.host.store.tickets.get(ticketId))) {
+        const allowed = () => this.readyWorkerModels.has(agent) && ctx.agents.get(agent.id) === agent && this.host.workerAuthorized(ticketId, agent.id)
+        if (!allowed()) return { kind: 'reject' }
+        const decision = await next()
+        return decision.kind === 'enter' && !allowed() ? { kind: 'reject' } : decision
       }
       if (!this.host.isHubGeneration(agent.id)) return next()
       if (!this.isHubRoot(agent)) return { kind: 'reject' }
@@ -672,19 +680,23 @@ const withdrawnRelay = Symbol('withdrawn relay')
     if (role === 'worker' && (!ticketId || !this.host.workerAuthorized(ticketId, id))) {
       throw new Error(`Worker ${id} has no verified writer grant; refusing to create its Session`)
     }
-    const bind = (reserve = false) => {
+    const authorize = () => {
       if (this.host.closing()) throw new Error('Session dispatch is stopping')
       if (role === 'orchestrator') {
         const expected = this.host.hubTargetId() ?? this.host.currentHubId()
         if (id !== expected) throw new Error('The Hub Session is not the current persisted authority target')
       } else if (ticketId !== undefined) {
         if (!this.host.workerAuthorized(ticketId, id)) throw new Error(`Worker ${id} lost its writer grant before Session setup`)
+      } else if (plannerId ? !this.host.plannerActive(plannerId) : !splitterId || this.host.splitterWorkspace(splitterId) !== cwd) {
+        throw new Error('Planning dispatch changed before Session setup')
+      }
+    }
+    const bind = (reserve = false) => {
+      authorize()
+      if (ticketId !== undefined) {
         if (reserve) this.reserveWorker(ticketId, id)
         else this.bindWorker(ticketId, id)
       } else if (role === 'planner' || role === 'splitter') {
-        if (plannerId ? !this.host.plannerActive(plannerId) : !splitterId || this.host.splitterWorkspace(splitterId) !== cwd) {
-          throw new Error('Planning dispatch changed before Session setup')
-        }
         this.host.projectMeter.bind({ session_id: id, role,
           ...this.host.projectMeter.owns(id) ? {} : { parent_session_id: this.host.currentHubId() ?? this.host.masterId } })
       }
@@ -693,12 +705,13 @@ const withdrawnRelay = Symbol('withdrawn relay')
     const creation = role === 'orchestrator' ? this.host.hubCreation(id) : undefined
     if (role === 'orchestrator' && this.host.hubRequiresProof(id) && !creation) throw new Error('The Hub Session has no creation proof')
     let result = creation
-      ? { agent: await openNativeRoot(ctx, id as SessionId, creation, ROUTER_PRESET, this.host.hubTargetId() === id) }
+      ? { agent: await openNativeRoot(ctx, id as SessionId, creation, ROUTER_PRESET, this.host.hubTargetId() === id, authorize) }
       : await ctx.sessionController.resolveAgent(id as SessionId)
     if (creation && 'agent' in result) this.verifiedHubRoots.add(result.agent)
     if (!creation && 'error' in result && result.error.code === 'session/not-found') {
       const workspace = await ctx.workspaceRegistry.create(cwd)
       if (ticketId !== undefined) bind(true) // Plan Workers already have a durable reservation; standalone Workers reserve here.
+      else authorize()
       // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml).
       await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id,
         agentPreset: role === 'planner' || role === 'splitter' ? PLANNER_PRESET : role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
@@ -727,12 +740,13 @@ const withdrawnRelay = Symbol('withdrawn relay')
       if (!same) throw new Error(`Worker ${id} belongs to ${createdIn}, not the verified ticket worktree ${cwd}`)
     }
     bind()
-    if (ticketId !== undefined) await initializeRoleModel(ctx, result.agent, () => this.initialWorkerModel(ticketId, id))
+    if (ticketId !== undefined) await this.prepareWorkerModel(result.agent, ticketId, authorize)
     else {
       const settings = this.host.store.settings()
-      await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
+      await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model, authorize)
     }
     await this.decorate(result.agent)
+    authorize()
     ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
     return result.agent
@@ -810,7 +824,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
     this.verifiedScopeRoots.add(agent)
     await this.decorate(agent)
     authorize()
-    await initializeRoleModel(ctx, agent, host.store.settings().executor.model)
+    await initializeRoleModel(ctx, agent, host.store.settings().executor.model, authorize)
     authorize()
     await ctx.sessionController.rename({ sessionId, title: `Requirement scope: ${id}` })
     authorize()
@@ -875,7 +889,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
       return
     }
     if (prior.taskSeq !== undefined || prior.pending || prior.inserted) return
-    await initializeRoleModel(ctx, agent, task.model)
+    await initializeRoleModel(ctx, agent, task.model, authorize)
     authorize()
     try { await this.agentDelivery.send(agent, key(request.id), request.text, 'queue', host.lifetime, authorize) }
     catch (error) {
@@ -907,9 +921,21 @@ const withdrawnRelay = Symbol('withdrawn relay')
     store.set(key, model ?? null)
     return model ?? null
   }
+  /** A native turn may not use the host default while a reserved Worker route is still being initialized. */
+  workerModelReady(sessionId: string): boolean {
+    const agent = this.ctx.agents.get(sessionId as SessionId)
+    return !!agent && this.readyWorkerModels.has(agent)
+  }
+  private async prepareWorkerModel(agent: Agent, ticketId: string, authorize: () => void): Promise<void> {
+    const current = () => { authorize(); this.requireWorkerRoot(agent, workerSessionId(ticketId)) }
+    await initializeRoleModel(this.ctx, agent, () => this.initialWorkerModel(ticketId, agent.id), current)
+    current()
+    this.readyWorkerModels.add(agent)
+  }
   private requireWorkerRoot(agent: Agent, sessionId: string): void {
     const { header } = agent.session
-    if (agent.id !== sessionId || header.id !== sessionId || header.parentSession !== undefined || header.origin === 'subagent') {
+    if (this.ctx.agents.get(agent.id) !== agent || agent.id !== sessionId || header.id !== sessionId ||
+      header.parentSession !== undefined || header.origin === 'subagent') {
       throw new Error(`Resolved Session is not the Ticket's root Worker ${sessionId}`)
     }
   }
@@ -952,10 +978,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
     granted()
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
     if ('error' in result) throw result.error
-    if (ticketId !== undefined) {
-      this.requireWorkerRoot(result.agent, sessionId)
-      await initializeRoleModel(this.ctx, result.agent, () => this.initialWorkerModel(ticketId, sessionId))
-    }
+    if (ticketId !== undefined) await this.prepareWorkerModel(result.agent, ticketId, granted)
     await this.agentDelivery.send(result.agent, key(requestId), text, mode, this.host.lifetime, granted, accepted)
   }
   /** The id of the message `prompt` delivers under `requestId`, which DSH's inbox events name it by. */
@@ -1007,7 +1030,9 @@ const withdrawnRelay = Symbol('withdrawn relay')
           return image ? [text, { type: 'image' as const, attachment: image }] : [text]
         } },
         execute: async (args, execution) => {
-          if (name === 'orchestrator_lookup' && execution.agent !== agent) throw new Error('Only the calling Hub may delegate a lookup')
+          if ((name === 'orchestrator_lookup' || name === 'orchestrator_settings_save') && execution.agent !== agent) {
+            throw new Error('Only the calling Hub may use this tool')
+          }
           const release = binding.role === 'orchestrator' ? this.beginHubOperation(agent.id) : undefined
           try { return await execute(schema.parse(args), execution.signal, execution.callId) }
           finally { release?.() }

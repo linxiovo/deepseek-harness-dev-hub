@@ -91,7 +91,7 @@ export class LightweightLookup {
     const task = this.active.get(binding.session_id), refusal = { admitted: false as const, reason: 'Lookup has no authorized model request' }
     if (!task || task.route || task.agent.status !== 'running' || task.hubId !== binding.parent_session_id || binding.roles.length !== 1 ||
       binding.roles[0] !== 'lookup' || binding.ticket_id !== null || binding.plan_id !== null ||
-      this.host.store.get(KV.lookup.native(binding.session_id)) !== task.agent.session.header.createdAt) return refusal
+      this.host.store.get(KV.lookup.native(binding.session_id))?.createdAt !== task.agent.session.header.createdAt) return refusal
     const route = task.agent.session.requestContext()
     if (!route || route.provider !== options.provider || route.model !== options.model || !sealedInput(options, task.request.text)) return refusal
     try {
@@ -147,23 +147,28 @@ export class LightweightLookup {
     }
     // A re-entry of the same physical call addresses the same root, but can never adopt its creation token.
     const id = SessionId(`lookup-${key(project.id, hub.id, String(hub.session.header.createdAt), String(call.data.turn), String(call.data.step), call.data.callId)}`)
-    if (store.get(KV.lookup.native(id)) !== undefined) throw new Error('This Hub lookup call was already consumed')
+    const native = KV.lookup.native(id)
+    if (store.get(native) !== undefined) throw new Error('This Hub lookup call was already consumed')
     current()
     const { source, facts } = await this.snapshot(input, current)
     current()
     const text = JSON.stringify({ kind: input.kind, ...input.kind !== 'status' && { query: input.query }, source, facts })
     if (text.length > 32_000) throw new Error('Lookup page exceeds the bounded model input')
     const cwd = join(project.stateDir, 'lookup-sessions')
+    const creation = { token: randomUUID(), cwd, marker: 'dsh-superagent/lookup-root' as const }
+    current()
+    if (store.get(native) !== undefined) throw new Error('This Hub lookup call was already consumed')
+    store.set(native, { token: creation.token })
     mkdirSync(cwd, { recursive: true, mode: 0o700 })
     if (relative(cwd, realpathSync.native(cwd)) !== '') throw new Error('Lookup requires a physical private Session directory')
-    const creation = { token: randomUUID(), cwd, marker: 'dsh-superagent/lookup-root' as const }
     const request = { id: `lookup:${id}:task`, text, tools: [], systemPrompt }
     const agent = await openNativeRoot(ctx, id, creation, LOOKUP_PRESET, true, current)
     current()
     const model = store.settings().executor.lightweightModel ?? null
     const check = () => {
       current()
-      if (!matchesNativeRoot(ctx, agent, creation, LOOKUP_PRESET) || !isDeepStrictEqual(model, store.settings().executor.lightweightModel ?? null)) {
+      if (store.get(native)?.token !== creation.token || !matchesNativeRoot(ctx, agent, creation, LOOKUP_PRESET) ||
+        !isDeepStrictEqual(model, store.settings().executor.lightweightModel ?? null)) {
         throw new Error('Lookup Session or authorized model changed')
       }
     }
@@ -173,11 +178,11 @@ export class LightweightLookup {
     const prompt = agent.ctx.systemPrompt
     prompt.section({ name: 'dsh-superagent-lookup', order: 9999, complete: true, interpolate: false, text: systemPrompt })
     prompt.context({ name: 'working-directory:current', order: 0, text: '' }); prompt.suppressRuntimeContext()
-    await initializeRoleModel(ctx, agent, model)
+    await initializeRoleModel(ctx, agent, model, check)
     check()
     store.atomic(() => {
       this.host.meter.bind({ session_id: id, parent_session_id: hub.id, role: 'lookup' })
-      store.set(KV.lookup.native(id), agent.session.header.createdAt)
+      store.set(native, { token: creation.token, createdAt: agent.session.header.createdAt })
     })
     const task: Active = { hubId: hub.id, agent, request, model, check }
     this.active.set(id, task)

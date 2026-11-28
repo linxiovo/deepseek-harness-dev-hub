@@ -15,7 +15,9 @@ export async function resolveRoleModel(ctx: Context, model: RoleModel): Promise<
 const initialSelections = new WeakMap<Agent, Promise<void>>()
 
 /** Seed a Session's initial model, or reapply a native selection recorded before its first request. */
-export async function initializeRoleModel(ctx: Context, agent: Agent, model: RoleModel | null | (() => RoleModel | null)): Promise<void> {
+export async function initializeRoleModel(ctx: Context, agent: Agent, model: RoleModel | null | (() => RoleModel | null),
+  authorize?: () => void): Promise<void> {
+  authorize?.()
   const { session } = agent
   if (session.requestHeader()) return
   const initialized = initialSelections.get(agent)
@@ -25,6 +27,7 @@ export async function initializeRoleModel(ctx: Context, agent: Agent, model: Rol
     const configured = typeof model === 'function' ? model() : model
     if (!configured) return
     const resolved = await resolveRoleModel(ctx, configured)
+    authorize?.()
     if (session.requestHeader()) return
     const concurrent = initialSelections.get(agent)
     if (concurrent) return concurrent

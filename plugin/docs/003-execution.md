@@ -36,6 +36,8 @@ A Plan Ticket's registered `backend` or `frontend` role selects `executor.backen
 
 The Plan claim pins the configured route before launch. A standalone Worker pins its override (or absence of one) before Session creation. A configured override is recorded as a native `model/selection` before the first request. If interrupted before that request, recovery uses the same Worker Session ID and its durable selection if present, otherwise the pinned route. Settings changes apply to new reservations; they do not replace a pinned route or an existing native selection. Explicit native selections made later still take effect.
 
+A newly opened physical Worker cannot enter a native model step or call its provider until the host has initialized the route for that Agent and still holds its writer lease. Opening the Session directly while model resolution is pending does not start a turn with the host default.
+
 ### Background work and worker slots
 
 When a turn ends with shell jobs or subagents still running, the Ticket keeps its worker slot and stays working. It is not reported as waiting, and the main Session receives no waiting report. A completed job or subagent wakes the Executor with its result in the same slot. Once a turn ends with no background work, the Executor reports waiting normally.

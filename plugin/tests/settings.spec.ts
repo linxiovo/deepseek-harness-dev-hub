@@ -6,7 +6,7 @@ import { Setup } from '../src/app/setup.ts'
 import { environmentOf } from '../src/app/execution-environment.ts'
 import { SettingsConflict } from '../src/app/settings.ts'
 import { ExecutorConfigSchema, worktreePreparationConfig } from '../src/policy.ts'
-import { startRuntime, type Host } from './fixtures/host.ts'
+import { feishu, startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host | undefined
 afterEach(async () => { await h?.stop(); h = undefined })
@@ -41,6 +41,27 @@ it('refuses a save of a block that another save changed during its model or acco
   accounts.resolve()
   await expect(moved).rejects.toThrow(SettingsConflict)
   expect(store.settings().sources.github!.config).toMatchObject({ cli: value.config.cli, pollSeconds: 90 })
+})
+
+it('refuses a borrowed Hub setting and a genuine save cancelled during model resolution', async () => {
+  h = await startRuntime()
+  const host = h, { runtime } = host, hub = runtime.masterId
+  const { sessionId: worker } = await host.acceptedTicket(feishu('model-save', '@bot Fix model settings copy'))
+  const draft = runtime.settings.block('executor')
+  const args = { block: 'executor', revision: draft.revision, value: { ...runtime.settings.current().executor, model } }
+  const tool = host.tools.get(hub)!.get('orchestrator_settings_save')!
+  const stop = new AbortController()
+  await expect(tool.execute(args, { agent: host.agents.get(worker), signal: stop.signal })).rejects.toThrow(/calling Hub/)
+  const started = Promise.withResolvers<void>(), checked = Promise.withResolvers<void>()
+  const resolve = vi.mocked(host.ctx.llm.resolveCallConfig), resolveConfig = resolve.getMockImplementation()!
+  resolve.mockImplementationOnce(async (...params) => { started.resolve(); await checked.promise; return resolveConfig(...params) })
+  const save = tool.execute(args, { agent: host.agents.get(hub), signal: stop.signal })
+  await Promise.race([started.promise, save])
+  stop.abort(new Error('Configuration request cancelled'))
+  checked.resolve()
+  await expect(save).rejects.toThrow('Configuration request cancelled')
+  expect((await host.api('GET', 'settings')).body).toMatchObject({ blocks: { executor: { revision: draft.revision, value: draft.value } } })
+  expect(await host.runTool(hub, 'orchestrator_settings_save', args)).toMatchObject({ saved: true })
 })
 
 it('refuses a Hub listening expansion stored while Feishu is disabled', async () => {

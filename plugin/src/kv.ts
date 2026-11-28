@@ -109,8 +109,8 @@ export const KV = {
   inspection: { schedule: record<InspectionSchedule>('inspection-schedule'), run: family<InspectionRun>('inspection-run:'),
     native: family<number>('inspection-native:'), todo: family<InspectionTodo>('inspection-todo:'),
     page: family<true, [string, string, number]>('inspection-page:', (id, path, offset) => `${id}:${JSON.stringify([path, offset])}`) },
-  /** Native root creation evidence for a Hub-delegated lookup. */
-  lookup: { native: family<number>('lookup-native:') },
+  /** A lookup reserves its creation proof before opening a native root; only a verified root has a creation time. */
+  lookup: { native: family<{ token: string; createdAt?: number }>('lookup-native:') },
   /** Handoffs: current record by project; immutable full records and specs; direct confirmation receipts. */
   handoffs: { current: family<string, [projectId: string]>('handoff-current:'),
     record: family<Handoff, [id: string]>('handoff:'),

@@ -290,9 +290,24 @@ describe('managed project plan pause', () => {
     const { value, revision } = await readExecutorSettings()
     expect(await h.api('PUT', 'settings/executor', { revision, value: { ...value, frontendModel } }, project.id)).toMatchObject({ status: 200 })
     await expect(h.runTool(h.runtime.masterId, 'orchestrator_plan_dispatch', { planId: id, nodeId: 'catalog', role: 'frontend' })).rejects.toThrow()
-    const [backend, frontend] = await Promise.all([dispatchPlan(id, 'catalog'), dispatchPlan(id, 'dashboard')])
-    expect(backend).toMatchObject({ status: 'claimed', reused: false, role: 'backend' })
-    expect(frontend).toMatchObject({ status: 'claimed', reused: false, role: 'frontend' })
+    const resolved = Promise.withResolvers<void>(), allow = Promise.withResolvers<void>()
+    const resolve = vi.mocked(h.ctx.llm.resolveCallConfig)
+    const resolveConfig = resolve.getMockImplementation()!
+    resolve.mockImplementation(async (...args) => {
+      if (args[0].model === backendModel.model) { resolved.resolve(); await allow.promise }
+      return resolveConfig(...args)
+    })
+    let backend: PlanDispatch, frontend: PlanDispatch
+    try {
+      [backend, frontend] = await Promise.all([dispatchPlan(id, 'catalog'), dispatchPlan(id, 'dashboard')])
+      expect(backend).toMatchObject({ status: 'claimed', reused: false, role: 'backend' })
+      expect(frontend).toMatchObject({ status: 'claimed', reused: false, role: 'frontend' })
+      await Promise.race([resolved.promise, h.runtime.idle().then(() => { throw new Error('Worker never began model resolution') })])
+      expect(await h.nativeStep(backend.claim!.session, { starts: true })).toBe(false)
+      const prematureProvider = vi.fn(async function* (): AsyncGenerator<StreamChunk> { yield { type: 'finish', reason: { kind: 'stop' } } })
+      await expect(h.modelRequest(backend.claim!.session, 8192, prematureProvider)).rejects.toMatchObject({ code: 'SUPERAGENT_RUN_LIMIT' })
+      expect(prematureProvider).not.toHaveBeenCalled()
+    } finally { allow.resolve() }
     await h.runtime.idle()
     await Promise.all([expectWorkerModel(backend.claim!.session, backendModel), expectWorkerModel(frontend.claim!.session, frontendModel)])
     expect(h.controller.selectModel).not.toHaveBeenCalled()

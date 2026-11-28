@@ -300,7 +300,7 @@ The blocks:
 - `source:github`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository`, `cli`, [`requiredChecks`](#development-checks) (`[{"id":"<exact job name>","workflowId":"<decimal workflow ID>"}]`, empty by default), and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
 - `policy`: `{"rules": […], "sources": {"github": {"allowed": [{"id": "<login>"}], "bots": [{"id": "dependabot[bot]"}]}, "feishu": {"allowed": [{"id": "ou_…", "name": "…"}], "syncChat": "oc_…", "admission": {"oc_…": {"unlistedAddressed": "explicit"}}}}}`. `bots` lists the bots whose messages may become inferred candidates. An `admission` row is keyed by chat id, `other` or `direct` for Feishu, and by `issues`, `pulls`, `comments` or `ci` for GitHub; an unset cell takes its default (see [002 Authorization](002-authorization.md)).
 - `eval`: `mode`, `timeoutSeconds` and `model`.
-- `executor`: `model`, `maxWorkers`, `repository`, `baseRef`, `directory`, `prepare`, `blockedCommands` and optional `runLimits` (see `016-run-limits.md`). Optional `lightweightModel` and `idleInspection` are operator-only; see `020-idle-inspection.md`. Processing pause is a separate setting that `POST executor/pause` sets.
+- `executor`: required `backendModel` and `frontendModel`, optional `lightweightModel` and general `model` (see `012-project-runtime.md`), `maxWorkers`, `repository`, `baseRef`, `directory`, `prepare`, `blockedCommands`, optional `runLimits` and `idleInspection`. Project routes and the inspection grant are operator-only. Processing pause is separate, through `POST executor/pause`.
 
 Account settings that can still change (Feishu, or the legacy GitHub Source before adoption) run their setup check first. A legacy GitHub CLI change must verify as the same installation account. A failed check returns 400 with details in `setup`. A save that needs setup to run again returns `restarting: true`; the API is temporarily unavailable during remount.
 
@@ -308,7 +308,10 @@ Account settings that can still change (Feishu, or the legacy GitHub Source befo
 api=http://127.0.0.1:3082/orchestrator/api
 curl -sS -H 'x-orchestrator-request: 1' -H 'content-type: application/json' "$api/onboarding/github/verify" \
   -d '{"cli":"/home/operator/.local/bin/gh-agent"}'
-# Continue only when onboarding returns status "ready". The workspace is on the DSH host.
+# Choose both required routes in Settings → Execution, or save the complete executor
+# block by API as described in 012-project-runtime.md. Wait for a reported restart.
+curl -sS -H 'x-orchestrator-request: 1' "$api/onboarding"
+# Register only when onboarding reports "ready". The workspace is on the DSH host.
 curl -sS -H 'x-orchestrator-request: 1' -H 'content-type: application/json' "$api/projects" \
   -d '{"repository":"acme/widgets","workspace":"/srv/checkouts/widgets","baseRef":"refs/heads/main"}'
 curl -sS -H 'x-orchestrator-request: 1' "$api/runtime"

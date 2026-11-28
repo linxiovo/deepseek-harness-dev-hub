@@ -47,7 +47,7 @@ const overviewOf = (value: Runtime) => overview(viewsOf(value), value.health, po
 let directory: string
 let repository: GitRepository
 let controller: { create: ReturnType<typeof vi.fn>; selectModel: ReturnType<typeof vi.fn>; resolveAgent: ReturnType<typeof vi.fn>; rename: ReturnType<typeof vi.fn>; prompt: ReturnType<typeof vi.fn>; inspect: ReturnType<typeof vi.fn> }
-type RegisteredTool = { name: string; description: string; parameters: Record<string, unknown>; output: { render: (args: unknown, result: unknown) => unknown }; execute: (args: unknown, execution: { signal: AbortSignal }) => Promise<unknown> }
+type RegisteredTool = { name: string; description: string; parameters: Record<string, unknown>; output: { render: (args: unknown, result: unknown) => unknown }; execute: (args: unknown, execution: { signal: AbortSignal; agent?: unknown }) => Promise<unknown> }
 type ContainerResult = { isError: boolean; content: { type: string; text?: string }[]; value?: unknown; error?: { message: string } }
 type Section = { name: string; text: (context: { signal?: AbortSignal }) => string; interpolate?: boolean }
 let sections: Map<string, Section>
@@ -79,7 +79,7 @@ function finishSessionTurn(sessionId: string): void {
 const runTool = async (sessionId: string, name: string, args: unknown) => {
   const tool = registered(sessionId, name)
   if (!tool) throw new Error(`Tool ${name} is not registered for ${sessionId}`)
-  const output = await tool.execute(args, { signal: new AbortController().signal })
+  const output = await tool.execute(args, { agent: agents.get(sessionId), signal: new AbortController().signal })
   expect(JSON.parse(JSON.stringify(output))).toStrictEqual(output)
   await runtime.idle()
   return output as Record<string, unknown>

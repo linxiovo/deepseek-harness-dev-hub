@@ -195,7 +195,7 @@ export class Settings {
    * @throws SettingsConflict when `block`'s revision changed before or during validation checks.
    * @throws UserError | z.ZodError when `block` is unknown, the source is not installed, `value` is invalid (such as an `executor` block carrying `paused`, which only `pause` sets), a non-panel `origin` changes panel-only fields, or a role-model or account check fails.
    */
-  async save(block: SettingsBlock, value: unknown, revision: number, origin: SettingsOrigin) {
+  async save(block: SettingsBlock, value: unknown, revision: number, origin: SettingsOrigin, authorize?: () => void) {
     const { store, sources, sessions } = this.host
     const stale = () => revision !== store.blockRevision(block)
     if (stale()) throw new SettingsConflict('Settings changed. Reload before saving.')
@@ -217,6 +217,7 @@ export class Settings {
       catch (error) { throw new UserError('modelUnavailable', { block: field, error: error instanceof Error ? error.message : String(error) }) }
     }
     if (setupChanged(current, candidate)) await this.host.setup.checkAccounts(block, candidate)
+    authorize?.()
     if (stale()) throw new SettingsConflict('Settings changed during the checks. Reload before saving.')
     // Re-read current settings after async checks in case unrelated blocks were saved concurrently.
     const old = store.settings()

@@ -571,14 +571,17 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         revision: z.number().int().nonnegative().describe('The block\'s revision; pause ignores it.'),
       }).strict()
         .refine(args => (args.block === 'source') === (args.source !== undefined), 'source names the Source instance, with block source only'),
-      execute: async args => {
-        if (host.planIntegration?.stage().stage === 2) {
-          throw new Error('Only the operator can change Stage 2 settings in management settings')
+      execute: async (args, signal) => {
+        const authorize = () => {
+          signal.throwIfAborted()
+          if (agent.id !== host.resources.masterId || host.context.agents.get(agent.id) !== agent) throw new Error('Only the current Hub can save settings')
+          if (host.planIntegration?.stage().stage === 2) throw new Error('Only the operator can change Stage 2 settings in management settings')
         }
+        authorize()
         if (args.block === 'pause') return host.settings.pause(z.object({ paused: z.boolean() }).parse(args.value).paused, 'tool')
         // Strip context_delivery since the main Session initiated the save itself.
         const { context_delivery: _delivery, ...saved } = await host.settings.save(args.block === 'source' ? `source:${args.source!}` : args.block,
-          args.value, args.revision, 'tool')
+          args.value, args.revision, 'tool', authorize)
         return saved
       },
     }),

@@ -17,8 +17,8 @@ export function SettingsPage({ group, query, state, deploymentForm }: {
   const content = (() => {
     switch (group) {
       case 'source': return <SettingsProvider><SourceSettings {...query.source ? { focus: query.source } : {}} /></SettingsProvider>
-      case 'eval': return <SettingsProvider><EvalSettings version={query.version} /></SettingsProvider>
-      case 'execution': return <SettingsProvider><ExecutionSettings /></SettingsProvider>
+      case 'eval': return <SettingsProvider withModels><EvalSettings version={query.version} /></SettingsProvider>
+      case 'execution': return <SettingsProvider withModels><ExecutionSettings /></SettingsProvider>
       case 'prompts': return <PromptsPage />
       case 'deployment': return <DeploymentPage setup={state.setup} form={deploymentForm} />
     }

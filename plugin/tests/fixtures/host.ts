@@ -40,7 +40,7 @@ export function feishu(id: string, text: string, overrides: Record<string, unkno
     mentions: [{ id: 'ou_bot' }], ...overrides }, 'ou_bot', 'cli_bot')!
 }
 
-type RegisteredTool = { name: string; execute: (args: unknown, execution: { signal: AbortSignal }) => Promise<unknown> }
+type RegisteredTool = { name: string; execute: (args: unknown, execution: { signal: AbortSignal; agent?: FakeAgent | undefined }) => Promise<unknown> }
 type FakeAgent = {
   id: string; ctx: Context; status: string; inbox: { nextTurn: UserMessage[]; nextStep: UserMessage[] }
   cancel: Mock; inject: Mock<(message: UserMessage) => void>; steer: Mock<(message: UserMessage) => void>; followup: Mock<(message: UserMessage) => void>
@@ -473,7 +473,7 @@ export async function startRuntime(seed?: (store: Store) => void, options: { wit
   const runTool = async (sessionId: string, name: string, args: unknown) => {
     const tool = tools.get(sessionId)?.get(name)
     if (!tool) throw new Error(`Tool ${name} is not registered for ${sessionId}`)
-    return await tool.execute(args, { signal: new AbortController().signal }) as Record<string, unknown>
+    return await tool.execute(args, { agent: agents.get(sessionId), signal: new AbortController().signal }) as Record<string, unknown>
   }
   /** Dispatch an observed native model tool call, including the DSH execution identity and turn conclusion. */
   let modelCallSequence = 0

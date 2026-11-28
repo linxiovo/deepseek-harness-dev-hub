@@ -821,8 +821,10 @@ export class Runtime extends Service implements SourceHost {
           return this.runLimits.acquire(binding, maximum, signal, grant)
         }
         const { ticket_id: ticket } = binding
-        if (ticket && !this.executor.writerAuthorized(ticket, workerSessionId(ticket))) {
-          return { admitted: false, reason: 'Run limit Session has no active Ticket writer' }
+        if (ticket) {
+          const worker = workerSessionId(ticket)
+          if (!this.executor.writerAuthorized(ticket, worker)) return { admitted: false, reason: 'Run limit Session has no active Ticket writer' }
+          if (!this.sessions.workerModelReady(worker)) return { admitted: false, reason: 'Worker initial model is not ready' }
         }
         return this.runLimits.acquire(binding, maximum, signal)
       },
@@ -965,7 +967,7 @@ export class Runtime extends Service implements SourceHost {
     if (header.origin !== undefined || header.parentSession !== undefined || header.isSeeded) return 'unverified'
     if (lookup) {
       return roles.length === 1 && roles[0] === 'lookup' && ticketId === null && binding.plan_id === null
-        && !!parentId && this.hubAuthority.isGeneration(parentId) && this.store.get(KV.lookup.native(id)) === header.createdAt
+        && !!parentId && this.hubAuthority.isGeneration(parentId) && this.store.get(KV.lookup.native(id))?.createdAt === header.createdAt
         && header.agentPreset === LOOKUP_PRESET && !!header.cwd && isAbsolute(header.cwd)
         && sameDirectory(header.cwd, join(this.machine.stateDir, 'lookup-sessions')) ? { header } : 'unverified'
     }

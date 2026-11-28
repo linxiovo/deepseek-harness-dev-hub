@@ -179,3 +179,16 @@ it('refuses replay of the very same native Hub call after a stop and remount of 
   expect(provider).toHaveBeenCalledOnce()
   expect(h.deliveries.mock.calls.filter(([d]) => d.sessionId.startsWith('lookup-'))).toHaveLength(1)
 })
+
+it('does not relaunch the same lookup after native creation is interrupted before a Session exists', async () => {
+  const mounted = await startManagedProject(), h = host = mounted.host, hub = h.runtime.masterId
+  const input = { kind: 'status' }
+  vi.mocked(h.ctx.sessionPersistence.create).mockRejectedValueOnce(new Error('Native creation interrupted'))
+  await expect(h.modelTool(hub, lookup, input)).rejects.toThrow('Native creation interrupted')
+  const native = h.ctx.agents.get(hub as SessionId)!.session.snapshotEvents().findLast(e => e.type === 'tool/call')
+  if (native?.type !== 'tool/call') throw new Error('Expected a native Hub call')
+  await h.restart()
+  const replay = { agent: h.agents.get(hub), callId: native.data.callId, signal: new AbortController().signal }
+  await expect(h.tools.get(hub)!.get(lookup)!.execute(input, replay)).rejects.toThrow(/already consumed/)
+  expect(h.deliveries.mock.calls.filter(([message]) => message.sessionId.startsWith('lookup-'))).toEqual([])
+})

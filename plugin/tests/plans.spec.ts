@@ -1267,6 +1267,8 @@ it('replays a durable Worker model claim across settings changes and both pre-re
   expect(await dispatchPlan(published.id, 'saved-page')).toMatchObject({ status: 'blocked', waitingOn: ['saved-api'] })
   // The native selection is now durable, but the fixture has not dispatched the first agent/request.
   expect(await workerSelections(beforeClaim.session)).toEqual([backendModel])
+  const flushing = Promise.withResolvers<void>(), allowFlush = Promise.withResolvers<void>()
+  vi.mocked(h.ctx.sessionPersistence.flush).mockImplementationOnce(() => { flushing.resolve(); return allowFlush.promise })
   const probing = Promise.withResolvers<void>(), allowStartup = Promise.withResolvers<void>()
   const spawn = h.subprocess.spawn.getMockImplementation()!
   h.subprocess.spawn.mockImplementation(spec => {
@@ -1275,14 +1277,18 @@ it('replays a durable Worker model claim across settings changes and both pre-re
     probing.resolve()
     return { ...result, done: allowStartup.promise.then(() => result.done) }
   })
+  const direct = freezeMessage({ role: 'user', id: MessageId('startup-direct'), source: { kind: 'user' }, content: [{ type: 'text', text: 'Continue' }] })
   const restarted = h.restart()
   try {
-    await Promise.race([probing.promise, restarted.then(() => { throw new Error('Worker remounted before the startup barrier') })])
-    await h.resolveDefault(beforeClaim.session)
-    const direct = freezeMessage({ role: 'user', id: MessageId('startup-direct'), source: { kind: 'user' }, content: [{ type: 'text', text: 'Continue' }] })
+    await Promise.race([flushing.promise, restarted.then(() => { throw new Error('Worker restarted before the shutdown flush') })])
     h.agents.get(beforeClaim.session)!.inbox.nextTurn.push(direct)
     expect(await h.nativeStep(beforeClaim.session, { starts: true })).toBe(false)
-  } finally { allowStartup.resolve(); await restarted; h.subprocess.spawn.mockImplementation(spawn) }
+    allowFlush.resolve()
+    await Promise.race([probing.promise, restarted.then(() => { throw new Error('Worker remounted before the startup barrier') })])
+    await h.resolveDefault(beforeClaim.session)
+    h.agents.get(beforeClaim.session)!.inbox.nextTurn.push(direct)
+    expect(await h.nativeStep(beforeClaim.session, { starts: true })).toBe(false)
+  } finally { allowFlush.resolve(); allowStartup.resolve(); await restarted; h.subprocess.spawn.mockImplementation(spawn) }
   await h.runtime.idle()
   await expectWorkerModel(beforeClaim.session, backendModel)
   expect(h.controller.create.mock.calls.filter(([input]) => input.sessionId === beforeClaim.session)).toHaveLength(1)

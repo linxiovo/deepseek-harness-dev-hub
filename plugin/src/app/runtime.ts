@@ -24,7 +24,7 @@ import { fill } from '../infra/text.ts'
 import { promptFile } from './skill-files.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
-import { DshExecutor, sourceTrigger, workerSessionId } from '../executor/dsh.ts'
+import { DshExecutor, sourceTrigger, ticketOfSession, workerSessionId } from '../executor/dsh.ts'
 import { validateRepositoryIdentity } from '../executor/repository-identity.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
@@ -802,7 +802,8 @@ export class Runtime extends Service implements SourceHost {
     this.runLimits.recover()
     this.executor.recoverPauses()
     this.disposeAdmission = installModelAdmission(this.ctx, {
-      owns: id => isLookupId(id) || id.startsWith('inspection-') || scopeProposalId(id) !== undefined || this.projectMeter.owns(id) || this.sessions.hasManagedAncestry(id),
+      owns: id => ticketOfSession(id) !== undefined || isLookupId(id) || id.startsWith('inspection-') || scopeProposalId(id) !== undefined
+        || this.projectMeter.owns(id) || this.sessions.hasManagedAncestry(id),
       acquire: (id, maximum, signal, loopRequest) => {
         const binding = this.store.get(KV.projectMeter.binding(id))
         if (this.closing() || !binding) return { admitted: false, reason: 'Run limit Session is not authorized in this mount' }
@@ -1021,10 +1022,10 @@ export class Runtime extends Service implements SourceHost {
       // The workers' jobs and subagents stop too: their ends would start worker turns without the tool limits released below.
       await this.executor.shutdown()
       this.executor.dispose()
-      this.sessions.dispose()
       await this.ctx.sessionPersistence.flush()
       this.installation.stopped()
     } finally {
+      this.sessions.dispose()
       // Close the database before releasing the directory lock so another process cannot open the database mid-write; a compromised lock may already be released.
       this.runLimits.close()
       this.disposeAdmission?.()

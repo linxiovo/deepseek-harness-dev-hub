@@ -1,4 +1,4 @@
-import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
+import { freezeMessage, MessageId, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -127,6 +127,7 @@ it('does not call a fallback provider when the configured route is unavailable, 
 
 it('fences an in-flight lookup at project selection and never replays its consumed input in the new mount', async () => {
   const mounted = await startManagedProject(), h = host = mounted.host, oldHub = h.runtime.masterId
+  const previousWorker = (await h.acceptedTicket(feishu('321', '@bot Fix the project-specific dashboard'))).sessionId
   const root = join(dirname(mounted.project.workspace), 'second'); mkdirSync(root)
   const repo = gitRepository(root); repo.git('remote', 'set-url', 'origin', 'git@github.com:acme/gadgets.git')
   // Only the GitHub permission probe is remote. Both project roots, their catalog selection and restart are real.
@@ -157,6 +158,11 @@ it('fences an in-flight lookup at project selection and never replays its consum
   // The public controller may reopen the old physical log. Neither a resume nor its known ID can authorize spending.
   await h.resolveDefault(id)
   await expect(h.modelRequest(id, 10, provider)).rejects.toMatchObject({ code: 'SUPERAGENT_RUN_LIMIT' })
+  await h.resolveDefault(previousWorker)
+  h.agents.get(previousWorker)!.inbox.nextTurn.push(freezeMessage({ role: 'user', id: MessageId('old-worker'), source: { kind: 'user' },
+    content: [{ type: 'text', text: 'Continue' }] }))
+  expect(await h.nativeStep(previousWorker, { starts: true })).toBe(false)
+  await expect(h.modelRequest(previousWorker, 10, provider)).rejects.toMatchObject({ code: 'SUPERAGENT_RUN_LIMIT' })
   expect(provider).toHaveBeenCalledTimes(1)
   expect(h.deliveries.mock.calls.filter(([d]) => d.sessionId === id)).toHaveLength(1)
   expect((await h.api('GET', 'project/meter', undefined, other)).body.sessions).not.toEqual(expect.arrayContaining([expect.objectContaining({ session_id: id })]))
@@ -193,4 +199,27 @@ it.each(['snapshot', 'native creation'] as const)('does not relaunch the same lo
   const replay = { agent: h.agents.get(hub), callId: native.data.callId, signal: new AbortController().signal }
   await expect(h.tools.get(hub)!.get(lookup)!.execute(input, replay)).rejects.toThrow(/already consumed/)
   expect(h.deliveries.mock.calls.filter(([message]) => message.sessionId.startsWith('lookup-'))).toEqual([])
+})
+
+it('does not write the lookup root marker when authorization ends during native creation', async () => {
+  const mounted = await startManagedProject(), h = host = mounted.host, hub = h.runtime.masterId
+  const created = Promise.withResolvers<SessionId>(), release = Promise.withResolvers<void>()
+  const create = vi.mocked(h.ctx.sessionPersistence.create), createLog = create.getMockImplementation()!
+  create.mockImplementationOnce(async (...args) => {
+    const log = await createLog(...args)
+    created.resolve(log.id)
+    await release.promise
+    return log
+  })
+  const lookupCall = h.modelTool(hub, lookup, { kind: 'status' })
+  let id: SessionId
+  try {
+    id = await Promise.race([created.promise, lookupCall.then(() => { throw new Error('Lookup skipped native creation') })])
+  } finally {
+    const stopped = h.runtime.stop()
+    release.resolve()
+    await Promise.all([stopped, expect(lookupCall).rejects.toThrow()])
+  }
+  await using log = await h.ctx.sessionPersistence.open(id, 'read')
+  expect((await log.read()).events).toEqual([])
 })

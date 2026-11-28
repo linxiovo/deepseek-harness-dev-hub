@@ -215,7 +215,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
     // Block native steps before startup's GitHub and recovery waits can let a default request header persist.
     this.stopWorkerAdmission = this.ctx.on('agent/pre-step', async ({ agent }, next) => {
       const ticketId = ticketOfSession(agent.id)
-      if (!ticketId || (!this.host.closing() && !this.host.store.tickets.get(ticketId))) return next()
+      if (ticketId === undefined) return next()
       const allowed = () => this.readyWorkerModels.has(agent) && this.ctx.agents.get(agent.id) === agent && this.host.workerAuthorized(ticketId, agent.id)
       if (!allowed()) return { kind: 'reject' }
       const decision = await next()

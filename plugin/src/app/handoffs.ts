@@ -1,7 +1,7 @@
 import { realpathSync, statSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { key } from '../core/ids.ts'
-import type { Handoff, HandoffInput, HandoffQuestion, MaintenanceOrigin, ProjectRef, Spec, SpecInput } from '../core/handoff.ts'
+import type { Handoff, HandoffInput, HandoffQuestion, ProjectRef, Spec, SpecInput, StageTwoOrigin } from '../core/handoff.ts'
 import { PLAN_FEATURE_KINDS } from '../core/plan.ts'
 import { KV } from '../kv.ts'
 import type { Effects } from './effects.ts'
@@ -153,15 +153,16 @@ export class Handoffs {
     })
   }
 
-  /** Persist rule-authorized maintenance without claiming a human confirmation, changing the current brief, or sending IM. */
-  recordMaintenance(maintenance: MaintenanceOrigin, scope: string, constraints: string[], input: SpecInput): Spec {
+  /** Persist an authorized Stage 2 brief without changing the current product handoff or sending IM. */
+  recordStageTwo(origin: StageTwoOrigin, { scope, goal = scope, constraints }: { scope: string; goal?: string; constraints: string[] }, input: SpecInput): Spec {
     const project = this.binding
-    if (!project) throw new Error('Maintenance requires a registered project')
+    if (!project) throw new Error('Stage 2 work requires a registered project')
     return this.store.atomic(() => {
-      const id = key('maintenance-plan', project.id, maintenance.eventId)
-      if (this.get(id)) throw new Error(`Maintenance brief ${id} already exists`)
-      return this.saveSpec({ id, project, goal: scope, constraints, acceptanceScope: input.acceptance.map(item => item.statement),
-        authorization: { scope, release: 'not-authorized' }, maintenance, status: 'specified' }, input).spec
+      const id = origin.maintenance ? key('maintenance-plan', project.id, origin.maintenance.eventId)
+        : key('inspection-repair-plan', project.id, origin.inspectionRepair.todoId)
+      if (this.get(id)) throw new Error(`Stage 2 brief ${id} already exists`)
+      return this.saveSpec({ id, project, goal, constraints, acceptanceScope: input.acceptance.map(item => item.statement),
+        authorization: { scope, release: 'not-authorized' }, ...origin, status: 'specified' }, input).spec
     })
   }
 

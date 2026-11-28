@@ -38,4 +38,4 @@
 | 017 计划集成交付 | 正式票据关闭后的主干验证、Actions 全量回归、产物契约和 Harness 查询接口 | [docs/017-plan-integration.md](docs/017-plan-integration.md) |
 | 018 计划重排 | 停滞时保留承诺的技术恢复、产品变更预览与授权、替代节点和验收重验接口 | [docs/018-plan-replanning.md](docs/018-plan-replanning.md) |
 | 019 配置确认 | 受信 Feishu 与管理 API 共用的项目设置提案、审批、版本、状态和拒绝契约 | [docs/019-confirmed-settings.md](docs/019-confirmed-settings.md) |
-| 020 空闲巡检 | 独立检查授权、限定版本只读会话、额度与发现待办的查询契约 | [docs/020-idle-inspection.md](docs/020-idle-inspection.md) |
+| 020 空闲巡检 | 独立检查授权、限定版本只读会话、额度、发现待办与独立修复批准 | [docs/020-idle-inspection.md](docs/020-idle-inspection.md) |

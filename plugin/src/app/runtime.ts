@@ -259,7 +259,8 @@ export class Runtime extends Service implements SourceHost {
         ...(project ? { recordOperator: (input, transferred, historical) => this.maintenance?.receiveOperator(input, transferred, historical) } : {}),
         lifetime: this.lifetime, boundWorkspace: project?.workspace,
         get inspection() { return runtime.inspection },
-        relayAvailable: requestId => this.planIntegration.relayAvailable(requestId) && this.maintenance?.relayAvailable(requestId) !== false,
+        relayAvailable: requestId => this.planIntegration.relayAvailable(requestId) && this.maintenance?.relayAvailable(requestId) !== false &&
+          this.inspection?.relayAvailable(requestId) !== false,
         closing: () => this.closing(), environment, ownsPlanner: id => handoffs.get(id) !== undefined,
         plannerActive: id => this.configured() && handoffs.isPlanning(id),
         scopeTask: id => {
@@ -442,6 +443,8 @@ export class Runtime extends Service implements SourceHost {
         bindingEpoch: () => this.topicBinding?.view()?.epoch,
         relay: (id, text) => sessions.relay(id, text), relayConsumed: id => sessions.relayConsumed(id) })
       if (project) this.inspection = new IdleInspection({ project, store, commands, effects, limits: runLimits, meter: projectMeter,
+        handoffs, plans, stageTwo: () => planIntegration.stage().stage === 2, readyHub: () => authority.readySessionId(),
+        assertNewWork: () => installation.assertNewWork(), relayConsumed: id => sessions.relayConsumed(id),
         sessionDirectory: join(projectMachine.stateDir, 'inspection-sessions'), hub: () => {
           const id = authority.readySessionId(), agent = id ? ctx.agents.get(id as SessionId) : undefined
           return agent?.status === 'idle' && !agent.inbox.nextTurn.some(message => message.source.kind === 'user') &&
@@ -851,7 +854,8 @@ export class Runtime extends Service implements SourceHost {
     this.planDispatcher.resume()
     this.planning.resume()
     this.effects.wakeParked('requirementScopeReview')
-    this.inspection?.resume()
+    await this.inspection?.resume()
+    if (this.closing()) return
     this.executor.resume()
     this.passes.start()
     this.effects.start()
@@ -889,6 +893,7 @@ export class Runtime extends Service implements SourceHost {
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, get masterId() { return runtime.masterId }, sourceLinks, projectMeter, installation,
       attention: this.attention, runLimits: this.runLimits, planIntegration: this.planIntegration,
       inspection: this.inspection,
+      verifyProjectBinding: async () => { await installation.validateWorkspace() },
       planArtifact: async id => {
         const view = this.planIntegration.view(id)
         return view && 'artifact' in view && (!('artifactAvailable' in view) || view.artifactAvailable !== false)

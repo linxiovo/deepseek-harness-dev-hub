@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { lstat } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative } from 'node:path'
-import type { ProjectRef } from '../core/handoff.ts'
+import type { InspectionRepairOrigin, ProjectRef } from '../core/handoff.ts'
 import { CliError, type Commands } from '../infra/commands.ts'
 import { physicalPath } from '../infra/paths.ts'
 import { validateRepositoryIdentity } from './repository-identity.ts'
@@ -16,12 +16,16 @@ export type InspectionPage = { kind: 'file'; path: string; text: string; nextOff
   | { kind: 'directory'; path: string; entries: string[]; nextOffset: number | null }
 
 type InspectionCheckout = Pick<ProjectRef, 'workspace' | 'repository'>
+type GitRead = (action: string, ...args: string[]) => Promise<string>
 
 /** Accept exact, portable repository-relative paths, not filesystem aliases or pathspec syntax. */
 export function validInspectionPath(path: string): boolean {
   return !/[\\:<>"|?*\p{Cc}\p{Cf}\p{Cs}]/u.test(path) && path.split('/').every(segment =>
     segment.length > 0 && !/[. ]$/.test(segment) && !unsafeSegment.test(segment))
 }
+
+/** Scopes name a file or a path-segment prefix; sibling names are not descendants. */
+export const inInspectionScope = (path: string, scope: string): boolean => path === scope || path.startsWith(`${scope}/`)
 
 async function rejectMetadata(path: string, message: string): Promise<void> {
   try { await lstat(path) }
@@ -97,15 +101,20 @@ async function checkoutGit(commands: Commands, { workspace, repository }: Inspec
   return { git, format, oidLength: format === 'sha1' ? 40 : 64 }
 }
 
-/** Pin the configured base and verify the scoped object exists without loading its contents. */
-export async function inspectionCommit(commands: Commands, checkout: InspectionCheckout, baseRef: string, scope: string): Promise<string> {
+async function resolveInspectionCommit(git: GitRead, oidLength: number, baseRef: string): Promise<string> {
   if (!baseRef || baseRef.startsWith('-') || /[\s\p{Cc}]/u.test(baseRef) || baseRef.includes(':')) {
     throw new Error('Invalid inspection base reference.')
   }
-  if (!validInspectionPath(scope)) throw new Error('Invalid inspection scope.')
-  const { git, oidLength } = await checkoutGit(commands, checkout)
   const oid = (await git('resolve the base reference', 'rev-parse', '--verify', '--end-of-options', `${baseRef}^{commit}`)).trim()
   if (oid.length !== oidLength || !fullOid.test(oid)) throw new Error('Git did not return an inspection commit ID.')
+  return oid
+}
+
+/** Pin the configured base and verify the scoped object exists without loading its contents. */
+export async function inspectionCommit(commands: Commands, checkout: InspectionCheckout, baseRef: string, scope: string): Promise<string> {
+  if (!validInspectionPath(scope)) throw new Error('Invalid inspection scope.')
+  const { git, oidLength } = await checkoutGit(commands, checkout)
+  const oid = await resolveInspectionCommit(git, oidLength, baseRef)
   await inspectionObject(git, oidLength, oid, scope)
   return oid
 }
@@ -119,7 +128,7 @@ function readTreeRecord(output: string, start: number, oidLength: number) {
   return { mode: match[1]!, type: match[2]!, oid: match[3]!, name: match[4], end: treeRecord.lastIndex }
 }
 
-async function inspectionObject(git: (action: string, ...args: string[]) => Promise<string>, oidLength: number, commit: string, path: string) {
+async function inspectionObject(git: GitRead, oidLength: number, commit: string, path: string) {
   const matched = await git('find the scoped path', 'ls-tree', '--full-tree', '-z', `--abbrev=${oidLength}`, commit, '--', path)
   if (!matched) throw new Error('Inspection path not found in the pinned commit.')
   const { mode, type, oid, name, end } = readTreeRecord(matched, 0, oidLength)
@@ -131,12 +140,58 @@ async function inspectionObject(git: (action: string, ...args: string[]) => Prom
   return { oid, type }
 }
 
+async function sameFindingBlob(git: GitRead, oidLength: number, observed: string, base: string, path: string): Promise<boolean> {
+  if (!validInspectionPath(path) || observed.length !== oidLength || !fullOid.test(observed) || base.length !== oidLength || !fullOid.test(base)) {
+    throw new Error('Repair verification requires an exact path and full commit IDs.')
+  }
+  const record = (commit: string) => git('verify the repair finding', 'ls-tree', '--full-tree', '-z', `--abbrev=${oidLength}`, commit, '--', path)
+  const before = await record(observed)
+  if (!before) return false
+  const { mode, type, name, end } = readTreeRecord(before, 0, oidLength)
+  return name === path && end === before.length && type === 'blob' && (mode === '100644' || mode === '100755') &&
+    (base === observed || await record(base) === before)
+}
+
+/** A changed or missing observed file requires a new inspection; unrelated commits do not. */
+export async function inspectionFindingCurrent(commands: Commands, checkout: InspectionCheckout, baseRef: string, observed: string, path: string):
+Promise<'current' | 'file-changed' | 'ref-moved'> {
+  const { git, oidLength } = await checkoutGit(commands, checkout)
+  const base = await resolveInspectionCommit(git, oidLength, baseRef)
+  if (!await sameFindingBlob(git, oidLength, observed, base, path)) return 'file-changed'
+  return await resolveInspectionCommit(git, oidLength, baseRef) === base ? 'current' : 'ref-moved'
+}
+
+/** Compare exact commit trees, not worktree files, before a repair can enter or pass the mainline queue. */
+export async function inspectionRepairViolation(commands: Commands, checkout: InspectionCheckout,
+  repair: InspectionRepairOrigin, path: string, base: string, candidate: string): Promise<'inspection_repair_target' | 'inspection_repair_scope' | undefined> {
+  const { git, oidLength } = await checkoutGit(commands, checkout)
+  if (!await sameFindingBlob(git, oidLength, repair.observation.commit, base, path)) return 'inspection_repair_target'
+  if (candidate.length !== oidLength || !fullOid.test(candidate)) throw new Error('Repair candidate requires a full commit ID.')
+  const changes = await git('verify the repair candidate paths', 'diff-tree', '--no-commit-id', '--raw', '-r', '-t', '-z', '--no-renames',
+    '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--no-relative', base, candidate, '--')
+  if (!changes) return
+  if (!changes.endsWith('\0')) throw new Error('Incomplete Git repair diff output.')
+  const fields = changes.slice(0, -1).split('\0')
+  if (fields.length % 2) throw new Error('Invalid Git repair diff output.')
+  const allowed = [path, ...repair.supportingPaths]
+  const regular = /^(000000|100644|100755)$/
+  for (let i = 0; i < fields.length; i += 2) {
+    const modes = /^:([0-7]{6}) ([0-7]{6}) /.exec(fields[i]!)
+    const changed = fields[i + 1]!
+    if (!modes || !changed || changed.includes('\uFFFD')) return 'inspection_repair_scope'
+    const [, before, after] = modes
+    if ((before === '040000' && (after === '040000' || after === '000000') || before === '000000' && after === '040000') &&
+        allowed.some(file => file.startsWith(`${changed}/`))) continue
+    if (!allowed.includes(changed) || !regular.test(before!) || !regular.test(after!)) return 'inspection_repair_scope'
+  }
+}
+
 /** Read one bounded page of an authorized object without consulting the worktree or following links. */
 export async function readInspectionPath(commands: Commands, checkout: InspectionCheckout, commit: string, scope: string,
   path: string, offset: number): Promise<InspectionPage> {
   if (!validInspectionPath(scope)) throw new Error('Invalid inspection scope.')
   if (!validInspectionPath(path)) throw new Error('Invalid inspection path.')
-  if (path !== scope && !path.startsWith(`${scope}/`)) throw new Error('Path is outside the authorized inspection scope.')
+  if (!inInspectionScope(path, scope)) throw new Error('Path is outside the authorized inspection scope.')
   if (!fullOid.test(commit)) throw new Error('Inspection requires a full commit ID.')
   if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('Invalid inspection offset.')
 

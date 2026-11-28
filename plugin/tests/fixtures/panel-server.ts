@@ -426,6 +426,7 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET plans/:id/artifact': { answer: ({ params }) => server.planArtifacts[params.id] ?? refuse(404, 'Plan artifact not found') },
   'GET project/meter': { answer: () => refuse(404, 'Project meter not available in the panel fixture') },
   'GET project/inspection': { query: ['offset', 'limit'], answer: () => refuse(409, 'Select a project before starting work.', { code: 'noProject' }) },
+  'POST project/inspection/:id/repair': { body: true, answer: () => refuse(409, 'Select a project before starting work.', { code: 'noProject' }) },
   'GET project/run-limits': { answer: () => refuse(404, 'Project run limits not available in the panel fixture') },
   'GET tickets/:id/run-limits': { answer: () => refuse(404, 'Ticket run limits not available in the panel fixture') },
   'GET prompts': { query: ['revision', 'offset'], answer: ({ query }) => {

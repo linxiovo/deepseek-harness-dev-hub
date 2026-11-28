@@ -24,7 +24,7 @@ import type { Sessions } from './sessions.ts'
 import type { ProjectMeter } from './project-meter.ts'
 import type { RunLimitStatus } from './run-limits.ts'
 import type { ScopedAttention } from './scoped-attention.ts'
-import type { IdleInspection } from './idle-inspection.ts'
+import { InspectionRepairSchema, type IdleInspection } from './idle-inspection.ts'
 import type { SessionMeter } from './session-meter.ts'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
@@ -48,6 +48,7 @@ export interface HttpHost {
   readonly settingsConfirmations?: Pick<SettingsConfirmations, 'propose' | 'read' | 'approve'> | undefined
   /** Verify the workspace under the write lock, before the final scope check and bind. */
   readonly verifyTopicBinding?: (() => Promise<void>) | undefined
+  readonly verifyProjectBinding?: () => Promise<void>
   assertNewWork?(): void
   rotateHub?(): Promise<string>
   /** Successor of a completed retired Hub root in the mounted project; undefined for non-members or an unfinished map. */
@@ -66,7 +67,7 @@ export interface HttpHost {
   readonly meter: Pick<SessionMeter, 'read'>
   readonly projectMeter: Pick<ProjectMeter, 'read'>
   readonly runLimits?: { view(ticketId?: string): RunLimitStatus | undefined }
-  readonly inspection?: Pick<IdleInspection, 'view'>
+  readonly inspection?: Pick<IdleInspection, 'view' | 'approveRepair'>
   readonly planIntegration?: { view(id: string): PlanIntegrationView | undefined }
   readonly planArtifact?: (id: string) => Promise<PlanArtifactFile | undefined>
   readonly attention: Pick<ScopedAttention, 'summary' | 'entry' | 'verify'>
@@ -286,7 +287,7 @@ const projectMeterRoutes: Partial<Record<keyof Api, true>> = {
 
 const requiredProjectRoutes: Partial<Record<keyof Api, true>> = {
   'GET hub/conversation': true, 'GET plans/:id/delivery': true, 'GET plans/:id/artifact': true,
-  'GET project/inspection': true,
+  'GET project/inspection': true, 'POST project/inspection/:id/repair': true,
 }
 
 const runLimitRoutes: Partial<Record<keyof Api, true>> = {
@@ -477,6 +478,18 @@ function routes(runtime: HttpHost): Routes {
       const { offset, limit } = InspectionQuery.parse(query)
       return runtime.inspection.view(offset, limit)
     },
+    'POST project/inspection/:id/repair': async ({ body, params, write }) => {
+      const { inspection, verifyProjectBinding } = runtime
+      if (!inspection || !verifyProjectBinding) throw new InstallationError(409, 'noProject')
+      const request = InspectionRepairSchema.safeParse(await body())
+      if (!request.success) throw new RouteError(400, 'Invalid inspection repair approval')
+      return write(async () => {
+        runtime.assertNewWork?.()
+        const result = await inspection.approveRepair(params.id, request.data)
+        runtime.requestPass()
+        return result
+      }, verifyProjectBinding)
+    },
     'GET plans/:id/delivery': ({ params }) => {
       const view = runtime.planIntegration?.view(params.id)
       if (!view) throw new UserError('unknownPlan', { id: params.id })
@@ -537,7 +550,7 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
     verify?: () => Promise<void>): Promise<T> {
     if (retiring) throw new InstallationError(409, 'switching')
     const installationRoute = installationRoutes.has(route)
-    const requirement = topicBindingRoutes[route] || attentionRoutes[route] || confirmationRoutes[route] ? 'required' : 'when-active'
+    const requirement = topicBindingRoutes[route] || attentionRoutes[route] || confirmationRoutes[route] || requiredProjectRoutes[route] ? 'required' : 'when-active'
     const { installation } = runtime
     const mount = installation?.runtime()
     if (!installationRoute || scope !== undefined) {
@@ -602,7 +615,9 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         if (route.key === 'GET plans/:id/delivery' && url.searchParams.size !== 0) {
           throw new RouteError(400, 'Invalid plan delivery query')
         }
-        if ((route.key === 'POST attention/credentials/:id/verify' || (confirmationRoute && route.key.startsWith('POST ')))
+        if (route.key === 'POST project/inspection/:id/repair' && url.searchParams.size !== 0) throw new RouteError(400, 'Invalid inspection repair query')
+        if ((route.key === 'POST attention/credentials/:id/verify' || route.key === 'POST project/inspection/:id/repair' ||
+          (confirmationRoute && route.key.startsWith('POST ')))
           && req.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') {
           throw new RouteError(400, 'Expected Content-Type: application/json')
         }

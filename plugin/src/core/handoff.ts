@@ -48,6 +48,19 @@ export interface MaintenanceOrigin {
   intentEvidence: string
 }
 
+export interface InspectionObservation { sessionId: string; scope: string; commit: string; at: string }
+export interface InspectionRepairOrigin {
+  todoId: string
+  observation: InspectionObservation
+  baseRef: string
+  supportingPaths: string[]
+  hubSessionId: string
+  approvedAt: string
+}
+
+export type StageTwoOrigin = { maintenance: MaintenanceOrigin; inspectionRepair?: never } |
+  { inspectionRepair: InspectionRepairOrigin; maintenance?: never }
+
 export type Handoff = {
   id: string
   project: ProjectRef
@@ -58,10 +71,10 @@ export type Handoff = {
   status: 'confirmed' | 'planning' | 'awaiting' | 'specified'
   question?: HandoffQuestion
   spec?: Spec
-} & ({ confirmedBy: HandoffInput['confirmedBy']; maintenance?: never } | {
-  confirmedBy?: never; maintenance: MaintenanceOrigin
+} & ({ confirmedBy: HandoffInput['confirmedBy']; maintenance?: never; inspectionRepair?: never } | (StageTwoOrigin & {
+  confirmedBy?: never
   authorization: { scope: string; release: 'not-authorized' }
-})
+}))
 
 export const handoffHubSession = (handoff: Handoff): string =>
-  handoff.confirmedBy ? handoff.confirmedBy.sessionId : handoff.maintenance.hubSessionId
+  handoff.confirmedBy ? handoff.confirmedBy.sessionId : (handoff.maintenance ?? handoff.inspectionRepair).hubSessionId

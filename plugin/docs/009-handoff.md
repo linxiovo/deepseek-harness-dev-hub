@@ -9,7 +9,7 @@ A handoff carries a project, goal, constraints, acceptance scope and authorizati
 | Record | Fields | Rules |
 | --- | --- | --- |
 | Project | `id`, `repository`, `workspace` | `workspace` is resolved to an absolute path. `id` derives from the repository and that path, so one checkout keeps one identity |
-| Handoff | `id`, `project`, `goal`, `constraints`, `acceptanceScope`, `authorization {scope, release, releaseTarget?}`, `confirmedBy` or `maintenance`, `status`, `question?`, `spec?` | The brief is written once. Direct confirmation binds one user message to one brief; a project has at most one handoff that is not `specified`. Maintenance records the intake event and matching rules instead and grants no release authority. `releaseTarget {environment, target, scope}` is required when `release: authorized`; older records without it cannot publish. |
+| Handoff | `id`, `project`, `goal`, `constraints`, `acceptanceScope`, `authorization {scope, release, releaseTarget?}`, `confirmedBy`, `maintenance` or `inspectionRepair`, `status`, `question?`, `spec?` | The brief is written once. Direct confirmation binds one user message to one brief; a project has at most one handoff that is not `specified`. The separate Stage 2 origins grant no release authority. `releaseTarget {environment, target, scope}` is required when `release: authorized`; older records without it cannot publish. |
 | Question | `id`, `text`, `why`, `affectedAcceptance`, `status`, `answer?`, `answeredBy?` | At most one per handoff. Its status is `awaiting` or `answered`; every affected item belongs to `acceptanceScope`. Feishu answers retain the sender's open ID and the originating Trigger ID. |
 | Spec | `id`, `handoffId`, `revision`, `body`, `acceptance`, `testInterfaces`, `outOfScope` | Stored once with revision `1`; never updated in place. `outOfScope` is required and may be empty: `[]` explicitly means there are no confirmed exclusions, while every entry is an actual excluded item; the field is neither omitted nor filled with invented items |
 
@@ -171,6 +171,8 @@ The Hub receives `maintenance-candidate` with `event_id` and a `maintenance/<id>
 The host requires a verbatim excerpt from the author, one assessment per enabled rule and at least one match before recording a positive verdict. A `plan` also needs a settled implementation request. Semantic classification belongs to the Hub; the host enforces identity, mode, rule IDs and Plan structure. A new Plan contains one feature: a single node for single-end work or a backend contract and dependent frontend node for cross-end work. Registration and the event receipt are atomic. Dispatch still uses the normal Frontier, worktree, budget, review and delivery gates.
 
 Replaying an adjudicated native event returns its original result. Edits of the same GitHub comment and matching text in the same source conversation (ignoring surrounding whitespace and CRLF) associate to already registered work. Different issues, chats and entrances are not automatically deduplicated against each other. For paraphrases and cross-entrance feedback, the Hub identifies matching work and uses `existing`. Association leaves the Ticket, Plan and delivery evidence unchanged.
+
+Completed inspection findings are not maintenance events. Only the separate approval in `020-idle-inspection.md` admits that work; it uses this same Plan dispatch and evidence path.
 
 ## Tests
 

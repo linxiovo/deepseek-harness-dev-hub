@@ -106,6 +106,7 @@ export const KV = {
   /** Inspection scheduler and evidence; the Session adapter independently pins the native root at creation. */
   inspection: { schedule: record<InspectionSchedule>('inspection-schedule'), run: family<InspectionRun>('inspection-run:'),
     native: family<number>('inspection-native:'), todo: family<InspectionTodo>('inspection-todo:'),
+    repairWake: family<string>('inspection-repair-wake:'),
     page: family<true, [string, string, number]>('inspection-page:', (id, path, offset) => `${id}:${JSON.stringify([path, offset])}`) },
   /** Handoffs: current record by project; immutable full records and specs; direct confirmation receipts. */
   handoffs: { current: family<string, [projectId: string]>('handoff-current:'),

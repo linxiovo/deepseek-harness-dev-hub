@@ -51,6 +51,8 @@ const ERROR_MESSAGES = {
   legacyProjectMismatch: 'The project does not match the legacy project configuration.',
   projectConflict: 'The project conflicts with an existing project or operation.',
   projectBindingImmutable: 'The mounted project binding cannot be changed.',
+  inspectionFindingNotFound: 'Inspection finding not found.',
+  inspectionRepairConflict: 'The request does not match a repairable inspection finding.',
 } as const
 export type InstallationErrorCode = keyof typeof ERROR_MESSAGES
 

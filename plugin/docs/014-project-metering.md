@@ -72,6 +72,8 @@ Attribution is recorded by the plugin at trusted delegation points; reading a me
 
 A trusted lifecycle caller can bind a separate retro Session to its Ticket. Idle inspections bind a fresh `inspection` Session to the project and its Hub generation, with no Ticket or Plan; the host checks its pinned native identity before sampling. Binding records attribution, not permission to start a turn. Startup reconciles existing review receipts against host metadata for detached reviewers, excluding replacement logs created after the receipt. A receipt restores attribution, not a Session or its permission to submit evidence.
 
+When an inspection finding becomes a repair Plan (see `020-idle-inspection.md`), the inspection remains project shared. The repair's Worker and descendants are attributed to the new Ticket and Plan as usual. Both contribute once to the project total; the repair Plan's `total` excludes the inspection.
+
 ## Errors
 
 | HTTP status and JSON body | Condition |

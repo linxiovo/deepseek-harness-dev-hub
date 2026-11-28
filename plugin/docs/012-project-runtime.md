@@ -73,6 +73,8 @@ Under `/orchestrator/api/`, scoped writes are `PUT settings/:block` and `PUT pro
 
 `GET topic-binding`, `POST topic-binding` and `POST topic-binding/unbind` require a registered mount and its explicit scope, including for reads. Binding uses the local operator's management authority, not a Feishu credential; the header prevents wrong-project writes, not access by other programs running as the operator. See [the Feishu handoff contract](009-handoff.md#optional-feishu-entry).
 
+`POST project/inspection/:id/repair` also requires the registered mount and explicit project scope. It verifies the checkout and rechecks authorization under the project write lock before recording approval. See `020-idle-inspection.md` for the repair request contract.
+
 `GET /orchestrator/api/sessions/:id/meter` exposes only the mounted project's Hub, Worker, planner or splitter meters in managed mode. An unowned or missing Session returns `404 {error: "Session not found"}`. A new handoff must match the mounted repository and canonical workspace before persisting its approval.
 
 The write check runs after body parsing and before applying the mutation. An installation write or ongoing remount blocks concurrent writes with `409 switching`. An active project write blocks another write, including selection, with `409 projectConflict`. Retrying a Ticket or requeueing a Trigger also checks GitHub, project setup and operator pause (`githubSetupRequired`, `noProject`, `projectSetupRequired` or `operatorPaused` as applicable). A correctly scoped pause change remains available when setup is pending. After a switch, refresh the mounted ID and confirm the operator's intent before resubmitting a refused mutation.

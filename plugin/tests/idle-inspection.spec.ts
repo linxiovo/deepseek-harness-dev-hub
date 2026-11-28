@@ -1,9 +1,10 @@
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import { z } from 'zod'
+import { Commands } from '../src/infra/commands.ts'
 import { KV } from '../src/kv.ts'
 import { startManagedProject, type Host } from './fixtures/host.ts'
 
@@ -115,6 +116,101 @@ it('reads pinned content, chooses the configured route, and associates repeat ev
   expect(git.git('rev-parse', 'refs/heads/main')).toBe(git.base.sha)
   expect(git.git('status', '--porcelain')).toBe('')
   expect(readFileSync(join(git.repository, 'shared.txt'), 'utf8')).toMatch(/^baseline\r?\n$/)
+
+  const todo = z.object({ items: z.array(z.object({ id: z.string(), latest: z.object({ sessionId: z.string() }) })).length(1) })
+    .parse(await inspectionView(h, project)).items[0]!
+  const approve = (approval: object, scope = project) => h.api('POST', `project/inspection/${todo.id}/repair`, approval, scope)
+  const approval = { path: 'shared.txt', sessionId: todo.latest.sessionId, role: 'backend', goal: 'Clarify the baseline label',
+    check: { seam: 'Read the public label file', observable: 'shared.txt identifies the stable baseline label' } }
+  expect(await approve({ ...approval, path: 'shared.txt/other' })).toMatchObject({ status: 409 })
+  expect(await approve({ ...approval, sessionId: firstId })).toMatchObject({ status: 409 })
+  expect(await approve(approval, 'another-project')).toMatchObject({ status: 409, body: { code: 'staleProject' } })
+  expect(await approve({ ...approval, release: 'authorized' })).toMatchObject({ status: 400 })
+  const file = join(git.repository, 'shared.txt'), original = readFileSync(file)
+  writeFileSync(file, 'The reported line is gone.\n')
+  git.git('add', 'shared.txt'); git.git('commit', '-qm', 'Remove the observed line')
+  expect(await approve(approval)).toMatchObject({ status: 409, body: { code: 'inspectionRepairConflict' } })
+  writeFileSync(file, original)
+  git.git('add', 'shared.txt'); git.git('commit', '-qm', 'Restore the observed file on a newer base')
+  const restoringBase = git.git('rev-parse', 'refs/heads/main')
+  const gitRead = vi.spyOn(Commands.prototype, 'git'), execute = gitRead.getMockImplementation()!
+  let moved = false
+  gitRead.mockImplementation(async function (this: Commands, args, directory) {
+    const result = await execute.call(this, args, directory)
+    if (!moved && args.includes('ls-tree') && args.includes(restoringBase) && args.at(-1) === 'shared.txt') {
+      moved = true
+      writeFileSync(file, 'The observed line disappeared during verification.\n')
+      git.git('add', 'shared.txt'); git.git('commit', '-qm', 'Move the ref during finding verification')
+    }
+    return result
+  })
+  try {
+    expect(await approve(approval)).toMatchObject({ status: 409, body: { code: 'inspectionRepairConflict', error: expect.stringMatching(/ref moved/) } })
+  } finally { gitRead.mockImplementation(execute) }
+  writeFileSync(file, original)
+  git.git('add', 'shared.txt'); git.git('commit', '-qm', 'Restore the finding on the current base')
+  const main = git.git('rev-parse', 'refs/heads/main')
+
+  const checking = Promise.withResolvers<void>(), proceed = Promise.withResolvers<void>()
+  const verify = h.runtime.installation.validateWorkspace.bind(h.runtime.installation)
+  vi.spyOn(h.runtime.installation, 'validateWorkspace').mockImplementationOnce(async () => {
+    const workspace = await verify()
+    checking.resolve()
+    await proceed.promise
+    return workspace
+  })
+  const interrupted = approve(approval)
+  try {
+    await Promise.race([checking.promise, interrupted.then(response => { throw new Error(`Approval returned ${response.status} before verification resumed`) })])
+    expect(await h.api('POST', `projects/${project}/select`, undefined, project)).toMatchObject({ status: 409, body: { code: 'projectConflict' } })
+    await h.runtime.settings.pause(true, 'panel')
+  } finally { proceed.resolve(); await interrupted }
+  expect(await interrupted).toMatchObject({ status: 409, body: { code: 'operatorPaused' } })
+  await h.runtime.settings.pause(false, 'panel')
+  await h.idleRelay()
+  expect(h.jsonRelays(h.runtime.masterId, 'inspection-repair-approved')).toEqual([])
+  expect((await inspectionView(h, project)).items).toEqual([expect.not.objectContaining({ repairPlanId: expect.anything() })])
+
+  const relays = () => h.jsonRelays(h.runtime.masterId, 'inspection-repair-approved')
+  const flush = vi.spyOn(h.ctx.sessionPersistence, 'flush'), persist = flush.getMockImplementation()!
+  let lostReceipt = false
+  flush.mockImplementation(async (...args) => {
+    if (!lostReceipt && relays().length === 1) {
+      lostReceipt = true
+      h.step(h.runtime.masterId)
+      await persist.apply(h.ctx.sessionPersistence, args)
+      throw new Error('Interrupted after native consumption, before the local effect receipt')
+    }
+    return persist.apply(h.ctx.sessionPersistence, args)
+  })
+  const saved = await approve(approval)
+  try { await h.idleRelay() } finally { flush.mockImplementation(persist) }
+  expect(saved).toMatchObject({ status: 200, body: { planId: expect.any(String), reused: false } })
+  const { planId } = z.object({ planId: z.string() }).parse(saved.body)
+  expect(relays()).toMatchObject([{ planId }])
+  expect(h.runtime.effects.pending('relay', `inspection-repair:${planId}`)).toBe(true)
+  await h.restart()
+  await h.idleRelay()
+  expect(relays()).toMatchObject([{ planId }, { planId }])
+  expect(await approve(approval)).toMatchObject({ status: 200, body: { planId, reused: true } })
+  expect(await approve({ ...approval, role: 'frontend' })).toMatchObject({ status: 409 })
+  expect(await inspectionView(h, project)).toMatchObject({ grant, items: [{ id: todo.id, repairPlanId: planId }] })
+  expect(await h.runTool(h.runtime.masterId, 'orchestrator_read', { resource: `handoff/${planId}` })).toMatchObject({
+    authorization: { scope: 'shared.txt', release: 'not-authorized' }, inspectionRepair: { todoId: todo.id,
+      observation: { sessionId: approval.sessionId, commit: git.base.sha, scope: grant.scope } },
+  })
+  expect(await h.runTool(h.runtime.masterId, 'orchestrator_read', { resource: `plan/${planId}` })).toMatchObject({
+    nodes: [{ id: 'repair', role: 'backend', acceptance: [1], blockedBy: [] }],
+  })
+  expect(await h.runTool(h.runtime.masterId, 'orchestrator_read', { resource: 'tickets' })).toMatchObject({ items: [] })
+  await expect(h.runTool(approval.sessionId, 'orchestrator_plan_dispatch', { planId, nodeId: 'repair' })).rejects.toThrow(/not registered/)
+  const dispatch = () => h.runTool(h.runtime.masterId, 'orchestrator_plan_dispatch', { planId, nodeId: 'repair' })
+  const dispatched = await dispatch()
+  expect(dispatched).toMatchObject({ reused: false, claim: { ticketId: expect.any(String) } })
+  expect(await dispatch()).toMatchObject({ reused: true, claim: dispatched.claim })
+  await h.runtime.idle()
+  expect(await h.runTool(h.runtime.masterId, 'orchestrator_read', { resource: 'tickets' })).toMatchObject({ items: [expect.anything()] })
+  expect(git.git('rev-parse', 'refs/heads/main')).toBe(main)
 })
 
 it('yields to pending maintenance and never replays an already consumed task after restart', async () => {

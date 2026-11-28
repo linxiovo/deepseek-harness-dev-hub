@@ -29,7 +29,7 @@ interface Host {
   effects: Pick<Effects, 'cancel' | 'pending'>
   project: ProjectRef
   plans: Pick<Plans, 'get' | 'register' | 'state'>
-  handoffs: Pick<Handoffs, 'get' | 'recordMaintenance'>
+  handoffs: Pick<Handoffs, 'get' | 'recordStageTwo'>
   sources: Pick<SourceRegistry, 'scope'>
   stage: PlanIntegration['stage']
   feishuIngress: TopicBinding['maintenanceIngress']
@@ -202,8 +202,8 @@ export class Maintenance {
       if (outcome.kind !== 'accept') throw new Error(`Maintenance is not authorized: ${typeof outcome.reason === 'string' ? outcome.reason : reasonText(outcome.reason)}`)
       const rules = outcome.rules ?? []
       const constraints = settings.policy.rules.filter(rule => rules.includes(rule.id)).map(rule => rule.instruction)
-      const spec = host.handoffs.recordMaintenance({ eventId: id, actor: event.actor, policyVersion: version, rules, hubSessionId,
-        intentEvidence: verdict.intentEvidence }, verdict.scope, constraints, verdict.spec)
+      const spec = host.handoffs.recordStageTwo({ maintenance: { eventId: id, actor: event.actor, policyVersion: version, rules, hubSessionId,
+        intentEvidence: verdict.intentEvidence } }, { scope: verdict.scope, constraints }, verdict.spec)
       const plan = host.plans.register(spec.handoffId, spec.id, verdict.draft)
       return this.finish(id, event, { status: 'registered', target: { planId: plan.id } }, text, trigger)
     })

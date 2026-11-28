@@ -24,7 +24,7 @@ import { IM_WORDS, NOTE_WORDS, checkedImText } from '../src/infra/text.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { feishuKind, feishuTrigger } from '../src/sources/feishu.ts'
 import { githubKind } from '../src/sources/github.ts'
-import { testMachine } from './fixtures/deployment.ts'
+import { developmentModels, testMachine } from './fixtures/deployment.ts'
 import { gitEnv, gitRepository } from './fixtures/git.ts'
 
 type Role = 'orchestrator' | 'worker'
@@ -168,7 +168,7 @@ async function start() {
   const seed = new Store(join(directory, 'orchestrator.sqlite'))
   const github = { enabled: true, config: { repository: 'acme/widgets', cli: AGENT } }
   const initial = seed.settings()
-  seed.saveSettings(SettingsSchema.parse({ ...initial, executor: { ...initial.executor,
+  seed.saveSettings(SettingsSchema.parse({ ...initial, executor: { ...initial.executor, ...developmentModels,
     repository: localGit.repository, baseRef: localGit.base.ref }, sources: { github, feishu: { enabled: true, config: { cli: BOT } } } }))
   seed.close()
   const runtime = new Runtime(ctx, testMachine({ stateDir: directory }), () => {})
@@ -402,6 +402,7 @@ it('collects both roles\' tools, prompts, skills and inputs', () => {
   expect(toolsOf('orchestrator').has('orchestrator_retro_evidence')).toBe(false)
   expect([...toolsOf('orchestrator').keys()]).toEqual(expect.arrayContaining(['orchestrator_route', 'orchestrator_eval_decide', 'orchestrator_reply']))
   expect(toolsOf('orchestrator').has('orchestrator_maintenance')).toBe(false)
+  expect(toolsOf('orchestrator').has('orchestrator_lookup')).toBe(false)
   // The one routing tool takes the place of four.
   for (const name of ['orchestrator_ticket_accept', 'orchestrator_ticket_attach', 'orchestrator_ticket_stop', 'orchestrator_trigger_ignore']) {
     expect(toolsOf('orchestrator').has(name)).toBe(false)

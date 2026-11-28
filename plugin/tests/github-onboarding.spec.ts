@@ -11,7 +11,7 @@ import { credentialHelper, workerGitConfig } from '../src/infra/environment.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { githubKind } from '../src/sources/github.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
-import { testMachine } from './fixtures/deployment.ts'
+import { developmentModels, testMachine } from './fixtures/deployment.ts'
 import { gitRepository } from './fixtures/git.ts'
 
 const account: VerifiedGithub = { cli: process.execPath, id: 17, login: 'project-agent', noreply: '17+project-agent@users.noreply.github.com' }
@@ -71,7 +71,7 @@ it('keeps legacy onboarding ready when repository setup fails, but refuses adopt
   writeFileSync(alternate, '', { mode: 0o755 })
   const machine = testMachine({ stateDir })
   const settings = SettingsSchema.parse({ sources: { github: { enabled: false, config: { cli: process.execPath, repository: 'acme/widgets' } } },
-    executor: { repository: checkout.repository, baseRef: checkout.base.ref } })
+    executor: { ...developmentModels, repository: checkout.repository, baseRef: checkout.base.ref } })
   const context = new Context()
   let sourceId = account.id
   let alternateId = 18

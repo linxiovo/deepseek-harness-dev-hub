@@ -5,12 +5,13 @@ import { SESSION_FORMAT_VERSION, SessionSeq, type SessionEvent, type SessionHead
 import { realpathSync } from 'node:fs'
 import { isAbsolute, relative } from 'node:path'
 
-type Creation = { token: string; cwd: string; marker?: 'dsh-superagent/inspection-root' }
+type Creation = { token: string; cwd: string; marker?: 'dsh-superagent/inspection-root' | 'dsh-superagent/lookup-root' }
 
 declare module '@deepseek-ai/dsh-session/types' {
   interface SessionEventMap {
     'dsh-superagent/hub-root': { sessionId: string; token: string }
     'dsh-superagent/inspection-root': { sessionId: string; token: string }
+    'dsh-superagent/lookup-root': { sessionId: string; token: string }
   }
 }
 
@@ -21,8 +22,8 @@ function rootHeader(header: SessionHeader, inherited: number, id: SessionId, cre
 }
 
 function hasMarker(event: SessionEvent | undefined, id: SessionId, creation: Creation): boolean {
-  return !!creation.token && !!event && (event.type === 'dsh-superagent/hub-root' || event.type === 'dsh-superagent/inspection-root')
-    && event.type === (creation.marker ?? 'dsh-superagent/hub-root') && event.seq === 0 && event.ignorable === true
+  return !!creation.token && !!event && event.type === (creation.marker ?? 'dsh-superagent/hub-root')
+    && event.seq === 0 && event.ignorable === true
     && event.data?.sessionId === id && event.data.token === creation.token
 }
 
@@ -55,6 +56,7 @@ export async function openNativeRoot(ctx: Context, id: SessionId, creation: Crea
     authorize?.()
     const time = Date.now()
     await using fresh = await persistence.create({ version: SESSION_FORMAT_VERSION, id, createdAt: time, cwd, agentPreset: preset, isSeeded: false })
+    authorize?.()
     // V4 preserves unknown, explicitly ignorable, log-only events without projecting them into model history.
     await fresh.append([{ type: creation.marker ?? 'dsh-superagent/hub-root', seq: SessionSeq(0), time, data: { sessionId: id, token: creation.token }, ignorable: true }])
     await fresh.flush()

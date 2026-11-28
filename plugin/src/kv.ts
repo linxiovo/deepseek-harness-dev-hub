@@ -24,7 +24,7 @@ import type { CredentialBlocker } from './app/scoped-attention.ts'
 import type { PlanControlState } from './app/plan-control.ts'
 import type { MaintenanceEvent, MaintenanceTarget } from './app/maintenance.ts'
 import type { InspectionRun, InspectionSchedule, InspectionTodo } from './app/idle-inspection.ts'
-import type { SettingsSave } from './policy.ts'
+import type { RoleModel, SettingsSave } from './policy.ts'
 import type { GithubConfig, Retry } from './sources/github.ts'
 
 /** Key of a KV record whose value has type `V`; a plain string represents an untyped key. */
@@ -63,7 +63,9 @@ export const KV = {
       'hub-inbox-request:', (kind, id) => JSON.stringify([kind, id])),
     inboxFence: family<number, [sessionId: string]>('hub-inbox-fence:') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
-  sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
+  sessions: { prompts: family<number[], [session: string]>('session-prompts:'),
+    /** Initial model intent for a reserved Worker root; null pins the absence of a role override. */
+    workerModel: family<RoleModel | null, [session: string]>('worker-initial-model:') },
   /** Session meter: durable exclusive log cursor and its cumulative, own-event projection. */
   meter: { state: family<SessionMeterState, [session: string]>('session-meter:') },
   /** Project meter: one append-only business identity per Session, with a cumulative set of roles. */
@@ -108,6 +110,8 @@ export const KV = {
     native: family<number>('inspection-native:'), todo: family<InspectionTodo>('inspection-todo:'),
     repairWake: family<string>('inspection-repair-wake:'),
     page: family<true, [string, string, number]>('inspection-page:', (id, path, offset) => `${id}:${JSON.stringify([path, offset])}`) },
+  /** A lookup reserves its creation proof before opening a native root; only a verified root has a creation time. */
+  lookup: { native: family<{ token: string; createdAt?: number }>('lookup-native:') },
   /** Handoffs: current record by project; immutable full records and specs; direct confirmation receipts. */
   handoffs: { current: family<string, [projectId: string]>('handoff-current:'),
     record: family<Handoff, [id: string]>('handoff:'),

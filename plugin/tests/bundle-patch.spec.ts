@@ -4,6 +4,7 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { expect, it } from 'vitest'
 import { INSPECTION_PRESET, PLANNER_PRESET, ROUTER_PRESET, WORKER_PRESET } from '../src/app/sessions.ts'
+import { LOOKUP_PRESET } from '../src/app/lightweight-lookup.ts'
 
 interface Row { id?: string; name: string; disabled?: unknown; config?: Record<string, unknown> & { plugins?: Row[] } | Row[] }
 /** The patch as DSH reads it: Cordis's include plugin parses `!!js` scalars, and applies the inserts to an entry list. */
@@ -29,7 +30,7 @@ const presetOf = (rows: readonly Row[], id: string) => rows.map(row => row.confi
 it('defines the worker preset Executor Sessions run under, with a shell that moves long commands to the background', async () => {
   const rows = await patched()
   expect(rows.map(row => row.id)).toEqual(['dsh-superagent', 'dsh-superagent-github', 'dsh-superagent-feishu', 'dsh-superagent-worker-preset',
-    'dsh-superagent-router-preset', 'dsh-superagent-planner-preset', 'dsh-superagent-inspection-preset'])
+    'dsh-superagent-router-preset', 'dsh-superagent-planner-preset', 'dsh-superagent-inspection-preset', 'dsh-superagent-lookup-preset'])
   const preset = presetOf(rows, WORKER_PRESET)
   expect(preset.id).toBe(WORKER_PRESET)
   const plugins = flat(preset.plugins)
@@ -86,6 +87,6 @@ it('keeps the planner able to research but unable to run commands or edit files'
     '@deepseek-ai/dsh-tool-jobs', '@deepseek-ai/dsh-tool-subagent', '@deepseek-ai/dsh-tool-ask-user']) expect(named(name)).toEqual([])
 })
 
-it('gives the inspection root no filesystem, instructions or other preset plugins', async () => {
-  expect(presetOf(await patched(), INSPECTION_PRESET)).toMatchObject({ id: INSPECTION_PRESET, order: 93, plugins: [] })
+it.each([[INSPECTION_PRESET, 93], [LOOKUP_PRESET, 94]] as const)('gives %s no filesystem, instructions or other preset plugins', async (id, order) => {
+  expect(presetOf(await patched(), id)).toMatchObject({ id, order, plugins: [] })
 })

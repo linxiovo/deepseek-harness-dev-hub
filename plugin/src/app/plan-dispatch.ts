@@ -5,6 +5,8 @@ import { key } from '../core/ids.ts'
 import { PLAN_ROLES, type PlanNode, type PlanNodeClaim, type PlanNodeState, type PlanRole } from '../core/plan.ts'
 import type { Engine } from '../core/engine.ts'
 import type { DshExecutor } from '../executor/dsh.ts'
+import { developmentModelsReady } from '../policy.ts'
+import { InstallationError } from './installation-api.ts'
 import type { Store } from './store.ts'
 import type { Plans } from './plans.ts'
 import type { PlanControl } from './plan-control.ts'
@@ -25,7 +27,7 @@ export type PlanDispatchResult = {
 }
 
 interface PlanDispatcherHost {
-  readonly store: Pick<Store, 'tickets'>
+  readonly store: Pick<Store, 'tickets' | 'settings'>
   readonly plans: Pick<Plans, 'get' | 'state' | 'waitingOn' | 'waitingForWriters' | 'claim' | 'list' | 'rearm'>
   readonly engine: Pick<Engine, 'createPlanTicket'>
   readonly executor: Pick<DshExecutor, 'reserveLaunch' | 'releaseLaunch' | 'start'>
@@ -34,6 +36,7 @@ interface PlanDispatcherHost {
   readonly control: Pick<PlanControl, 'blocksWorker' | 'dispatchBlocked'>
   paused(): boolean
   bindWorker(ticketId: string, sessionId: string): void
+  reserveWorker(ticketId: string, sessionId: string): void
   readonly now?: () => string
 }
 
@@ -63,6 +66,7 @@ export class PlanDispatcher {
       }
       return replay
     }
+    if (!developmentModelsReady(this.host.store.settings().executor)) throw new InstallationError(409, 'developmentModelsRequired')
     const waitingOn = this.host.plans.waitingOn(planId, node)
     if (waitingOn.length) return { ...request, status: 'blocked', reused: false, waitingOn,
       reason: `Waiting for formal delivery of ${waitingOn.join(', ')}` }
@@ -88,7 +92,7 @@ export class PlanDispatcher {
         if (ticket.id !== ticketId || latestAssignment(ticket)?.id !== assignmentId) {
           throw new Error(`Plan node ${planId}/${nodeId} did not create its stable Ticket and Assignment`)
         }
-        this.host.bindWorker(ticket.id, claim.session)
+        this.host.reserveWorker(ticket.id, claim.session)
       })
       committed = true
       return this.result(request, state, false)

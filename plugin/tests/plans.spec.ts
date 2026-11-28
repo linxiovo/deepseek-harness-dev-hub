@@ -1,13 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import { unlinkSync, writeFileSync } from 'node:fs'
-import type { StreamChunk } from '@deepseek-ai/dsh-llm'
+import { freezeMessage, MessageId, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { resolve } from 'node:path'
 import { startManagedProject, startRuntime, type Host } from './fixtures/host.ts'
 import { KV } from '../src/kv.ts'
 import { planDeliveryWriter } from '../src/app/plans.ts'
+import type { RoleModel } from '../src/policy.ts'
+import { commentTrigger } from '../src/sources/github.ts'
 
 let h: Host
 let brief: { project: { repository: string; workspace: string }; goal: string; constraints: string[];
@@ -247,10 +249,70 @@ type PlanDispatch = z.infer<typeof PlanDispatchSchema>
 const dispatchPlan = async (planId: string, nodeId: string): Promise<PlanDispatch> => PlanDispatchSchema.parse(
   await h.runTool(h.runtime.masterId, 'orchestrator_plan_dispatch', { planId, nodeId }))
 
+async function workerSelections(session: string) {
+  await using log = await h.ctx.sessionPersistence.open(session as SessionId, 'read')
+  return (await log.read()).events.filter(event => event.type === 'model/selection').map(event => event.data)
+}
+
+async function expectWorkerModel(session: string, expected: RoleModel) {
+  expect(await workerSelections(session)).toEqual([expected])
+  const request = vi.fn(async function* ({ provider, model, reasoningEffort }: GenerateOptions): AsyncGenerator<StreamChunk> {
+    expect({ provider, model, reasoningEffort }).toEqual({ ...expected, reasoningEffort: expected.reasoningEffort })
+    yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }
+  })
+  await h.modelRequest(session, 8192, request)
+  expect(request).toHaveBeenCalledOnce()
+}
+
 
 describe('managed project plan pause', () => {
   let managedHost: Host | undefined
   afterEach(async () => { if (managedHost) { await managedHost.stop(); managedHost = undefined } })
+  it('blocks dispatch with one development model, then routes concurrent Worker requests by persisted role', async () => {
+    const { host, project, projectBrief } = await startManagedProject({ withFeishu: false })
+    managedHost = h = host
+    brief = savedProductsBrief(projectBrief)
+    const specification = { ...fanInSpec, body: 'Build independent catalog, accounts and dashboard slices.' }
+    const { id, register } = await publish({ ...brief, goal: specification.body }, specification)
+    await h.runtime.idle()
+    await register({ ...fanInDraft, nodes: fanInDraft.nodes.map(node => node.id === 'dashboard' ? { ...node, blockedBy: [] } : node) })
+
+    const backendModel = { provider: 'code-provider', model: 'backend-dev', reasoningEffort: 'high' }
+    const frontendModel = { provider: 'ui-provider', model: 'frontend-dev' }
+    const model = { provider: 'general-provider', model: 'general-dev' }
+    const current = h.runtime.store.settings()
+    h.runtime.store.saveSettings({ ...current, executor: { ...current.executor, model, backendModel, frontendModel: null, maxWorkers: 2 } })
+    expect(await h.api('GET', 'onboarding', undefined, project.id)).toMatchObject({ status: 200, body: { status: 'models-required', missing: ['frontend'] } })
+    await expect(dispatchPlan(id, 'accounts')).rejects.toMatchObject({ code: 'developmentModelsRequired' })
+    expect(await read(`plan/${id}/node/accounts`)).not.toHaveProperty('claim')
+    expect(h.controller.create.mock.calls.some(([input]) => input.sessionId.startsWith('worker-'))).toBe(false)
+
+    const { value, revision } = await readExecutorSettings()
+    expect(await h.api('PUT', 'settings/executor', { revision, value: { ...value, frontendModel } }, project.id)).toMatchObject({ status: 200 })
+    await expect(h.runTool(h.runtime.masterId, 'orchestrator_plan_dispatch', { planId: id, nodeId: 'catalog', role: 'frontend' })).rejects.toThrow()
+    const resolved = Promise.withResolvers<void>(), allow = Promise.withResolvers<void>()
+    const resolve = vi.mocked(h.ctx.llm.resolveCallConfig)
+    const resolveConfig = resolve.getMockImplementation()!
+    resolve.mockImplementation(async (...args) => {
+      if (args[0].model === backendModel.model) { resolved.resolve(); await allow.promise }
+      return resolveConfig(...args)
+    })
+    let backend: PlanDispatch, frontend: PlanDispatch
+    try {
+      [backend, frontend] = await Promise.all([dispatchPlan(id, 'catalog'), dispatchPlan(id, 'dashboard')])
+      expect(backend).toMatchObject({ status: 'claimed', reused: false, role: 'backend' })
+      expect(frontend).toMatchObject({ status: 'claimed', reused: false, role: 'frontend' })
+      await Promise.race([resolved.promise, h.runtime.idle().then(() => { throw new Error('Worker never began model resolution') })])
+      expect(await h.nativeStep(backend.claim!.session, { starts: true })).toBe(false)
+      const prematureProvider = vi.fn(async function* (): AsyncGenerator<StreamChunk> { yield { type: 'finish', reason: { kind: 'stop' } } })
+      await expect(h.modelRequest(backend.claim!.session, 8192, prematureProvider)).rejects.toMatchObject({ code: 'SUPERAGENT_RUN_LIMIT' })
+      expect(prematureProvider).not.toHaveBeenCalled()
+    } finally { allow.resolve() }
+    await h.runtime.idle()
+    await Promise.all([expectWorkerModel(backend.claim!.session, backendModel), expectWorkerModel(frontend.claim!.session, frontendModel)])
+    expect(h.controller.selectModel).not.toHaveBeenCalled()
+  })
+
   it('reports the same effective limits at startup and after a scoped operator save, not a Hub elevation', async () => {
     const { host, project } = await startManagedProject({ withFeishu: false })
     managedHost = h = host
@@ -1169,16 +1231,31 @@ it('clears only the named Plan hold and keeps quota and predecessor waits', asyn
 })
 
 
-it('replays a durable claim after restart without creating a second Worker delivery', async () => {
+it('ignores an untrusted GitHub role and keeps the standalone Worker on the general override', async () => {
+  const settings = h.runtime.store.settings()
+  const model = { provider: 'general-provider', model: 'general-model' }
+  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, model } })
+  const trigger = commentTrigger({ id: 915, user: { login: 'alice' }, body: '@agent-bot Fix the list. Role: frontend',
+    html_url: 'https://github.com/acme/widgets/issues/42#issuecomment-915' }, { number: 42, isPr: false }, 'conversation', 'agent-bot')
+  const { ticket, sessionId } = await h.acceptedTicket({ ...trigger, meta: { ...trigger.meta, role: 'frontend', labels: ['frontend'] } })
+  expect(await read(`ticket/${ticket.id}`)).not.toHaveProperty('plan')
+  await expectWorkerModel(sessionId, model)
+})
+
+it('replays a durable Worker model claim across settings changes and both pre-request interruptions', async () => {
   const published = await publish()
   await h.runtime.idle()
   await published.register(splitDraft)
   const settings = h.runtime.store.settings()
-  h.runtime.store.saveSettings({ ...settings, paused: true, executor: { ...settings.executor, maxWorkers: 1 } })
+  const backendModel = { provider: 'code-provider', model: 'original-backend', reasoningEffort: 'medium' }
+  h.runtime.store.saveSettings({ ...settings, paused: true, executor: { ...settings.executor, backendModel, maxWorkers: 1 } })
   const before = h.runtime.planDispatcher.dispatch(published.id, 'saved-api')
   const beforeClaim = before.claim
   if (!beforeClaim) throw new Error('A dispatched node must have a durable claim')
   expect(before).toMatchObject({ status: 'claimed', claim: { pendingAction: 'launch' } })
+  expect(h.agents.has(beforeClaim.session)).toBe(false)
+  const claimed = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...claimed, executor: { ...claimed.executor, backendModel: { provider: 'another', model: 'new-backend' } } })
   await h.restart()
   expect((await read(`plan/${published.id}/node/saved-api`)).claim).toEqual(beforeClaim)
   expect(await read(`plan/${published.id}/node/saved-page`)).toMatchObject({ status: 'blocked', waiting_on: ['saved-api'] })
@@ -1188,6 +1265,33 @@ it('replays a durable claim after restart without creating a second Worker deliv
   expect(deliveries).toHaveLength(1)
   expect((await read(`plan/${published.id}/node/saved-api`)).status).toBe('running')
   expect(await dispatchPlan(published.id, 'saved-page')).toMatchObject({ status: 'blocked', waitingOn: ['saved-api'] })
+  // The native selection is now durable, but the fixture has not dispatched the first agent/request.
+  expect(await workerSelections(beforeClaim.session)).toEqual([backendModel])
+  const flushing = Promise.withResolvers<void>(), allowFlush = Promise.withResolvers<void>()
+  vi.mocked(h.ctx.sessionPersistence.flush).mockImplementationOnce(() => { flushing.resolve(); return allowFlush.promise })
+  const probing = Promise.withResolvers<void>(), allowStartup = Promise.withResolvers<void>()
+  const spawn = h.subprocess.spawn.getMockImplementation()!
+  h.subprocess.spawn.mockImplementation(spec => {
+    const result = spawn(spec)
+    if (!spec.argv.includes('api') || !spec.argv.includes('user')) return result
+    probing.resolve()
+    return { ...result, done: allowStartup.promise.then(() => result.done) }
+  })
+  const direct = freezeMessage({ role: 'user', id: MessageId('startup-direct'), source: { kind: 'user' }, content: [{ type: 'text', text: 'Continue' }] })
+  const restarted = h.restart()
+  try {
+    await Promise.race([flushing.promise, restarted.then(() => { throw new Error('Worker restarted before the shutdown flush') })])
+    h.agents.get(beforeClaim.session)!.inbox.nextTurn.push(direct)
+    expect(await h.nativeStep(beforeClaim.session, { starts: true })).toBe(false)
+    allowFlush.resolve()
+    await Promise.race([probing.promise, restarted.then(() => { throw new Error('Worker remounted before the startup barrier') })])
+    await h.resolveDefault(beforeClaim.session)
+    h.agents.get(beforeClaim.session)!.inbox.nextTurn.push(direct)
+    expect(await h.nativeStep(beforeClaim.session, { starts: true })).toBe(false)
+  } finally { allowFlush.resolve(); allowStartup.resolve(); await restarted; h.subprocess.spawn.mockImplementation(spawn) }
+  await h.runtime.idle()
+  await expectWorkerModel(beforeClaim.session, backendModel)
+  expect(h.controller.create.mock.calls.filter(([input]) => input.sessionId === beforeClaim.session)).toHaveLength(1)
 })
 
 it('does not meter a preallocated Worker ID before its verified Session is handed off', async () => {
@@ -1204,6 +1308,10 @@ it('does not meter a preallocated Worker ID before its verified Session is hande
   expect(await read(meter)).toMatchObject(expected)
   await h.restart()
   expect(await read(meter)).toMatchObject(expected)
+  await h.runtime.settings.pause(false, 'panel')
+  await h.runtime.idle()
+  expect(await workerSelections(claim.session)).toEqual([])
+  expect(h.deliveries.mock.calls.some(([delivery]) => delivery.sessionId === claim.session)).toBe(false)
 })
 
 it('replans a repeatedly failing Plan check without loosening its successor gate', async () => {

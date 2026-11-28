@@ -258,6 +258,13 @@ it('stages shared rules without applying them to running Tickets or permitting a
 }, 120_000)
 
 it('publishes isolated shared rules once after verified delivery, even when the write receipt is interrupted', async () => {
+  await h.stop()
+  const previous = { ...defaultPrompts(), skills: { release: 'Check the old release checklist.', retired: 'Use the legacy checklist.' } }
+  h = await startRuntime(store => {
+    store.set(KV.prompts.version(0), { revision: 0, previousRevision: null, savedAt: '', source: 'defaults', config: defaultPrompts() })
+    store.set(KV.prompts.version(1), { revision: 1, previousRevision: 0, savedAt: '', source: 'panel', config: previous })
+    store.set(KV.prompts.revision, 1)
+  })
   const { git, base, runGit, tip } = mainlineRepository()
   const ci = actionsHost()
   await configureCI()
@@ -282,14 +289,16 @@ it('publishes isolated shared rules once after verified delivery, even when the 
   const config = { ...defaultPrompts(), scope: 'Verify the approved release notes before reporting.',
     skills: { release: 'Read release notes.', retired: 'This skill is disabled.' }, disabledSkills: ['retired'],
     admissionRules: [{ id: 'release-note', name: 'Release notes', enabled: true, instruction: 'Validate release notes.' }] }
-  const proposal = { config, baseRevision: 0, maintenanceTicketId: worker.ticketId }
+  const proposal = { config, baseRevision: 1, maintenanceTicketId: worker.ticketId }
   expect(await h.api('PUT', 'prompts', { ...proposal, config: { ...config, runLimits: { projectTokens: 999999 } } })).toMatchObject({ status: 400 })
   const policy = JSON.parse(String((await read('settings/policy')).text))
   expect(await h.api('PUT', 'settings/policy', { revision: policy.revision, value: { ...policy.value, rules: [] } }))
     .toMatchObject({ status: 400, body: { code: 'ruleMaintenanceRequired' } })
-  expect(await h.api('PUT', 'prompts', proposal)).toMatchObject({ status: 200, body: { revision: 1, effect: 'pending-review' } })
-  expect(await h.api('PUT', 'prompts', proposal)).toMatchObject({ status: 200, body: { revision: 1 } })
-  expect(await h.api('GET', 'prompts?revision=1')).toMatchObject({ status: 200, body: { revision: 0, shownState: 'pending' } })
+  expect(await h.api('PUT', 'prompts', proposal)).toMatchObject({ status: 200, body: { revision: 2, effect: 'pending-review' } })
+  expect(await h.api('PUT', 'prompts', proposal)).toMatchObject({ status: 200, body: { revision: 2 } })
+  expect(await h.api('GET', 'prompts?revision=2')).toMatchObject({ status: 200, body: {
+    revision: 1, shownState: 'pending', current: { config }, effective: { config: previous },
+  } })
   mkdirSync(join(worker.directory, '.dsh-superagent'))
   write(worker.directory, '.dsh-superagent/rules.json', JSON.stringify(config))
   const candidate = commit(worker.directory, 'Review a shared rule version in isolation')
@@ -298,7 +307,7 @@ it('publishes isolated shared rules once after verified delivery, even when the 
   for (const axis of ['standards', 'spec'] as const) {
     const reviewer = await h.reviewSubagent(worker.session, axis)
     expect(h.mountedSkills.get(reviewer)?.get('dsh-worker-code-review')).toContain('orchestrator_review_submit')
-    expect(h.mountedSkills.get(reviewer)?.has('dsh-superagent-release')).toBe(false)
+    expect(h.mountedSkills.get(reviewer)?.get('dsh-superagent-release')).toBe(previous.skills.release)
     await h.runTool(reviewer, 'orchestrator_review_submit', { candidate, axis,
       basis: [axis === 'standards' ? 'DOCS.md' : `spec/${id}`], conclusion: 'passed',
       summary: 'The change is limited to the proposed shared rule manifest.', blockers: [] })
@@ -336,27 +345,28 @@ it('publishes isolated shared rules once after verified delivery, even when the 
   await Promise.race([pushed.promise, h.runtime.idle().then(() => { throw new Error('The queued rule change never reached the push') })])
   expect(tip()).not.toBe(base)
   expect(await read(`ticket/${worker.ticketId}`)).toMatchObject({ mainline: { status: 'applying' } })
-  expect(await h.api('GET', 'prompts')).toMatchObject({ status: 200, body: { revision: 0 } })
+  expect(await h.api('GET', 'prompts')).toMatchObject({ status: 200, body: { revision: 1 } })
   await h.restart()
   await h.runtime.idle()
   expect(await delivery(worker.ticketId)).toMatchObject({ formal_delivery: { status: 'blocked', missing: ['required_ci'] } })
-  expect(await h.api('GET', 'prompts')).toMatchObject({ body: { revision: 0 } })
+  expect(await h.api('GET', 'prompts')).toMatchObject({ body: { revision: 1 } })
   restoreRun()
   await queue(worker.ticketId, candidate)
   await h.runtime.idle()
   expect(await delivery(worker.ticketId)).toMatchObject({ formal_delivery: { status: 'delivered' } })
   await delivered(id, 'rules', worker, intent, base, candidate, tip())
   expect(writes).toBe(1)
-  expect(await h.api('GET', 'prompts')).toMatchObject({ status: 200, body: { revision: 1, shownState: 'active' } })
+  expect(await h.api('GET', 'prompts')).toMatchObject({ status: 200, body: { revision: 2, shownState: 'active', effective: { config } } })
   expect(await h.api('PUT', 'prompts', proposal)).toMatchObject({ status: 409 })
   expect(JSON.parse(String((await read('settings/policy')).text)).value.rules).toEqual(config.admissionRules)
   for (const existing of [trim, lowercase]) {
-    expect(await read(`ticket/${existing.ticketId}`)).toMatchObject({ rules_revision: 0 })
+    expect(await read(`ticket/${existing.ticketId}`)).toMatchObject({ rules_revision: 1 })
     expect(await h.runTool(existing.session, 'orchestrator_read', { resource: 'prompts/current' }))
-      .toMatchObject({ resource: 'prompts/0' })
-    await expect(h.runTool(existing.session, 'orchestrator_read', { resource: 'prompts/1' })).rejects.toThrow(/inaccessible prompt version/)
+      .toMatchObject({ resource: 'prompts/1' })
+    await expect(h.runTool(existing.session, 'orchestrator_read', { resource: 'prompts/2' })).rejects.toThrow(/inaccessible prompt version/)
     expect(h.mountedSkills.get(existing.session)?.get('dsh-worker-code-review')).toContain('orchestrator_review_submit')
-    expect(h.mountedSkills.get(existing.session)?.has('dsh-superagent-release')).toBe(false)
+    expect(h.mountedSkills.get(existing.session)?.get('dsh-superagent-release')).toBe(previous.skills.release)
+    expect(h.mountedSkills.get(existing.session)?.get('dsh-superagent-retired')).toBe(previous.skills.retired)
   }
   const fresh = await h.acceptedTicket(feishu('use-new-rules', '@bot Add a release note'))
   expect(h.mountedSkills.get(fresh.sessionId)?.get('dsh-superagent-release')).toBe(config.skills.release)
@@ -367,7 +377,7 @@ it('publishes isolated shared rules once after verified delivery, even when the 
     body += String(page.text)
     offset = Number(page.next_offset)
   } while (offset > 0)
-  expect(JSON.parse(body)).toMatchObject({ revision: 1, config })
+  expect(JSON.parse(body)).toMatchObject({ revision: 2, config })
 }, 160_000)
 
 // Fault setup only: the API intentionally has no eraser for a verified observation. Each replay starts

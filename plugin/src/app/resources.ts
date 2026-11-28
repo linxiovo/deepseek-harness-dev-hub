@@ -790,7 +790,8 @@ const ROUTES: readonly Route[] = [
   }],
   ['models', async read => {
     const host = main(read), catalog = await host.context.sessionController.modelCatalog(), settings = host.store.settings()
-    const roles = { orchestrator: settings.eval.model, worker: settings.executor.model, lightweight: settings.executor.lightweightModel ?? null }
+    const { model: worker, backendModel, frontendModel, lightweightModel } = settings.executor
+    const roles = { orchestrator: settings.eval.model, worker, backend: backendModel ?? null, frontend: frontendModel ?? null, lightweight: lightweightModel ?? null }
     return { default: catalog.default, roles, failures: catalog.failures,
       providers: catalog.groups.map(group => ({ id: group.id, name: group.name, count: group.models.length, read: `models/${group.id}` })) }
   }],

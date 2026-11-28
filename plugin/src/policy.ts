@@ -124,6 +124,8 @@ const absoluteFilesystemPath = (value: string): boolean => posix.isAbsolute(valu
  * Optional/empty values keep previously saved settings readable; they never authorize an empty-directory fallback. */
 export const ExecutorConfigSchema = z.object({
   model: RoleModelSchema.nullable().default(null),
+  backendModel: RoleModelSchema.nullable().optional(),
+  frontendModel: RoleModelSchema.nullable().optional(),
   lightweightModel: RoleModelSchema.nullable().optional(),
   idleInspection: InspectionGrantSchema.nullable().optional(),
   maxWorkers: z.number().int().min(LIMITS.maxWorkers.min).max(LIMITS.maxWorkers.max).default(RUN_LIMIT_DEFAULTS.maxWorkers),
@@ -143,6 +145,11 @@ export const SettingsSchema = z.object({
   executor: ExecutorConfigSchema.default(() => ExecutorConfigSchema.parse({})),
 }).strict()
 export type Settings = z.infer<typeof SettingsSchema>
+
+/** Both development routes must be set before any new project work can start. */
+export function developmentModelsReady(executor: Settings['executor']): boolean {
+  return !!(executor.backendModel && executor.frontendModel)
+}
 
 export interface EffectiveRunLimits {
   preset: 'default'

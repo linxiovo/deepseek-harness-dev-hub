@@ -30,6 +30,14 @@ Executor Sessions run commands without approval as the operator's OS user. Their
 
 The main Session uses `dsh-superagent-router`, a read-only preset with inspection and coordination tools and no shell, background jobs or file writes; `010-session-boundaries.md` states that contract. Sessions retain the preset selected at creation. Worker subagents use DeepSeek Harness's `standard` preset.
 
+### Initial Worker model
+
+A Plan Ticket's registered `backend` or `frontend` role selects `executor.backendModel` or `executor.frontendModel` for its root Worker Session. Only the persisted Ticket role selects the route; GitHub labels, issue text and Hub dispatch arguments cannot override it. Both development models must be configured to dispatch new project work; a split role never falls back to the general model. A standalone Ticket uses `executor.model` if configured, otherwise the native host default.
+
+The Plan claim pins the configured route before launch. A standalone Worker pins its override (or absence of one) before Session creation. A configured override is recorded as a native `model/selection` before the first request. If interrupted before that request, recovery uses the same Worker Session ID and its durable selection if present, otherwise the pinned route. Settings changes apply to new reservations; they do not replace a pinned route or an existing native selection. Explicit native selections made later still take effect.
+
+A Worker Session cannot enter a native model step or call a provider unless the mounted project holds its writer lease and has initialized the route for that physical Agent. The profile owns the guard independently of the plugin's Cordis mount. It rejects reserved Worker IDs during startup, shutdown and between project mounts, including IDs from an inactive project.
+
 ### Background work and worker slots
 
 When a turn ends with shell jobs or subagents still running, the Ticket keeps its worker slot and stays working. It is not reported as waiting, and the main Session receives no waiting report. A completed job or subagent wakes the Executor with its result in the same slot. Once a turn ends with no background work, the Executor reports waiting normally.
@@ -200,7 +208,6 @@ Once a person's message reached a blocked or failed Ticket, the Executor has the
 
 A retry ends the current Assignment and starts a new one in the same Executor Session, verified worktree, branch and pull request. The new Assignment gets the worktree only after the previous writer is confirmed idle; if that cannot be established, it stays refused rather than sharing the tree.
 
-The Executor model applies only when a Session is created; an existing Session keeps its model.
 ### Restart
 
 Interrupted work resumes the same running Assignment, Worker Session and verified worktree. The recovery note is a durable Input; a restart before its delivery reuses that pending note. It asks the worker to inspect its worktree, Git history and GitHub before repeating an external operation. See `012-project-runtime.md` for project startup reconciliation.

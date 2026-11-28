@@ -9,7 +9,7 @@ import { Store } from '../src/app/store.ts'
 import { key } from '../src/core/ids.ts'
 import { KV } from '../src/kv.ts'
 import { PolicyConfigSchema, SettingsSchema } from '../src/policy.ts'
-import { testMachine } from './fixtures/deployment.ts'
+import { developmentModels, testMachine } from './fixtures/deployment.ts'
 import { gitRepository } from './fixtures/git.ts'
 
 let directory: string
@@ -152,7 +152,7 @@ async function registration() {
   const installation = new Installation({ machine: testMachine({ stateDir }), signal: new AbortController().signal,
     probe: async argv => argv[2] === 'user' ? JSON.stringify({ id: 17, login: 'agent' }) : JSON.stringify({ name: 'acme/widgets', push: true }),
     restart: vi.fn(), configured: () => false, paused: () => false, recoveryPending: () => false,
-    recoverable: () => ({ assignments: 0, handoffs: 0, effects: 0 }), settings: () => SettingsSchema.parse({}),
+    recoverable: () => ({ assignments: 0, handoffs: 0, effects: 0 }), settings: () => SettingsSchema.parse({ executor: developmentModels }),
     legacyHubId: () => 'legacy-hub', legacyHandoffsMatch: () => true })
   try {
     await installation.initialize()

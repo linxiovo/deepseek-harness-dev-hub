@@ -15,7 +15,7 @@ import { existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
 import { Engine, key, latestAssignment, UserError, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
-import { policyVersion, settingsPolicy, SettingsSchema } from '../policy.ts'
+import { developmentModelsReady, policyVersion, settingsPolicy, SettingsSchema } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
 import { workerProbe, type Deployment, type Machine } from '../deployment.ts'
@@ -24,7 +24,7 @@ import { fill } from '../infra/text.ts'
 import { promptFile } from './skill-files.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
-import { DshExecutor, sourceTrigger, workerSessionId } from '../executor/dsh.ts'
+import { DshExecutor, sourceTrigger, ticketOfSession, workerSessionId } from '../executor/dsh.ts'
 import { validateRepositoryIdentity } from '../executor/repository-identity.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
@@ -46,6 +46,7 @@ import { PlanStagnation } from './plan-stagnation.ts'
 import { PlanIntegration } from './plan-integration.ts'
 import { Maintenance } from './maintenance.ts'
 import { IdleInspection } from './idle-inspection.ts'
+import { isLookupId, LightweightLookup, LOOKUP_PRESET } from './lightweight-lookup.ts'
 import { releaseAdapter } from './release-adapter.ts'
 import { ScopedAttention } from './scoped-attention.ts'
 import { PlanDispatcher } from './plan-dispatch.ts'
@@ -104,6 +105,7 @@ export class Runtime extends Service implements SourceHost {
   private readonly planIntegration: PlanIntegration
   private readonly maintenance?: Maintenance
   private readonly inspection?: IdleInspection
+  private readonly lookup?: LightweightLookup
   readonly planDispatcher: PlanDispatcher
   readonly attention: ScopedAttention
   readonly planning: Planning
@@ -167,14 +169,15 @@ export class Runtime extends Service implements SourceHost {
       cleanupPlanArtifactStaging(projectMachine.stateDir)
       const store = opened = this.store = new Store(projectDatabase(installation), report)
       if (project?.initial && store.get(KV.settings.revision) === undefined) {
-        const { baseRef, policy } = project.initial
+        const { baseRef, policy, models } = project.initial
         store.saveSettings(SettingsSchema.parse({ policy, sources: { github: { config: { repository: project.repository } } },
-          executor: { repository: project.workspace, baseRef } }))
+          executor: { ...models, repository: project.workspace, baseRef } }))
       }
       if (project && store.settings().executor.repository !== project.workspace) {
         const saved = store.settings()
         store.saveSettings({ ...saved, executor: { ...saved.executor, repository: project.workspace } })
       }
+      const dispatchPaused = () => this.paused() || !developmentModelsReady(store.settings().executor)
       const setup = this.setup = new Setup({ context: ctx, machine: projectMachine, lifetime: this.lifetime, restart }, project ? {
         managed: () => installation.github && { repository: project.repository, github: installation.github },
       } : { legacy: () => installation.legacyGithub, verifyLegacy: cli => installation.verifyLegacyGithub(cli) })
@@ -329,7 +332,7 @@ export class Runtime extends Service implements SourceHost {
       })
       const verifyProjectBinding = installation.validateWorkspace.bind(installation)
       this.planning = new Planning({ handoffs, plans, effects, sessions, verifyProjectBinding,
-        paused: () => this.paused(), closing: () => this.closing() })
+        paused: dispatchPaused, closing: () => this.closing() })
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
         sourceHost: this, setup, requestPass: () => { this.passes.request() },
@@ -360,10 +363,10 @@ export class Runtime extends Service implements SourceHost {
         diagnosisAllowed: (ticket, inputId) => runtime.stagnation.allowed(ticket, inputId),
         reassignmentAllowed: ticket => runtime.stagnation.allowed(ticket),
         quota: runLimits,
-        paused: () => this.paused(), environment, sourceLink: link,
+        paused: dispatchPaused, environment, sourceLink: link,
         repliedTo: trigger => repliedTo({ store, sources }, trigger) })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
-        settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
+        settings: () => store.settings(), paused: dispatchPaused, threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(runtime.masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
       const outbox = this.outbox = new Outbox({ store, effects, commands, paused: () => this.paused(), sources: {
         instance: sources.instance.bind(sources), channelAllowed: channel => channel.address.bindingEpoch !== undefined
@@ -400,7 +403,11 @@ export class Runtime extends Service implements SourceHost {
           projectId: project.id, repository: project.repository, cardIdentity: () => this.feishuCardIdentity })
       }
       const { assessor, executor } = this
-      const policy = () => settingsPolicy(store.settings(), sources)
+      const policy = () => {
+        const settings = store.settings(), effective = settingsPolicy(settings, sources)
+        effective.paused ||= !developmentModelsReady(settings.executor)
+        return effective
+      }
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor, ...(project ? { projectId: project.id } : {}),
         credentialBlocked: ticketId => attention.blocked(ticketId),
         quotaBlocked: ticketId => runLimits.blocked(ticketId),
@@ -442,6 +449,8 @@ export class Runtime extends Service implements SourceHost {
           ? this.topicBinding?.maintenanceIngress(trigger) : undefined,
         bindingEpoch: () => this.topicBinding?.view()?.epoch,
         relay: (id, text) => sessions.relay(id, text), relayConsumed: id => sessions.relayConsumed(id) })
+      if (project) this.lookup = new LightweightLookup({ ctx, project, store, commands, meter: projectMeter, limits: runLimits,
+        lifetime: this.lifetime, currentHub: id => sessions.isPublishedHub(id), assertCurrent: () => installation.assertNewWork() })
       if (project) this.inspection = new IdleInspection({ project, store, commands, effects, limits: runLimits, meter: projectMeter,
         handoffs, plans, stageTwo: () => planIntegration.stage().stage === 2, readyHub: () => authority.readySessionId(),
         assertNewWork: () => installation.assertNewWork(), relayConsumed: id => sessions.relayConsumed(id),
@@ -452,7 +461,7 @@ export class Runtime extends Service implements SourceHost {
         },
         closing: () => this.closing(),
         idle: () => {
-          if (this.paused() || planIntegration.stage().stage !== 2 || !authority.readySessionId() ||
+          if (dispatchPaused() || planIntegration.stage().stage !== 2 || !authority.readySessionId() ||
               store.tickets.open().length || this.maintenance?.pending(0, 1).items.length) return false
           return handoffs.list().every(handoff => {
             const delivery = store.get(KV.plans.integration(handoff.id))
@@ -464,10 +473,11 @@ export class Runtime extends Service implements SourceHost {
       })
       this.planDispatcher = new PlanDispatcher({ store, plans, engine, executor, attention, limits: runLimits,
         get control() { return planControl },
-        paused: () => this.paused(),
-        bindWorker: (ticket, id) => sessions.bindWorker(ticket, id) })
+        paused: dispatchPaused,
+        bindWorker: (ticket, id) => sessions.bindWorker(ticket, id),
+        reserveWorker: (ticket, id) => sessions.reserveWorker(ticket, id) })
       const stagnation = this.stagnation = new PlanStagnation({ store, plans, limits: runLimits, engine,
-        paused: () => this.paused(), eligible: ticket => {
+        paused: dispatchPaused, eligible: ticket => {
           const binding = ticket.plan
           if (!binding || store.get(KV.plans.retired(binding.planId, binding.nodeId)) || attention.blocked(ticket.id)
             || planControl.blocksTicket(ticket.id)) return false
@@ -498,7 +508,7 @@ export class Runtime extends Service implements SourceHost {
         mainlineHeld: ticketId => planControl.blocksTicket(ticketId), cancelQueuedMerge: ticketId => mainline.cancelQueued(ticketId),
         requestScopeReview: id => effects.enqueue('requirementScopeReview', id, {}), isHubGeneration: id => authority.isGeneration(id), isCurrentHub: id => authority.isCurrent(id) })
       const scopeDispatchOpen = () => {
-        if (this.paused()) return false
+        if (dispatchPaused()) return false
         const state = runLimits.view()?.budget.state
         return state === 'unlimited' || state === 'available'
       }
@@ -643,6 +653,7 @@ export class Runtime extends Service implements SourceHost {
         planControl,
         assessor, resources, projectMeter, runLimits, attention, handoffs, plans, planIntegration, maintenance: this.maintenance,
         inspection: this.inspection,
+        lookup: this.lookup,
         stagnation, requirements, lifetime: this.lifetime,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(), assertNewWork: () => installation.assertNewWork(), verifyProjectBinding,
@@ -789,15 +800,21 @@ export class Runtime extends Service implements SourceHost {
     } finally { database.close() }
   }
   private async initialize(): Promise<void> {
+    this.sessions.installWorkerGate()
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposeHttp = registerHttp(this.ctx, this.httpHost())
     this.runLimits.recover()
     this.executor.recoverPauses()
     this.disposeAdmission = installModelAdmission(this.ctx, {
-      owns: id => id.startsWith('inspection-') || scopeProposalId(id) !== undefined || this.projectMeter.owns(id) || this.sessions.hasManagedAncestry(id),
-      acquire: (id, maximum, signal) => {
+      owns: id => ticketOfSession(id) !== undefined || isLookupId(id) || id.startsWith('inspection-') || scopeProposalId(id) !== undefined
+        || this.projectMeter.owns(id) || this.sessions.hasManagedAncestry(id),
+      acquire: (id, maximum, signal, loopRequest) => {
         const binding = this.store.get(KV.projectMeter.binding(id))
         if (this.closing() || !binding) return { admitted: false, reason: 'Run limit Session is not authorized in this mount' }
+        if (isLookupId(id) || binding.roles.includes('lookup')) {
+          if (!loopRequest) return { admitted: false, reason: 'Lookup requires an agent-loop request' }
+          return this.lookup?.acquire(binding, maximum, signal, loopRequest) ?? { admitted: false, reason: 'No active project lookup' }
+        }
         if (scopeProposalId(id) !== undefined && !this.sessions.scopeModelAllowed(id)) {
           return { admitted: false, reason: 'Requirement scope reviewer has no authorized native task in this mount' }
         }
@@ -809,8 +826,10 @@ export class Runtime extends Service implements SourceHost {
           return this.runLimits.acquire(binding, maximum, signal, grant)
         }
         const { ticket_id: ticket } = binding
-        if (ticket && !this.executor.writerAuthorized(ticket, workerSessionId(ticket))) {
-          return { admitted: false, reason: 'Run limit Session has no active Ticket writer' }
+        if (ticket) {
+          const worker = workerSessionId(ticket)
+          if (!this.executor.writerAuthorized(ticket, worker)) return { admitted: false, reason: 'Run limit Session has no active Ticket writer' }
+          if (!this.sessions.workerModelReady(worker)) return { admitted: false, reason: 'Worker initial model is not ready' }
         }
         return this.runLimits.acquire(binding, maximum, signal)
       },
@@ -933,7 +952,8 @@ export class Runtime extends Service implements SourceHost {
     const worker = !!ticketId && parent?.roles.includes('hub') && roles.includes('implementation')
     const nativeChild = !!ticketId && !worker && (roles.includes('implementation') || roles.includes('review'))
     const inspection = id.startsWith('inspection-')
-    if (!hub && !planning && !worker && !nativeChild && scopeId === undefined && !inspection) return 'read'
+    const lookup = isLookupId(id)
+    if (!hub && !planning && !worker && !nativeChild && scopeId === undefined && !inspection && !lookup) return 'read'
     const ticket = ticketId ? this.store.tickets.get(ticketId) : undefined, execution = ticket?.execution
     if (worker && (!ticket || execution?.ownership?.ticket !== ticketId || !execution.ownership.verified || !execution.worktree)) return 'unverified'
     const issued = worker && (execution?.session === id || ticket?.assignments.some(item => item.writer?.session === id))
@@ -952,6 +972,12 @@ export class Runtime extends Service implements SourceHost {
     if (header.id !== id) return 'unverified'
     if (nativeChild) return header.origin === 'subagent' && header.parentSession === parentId ? { header } : 'unverified'
     if (header.origin !== undefined || header.parentSession !== undefined || header.isSeeded) return 'unverified'
+    if (lookup) {
+      return roles.length === 1 && roles[0] === 'lookup' && ticketId === null && binding.plan_id === null
+        && !!parentId && this.hubAuthority.isGeneration(parentId) && this.store.get(KV.lookup.native(id))?.createdAt === header.createdAt
+        && header.agentPreset === LOOKUP_PRESET && !!header.cwd && isAbsolute(header.cwd)
+        && sameDirectory(header.cwd, join(this.machine.stateDir, 'lookup-sessions')) ? { header } : 'unverified'
+    }
     if (inspection) {
       const run = this.store.get(KV.inspection.run(id))
       return roles.length === 1 && roles[0] === 'inspection' && run?.hubSessionId === parentId && !!parentId && this.hubAuthority.isGeneration(parentId)
@@ -989,7 +1015,7 @@ export class Runtime extends Service implements SourceHost {
         return splitter && this.sessions.isSplitterSession(splitter) ? [`planner-${id}`, splitter.id] : [`planner-${id}`]
       })
       const live = (ids: string[]) => ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
-      const auxiliarySessions = () => this.ctx.agents.list().filter(agent => (scopeProposalId(agent.id) !== undefined || agent.id.startsWith('inspection-'))
+      const auxiliarySessions = () => this.ctx.agents.list().filter(agent => (scopeProposalId(agent.id) !== undefined || agent.id.startsWith('inspection-') || isLookupId(agent.id))
         && this.projectMeter.owns(agent.id)).map(agent => agent.id)
       const agents = live([...this.hubAuthority.generations(), this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id)), ...handoffSessions(), ...auxiliarySessions()])
       for (const agent of agents) agent.cancel({ kind: 'user' }, { keepInbox: true })
@@ -1002,10 +1028,10 @@ export class Runtime extends Service implements SourceHost {
       // The workers' jobs and subagents stop too: their ends would start worker turns without the tool limits released below.
       await this.executor.shutdown()
       this.executor.dispose()
-      this.sessions.dispose()
       await this.ctx.sessionPersistence.flush()
       this.installation.stopped()
     } finally {
+      this.sessions.dispose()
       // Close the database before releasing the directory lock so another process cannot open the database mid-write; a compromised lock may already be released.
       this.runLimits.close()
       this.disposeAdmission?.()

@@ -42,6 +42,7 @@ The mainline queue uses `prompts/queue-merge-tool.md` for its Hub tool, `prompts
 `prompts/plan-control-tool.md` describes direct Harness commands and stop statuses. `prompts/plan-control-target.md` supplies the tool's clarification when a direct command does not identify its scope. See `009-handoff.md`.
 `prompts/maintenance-tool.md` is the Hub's fixed Stage 2 tool description. It distinguishes read-only checking and association from registering new work under an enabled rule; it never grants listening or release authority. See `009-handoff.md#stage-2-maintenance`.
 `prompts/idle-inspection.md`, `prompts/inspection-read-tool.md`, `prompts/inspection-finish-tool.md` and `prompts/inspection-denied.md` are fixed inspection instructions, tool descriptions and refusal text. They do not grant repository access; `020-idle-inspection.md` describes enforcement.
+`prompts/lightweight-lookup-tool.md`, `prompts/lightweight-lookup.md` and `prompts/lightweight-lookup-denied.md` define the mounted Hub lookup tool, its sealed task instructions and its tool denial. They are fixed assets; see `021-lightweight-lookup.md`.
 
 The independent scope reviewer receives `prompts/plan-requirement-scope-review.md` with its sealed request. `prompts/plan-requirement-scope-tool.md` describes its only tool.
 The Hub's rotation recovery loads `prompts/hub-resume.md` as a fixed continuation preface; the following JSON is assembled from durable project state and resource references, not copied Session history.
@@ -127,5 +128,17 @@ These apply [000 Philosophy](000-philosophy.md) to the agents:
 4. `GET /orchestrator/api/prompts` returns the active `revision`, the requested `current` configuration (`revision` query, or the effective version by default), `shownState`, and paged `revisions` (`offset`). States are `active`, `previous`, `pending` and `stale`. Restoring an older configuration or defaults stages another proposal. `POST /orchestrator/api/prompts/preview` validates and renders a draft without staging it.
 
 Each Ticket binds the effective revision before launch. Retry, restart and independent re-review keep that binding. `ticket/<id>` reports `rules_revision`; management Ticket detail returns `rulesRevision`. Workers can read the snapshot through `prompts/current` or its exact revision. Calls to a managed Skill (`dsh-superagent-` or `dsh-worker-`) not mounted for the Ticket are refused rather than loaded from a same-name filesystem Skill. Non-Ticket Sessions use the published revision on their next request. Managed text does not grant tool permissions, lower registered acceptance, alter required checks or raise resource limits.
+
+### Custom Skill management API
+
+Use the same project-scoped configuration for user and team Skills. There is no separate publication path: registering, updating, enabling and disabling are changes to the reviewed configuration, not live edits to a Session.
+
+| Method and path under `/orchestrator/api/` | Contract |
+| --- | --- |
+| `GET prompts?revision=<n>&offset=<n>` | Both query values are optional nonnegative integers. Returns HTTP 200 with `revision` (active), `current` (selected version), `effective` (active snapshot), `shownState`, `revisions` and `next_offset` for further history. `current` and `effective` include `config`; history items contain metadata such as `revision`, `previousRevision`, `savedAt` and `source`, but not configuration text. Read `current.config.skills` (name → text) and `current.config.disabledSkills` (names; omitted means none disabled). |
+| `POST prompts/preview` | Takes the complete candidate config and returns HTTP 200 with rendered `orchestrator`, `worker`, `planner`, `splitter` prompts, their `parts`, enabled `skills` and a `scope` explanation. It does not write a version. |
+| `PUT prompts` | Take `current.config` from the active editable version, not the resolved `effective` snapshot. Add or replace a name in `config.skills`, then remove it from `disabledSkills` to enable it or add it to disable it without erasing its text. Send the full `{config, baseRevision, maintenanceTicketId}` described above. Success is HTTP 200 with `{revision, effect:'pending-review'}`; the original active revision remains until formal delivery. |
+
+Names match `^[a-z][a-z0-9-]*$`, excluding reserved built-in names. Enabled custom names mount as `dsh-superagent-<name>`. Use the same-origin request marker, plus `x-orchestrator-project-id` on writes to a registered project. A stale supplied scope returns `409 staleProject`; reads and preview during remount return `409 switching`. An unknown revision gives `404 unknownPromptRevision`. Validation failures are `400 {error, issues}` or `400 {error, code, values}`, including `unknownCustomSkill` for disabled names absent from `skills` and `promptTooLong` for an oversized configuration. Publication staging conflicts return `409 promptRevisionChanged` or `409 promptProposalRefused`. The active revision and a Worker Ticket's bound revision can deliberately differ.
 
 Verification: `tests/prompts.spec.ts`, `tests/mainline-git.spec.ts`, `tests/mainline-queue.spec.ts`, `tests/http.spec.ts`, and `tests/panel-prompts.spec.tsx`.

@@ -29,6 +29,9 @@ it('keeps prompt variables and initial routing on the role model without saving 
   expect(selected).toEqual({ provider: 'worker-provider', model: 'worker-model' })
   expect(agent.session.snapshotEvents().some(event => event.type === 'model/selection')).toBe(true)
   expect(flush).toHaveBeenCalledOnce()
+  await initializeRoleModel(ctx, agent, { provider: 'another', model: 'ignored' })
+  expect(agent.session.snapshotEvents().filter(event => event.type === 'model/selection')).toHaveLength(1)
+  expect(flush).toHaveBeenCalledOnce()
   record(selected)
   // A retry of the same assembled step keeps the same model even after the header is persisted.
   expect(await request()).toEqual(selected)
@@ -46,13 +49,29 @@ it('lets a later explicit selection win without changing the in-flight assembled
   await ctx.systemPrompt.assemble()
   expect(await request()).toEqual(manual)
 })
-it.each(['header', 'selection'])('preserves a resumed Session with existing %s', async kind => {
-  const { ctx, agent, resolve } = await fixture()
-  const existing = { provider: 'existing', model: 'keep' }
+it.each(['header', 'selection'])('uses the durable %s in the first request after reopening a Session', async kind => {
+  const { ctx, agent, resolve, request } = await fixture()
+  const existing = { provider: 'existing', model: 'keep', reasoningEffort: ReasoningEffortId('low') }
   if (kind === 'header') agent.session.append('request/header', { header: { config: existing }, reason: 'initial' })
-  else agent.session.append('model/selection', existing)
+  else {
+    agent.session.append('model/selection', { provider: 'previous', model: 'old' })
+    agent.session.append('model/selection', existing)
+  }
   await initializeRoleModel(ctx, agent, { provider: 'worker', model: 'new' })
   expect(resolve).not.toHaveBeenCalled()
+  expect((await ctx.systemPrompt.assemble()).variables).toMatchObject({ provider: 'existing', model: 'keep' })
+  expect(await request()).toEqual(existing)
+  expect(agent.session.snapshotEvents().filter(event => event.type === 'model/selection')).toHaveLength(kind === 'selection' ? 2 : 0)
+})
+it('reuses the recorded selection when the first persistence flush was interrupted', async () => {
+  const { ctx, agent, flush, request } = await fixture()
+  const pinned = { provider: 'worker', model: 'original' }
+  flush.mockRejectedValueOnce(new Error('interrupted flush'))
+  await expect(initializeRoleModel(ctx, agent, pinned)).rejects.toThrow('interrupted flush')
+  await initializeRoleModel(ctx, agent, { provider: 'worker', model: 'changed' })
+  await ctx.systemPrompt.assemble()
+  expect(await request()).toEqual(pinned)
+  expect(agent.session.snapshotEvents().filter(event => event.type === 'model/selection')).toHaveLength(1)
 })
 it('inherits the host when unset and fails unavailable routes before recording a selection', async () => {
   const { ctx, agent, resolve, request } = await fixture()
@@ -62,4 +81,15 @@ it('inherits the host when unset and fails unavailable routes before recording a
   resolve.mockRejectedValueOnce(new Error('unknown provider'))
   await expect(initializeRoleModel(ctx, agent, { provider: 'unknown', model: 'x' })).rejects.toThrow('unknown provider')
   expect(agent.session.snapshotEvents().some(event => event.type === 'model/selection')).toBe(false)
+})
+it('does not record a model selection when the Session loses authority during provider resolution', async () => {
+  const { ctx, agent, resolve } = await fixture()
+  const model = { provider: 'worker', model: 'pinned' }, checked = Promise.withResolvers<typeof model>()
+  resolve.mockImplementationOnce(() => checked.promise)
+  const stop = new AbortController()
+  const selection = initializeRoleModel(ctx, agent, model, () => stop.signal.throwIfAborted())
+  stop.abort(new Error('Session no longer current'))
+  checked.resolve(model)
+  await expect(selection).rejects.toThrow('Session no longer current')
+  expect(agent.session.snapshotEvents().filter(event => event.type === 'model/selection')).toEqual([])
 })

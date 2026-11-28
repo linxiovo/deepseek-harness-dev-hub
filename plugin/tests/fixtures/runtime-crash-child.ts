@@ -7,12 +7,13 @@ import { Context } from '@deepseek-ai/cordis'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { Runtime } from '../../src/app/runtime.ts'
 import type { StateView, TicketPageView } from '../../src/app/http.ts'
+import type { ApiResponse } from '../../src/app/api.ts'
 import type { CreateProjectResult, RuntimeView } from '../../src/app/installation-api.ts'
 import { workerSessionId } from '../../src/executor/dsh.ts'
 import { Commands } from '../../src/infra/commands.ts'
 import { githubKind } from '../../src/sources/github.ts'
 import { commentTrigger } from '../../src/sources/github-trigger.ts'
-import { testMachine } from './deployment.ts'
+import { developmentModels, testMachine } from './deployment.ts'
 import { gitEnv, gitRepository } from './git.ts'
 
 export type CrashPoint = 'switch' | 'dispatch' | 'merge'
@@ -117,7 +118,7 @@ function mount(onRestart: () => void = () => {}): Host {
   let unexpectedReplay: Promise<string> | undefined
   function load(id: string) {
     const log = readLog(id)
-    const session = { id, header: { id, cwd: log.cwd }, snapshotEvents: () => log.events }
+    const session = { id, header: { id, cwd: log.cwd }, snapshotEvents: () => log.events, requestHeader: () => undefined }
     const sessionTools = new Map<string, Tool>()
     tools.set(id, sessionTools)
     const agentCtx = new Context()
@@ -217,12 +218,17 @@ async function crash(): Promise<Evidence> {
   const bootstrap = mount()
   await bootstrap.runtime.ready
   const verified = await bootstrap.api<{ status: string }>('POST', 'onboarding/github/verify', { cli })
-  assert.equal(verified.status, 'ready', JSON.stringify(verified))
+  assert.equal(verified.status, 'models-required', JSON.stringify(verified))
+  const { blocks: { executor } } = await bootstrap.api<ApiResponse<'GET settings'>>('GET', 'settings')
+  await bootstrap.api('PUT', 'settings/executor', { ...executor, value: { ...executor.value, ...developmentModels } })
+  await bootstrap.runtime.stop()
+  const ready = mount()
+  await ready.runtime.ready
   const create = (host: Host, slug: string, workspace: string) => host.api<CreateProjectResult>('POST', 'projects', {
     repository: slug, workspace, baseRef: firstGit.base.ref, policy: { sources: { github: { allowed: [{ id: 'alice' }] } } },
   })
-  const first = await create(bootstrap, repository, firstGit.repository)
-  await bootstrap.runtime.stop()
+  const first = await create(ready, repository, firstGit.repository)
+  await ready.runtime.stop()
   const remount = Promise.withResolvers<void>()
   const host = mount(remount.resolve) // The test owns the restart callback; leave the old mount alive at the barrier.
   await host.runtime.ready

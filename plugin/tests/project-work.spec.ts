@@ -3,8 +3,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
 import type { Fiber } from '@deepseek-ai/cordis'
+import { freezeMessage, MessageId, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { Effects } from '../src/app/effects.ts'
+import type { ApiResponse } from '../src/app/api.ts'
 import { Handoffs } from '../src/app/handoffs.ts'
 import { InstallationError, type CreateProjectResult, type ProjectView } from '../src/app/installation-api.ts'
 import { Plans } from '../src/app/plans.ts'
@@ -19,7 +21,7 @@ import { credentialHelper, workerGitConfig } from '../src/infra/environment.ts'
 import { HealthBoard } from '../src/infra/health.ts'
 import { KV } from '../src/kv.ts'
 import * as githubSource from '../src/sources/github.ts'
-import { testMachine } from './fixtures/deployment.ts'
+import { developmentModels, testMachine } from './fixtures/deployment.ts'
 import { gitRepository } from './fixtures/git.ts'
 import { feishu, startRuntime, type Host } from './fixtures/host.ts'
 
@@ -172,6 +174,7 @@ async function managedHarness(runtimeMode: RuntimeMode = 'desktop') {
   const host = await startRuntime(undefined, { withFeishu: false })
   // Keep the host's Sessions alive, but give the managed installation a fresh catalog and scoped plugin lifecycle.
   const scope = host.ctx.isolate('orchestrator')
+  let current: Runtime
   let mounted: Fiber | undefined
   let watcher: Fiber | undefined
   const unwatch = async () => { await watcher?.dispose(); watcher = undefined }
@@ -206,14 +209,13 @@ async function managedHarness(runtimeMode: RuntimeMode = 'desktop') {
     const mount = async () => {
       await unwatch()
       await mounted?.dispose()
-      let runtime!: Runtime
       mounted = scope.plugin({ async apply(ctx) {
-        const value = runtime = new Runtime(ctx, testMachine({ stateDir, runtimeMode }), vi.fn())
+        const value = current = new Runtime(ctx, testMachine({ stateDir, runtimeMode }), vi.fn())
         ctx.effect(() => () => value.stop())
         await value.ready
       } })
       await mounted
-      return runtime
+      return current
     }
     const watchGithub = async () => { watcher = scope.plugin(githubSource); await watcher }
     const create = async (index: 0 | 1, repository: string, allowed: string) => {
@@ -227,11 +229,17 @@ async function managedHarness(runtimeMode: RuntimeMode = 'desktop') {
       expect(await host.api('POST', `projects/${project.id}/select`)).toMatchObject({ status: 200, body: { restarting: true } })
     }
     await mount()
-    expect(await host.api('POST', 'onboarding/github/verify', { cli })).toMatchObject({ status: 200, body: { status: 'ready' } })
+    expect(await host.api('POST', 'onboarding/github/verify', { cli })).toMatchObject({ status: 200, body: { status: 'models-required' } })
+    const setup = await host.api('GET', 'settings')
+    const { blocks: { executor } } = setup.body as ApiResponse<'GET settings'>
+    expect(await host.api('PUT', 'settings/executor', { ...executor, value: { ...executor.value, ...developmentModels } }))
+      .toMatchObject({ status: 200, body: { restarting: true } })
+    await mount()
     const first = await create(0, 'acme/widgets', 'alice')
     const runtime = await mount()
     const second = await create(1, 'acme/gadgets', 'bob')
-    return { host, first, second, runtime, mount, select, watchGithub, stop }
+    return { host, first, second, runtime, mount, select, watchGithub, stop,
+      restartFiber: async () => { await mounted!.restart(); return current } }
   } catch (error) { await stop(); throw error }
 }
 
@@ -320,6 +328,47 @@ it('keeps confirmed handoffs, specifications and Plan DAGs isolated across manag
     await select(second)
     await mount()
     expect(await readWork(second, b.id)).toEqual(savedB)
+  } finally { await stop() }
+})
+
+it('keeps Worker model admission closed through a real Cordis Fiber restart', async () => {
+  const { host, first, runtime, restartFiber, stop } = await managedHarness()
+  try {
+    const plan = await publishSpec(host, runtime, first, 'saved products')
+    await host.runTool(plan.splitter, 'orchestrator_plan_register', plan.registration)
+    const result = await host.runTool(runtime.masterId, 'orchestrator_plan_dispatch', { planId: plan.id, nodeId: 'api' })
+    const claim = result.claim
+    if (!claim || typeof claim !== 'object' || !('session' in claim) || typeof claim.session !== 'string') throw new Error('Missing Worker claim')
+    const id = claim.session
+    await runtime.idle()
+    const settings = await host.api('GET', 'settings', undefined, first.id)
+    const { blocks: { executor } } = settings.body as ApiResponse<'GET settings'>
+    expect(executor.value.backendModel).toEqual(developmentModels.backendModel)
+    expect(await host.api('PUT', 'settings/executor', { ...executor, value: { ...executor.value, backendModel: { provider: 'other', model: 'new' } } }, first.id))
+      .toMatchObject({ status: 200, body: { restarting: false } })
+    await runtime.idle()
+    const provider = vi.fn(async function* (_request: GenerateOptions): AsyncGenerator<StreamChunk> {
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    })
+    const flushing = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+    vi.mocked(host.ctx.sessionPersistence.flush).mockImplementationOnce(() => { flushing.resolve(); return release.promise })
+    const restart = restartFiber()
+    let resumed: Runtime
+    try {
+      await Promise.race([flushing.promise, restart.then(() => { throw new Error('Fiber restarted before the expected log flush') })])
+      // Dispatch from the surviving host, not from the child Fiber that is already unloading.
+      host.agents.get(id)!.inbox.nextTurn.push(freezeMessage({ role: 'user', source: { kind: 'user' }, id: MessageId('during-fiber-restart'),
+        content: [{ type: 'text', text: 'Continue' }] }))
+      expect(await host.nativeStep(id, { starts: true })).toBe(false)
+      await expect(host.modelRequest(id, 10, provider)).rejects.toMatchObject({ code: 'SUPERAGENT_RUN_LIMIT' })
+      expect(provider).not.toHaveBeenCalled()
+    } finally { release.resolve(); resumed = await restart }
+    expect(await host.api('GET', 'runtime')).toMatchObject({ status: 200, body: { projectId: first.id, status: 'ready' } })
+    await resumed.idle()
+    await host.modelRequest(id, 10, provider)
+    expect(provider).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(developmentModels.backendModel))
+    await using log = await host.ctx.sessionPersistence.open(id as SessionId, 'read')
+    expect((await log.read()).events.filter(event => event.type === 'model/selection').map(event => event.data)).toEqual([developmentModels.backendModel])
   } finally { await stop() }
 })
 

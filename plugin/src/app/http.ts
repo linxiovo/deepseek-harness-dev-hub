@@ -232,6 +232,7 @@ function identityView({ id, login, noreply }: GithubIdentity): GithubIdentity { 
 function onboardingView(view: OnboardingView): OnboardingView {
   if (view.status === 'unconfigured') return { status: view.status }
   if (view.status === 'ready') return { status: view.status, identity: identityView(view.identity) }
+  if (view.status === 'models-required') return { status: view.status, identity: identityView(view.identity), missing: view.missing }
   return { status: view.status, ...(view.identity && { identity: identityView(view.identity) }),
     ...(view.problem && { problem: publicSetupProblem(view.problem) }) }
 }
@@ -600,10 +601,11 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => Promise<voi
         const runLimitRoute = runLimitRoutes[route.key] === true
         const requiredProject = attentionRoute || runLimitRoute || confirmationRoute
           || topicBindingRoutes[route.key] === true || requiredProjectRoutes[route.key] === true
-        const mountedRoute = requiredProject || route.key === 'GET settings' || projectMeterRoutes[route.key]
+        const mountedRoute = requiredProject || route.key === 'GET onboarding' || route.key === 'GET settings'
+          || route.key === 'GET prompts' || route.key === 'POST prompts/preview' || projectMeterRoutes[route.key]
         const requirement = requiredProject ? 'required' : 'optional'
         if (mountedRoute) mounted = readableMount(scope, requirement)
-        else if (!installationRoute && scope !== undefined && (route.key.startsWith('GET ') || route.key === 'POST prompts/preview')) {
+        else if (!installationRoute && scope !== undefined && route.key.startsWith('GET ')) {
           assertProjectScope(runtime.installation?.runtime().projectId ?? null, scope, 'optional')
         }
         const query = Object.fromEntries(url.searchParams)

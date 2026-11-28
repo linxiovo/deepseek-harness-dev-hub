@@ -13,7 +13,7 @@ import type { DroppedReply, HistoryView, Problem, PromptsView, SetupView, Source
   TicketRow, TicketStage,
   TriggerRow } from '../../src/client/api.ts'
 import { SETUP_FIELDS } from '../../src/deployment.ts'
-import { EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema } from '../../src/policy.ts'
+import { developmentModelsReady, EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema } from '../../src/policy.ts'
 import { SetupError, type SetupCode } from '../../src/setup.ts'
 import { feishuChannel } from '../../src/sources/feishu-trigger.ts'
 import { githubChannel } from '../../src/sources/github-trigger.ts'
@@ -21,7 +21,7 @@ import { feishuKind } from '../../src/sources/feishu.ts'
 import { githubKind } from '../../src/sources/github.ts'
 import type { Health } from '../../src/sources/host.ts'
 import type { SourceKind } from '../../src/sources/kind.ts'
-import { testDeployment } from './deployment.ts'
+import { developmentModels, testDeployment } from './deployment.ts'
 
 export const MEMBER = 'ou_alice'
 const ALLOWED: Record<string, { id: string; name?: string }[]> = { feishu: [{ id: MEMBER, name: 'Alice' }], github: [{ id: 'alice' }] }
@@ -263,7 +263,7 @@ function initial(): PanelServer {
     sources: { feishu: { enabled: true, config: { cli: 'lark-bot', chats: [{ chatId: 'oc_team', listen: 'mentions' }],
       directMessages: true } },
       github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh-agent' } } },
-    executor: { blockedCommands: ['gh-personal'] },
+    executor: { ...developmentModels, blockedCommands: ['gh-personal'] },
   })
   const ended = ticketSummary({ id: 't0', title: '旧工单', state: 'ended', actions: { retry: false, stop: false },
     ended: { at: '2026-09-21T00:00:00Z', by: 'human', reason: 'Human asked to stop', outcome: 'stopped' } }, { stage: 'ended' })
@@ -397,7 +397,12 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     if (body.revision !== (server.revisions[block] ?? 0)) return refuse(409, 'Settings changed. Reload before saving.')
     let restarting = false
     if (block === 'policy') server.settings = { ...server.settings, policy: PolicyConfigSchema.parse(body.value) }
-    else if (block === 'executor') server.settings = { ...server.settings, executor: ExecutorConfigSchema.parse(body.value) }
+    else if (block === 'executor') {
+      const executor = ExecutorConfigSchema.parse(body.value)
+      if (!developmentModelsReady(executor)) return refuse(400, 'Configure both backend and frontend development models before starting work.',
+        { code: 'developmentModelsRequired' })
+      server.settings = { ...server.settings, executor }
+    }
     else if (block === 'eval') server.settings = { ...server.settings, eval: EvalConfigSchema.parse(body.value) }
     else if (source) {
       const { enabled, config: value } = SourceSave.parse(body.value)

@@ -5,6 +5,7 @@ export interface GithubIdentity { id: number; login: string; noreply: string }
 export type OnboardingView =
   | { status: 'unconfigured' }
   | { status: 'ready'; identity: GithubIdentity }
+  | { status: 'models-required'; identity: GithubIdentity; missing: ('backend' | 'frontend')[] }
   | { status: 'blocked'; identity?: GithubIdentity; problem?: SetupProblem }
 
 export interface VerifyGithubInput { cli: string }
@@ -17,7 +18,7 @@ export interface CreateProjectResult extends SelectProjectResult { reused: boole
 export interface RuntimeView {
   mode: 'desktop' | 'headless'
   status: 'starting' | 'ready' | 'paused'
-  reason: 'githubSetupRequired' | 'noProject' | 'operatorPaused' | 'projectSetupRequired' | 'switching' | 'recoveryPending' | null
+  reason: 'githubSetupRequired' | 'developmentModelsRequired' | 'noProject' | 'operatorPaused' | 'projectSetupRequired' | 'switching' | 'recoveryPending' | null
   projectId: string | null
   resumedFrom: null | {
     reason: 'hostStopped' | 'projectSwitched' | 'interrupted'
@@ -37,6 +38,7 @@ export interface InstallationApi {
 
 const ERROR_MESSAGES = {
   githubSetupRequired: 'Set up GitHub before starting work.',
+  developmentModelsRequired: 'Configure both backend and frontend development models before starting work.',
   noProject: 'Select a project before starting work.',
   projectSetupRequired: 'Finish project setup before starting work.',
   operatorPaused: 'Resume processing before starting work.',

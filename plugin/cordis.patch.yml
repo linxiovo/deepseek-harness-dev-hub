@@ -227,3 +227,12 @@
         description: dsh-superagent 的授权巡检专用，仅通过限定对象的宿主工具读取证据和登记待办。
         order: 93
         plugins: []
+    # One sealed question; no filesystem, delegation, workspace instructions or tool plugins.
+    - id: dsh-superagent-lookup-preset
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: dsh-superagent-lookup
+        name: dsh-superagent 只读查询
+        description: 项目 Hub 的只读检索、文档定位和状态摘要专用，无工具。
+        order: 94
+        plugins: []

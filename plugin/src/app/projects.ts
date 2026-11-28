@@ -4,9 +4,10 @@ import { DatabaseSync } from 'node:sqlite'
 import { isDeepStrictEqual } from 'node:util'
 import { key } from '../core/ids.ts'
 import type { VerifiedGithub } from '../deployment.ts'
-import type { Settings } from '../policy.ts'
+import type { RoleModel, Settings } from '../policy.ts'
 
-export interface ProjectInitial { baseRef: string; policy: Settings['policy'] }
+export interface ProjectInitial { baseRef: string; policy: Settings['policy'];
+  models?: { backendModel: RoleModel; frontendModel: RoleModel; lightweightModel: RoleModel | null } }
 
 export interface ProjectSuspension {
   reason: 'hostStopped' | 'projectSwitched' | 'interrupted'

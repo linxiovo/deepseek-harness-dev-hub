@@ -1,6 +1,5 @@
 /** Admission at DSH's one-stream-per-attempt waterfall, before delegation to the adapter. */
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
 import { isAgentLoopRequest, LlmError, type GenerateOptions, type StreamChunk, type TokenUsage } from '@deepseek-ai/dsh-llm'
 import { addAbortListener } from 'node:events'
 
@@ -11,7 +10,7 @@ export type ModelAdmission = { admitted: true; settle(totalTokens: number | null
   | { admitted: false; reason: string; wait?: Promise<void>; requiresOperator?: true }
 interface AdmissionHost {
   owns(sessionId: string): boolean
-  acquire(sessionId: string, reservation: number | null, signal?: AbortSignal): ModelAdmission
+  acquire(sessionId: string, reservation: number | null, signal: AbortSignal | undefined, loopRequest: GenerateOptions | undefined): ModelAdmission
 }
 
 async function waitForBalance(change: Promise<void>, signal: AbortSignal): Promise<void> {
@@ -43,14 +42,6 @@ function receipt(usage: TokenUsage): TokenUsage | null {
   return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens, totalTokens }
 }
 
-/** The loop records this exact prepared adapter generation's combined input/output capacity before dispatch. */
-function reservation(options: GenerateOptions, agent: Agent): number | null {
-  if (!isAgentLoopRequest(options) || options.sessionId !== agent.id) return null
-  const route = agent.session.requestContext()
-  if (!route || route.provider !== options.provider || route.model !== options.model) return null
-  return count(route.contextWindow) && route.contextWindow > 0 ? route.contextWindow : null
-}
-
 /**
  * Install on the owning Runtime's Cordis context. `owns` classifies, it does not authorize: `acquire` must
  * synchronously revalidate ownership, liveness and limits (including pending attempts) and persist before returning.
@@ -64,7 +55,8 @@ function reservation(options: GenerateOptions, agent: Agent): number | null {
  */
 export function installModelAdmission(context: Context, host: AdmissionHost, lifetime: AbortSignal): () => void {
   let installed = true
-  const remove = context.on('llm/stream', (options, next) => {
+  // Runtime owns disposal after draining; Cordis must not detach admission concurrently with its shutdown callback.
+  const remove = context.root.on('llm/stream', (options, next) => {
     // Capture at dispatch, not at first pull: the initiating async scope and the Session's prepared route
     // belong to the caller, not necessarily to the consumer that later iterates the returned handle.
     const initiator = context.agents.currentInitiator()
@@ -78,7 +70,9 @@ export function installModelAdmission(context: Context, host: AdmissionHost, lif
     // blocker for its Worker. Setting this purpose cannot grant a passthrough or start provider I/O.
     if (options.purpose === 'session-title') refuse()
     if (!initiator || context.agents.get(subject) !== initiator) refuse()
-    const maximum = reservation(options, initiator)
+    const route = isAgentLoopRequest(options) && sessionId === initiator.id ? initiator.session.requestContext() : undefined
+    const loopRequest = !!route && route.provider === options.provider && route.model === options.model
+    const maximum = loopRequest && count(route.contextWindow) && route.contextWindow > 0 ? route.contextWindow : null
 
     // No reservation for a handle never iterated. Each DSH retry/restart dispatches a fresh handle.
     const stream = (async function* (): AsyncGenerator<StreamChunk, void> {
@@ -87,7 +81,7 @@ export function installModelAdmission(context: Context, host: AdmissionHost, lif
       for (;;) {
         if (!installed || lifetime.aborted || signal?.aborted || options.sessionId !== sessionId || context.agents.get(subject) !== initiator) refuse()
         let decision: ModelAdmission
-        try { decision = host.acquire(subject, maximum, signal) }
+        try { decision = host.acquire(subject, maximum, signal, loopRequest ? options : undefined) }
         catch { throw new LlmError('Host could not reserve model usage.', 'SUPERAGENT_USAGE_RESERVATION_FAILED') }
         if (decision.admitted) { lease = decision; break }
         if (decision.requiresOperator) throw new LlmError(decision.reason, 'SUPERAGENT_RUN_LIMIT_CONFIGURATION')

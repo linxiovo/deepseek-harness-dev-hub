@@ -13,19 +13,28 @@ import { Hint, LoadState } from './widgets.tsx'
 
 /** Parse a numeric input string, returning `null` when empty so the server rejects blank required numbers instead of coercing to 0. */
 export const numberOf = (text: string): number | null => text.trim() ? Number(text) : null
-interface SettingsData { settings: SettingsView; reload: () => Promise<void> }
+interface ModelCatalogState { catalog?: ApiResponse<'GET models'>; catalogError?: string }
+interface SettingsData extends ModelCatalogState { settings: SettingsView; reload: () => Promise<void> }
 const SettingsContext = createContext<SettingsData | undefined>(undefined)
 export function useSettings(): SettingsData {
   const value = useContext(SettingsContext)
   if (!value) throw new Error('A settings block rendered outside the settings')
   return value
 }
-export function SettingsProvider({ children }: { children: ReactNode }) {
+export function SettingsProvider({ children, withModels = false }: { children: ReactNode; withModels?: boolean }) {
   const { call } = usePanel()
   const { restarts } = usePanelData()
   const { data, error, reload } = usePoll(() => call('GET settings'), [call, restarts])
+  const [models, setModels] = useState<ModelCatalogState>({})
+  useEffect(() => {
+    if (!withModels) return
+    let current = true
+    call('GET models').then(catalog => { if (current) setModels({ catalog }) },
+      error => { if (current) setModels({ catalogError: errorText(error) }) })
+    return () => { current = false }
+  }, [call, restarts, withModels])
   if (!data) return <LoadState error={error} loading />
-  return <SettingsContext.Provider value={{ settings: data, reload }}>
+  return <SettingsContext.Provider value={{ settings: data, reload, ...models }}>
     {error && <LoadState error={error} loading={false} />}
     {children}
   </SettingsContext.Provider>
@@ -70,11 +79,11 @@ function SwitchRow({ label, hint, checked,
   </div>
 }
 type RoleModel = Settings['eval']['model']
-export function ModelField({ id, value, onChange }: { id: string; value: RoleModel; onChange: (next: RoleModel) => void }) {
-  const { t, call } = usePanel()
-  const [catalog, setCatalog] = useState<ApiResponse<'GET models'>>()
-  const [error, setError] = useState<string>()
-  useEffect(() => { call('GET models').then(setCatalog, failure => setError(errorText(failure))) }, [call])
+export function ModelField({ id, value, onChange, label, required = false }: {
+  id: string; value: RoleModel; onChange: (next: RoleModel) => void; label?: string; required?: boolean
+}) {
+  const { t } = usePanel()
+  const { catalog, catalogError } = useSettings()
   const current = { provider: value?.provider ?? '', model: value?.model ?? '', effort: value?.reasoningEffort ?? '' }
   const set = (next: Partial<typeof current>) => {
     const { provider, model, effort } = { ...current, ...next }
@@ -83,16 +92,16 @@ export function ModelField({ id, value, onChange }: { id: string; value: RoleMod
   const models = catalog?.groups.find(group => group.id === current.provider.trim())?.models ?? []
   const fallback = catalog?.default
   const input = (name: keyof typeof current, label: string, placeholder: string) => <Field label={label}>
-    <Input list={`${id}-${name}s`} spellCheck={false} placeholder={placeholder} value={current[name]}
+    <Input list={`${id}-${name}s`} spellCheck={false} placeholder={placeholder} value={current[name]} required={required && name !== 'effort'}
       onChange={event => set({ [name]: event.target.value })} />
   </Field>
-  return <div className="dt-model">
-    <Hint>{fallback ? t('defaultModel', { model: `${fallback.provider} / ${fallback.model}${fallback.reasoningEffort
-      ? ` · ${fallback.reasoningEffort}` : ''}` }) : t('defaultModelUnavailable')}</Hint>
-    {error && <p className="dt-error">{t('modelCatalogError', { error })}</p>}
+  const placeholder = t(required ? 'developmentModelRequired' : 'modelInherit')
+  return <div className="dt-model" role={label ? 'group' : undefined} aria-label={label}>
+    {!required && <Hint>{fallback ? t('defaultModel', { model: `${fallback.provider} / ${fallback.model}${fallback.reasoningEffort
+      ? ` · ${fallback.reasoningEffort}` : ''}` }) : t('defaultModelUnavailable')}</Hint>}
+    {catalogError && <p className="dt-error">{t('modelCatalogError', { error: catalogError })}</p>}
     <div className="dt-grid3">
-      {input('provider', t('modelProvider'), t('modelInherit'))}{input('model', t('modelName'), t('modelInherit'))}{input('effort',
-        t('modelEffort'), t('modelEffortDefault'))}
+      {input('provider', t('modelProvider'), placeholder)}{input('model', t('modelName'), placeholder)}{input('effort', t('modelEffort'), t('modelEffortDefault'))}
     </div>
     <datalist id={`${id}-providers`}>{catalog?.groups.map(group => <option key={group.id}
       value={group.id}>{group.name}</option>)}</datalist>

@@ -4,6 +4,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import { z } from 'zod'
+import { Commands } from '../src/infra/commands.ts'
 import { gitRepository } from './fixtures/git.ts'
 import { feishu, startManagedProject, type Host } from './fixtures/host.ts'
 
@@ -180,11 +181,12 @@ it('refuses replay of the very same native Hub call after a stop and remount of 
   expect(h.deliveries.mock.calls.filter(([d]) => d.sessionId.startsWith('lookup-'))).toHaveLength(1)
 })
 
-it('does not relaunch the same lookup after native creation is interrupted before a Session exists', async () => {
+it.each(['snapshot', 'native creation'] as const)('does not relaunch the same lookup interrupted at %s before a Session exists', async phase => {
   const mounted = await startManagedProject(), h = host = mounted.host, hub = h.runtime.masterId
-  const input = { kind: 'status' }
-  vi.mocked(h.ctx.sessionPersistence.create).mockRejectedValueOnce(new Error('Native creation interrupted'))
-  await expect(h.modelTool(hub, lookup, input)).rejects.toThrow('Native creation interrupted')
+  const input = { kind: 'code', path: 'shared.txt', query: 'starting value' }
+  if (phase === 'snapshot') vi.mocked(Commands.prototype.git).mockRejectedValueOnce(new Error('Inspection interrupted'))
+  else vi.mocked(h.ctx.sessionPersistence.create).mockRejectedValueOnce(new Error('Native creation interrupted'))
+  await expect(h.modelTool(hub, lookup, input)).rejects.toThrow(phase === 'snapshot' ? /identify.*checkout/i : /Native creation interrupted/)
   const native = h.ctx.agents.get(hub as SessionId)!.session.snapshotEvents().findLast(e => e.type === 'tool/call')
   if (native?.type !== 'tool/call') throw new Error('Expected a native Hub call')
   await h.restart()

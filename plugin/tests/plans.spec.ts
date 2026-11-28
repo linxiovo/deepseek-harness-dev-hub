@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import { unlinkSync, writeFileSync } from 'node:fs'
-import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
+import { freezeMessage, MessageId, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { resolve } from 'node:path'
@@ -1267,7 +1267,22 @@ it('replays a durable Worker model claim across settings changes and both pre-re
   expect(await dispatchPlan(published.id, 'saved-page')).toMatchObject({ status: 'blocked', waitingOn: ['saved-api'] })
   // The native selection is now durable, but the fixture has not dispatched the first agent/request.
   expect(await workerSelections(beforeClaim.session)).toEqual([backendModel])
-  await h.restart()
+  const probing = Promise.withResolvers<void>(), allowStartup = Promise.withResolvers<void>()
+  const spawn = h.subprocess.spawn.getMockImplementation()!
+  h.subprocess.spawn.mockImplementation(spec => {
+    const result = spawn(spec)
+    if (!spec.argv.includes('api') || !spec.argv.includes('user')) return result
+    probing.resolve()
+    return { ...result, done: allowStartup.promise.then(() => result.done) }
+  })
+  const restarted = h.restart()
+  try {
+    await Promise.race([probing.promise, restarted.then(() => { throw new Error('Worker remounted before the startup barrier') })])
+    await h.resolveDefault(beforeClaim.session)
+    const direct = freezeMessage({ role: 'user', id: MessageId('startup-direct'), source: { kind: 'user' }, content: [{ type: 'text', text: 'Continue' }] })
+    h.agents.get(beforeClaim.session)!.inbox.nextTurn.push(direct)
+    expect(await h.nativeStep(beforeClaim.session, { starts: true })).toBe(false)
+  } finally { allowStartup.resolve(); await restarted; h.subprocess.spawn.mockImplementation(spawn) }
   await h.runtime.idle()
   await expectWorkerModel(beforeClaim.session, backendModel)
   expect(h.controller.create.mock.calls.filter(([input]) => input.sessionId === beforeClaim.session)).toHaveLength(1)

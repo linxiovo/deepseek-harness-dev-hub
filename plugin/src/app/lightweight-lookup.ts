@@ -148,17 +148,15 @@ export class LightweightLookup {
     // A re-entry of the same physical call addresses the same root, but can never adopt its creation token.
     const id = SessionId(`lookup-${key(project.id, hub.id, String(hub.session.header.createdAt), String(call.data.turn), String(call.data.step), call.data.callId)}`)
     const native = KV.lookup.native(id)
-    if (store.get(native) !== undefined) throw new Error('This Hub lookup call was already consumed')
     current()
+    const cwd = join(project.stateDir, 'lookup-sessions')
+    const creation = { token: randomUUID(), cwd, marker: 'dsh-superagent/lookup-root' as const }
+    if (store.get(native) !== undefined) throw new Error('This Hub lookup call was already consumed')
+    store.set(native, { token: creation.token })
     const { source, facts } = await this.snapshot(input, current)
     current()
     const text = JSON.stringify({ kind: input.kind, ...input.kind !== 'status' && { query: input.query }, source, facts })
     if (text.length > 32_000) throw new Error('Lookup page exceeds the bounded model input')
-    const cwd = join(project.stateDir, 'lookup-sessions')
-    const creation = { token: randomUUID(), cwd, marker: 'dsh-superagent/lookup-root' as const }
-    current()
-    if (store.get(native) !== undefined) throw new Error('This Hub lookup call was already consumed')
-    store.set(native, { token: creation.token })
     mkdirSync(cwd, { recursive: true, mode: 0o700 })
     if (relative(cwd, realpathSync.native(cwd)) !== '') throw new Error('Lookup requires a physical private Session directory')
     const request = { id: `lookup:${id}:task`, text, tools: [], systemPrompt }

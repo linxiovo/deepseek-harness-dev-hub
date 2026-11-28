@@ -192,6 +192,7 @@ const withdrawnRelay = Symbol('withdrawn relay')
  */
  export class Sessions {
   private readonly agentDelivery: AgentDelivery
+  private readonly stopWorkerAdmission: () => void
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
   /** A durable pin alone cannot open model admission before this mount verifies the checkout. */
@@ -211,6 +212,15 @@ const withdrawnRelay = Symbol('withdrawn relay')
   constructor(private readonly host: SessionsHost) {
     this.ctx = host.context
     this.agentDelivery = new AgentDelivery(host.context)
+    // Block native steps before startup's GitHub and recovery waits can let a default request header persist.
+    this.stopWorkerAdmission = this.ctx.on('agent/pre-step', async ({ agent }, next) => {
+      const ticketId = ticketOfSession(agent.id)
+      if (!ticketId || (!this.host.closing() && !this.host.store.tickets.get(ticketId))) return next()
+      const allowed = () => this.readyWorkerModels.has(agent) && this.ctx.agents.get(agent.id) === agent && this.host.workerAuthorized(ticketId, agent.id)
+      if (!allowed()) return { kind: 'reject' }
+      const decision = await next()
+      return decision.kind === 'enter' && !allowed() ? { kind: 'reject' } : decision
+    })
     // Deliver relays and notices to the main Session in the order they were queued.
     host.effects.handle('relay', ({ text }, requestId) => this.deliverRelay(requestId, text), { ordered: true })
     host.effects.handle('notice', ({ value, summary }, name) => this.inject(name, value, summary), { ordered: true })
@@ -299,13 +309,6 @@ const withdrawnRelay = Symbol('withdrawn relay')
         if (!allowed(messages)) return { kind: 'reject' }
         const decision = await next()
         return decision.kind === 'enter' && !allowed(decision.messages) ? { kind: 'reject' } : decision
-      }
-      const ticketId = ticketOfSession(agent.id)
-      if (ticketId && (this.host.closing() || this.host.store.tickets.get(ticketId))) {
-        const allowed = () => this.readyWorkerModels.has(agent) && ctx.agents.get(agent.id) === agent && this.host.workerAuthorized(ticketId, agent.id)
-        if (!allowed()) return { kind: 'reject' }
-        const decision = await next()
-        return decision.kind === 'enter' && !allowed() ? { kind: 'reject' } : decision
       }
       if (!this.host.isHubGeneration(agent.id)) return next()
       if (!this.isHubRoot(agent)) return { kind: 'reject' }
@@ -1380,5 +1383,8 @@ const withdrawnRelay = Symbol('withdrawn relay')
     }
   }
   /** Releases prompt sections, skills, and tools registered by `Sessions` across all decorated agents. */
-  dispose(): void { for (const agent of [...this.bindings.keys()]) this.release(agent) }
+  dispose(): void {
+    this.stopWorkerAdmission()
+    for (const agent of [...this.bindings.keys()]) this.release(agent)
+  }
 }

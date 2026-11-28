@@ -297,10 +297,12 @@ export class Settings {
   async pause(paused: boolean, origin: SettingsOrigin): Promise<{ paused: boolean }> {
     const { store, sessions } = this.host
     const old = store.settings()
+    const next = { ...old, paused }
+    this.host.validate?.(old, next)
     if (old.paused === paused) return { paused }
     store.atomic(() => {
       const record = { source: origin, block: 'pause' as const, policyVersion: policyVersion(old), policyChanged: false, notified: [] }
-      store.saveSettings({ ...old, paused }, record)
+      store.saveSettings(next, record)
       if (origin !== 'tool') sessions.notify(...settingsNotice('pause', ['paused']))
     })
     await sessions.delivery('settings:pause')
